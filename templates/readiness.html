@@ -133,5 +133,6 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='js/sync-queue.js') }}"></script>
 <script src="{{ url_for('static', filename='js/readiness.js') }}"></script>
 {% endblock %}

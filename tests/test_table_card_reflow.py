@@ -304,6 +304,7 @@ class OptInTests(unittest.TestCase):
                     if 'tbl-cards' in _read(os.path.relpath(path, REPO)):
                         found.add(os.path.relpath(path, REPO))
         registered = {'templates/tags.html', 'templates/jobs.html', 'templates/rule_detail.html',
+                      'templates/sports_league.html',
                       'templates/recording_detail.html',
                       'templates/channels/detail.html', 'templates/_account_stats.html',
                       'templates/account_detail.html', 'templates/account_form.html',

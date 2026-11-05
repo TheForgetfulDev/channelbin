@@ -58,7 +58,7 @@ NAV_LABELS = [
     # Always in the markup, hidden once setup is done (dev/changelog/1280).
     'Get started',
     'Dashboard', 'TV Guide', 'Search', 'Recordings',
-    'Channel Groups', 'Hide Channels', 'Tags', 'EPG Manager',
+    'Channel Groups', 'Hide Channels', 'Tags', 'EPG Manager', 'Sports Schedules',
     'Accounts', 'Auto-record', 'Recording Profiles', 'Health Check Profiles',
     'Alerts', 'Readiness', 'Jobs', 'Logs', 'Maintenance', 'Settings',
 ]
@@ -69,7 +69,7 @@ NAV_SECTIONS = [
     ('system', 'System', ['Alerts', 'Readiness', 'Jobs', 'Logs', 'Maintenance', 'Settings']),
 ]
 # The one section that does not fold (dev/changelog/1372).
-PLAIN_SECTION = ('Channels &amp; guide', ['Channel Groups', 'Hide Channels', 'Tags', 'EPG Manager'])
+PLAIN_SECTION = ('Channels &amp; guide', ['Channel Groups', 'Hide Channels', 'Tags', 'EPG Manager', 'Sports Schedules'])
 
 _SEC_RE = re.compile(
     r'<div class="nav-sec( is-folded)?" data-fold="(\w+)">\s*'

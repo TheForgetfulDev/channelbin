@@ -164,9 +164,10 @@ Link.__new__.__defaults__ = (None,)
 Result = namedtuple('Result', 'status tested found action detail')
 Result.__new__.__defaults__ = (None, None)
 
-#: A one-click fix: a label and the URLs to POST, in order. A list rather than one URL
-#: because "sync the 2 stale accounts" is still one click for the user.
-Action = namedtuple('Action', 'label urls')
+#: A one-click fix: a label and the URLs to POST, in order. `accounts` ({id, name} each) makes
+#: it a sync queue start, which the page confirms first and posts those ids with: several
+#: accounts are one request, because a sync refuses to overlap another (app/sync_queue.py).
+Action = namedtuple('Action', 'label urls accounts', defaults=(None,))
 
 
 def _cap(*ids):
@@ -256,6 +257,8 @@ class Context:
                 log.warning('readiness: could not list scheduler jobs: %s', exc)
 
         self.accounts = Account.query.order_by(Account.name).all()
+        from .sync_queue import status as sync_queue_status
+        self.sync_queue = sync_queue_status()
         self.default_sync_interval = sync_cfg.get('sync_interval_hours', 12)
 
         epg_total, epg_horizon = (db.session.query(func.count(EPGEntry.id),
@@ -655,7 +658,26 @@ def _check_account_login(ctx):
                   f'All {len(xtream)} answered and authenticated{tail}')
 
 
+def _sync_queue_sentence(ctx, queue):
+    """Where a running sync queue stands. Its waiting reason can name a recording, a name the
+    user chose, so the support bundle's pseudonymized evaluation leaves it out."""
+    from .sync_queue import describe
+    names = {a.id: _account_name(ctx, a) for a in ctx.accounts}
+    return describe(queue, lambda account_id: names.get(account_id, f'account {account_id}'),
+                    show_waiting=not ctx.pseudonymize)
+
+
 def _check_account_sync(ctx):
+    result = _account_sync_finding(ctx)
+    queue = ctx.sync_queue
+    if queue is None:
+        return result
+    return result._replace(
+        found=f'{result.found}. {_sync_queue_sentence(ctx, queue)}',
+        action=Action('Stop syncing the rest', [_url('accounts.sync_queue_stop_api')]))
+
+
+def _account_sync_finding(ctx):
     from .database import ACCOUNT_STATUS_ERROR
     tested = "Compared each account's last successful sync against its own interval"
     if not ctx.accounts:
@@ -678,7 +700,8 @@ def _check_account_sync(ctx):
     stale = [a for a, _age, _iv in overdue] + never
     if stale:
         action = Action(f'Sync {len(stale)} {plural(len(stale), "account")} now',
-                        [_url('accounts.sync_account_api', account_id=a.id) for a in stale])
+                        [_url('accounts.sync_queue_api')],
+                        [{'id': a.id, 'name': _account_name(ctx, a)} for a in stale])
     if bad:
         return Result(PROBLEM, tested,
                       f'{len(bad)} of {len(ctx.accounts)} last failed to sync: '
@@ -1270,7 +1293,8 @@ def evaluate(ctx=None, ignored=None, pseudonymize=False) -> dict:
             'ignored': check.id in ignored,
             'last_run': ran_at,
             # One click here, or a link to the page that owns it - never both on one row.
-            'action': ({'label': action.label, 'urls': list(action.urls)}
+            'action': ({'label': action.label, 'urls': list(action.urls),
+                        'accounts': action.accounts}
                        if action is not None else None),
             'link': ({'label': check.link.label,
                       'url': _url(check.link.endpoint, **({'q': check.link.q} if check.link.q
@@ -1299,6 +1323,8 @@ def evaluate(ctx=None, ignored=None, pseudonymize=False) -> dict:
         'nav': nav,
         'areas': [{'id': aid, 'label': label} for aid, label in AREAS],
         'generated_at': datetime.utcnow().isoformat(),
+        # The page re-reads itself while this is on, so the row follows the queue.
+        'sync_queue_active': ctx.sync_queue is not None,
     }
     payload['report'] = report_text(payload)
     return payload

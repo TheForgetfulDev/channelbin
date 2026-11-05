@@ -529,12 +529,18 @@ class DurationDimensionTests(_AiringTestCase):
 
 class StandingOptionTests(_AiringTestCase):
 
-    def test_past_hides_ended_showings_and_says_how_many(self):
+    def test_past_hides_ended_showings_without_giving_a_count(self):
+        """BUGS.md 2026-11-04: the count could be wrong in either direction, and an exact one
+        costs a second scan, so there is none. The rows are still out of the total."""
         result = self.run_search(standing=only_hiding('showpast'))
         self.assertNotIn('Old Wembley Show', [r.title for r in result.rows])
-        self.assertEqual(result.standing_hidden, {'showpast': 1})
-        # The numbers add up: what it hid plus what is left is what you get by turning it off.
+        self.assertNotIn('showpast', result.standing_hidden)
         self.assertEqual(result.total + 1, search(self.bare(), self.context()).total)
+
+    def test_other_options_keep_their_counts_beside_the_uncounted_past(self):
+        """Only `showpast` lost its count. The others are still how the disclosure rule holds."""
+        result = self.run_search(standing=only_hiding('showpast', 'grpdedup'), q='wembley cup')
+        self.assertEqual(result.standing_hidden, {'grpdedup': 1})
 
     def test_grpdedup_keeps_one_row_per_group_on_the_best_member(self):
         """`guide_search` did this unconditionally; here it is switchable and disclosed.
@@ -1340,17 +1346,21 @@ class QueryPlanTests(_AiringTestCase):
         grain, not four aggregates. Measured on the live database: four separate passes cost
         677 + 4609 + 4327 + 3908 = 13,521ms against 2117ms for the combined scan. Asserted as
         a delta against the same search with no facets, so unrelated query-count drift in the
-        row path cannot move it."""
+        row path cannot move it.
+
+        The duplicates a value would bring back are one more pass between the four, for the same
+        reason: two statements, the kept copies and the duplicates (dev/changelog/1435)."""
         without = len(self._statements(facets=()))
         with_four = len(self._statements(facets=('acct', 'cat', 'health', 'other')))
-        self.assertEqual(with_four - without, 1,
-                         'the four single-scan facet dimensions should add exactly one '
-                         'statement between them, not one each')
+        self.assertEqual(with_four - without, 3,
+                         'the four single-scan facet dimensions should add one statement '
+                         'between them and one pair for the duplicates, not one each')
 
     def test_a_filtered_dimension_still_falls_back_to_its_own_aggregate(self):
         """The combined pass counts each dimension against the same base, so a dimension the
         user has filtered ON cannot join it - its own filter has to come off first. Filtering
-        one of the four therefore costs two statements, not one.
+        one of the four therefore costs two statements, not one, plus a pair for the duplicates
+        each of those passes would bring back (dev/changelog/1435).
 
         The baseline also carries the cat filter (facets=()) rather than being fully
         unfiltered: an unfiltered airing search takes the cached-breakdown path
@@ -1361,7 +1371,7 @@ class QueryPlanTests(_AiringTestCase):
         cat_filter = (DimensionFilter('cat', ('Sports',), ()),)
         without = len(self._statements(filters=cat_filter, facets=()))
         filtered = len(self._statements(filters=cat_filter, **state))
-        self.assertEqual(filtered - without, 2)
+        self.assertEqual(filtered - without, 6)
 
     def test_the_combined_pass_returns_exactly_what_the_separate_aggregates_did(self):
         """The correctness half. Collapsing four aggregates into one grouped scan changes

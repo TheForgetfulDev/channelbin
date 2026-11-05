@@ -322,6 +322,7 @@ def init_scheduler(app):
     schedule_account_stats_fold(app)
     schedule_host_resolve_check(app)
     schedule_auto_rule_sweep(app)
+    schedule_sports_worker(app)
 
     # One-shot reconcile of every group's format state (auto-disable mismatched members /
     # re-enable conforming ones). Runs after migrations so schema-v6 columns exist.
@@ -1337,9 +1338,20 @@ def _find_safe_next_run(candidate: datetime, existing_times: list, gap_minutes: 
     return candidate
 
 
-def schedule_account_sync(app, account_id: int, *, force_reschedule: bool = False):
-    """Register or update the IntervalTrigger sync job for a single account."""
+def schedule_account_sync(app, account_id: int, *, force_reschedule: bool = False) -> bool:
+    """Register or update the IntervalTrigger sync job for a single account.
+
+    A changed interval moves the next run too. It belongs one new interval after the last
+    successful sync, and an account already past that syncs within the minute: keeping the
+    run the old interval booked left an account overdue for hours by the very setting that
+    had just been saved (dev/docs/BUGS.md 2026-11-05). Only a change of interval does this,
+    read from the job's own trigger, so every other reschedule keeps a next_sync_at somebody
+    set on purpose (_reanchor_account_sync).
+
+    Returns True when the account was already past its new interval, so the caller can say
+    a sync is about to start."""
     job_id = f'account_sync_{account_id}'
+    past_new_interval = False
 
     # Nothing to register against. Named rather than crashed on: every write path that
     # edits an account calls this, and on a scheduler-less app (a test app, or a startup
@@ -1348,7 +1360,7 @@ def schedule_account_sync(app, account_id: int, *, force_reschedule: bool = Fals
     if _scheduler is None:
         log.warning('No scheduler running - sync job for account %d was not (re)scheduled.',
                     account_id)
-        return
+        return False
 
     with app.app_context():
         from . import db
@@ -1359,28 +1371,34 @@ def schedule_account_sync(app, account_id: int, *, force_reschedule: bool = Fals
         if account is None:
             remove_job_if_exists(job_id)
             remove_job_if_exists(sync_retry_job_id(account_id))
-            return
+            return False
 
         if not account.sync_enabled:
             remove_job_if_exists(sync_retry_job_id(account_id))
             if remove_job_if_exists(job_id):
                 log.info('Removed sync job for account %d (%s) - sync disabled', account_id, account.name)
-            return
+            return False
 
         cfg = load_config()
         interval = account_sync_interval_hours(account, cfg)
 
         existing = _scheduler.get_job(job_id)
+        stored_td = getattr(existing.trigger, 'interval', None) if existing is not None else None
+        stored_hours = int(stored_td.total_seconds() / 3600) if stored_td else None
+        interval_changed = stored_hours is not None and stored_hours != interval
         if existing is not None and existing.next_run_time is not None and not force_reschedule:
-            stored_td = getattr(existing.trigger, 'interval', None)
-            stored_hours = int(stored_td.total_seconds() / 3600) if stored_td else None
             if stored_hours == interval:
                 log.debug('Sync job for account %d already scheduled correctly (every %dh)', account_id, interval)
-                return
+                return False
+        if interval_changed:
             log.info('Sync interval changed for account %d: %dh→%dh', account_id, stored_hours, interval)
 
         now = datetime.utcnow()
-        if account.next_sync_at is not None and account.next_sync_at > now:
+        if interval_changed and account.last_sync_at is not None:
+            due = account.last_sync_at + timedelta(hours=interval)
+            past_new_interval = due <= now
+            candidate = max(due, now + timedelta(minutes=1))
+        elif account.next_sync_at is not None and account.next_sync_at > now:
             candidate = account.next_sync_at
         elif account.status == ACCOUNT_STATUS_UNSYNCED or account.next_sync_at is None:
             candidate = now + timedelta(minutes=1)
@@ -1422,10 +1440,16 @@ def schedule_account_sync(app, account_id: int, *, force_reschedule: bool = Fals
         )
         log.info('Sync job scheduled for account %d (%s) every %dh, next run at %s',
                  account_id, account.name, interval, candidate)
+    return past_new_interval
 
 
-def schedule_all_account_syncs(app, *, force_reschedule_defaults: bool = False):
-    """Register sync jobs for all accounts. Called at startup and on global config change."""
+def schedule_all_account_syncs(app, *, force_reschedule_defaults: bool = False) -> int:
+    """Register sync jobs for all accounts. Called at startup and on global config change.
+    Returns how many accounts were already past a changed interval."""
+    if _scheduler is None:
+        log.warning('No scheduler running - account sync jobs were not (re)scheduled.')
+        return 0
+
     # Remove legacy global xtream_sync job if it's still in the store
     if remove_job_if_exists('xtream_sync'):
         log.info('Removed legacy global xtream_sync job from store')
@@ -1441,9 +1465,11 @@ def schedule_all_account_syncs(app, *, force_reschedule_defaults: bool = False):
         from .database import Account
         accounts = Account.query.all()
 
+    past_interval = 0
     for acc in accounts:
         force = force_reschedule_defaults and acc.sync_interval_hours is None
-        schedule_account_sync(app, acc.id, force_reschedule=force)
+        past_interval += schedule_account_sync(app, acc.id, force_reschedule=force)
+    return past_interval
 
 
 # ── EPG source refresh jobs (DESIGN-epg-sources.md §8.1) ────────────────────────────
@@ -2171,6 +2197,9 @@ _DAY_MAP = {1: 'sun', 2: 'mon', 3: 'tue', 4: 'wed', 5: 'thu', 6: 'fri', 7: 'sat'
 
 AUTO_RULES_EVALUATE_JOB_ID = 'auto_rules_evaluate'
 AUTO_RULE_SWEEP_JOB_ID = 'auto_rule_sweep'
+SPORTS_WORKER_JOB_ID = 'sports_worker'
+# A tick decides whether a call is due; the pace itself is sports_data.call_spacing_seconds.
+SPORTS_WORKER_TICK_SECONDS = 15
 #: How long a refused evaluation waits before asking admission again. Short, because what it
 #: yields to is usually a sync finishing, and the sync's own import queued it.
 _AUTO_RULES_RETRY_MINUTES = 5
@@ -2235,6 +2264,34 @@ def schedule_auto_rule_sweep(app):
     _add_job(func=_auto_rule_sweep_job, trigger='interval', hours=hours,
              id=AUTO_RULE_SWEEP_JOB_ID, replace_existing=True)
     log.info('Auto-record rule sweep scheduled every %d hour%s', hours, '' if hours == 1 else 's')
+
+
+def scheduler_app():
+    """The app whose scheduler is running here, or None when no scheduler is (a test app, or the
+    second instance init_scheduler refused)."""
+    return _app if _scheduler is not None else None
+
+
+def schedule_sports_worker(app):
+    """Run TheSportsDB's worker only while there is work for it. With nothing followed and nothing
+    stored there is no job at all, not just no call (dev/docs/DESIGN-sports-data.md 1). Each tick makes at most
+    one call, at the pace app/sports_data.py stores, so a tick is cheap and a restart cannot burst.
+    Left alone when already registered, so a save does not push the next tick back."""
+    with app.app_context():
+        from .sports_data import worker_needed
+        wanted = worker_needed()
+    existing = _scheduler.get_job(SPORTS_WORKER_JOB_ID)
+    if wanted and existing is None:
+        _add_job(func=_sports_worker_job, trigger='interval', seconds=SPORTS_WORKER_TICK_SECONDS,
+                 id=SPORTS_WORKER_JOB_ID, replace_existing=True, coalesce=True, max_instances=1)
+    elif not wanted and existing is not None:
+        _scheduler.remove_job(SPORTS_WORKER_JOB_ID)
+
+
+def _sports_worker_job():
+    with _app.app_context():
+        from .sports_data import tick
+        tick()
 
 
 def _auto_rule_sweep_admitted():
@@ -2695,9 +2752,7 @@ _INDEX_JANITOR_INTERVAL_MINUTES = 10
 
 
 def schedule_index_janitor(app):
-    """Register the search-index janitor. Registered unconditionally, like the other
-    recurring jobs: the job reads search.index_janitor_grace_minutes at run time, so
-    changing (or zeroing) it in Settings takes effect on the next tick with no restart.
+    """Register the search-index janitor, unconditionally like the other recurring jobs.
 
     Same "leave an existing live job alone" shape as apply_logo_cache_schedule, so a
     restart does not reset the interval and delay the next tick by a fresh 10 minutes."""
@@ -2715,8 +2770,8 @@ def schedule_index_janitor(app):
 
 
 def _index_janitor_job():
-    """Rebuild a search index that has been unusable for longer than its grace window with
-    nobody rebuilding it (app/search_index.py::run_index_janitor).
+    """Repair a search index that is unusable with nobody rebuilding it
+    (app/search_index.py::run_index_janitor).
 
     Yields the database axis to a sync or another rebuild, from inside
     rebuild_search_indexes(refusable=True) rather than from a check here - a caller that
@@ -2728,14 +2783,12 @@ def _index_janitor_job():
     average the /jobs "expected runtime" down to milliseconds - i.e. it would answer a
     question ("how long does this take when it runs?") with the cost of it not running."""
     with _app.app_context():
-        from .config import load_config
         from .database import record_job_run, JOB_RUN_SUCCESS, JOB_RUN_FAILED
         from .search_index import run_index_janitor
 
-        grace = load_config().get('search', {}).get('index_janitor_grace_minutes', 15)
         started = datetime.utcnow()
         try:
-            outcome = run_index_janitor(grace)
+            outcome = run_index_janitor()
         except Exception:
             log.exception('Search index janitor failed')
             record_job_run('search_index_janitor', started, datetime.utcnow(), JOB_RUN_FAILED)

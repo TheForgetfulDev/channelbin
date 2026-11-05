@@ -5,6 +5,50 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.39.0 - 2026-11-05
+
+Sports schedules from TheSportsDB, a Sync All button, and search counts that add up.
+
+**Added**
+
+- A Sports Schedules page under Channels & guide. Follow a league or specific teams and see who
+  is playing, when and where, in your own timezone, with a page per league showing what was
+  asked for and what came back. Six leagues are offered to start: English Premier League,
+  Formula 1, NASCAR Cup Series, NBA, NFL and NHL. Schedule data comes from
+  [TheSportsDB](https://www.thesportsdb.com/), fetched slowly and only for what you follow.
+  **For now this is read only and informational:** games are not yet matched to your guide
+  listings and cannot be recorded from this page. Connecting schedules to the guide and to
+  recordings is a work in progress.
+- Sync All on the Accounts page. It confirms first, then syncs every account one at a time on
+  the server, with a 60 second pause between them, whether or not you stay on the page.
+- The notice that search is running without its index has a Rebuild now button, or says why a
+  rebuild cannot start right now. The restart banner has a Restart now button on every page.
+- A typed Programs search says how many channels match by name but have nothing scheduled, with
+  a button that opens exactly those channels on Search Channels.
+- A black poster frame is skipped. The next try looks later by `poster_frame_retry_step_seconds`
+  (60 by default), up to 5 tries, and the recording's page says which frame was skipped and
+  which was used.
+
+**Changed**
+
+- Search Index Repair fixes a stale index on the first check that finds a problem, so a repair
+  waits 10 minutes at most instead of 20 to 30. The `search.index_janitor_grace_minutes`
+  setting is gone.
+
+**Fixed**
+
+- "Sync N accounts now" on the Readiness check works. It says what it will do, then syncs them
+  one at a time.
+- Saving a new sync interval moves each account's next sync to match, instead of leaving it
+  overdue for hours, and no longer asks for a restart it never needed.
+- With "Show duplicates" off, a channel carried on two copies of a stream no longer disappears
+  from search when a filter removes the kept copy.
+- A channel with no listings no longer counts its placeholder hour slots as programs, on its
+  page or in the TV Guide, and says when its row is on placeholders.
+- Programs search no longer shows an "N ended" count that disagreed with what "Show airings that
+  have ended" brought back. A search whose every match has ended says so, with a link that
+  turns that option on.
+
 ## 0.38.0 - 2026-11-03
 
 Improved A/V sync with dropping streams, and reconnects now impact the health score.

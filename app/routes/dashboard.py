@@ -1062,12 +1062,17 @@ def _search_readiness_dict():
     readiness_map() returns are not JSON-serializable, which is why they are flattened
     here rather than passed through.
 
+    `rebuild_refused` is why the search page's notice may not offer a rebuild right now, and
+    is read only while something is unusable, since a healthy poll has no notice to fill.
+
     This runs on EVERY page in the app, not just the search page: 4 state rows plus 4
     watermark lookups per poll, all index hits. dev/changelog/427.
     """
-    from ..search_index import SEARCH_INDEX_CHANNELS, SEARCH_INDEX_NAMES, readiness_map
+    from ..search_index import (SEARCH_INDEX_CHANNELS, SEARCH_INDEX_NAMES,
+                                manual_rebuild_refusal, readiness_map)
     ready = readiness_map()
-    return {name: {'ready': ready[names][0], 'reason': ready[names][1]}
+    refused = '' if all(answer[0] for answer in ready.values()) else manual_rebuild_refusal()
+    return {name: {'ready': ready[names][0], 'reason': ready[names][1], 'rebuild_refused': refused}
             for name, names in (('channels', (SEARCH_INDEX_CHANNELS,)),
                                 ('programs', SEARCH_INDEX_NAMES))}
 

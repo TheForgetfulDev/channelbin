@@ -1134,10 +1134,18 @@ class StandingOptionTests(_EngineTestCase):
     def test_which_copy_survives_does_not_depend_on_what_was_typed(self):
         """The cascade is computed over the whole channels table on purpose. Scoped to the
         filtered set instead, searching for the loser's name would promote it to survivor
-        and the KEPT badge would move around as the user types."""
+        and the KEPT badge would move around as the user types.
+
+        The copy itself IS shown, since its kept copy is not in these results
+        (dev/docs/BUGS.md 2026-11-04). It is shown as a duplicate, not as the one kept."""
         self.build_indexes()
         state = SearchState(q='Sky Sports Action HD', standing=only_hiding('showdup'), facets=())
-        self.assertEqual(self.names(state), [])
+        result = self.run_search(state)
+        self.assertEqual([r.name for r in result.rows], ['Sky Sports Action HD'])
+        self.assertEqual(result.kept_ids, frozenset())
+        db.session.expire_all()
+        self.assertFalse(self.espn2.is_duplicate_loser)
+        self.assertTrue(result.rows[0].is_duplicate_loser)
 
     def test_kept_ids_only_mean_something_while_hide_duplicates_is_on(self):
         with_dup = self.run_search(SearchState(standing=only_hiding('showdup'), facets=()))
@@ -1194,10 +1202,21 @@ class StandingOptionTests(_EngineTestCase):
 
     def test_the_breakdown_is_scoped_to_the_current_search(self):
         self.build_indexes()
+        hiding = only_hiding('showdup')
+        here = self.run_search(SearchState(filters=(DimensionFilter('cat', ('Sports',)),),
+                                           standing=hiding, facets=()))
+        self.assertEqual(here.standing_hidden, {'showdup': 2})
+        elsewhere = self.run_search(SearchState(filters=(DimensionFilter('cat', ('Docs',)),),
+                                                standing=hiding, facets=()))
+        self.assertEqual(elsewhere.standing_hidden, {})
+
+    def test_the_breakdown_does_not_count_a_copy_whose_kept_copy_is_not_in_the_search(self):
+        """Those two copies are on the page instead (dev/docs/BUGS.md 2026-11-04)."""
+        self.build_indexes()
         result = self.run_search(SearchState(q='Sky', standing=only_hiding('showdup'),
                                              facets=()))
-        self.assertEqual(result.standing_hidden, {'showdup': 2})
-        self.assertEqual(result.total, 0)
+        self.assertEqual(result.standing_hidden, {})
+        self.assertEqual(result.total, 2)
 
     def test_no_active_options_reports_nothing_hidden(self):
         result = self.run_search(SearchState(standing=only_hiding(), facets=()))

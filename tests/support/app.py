@@ -375,6 +375,7 @@ def reset_module_globals():
     import app.routes.channel_search as channel_search_routes
     import app.routes.system as system_routes
     import app.search_index as search_index
+    import app.routes.sports as routes_sports
     import app.setup_steps as setup_steps
     import app.examples as examples
     import app.toolchain as toolchain
@@ -393,6 +394,8 @@ def reset_module_globals():
     # is_running() (dev/changelog/1015).
     stop_channel_tester_run()
     channel_tester._state = channel_tester.RunState()
+    routes_sports._checked_leagues.clear()
+    routes_sports._checked_teams.clear()
     # Paired with the RunState above: the smoother carries the previous run's rate and its
     # +/-20% clamp, so leaving it would drag the next module's first estimate toward a
     # number measured over different channels.
@@ -405,6 +408,9 @@ def reset_module_globals():
     # The output feed's relays hold a seat the same way, and its redirect history would
     # otherwise show one module's plays on the next module's dashboard.
     output_feed.reset_for_tests()
+    # A step's in-memory half: which account a queue is syncing and why it is holding.
+    import app.sync_queue as sync_queue
+    sync_queue.reset_for_tests()
     # A roll attempt recorded by one module's stall test puts the next module's roll inside
     # the cooldown, so its resolution failure rolls nothing.
     account_links._last_roll_attempt.clear()
@@ -415,10 +421,6 @@ def reset_module_globals():
     # rebuild_in_progress() True makes the dashboard's background-activity indicator read
     # 'active' when the next module expects 'hidden'.
     search_index._rebuilding = False
-    # The janitor's stale clock is keyed by index name only, so an entry left by a previous
-    # module makes this module's first tick read as already past its grace window - i.e. an
-    # unexpected rebuild where the test set up a fresh observation.
-    search_index._stale_since.clear()
     # A GPU trial that passed is remembered for the process, keyed on binary and device;
     # a module that patched the trial to pass would hand the next module a GPU it does
     # not have. Only the trial is dropped - the tool and capability probes are machine

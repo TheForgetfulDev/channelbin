@@ -66,6 +66,7 @@ from sqlalchemy.orm import selectinload
 
 from . import db, duplicate_streams, health_bands
 from .channel_search import (FIELDS, GRAIN_AIRINGS, GRAIN_CHANNELS,
+                             cluster_is_folded,
                              HEALTH_UNTESTED, SearchStateError, effective_health,
                              field_hit_predicate, in_any_group_expr, include_terms,
                              matching_programs, tag_hit_predicate)
@@ -145,7 +146,7 @@ def _plain_channel_rows(rows, result, state, ctx) -> list:
     groups, guide_via = _groups_by_channel(ids)
     tags = _tags_by_channel(ids, ctx)
     lifecycle = _lifecycle(rows, ctx)
-    clusters = _duplicate_clusters(rows, ctx)
+    clusters = _duplicate_clusters(rows, ctx, state)
     # Hoisted: banding a score is per-row work, resolving the bands is per-request.
     bands = health_bands.resolve_bands(ctx.cfg)
 
@@ -341,7 +342,7 @@ def _airing_rows(result, state, ctx) -> list:
     # the row itself is a showing that is usually not the one on now - see tag_hit_predicate.
     tags = _tags_by_channel(channel_ids, ctx, now_scoped=False)
     lifecycle = _lifecycle(channels, ctx)
-    clusters = _duplicate_clusters(channels, ctx)
+    clusters = _duplicate_clusters(channels, ctx, state)
     recordings = _recordings_for(entries, channels_by_id)
     stands_for = _airing_group_labels(result, ctx)
     namings = _filename_namings(channels, ctx)
@@ -799,9 +800,12 @@ def _lifecycle(rows, ctx) -> dict:
     return lifecycle_states_for_channels(rows, ctx.cfg, accounts_by_id=ctx.accounts_by_id)
 
 
-def _duplicate_clusters(rows, ctx) -> dict:
-    """{channel id: {count, others, kept_id, kept_reason, key}} for every duplicate row on
-    the page.
+def _duplicate_clusters(rows, ctx, state) -> dict:
+    """{channel id: {count, others, kept_id, kept_reason, key, kept_absent}} for every duplicate
+    row on the page.
+
+    `kept_absent` is true on a copy the fold would hide but did not, which on a page of results
+    can only mean its kept copy is not in them (dev/changelog/1435).
 
     The cluster is the one the fold stored (app/duplicate_streams.py), read over the whole
     channels table rather than over the result set: which copy is KEPT must not change
@@ -858,6 +862,8 @@ def _duplicate_clusters(rows, ctx) -> dict:
                 'others': [{'id': o.id, 'name': o.name, 'category': o.category_name or ''}
                            for o in others[:DUP_TOOLTIP_MEMBERS]],
                 'others_hidden': max(0, len(others) - DUP_TOOLTIP_MEMBERS),
+                'kept_absent': (bool(member.is_duplicate_loser)
+                                and cluster_is_folded(member, state, ctx)),
                 'kept_id': keep.id,
                 'kept_reason': reason,
                 # What made these one stream: {'kind': 'url'} or {'kind': 'provider',

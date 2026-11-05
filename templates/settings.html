@@ -438,6 +438,8 @@
            [('poster','Poster frame, taken from inside the program'), ('last_frame','Final frame of the recording')], gated_by=['recording.live_thumbnail.enabled'], tier='advanced') }}
         {{ field_number('recording.live_thumbnail.poster_frame_offset_seconds', 'Poster frame offset (seconds)',
            'How far after the program\'s own start time the poster frame is taken. Measured from the program start, not from when the recording started, so front padding is skipped. The frame comes from a segment already on disk and never costs a second connection to the provider. If nothing was captured at that moment, the nearest content after it is used instead.', lt.get('poster_frame_offset_seconds', 60), gated_by=['recording.live_thumbnail.enabled'], tier='advanced') }}
+        {{ field_number('recording.live_thumbnail.poster_frame_retry_step_seconds', 'Poster frame retry step (seconds)',
+           'When the poster frame comes out black, how much later in the program the next try looks. If every try is black, the recording uses its final frame instead.', lt.get('poster_frame_retry_step_seconds', 60), gated_by=['recording.live_thumbnail.enabled'], tier='advanced') }}
         {{ field_bool('recording.logo_cache.enabled', 'Cache channel logos locally',
            'Download and cache channel logos locally instead of loading them from the provider/CDN on every page view. Only caches logos for channels that are in your TV Guide or belong to a group (a channel group or a health-check group) - not your whole channel catalog, which can be tens of thousands of channels on some accounts. A background job fetches a small batch every few minutes; a logo is only re-fetched if the provider gives it a different URL.', lc.get('enabled', False), tier='basic') }}
       </div>
@@ -525,7 +527,7 @@
       <div data-sub="sync-schedule">
         <div class="sec-sub"><strong>Sync schedule</strong></div>
         {{ field_number('sync.sync_interval_hours', 'Sync interval (hours)',
-           'How often to refresh channel lists and EPG data from M3U/Xtream accounts. A low value means more frequent playlist and guide downloads from each provider, and some providers rate-limit or ban accounts for that.', sync_cfg.get('sync_interval_hours', 12), restart=True, overridable_by='account', tier='basic') }}
+           'How often to refresh channel lists and EPG data from M3U/Xtream accounts. A low value means more frequent playlist and guide downloads from each provider, and some providers rate-limit or ban accounts for that.', sync_cfg.get('sync_interval_hours', 12), overridable_by='account', tier='basic') }}
         {{ field_number('sync.request_timeout_seconds', 'Request timeout (seconds)',
            'HTTP timeout for all Xtream API, M3U, and XMLTV fetch requests.', sync_cfg.get('request_timeout_seconds', 30), tier='advanced') }}
         {{ field_bool('sync.skip_sync_if_recording_active', 'Defer sync during recording',
@@ -578,8 +580,6 @@
            'While search is running without its index, how long it may spend on the optional numbers - the match total, the "Hide X" counts and the facet rail - before returning the results without them and labeling them as not counted. Matching rows are always returned and are always complete; only the counts around them are skipped. 0 = never attempt them while unindexed.', search_cfg.get('degraded_aggregate_timeout_seconds', 2), tier='advanced') }}
         {{ field_number('search.full_scan_aggregate_timeout_seconds', 'Uncounted totals when unindexable (seconds)',
            'The same limit for a search the index cannot answer even when it is perfectly healthy - today, an airing search with "Show airings that have ended" ticked, which puts every past showing back in scope. Counting those means reading the whole table, so past this many seconds the totals and the facet rail are returned as not counted. Matching rows are always returned and are always complete. 0 = never attempt them.', search_cfg.get('full_scan_aggregate_timeout_seconds', 8), tier='advanced') }}
-        {{ field_number('search.index_janitor_grace_minutes', 'Repair a stale index after (minutes)',
-           'How long a search index may sit unusable with nothing rebuilding it before it is rebuilt automatically. An account sync rebuilds the indexes when it finishes, so this only steps in when no sync is coming - after a restart mid-sync, a cancelled sync, or a restore from backup. 0 = leave repair to the next sync.', search_cfg.get('index_janitor_grace_minutes', 15), tier='advanced') }}
       </div>
     {% endcall %}
 
@@ -819,6 +819,25 @@
       {{ field_number('integrations.output_feed.xmltv_days', 'Guide depth (days)',
          'How many days of listings xmltv.php carries. The TV Guide\'s own depth is 3.',
          feedcfg.get('xmltv_days', 3), tier='advanced', gated_by=['integrations.output_feed.enabled']) }}
+
+      {#- How the Sports Schedules page's worker paces itself (app/sports_data.py). What to follow
+          is on that page, not here: these are the system's half of it. -#}
+      {% set sportscfg = cfg.get('sports_data', {}) %}
+      <div data-sub>
+      <div class="sec-sub"><strong>TheSportsDB</strong>How the <a href="{{ url_for('sports.sports_page') }}">Sports Schedules</a> page keeps its schedules current. With nothing followed, no calls are made.</div>
+      {{ field_number('sports_data.call_spacing_seconds', 'Seconds between calls',
+         'How long to wait between one call to TheSportsDB and the next. With the variation below, the shortest possible wait has to be at least 12 seconds, the fastest pace measured without being told to slow down. Checked about every 15 seconds, so a shorter wait than that has no further effect.',
+         sportscfg.get('call_spacing_seconds', 60), tier='advanced') }}
+      {{ field_number('sports_data.call_jitter_seconds', 'Variation (seconds)',
+         'Each wait is the seconds above, plus or minus a random amount up to this.',
+         sportscfg.get('call_jitter_seconds', 20), tier='advanced') }}
+      {{ field_number('sports_data.horizon_days', 'Days ahead',
+         'How far ahead a schedule reaches. Further ahead means more calls.',
+         sportscfg.get('horizon_days', 21), tier='advanced') }}
+      {{ field_number('sports_data.history_keep_days', 'Days to keep past games',
+         'A past game is deleted this long after it happened.',
+         sportscfg.get('history_keep_days', 30), tier='advanced') }}
+      </div>
     {% endcall %}
 
     {% call section('system', 'System') %}

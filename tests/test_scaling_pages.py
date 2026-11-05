@@ -455,6 +455,47 @@ def _seed_auto_rule_history(n):
     db.session.commit()
 
 
+def _seed_sports_leagues(n):
+    """n followed leagues, each with its queue rows and upcoming games, half of them team follows:
+    the Sports Schedules list (dev/changelog/1444)."""
+    from app.database import SportsEvent, SportsFetch, SportsFollow, SportsLeague
+    now = datetime.utcnow()
+    for i in range(n):
+        league = SportsLeague(tsdb_id=9000 + i, name=f'League {i}', sport='Pretend Ball', current_season='2099')
+        db.session.add(league)
+        db.session.flush()
+        db.session.add(SportsFollow(league_id=league.id, team_tsdb_id=(100 if i % 2 else 0), rule_id=0))
+        db.session.add(SportsFetch(target=f'next:{league.tsdb_id}', kind='next', league_id=league.id,
+                                   last_at=now, next_due_at=now + timedelta(hours=9), outcome='ok'))
+        db.session.add(SportsEvent(tsdb_id=500000 + i, league_id=league.id, name=f'Game {i}', season='2099', round=1,
+                                   home_team_id=100, away_team_id=200 + i, home_name='Reds', away_name=f'Team {i}',
+                                   start_at=now + timedelta(hours=i + 1), local_date=(now + timedelta(hours=i + 1)).date()))
+    db.session.commit()
+
+
+def _seed_sports_league_page(n):
+    """One followed league with n upcoming games, n teams and n queue rows: a league's own page."""
+    from app.database import SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsTeam
+    now = datetime.utcnow()
+    league = SportsLeague(tsdb_id=9000, name='Scaling league', sport='Pretend Ball', current_season='2099')
+    db.session.add(league)
+    db.session.flush()
+    db.session.add(SportsFollow(league_id=league.id, team_tsdb_id=0, rule_id=0))
+    for i in range(n):
+        db.session.add(SportsTeam(tsdb_id=1000 + i, full_name=f'Team {i}'))
+        db.session.add(SportsFetch(target=f'round:9000:2099:{i}', kind='round', league_id=league.id,
+                                   last_at=now, next_due_at=now + timedelta(hours=9), outcome='ok'))
+        db.session.add(SportsEvent(tsdb_id=500000 + i, league_id=league.id, name=f'Game {i}', season='2099', round=i,
+                                   home_team_id=1000 + i, away_team_id=1000, home_name=f'Team {i}', away_name='Team 0',
+                                   start_at=now + timedelta(hours=i + 1), local_date=(now + timedelta(hours=i + 1)).date()))
+    db.session.commit()
+
+
+def _scaling_sports_league_id():
+    from app.database import SportsLeague
+    return SportsLeague.query.filter_by(name='Scaling league').one().id
+
+
 def _scaling_rule_id():
     from app.database import AutoRule
     return AutoRule.query.filter_by(name='Scaling history rule').one().id
@@ -920,6 +961,12 @@ class PageScalingTests(unittest.TestCase):
         self._assert_row_independent(_seed_auto_rule_history,
                                      lambda: f'/rules/{_scaling_rule_id()}')
 
+    def test_sports_page(self):
+        self._assert_row_independent(_seed_sports_leagues, '/sports')
+
+    def test_sports_league_page(self):
+        self._assert_row_independent(_seed_sports_league_page, lambda: f'/sports/{_scaling_sports_league_id()}')
+
     def test_profiles_page(self):
         self._assert_row_independent(_seed_recording_profiles, '/profiles')
 
@@ -1141,6 +1188,8 @@ COVERED = {
     'channel_hide_rules.hide_rules_page': 'test_hide_rules_page',
     'auto_rules.rules_page': 'test_rules_page',
     'auto_rules.rule_page': 'test_rule_page',
+    'sports.sports_page': 'test_sports_page',
+    'sports.league_page': 'test_sports_league_page',
     'accounts.accounts_list': 'test_accounts_list_page',
     'accounts.account_detail': 'test_account_detail_page',
     'accounts.epg_source_review': 'test_epg_source_review_page',

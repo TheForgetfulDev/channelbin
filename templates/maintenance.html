@@ -255,7 +255,7 @@
         account sync is running, and names what is blocking it.</span>
       {% endif %}
       <div class="mrow-ctl">
-        <button class="btn btn-sm btn-danger" id="btn-restart-now">Restart service now</button>
+        <button class="btn btn-sm btn-danger" id="btn-restart-now" data-restart-service{% if in_docker %} data-docker="1"{% endif %}>Restart service now</button>
       </div>
     </div>
   </div>
@@ -270,7 +270,6 @@
     'hour': backup_hour,
     'enabled': backup_enabled,
   },
-  'is_docker': is_docker,
 } | tojson }}
 </script>
 {% endblock %}

@@ -505,18 +505,26 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
         would produce. Returns (segment, the content positions the detector read)."""
         samples = []
         alive_at_deadline = []
+        spool_bytes = []
+
+        def _at_deadline():
+            alive_at_deadline.append(self.wd.is_alive())
+            # Read here, with the capture still open: stop_event hands the state to the watchdog's
+            # own teardown, which closes the spool and clears this path, and on a busy machine
+            # that teardown can land before anything after _run() reads it (dev/docs/BUGS.md
+            # 2026-11-05).
+            spool_bytes.append(os.path.getsize(self.state.stderr_path))
 
         def _counting(path):
             pos = read_capture_content_position(path)
             samples.append(pos)
             return pos
         with mock.patch('app.watchdog.read_capture_content_position', _counting):
-            seg = self._run(on_deadline=lambda: alive_at_deadline.append(self.wd.is_alive()),
-                            **kw)
+            seg = self._run(on_deadline=_at_deadline, **kw)
         self.assertEqual(alive_at_deadline, [True],
                          'the watchdog was not alive when the wait ended - it never sat '
                          'through the window, it left')
-        self.assertGreater(os.path.getsize(self.state.stderr_path), 0,
+        self.assertGreater(spool_bytes[0], 0,
                            'the stand-in capture wrote no progress for the detector to read')
         return seg, samples
 

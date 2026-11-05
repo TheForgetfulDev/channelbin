@@ -14,7 +14,8 @@ Everything here is a derived cache with one writer, this module, the same kind o
   channel's key, NULL when it shares its key with nobody. `Channel.is_duplicate_stream` is
   that column read as a yes/no, not a second stored fact.
 * `Channel.is_duplicate_loser` - True on every member of a cluster except the one kept.
-  "Show duplicates" off is this column and nothing else.
+  "Show duplicates" off hides these while the copy kept is in the results; whether it is
+  there is the search's question (channel_search._fold_reject, dev/changelog/1435).
 
 **The keep rule is a CASCADE** - each rung only gets a say when the one above it ties: not
 hidden, then still in the provider's feed, then already in the guide, then in a channel

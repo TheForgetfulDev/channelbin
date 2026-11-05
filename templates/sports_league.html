@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}{{ league.name }} - Sports Schedules - ChannelBin{% endblock %}
+
+{#  One league (dev/docs/DESIGN-sports-data.md 11, mockup 50): the rule page's shell. Everything in
+    .gd-sections is a card Customize sections can reorder or hide. Every value comes from
+    sports_view.page_context(), a fixed number of queries. static/js/sports.js swaps .gd-head,
+    .gd-statezone and .gd-sections after an action, so the template stays the one renderer. #}
+
+{% block content %}
+<div class="page-head">
+  <h1>Sports Schedules</h1>
+  <a href="{{ url_for('sports.sports_page') }}" class="btn">{{ icon('back') }} All Leagues</a>
+</div>
+
+<div class="gd-head">
+  <div class="gd-head-main">
+    <div class="gd-title">
+      <h2>{{ league.name }}</h2>
+      <span class="badge {{ badge }} tip-plain" data-tip="{{ tip }}">{{ label }}</span>
+    </div>
+    <p class="gd-sub-lead">{{ lead }}</p>
+  </div>
+  <div class="gd-dates">Added {{ added }}</div>
+</div>
+
+<div class="gd-statezone">
+  {% for tone, strong, text in notices %}
+  <div class="notice notice-{{ tone }}"><div><strong>{{ strong }}</strong> {{ text }}</div></div>
+  {% endfor %}
+  <div class="gd-actionbar" id="sp-actionbar" data-league="{{ league.id }}" data-dialog="{{ dialog | tojson | forceescape }}">
+    <span class="badge {{ badge }} tip-plain" data-tip="{{ tip }}">{{ label }}</span>
+    <span class="gd-ab-msg">{{ message }}</span>
+    <div class="gd-ab-actions">
+      {% if followed %}
+      {% if can_change_teams %}<button class="btn btn-primary btn-sm" data-act="teams">Change teams</button>{% endif %}
+      <button class="btn btn-sm" data-act="stop">Stop following</button>
+      {% else %}
+      <button class="btn btn-primary btn-sm" data-act="refollow">Follow again</button>
+      {% endif %}
+      <span class="menu-wrap">
+        <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
+        <div class="menu pop-left">
+          <button class="menu-item" data-act="sections">Customize sections&hellip;</button>
+          <div class="sep"></div>
+          <button class="menu-item danger" data-act="delete">Delete league</button>
+        </div>
+      </span>
+    </div>
+  </div>
+</div>
+
+<div class="gd-sections" id="sp-sections">
+  <div class="card" data-section="about">
+    <div class="card-head">
+      <h2>This league</h2>
+      <div class="card-head-actions">
+        <a class="btn btn-sm" href="{{ league_url }}" target="_blank" rel="noopener">On TheSportsDB {{ icon('forward') }}</a>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="statlist">
+        <div class="srow"><span class="sk">Sport</span><span class="sv sp-plain">{{ league.sport or '-' }}</span></div>
+        <div class="srow"><span class="sk">Season</span><span class="sv">{{ league.current_season or '-' }}</span></div>
+        <div class="srow"><span class="sk">Following</span><span class="sv sp-plain">{{ follow_text }}</span></div>
+        <div class="srow"><span class="sk">Next update</span><span class="sv sp-plain">{{ next_update }}</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" data-section="upcoming">
+    <div class="card-head"><h2>Upcoming {{ many }}{% if games %} <span class="cnt">{{ games | length }}</span>{% endif %}</h2></div>
+    <div class="card-body">
+      <p class="card-note">The next {{ horizon_days }} days. Times are what TheSportsDB lists, and they have not been checked against your guide.</p>
+      {% if picked_teams %}
+      <div class="rl-filter">
+        <a class="chip{{ ' active' if scope == 'followed' else '' }}" href="{{ url_for('sports.league_page', league_id=league.id) }}">Your teams<span class="n">{{ mine_total }}</span></a>
+        <a class="chip{{ ' active' if scope == 'all' else '' }}" href="{{ url_for('sports.league_page', league_id=league.id, scope='all') }}">All {{ many }}<span class="n">{{ all_total }}</span></a>
+      </div>
+      {% endif %}
+      {% if games %}
+      <div class="table-scroll">
+        <table class="tbl tbl-cards rl-tbl">
+          <thead><tr><th>When</th><th>{{ one | capitalize }}</th><th>Where</th></tr></thead>
+          <tbody>
+            {% for g in games %}
+            <tr>
+              <td data-label="When" class="rl-when"><span class="day">{{ g.day }}</span>{{ g.time or 'Time not listed' }}</td>
+              <td data-label="{{ one | capitalize }}" class="rl-prog"><span class="t">{{ g.game }}</span>{% for n in g.notes %}<span class="sp-note">{{ n }}</span>{% endfor %}</td>
+              <td data-label="Where" class="rl-where">{{ g.where or '-' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="card-note">{{ no_games_note }}</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card" data-section="updates">
+    <div class="card-head"><h2>Schedule updates</h2></div>
+    <div class="card-body">
+      <p class="card-note">ChannelBin keeps this schedule current with a few calls to TheSportsDB a day, each one asking for about a week of {{ many }}, which TheSportsDB calls a round. These are the latest, so you can see what it asked for and what came back.</p>
+      {% if updates %}
+      <div class="table-scroll">
+        <table class="tbl tbl-cards rl-tbl">
+          <thead><tr><th>When</th><th>What it asked for</th><th>Result</th><th>Note</th></tr></thead>
+          <tbody>
+            {% for u in updates %}
+            <tr>
+              <td data-label="When" class="rl-when">{{ u.when }}</td>
+              <td data-label="What it asked for" class="rl-prog"><span class="t">{{ u.what }}</span>{% if u.sub %}<span class="s">{{ u.sub }}</span>{% endif %}</td>
+              <td data-label="Result">{% if u.badge %}<span class="badge {{ u.badge[0] }}">{{ u.badge[1] }}</span>{% else %}-{% endif %}</td>
+              <td data-label="Note" class="rl-why">{{ u.note }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="card-note">No calls are being made for this league.</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+<div class="sp-credit">Schedule data from <a href="https://www.thesportsdb.com/" target="_blank" rel="noopener">TheSportsDB</a>.</div>
+{% endblock %}
+
+{% block scripts %}
+<script type="application/json" id="sports-boot">{{ add_config | tojson }}</script>
+<script>
+window.SPORTS_LEAGUE = {
+  listUrl: {{ url_for('sports.sports_page') | tojson }},
+  sections: {{ sections | tojson }},
+  sectionNames: {{ section_names | tojson }},
+  sectionPref: {{ section_pref | tojson }},
+  sectionsPrefKey: {{ sections_pref_key | tojson }},
+};
+</script>
+<script src="{{ url_for('static', filename='js/sports.js') }}"></script>
+{% endblock %}

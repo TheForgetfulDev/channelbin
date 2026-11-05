@@ -53,7 +53,7 @@ from itertools import groupby
 from sqlalchemy import Integer, column, func, or_, select, table, text
 
 from . import admission, db
-from .database import Channel, EPGEntry, SearchIndexState
+from .database import ACCOUNT_STATUS_SYNCING, Account, Channel, EPGEntry, SearchIndexState
 from .db_utils import chunked, current_wal_size_bytes, retry_on_locked
 from .fmt_utils import fmt_bytes
 
@@ -537,6 +537,23 @@ def rebuilding_index_names() -> list:
     return [s.name for s in SearchIndexState.query.filter_by(status=STATUS_BUILDING).all()]
 
 
+def manual_rebuild_refusal() -> str:
+    """Why a person asking for a rebuild right now would be turned down, or '' if they would not.
+
+    One speller, read by the route that refuses and by the search page's notice, which offers
+    the rebuild only when this is empty. A sync is a refusal rather than a queue because it ends
+    with its own rebuild, so a manual one started mid-sync spends about a minute of CPU on an
+    index the sync's next insert makes stale.
+    """
+    if rebuild_in_progress():
+        return 'A search index rebuild is already running.'
+    syncing = Account.query.filter_by(status=ACCOUNT_STATUS_SYNCING).first()
+    if syncing is not None:
+        return (f'"{syncing.name}" is syncing right now, and a sync rebuilds the search indexes '
+                'when it finishes. Wait for it rather than rebuilding twice.')
+    return ''
+
+
 def rebuild_search_indexes(reason: str, names=SEARCH_INDEX_NAMES, refusable: bool = False,
                            only_changes: bool = False) -> dict:
     """Rebuild the named indexes and record the outcome. Returns {name: bool succeeded}.
@@ -544,8 +561,9 @@ def rebuild_search_indexes(reason: str, names=SEARCH_INDEX_NAMES, refusable: boo
     `only_changes=True` lets the programs index write just the rows that differ from
     epg_entries, when it can (see _why_programs_need_a_full_rebuild), and otherwise rebuilds it
     in full and logs why. The sync close-out asks for it because its cost is what grows with
-    the install. Every other caller stays full on purpose: a manual rebuild and the janitor are
-    repairs, and the daily EPG cleanup compacts the index.
+    the install, and the janitor because the usual thing it finds is a few rows from a key edit.
+    The other callers stay full on purpose: a manual rebuild is a repair a person asked for, and
+    the daily EPG cleanup compacts the index.
 
     Never raises: a rebuild failure must not turn an otherwise-successful sync into an
     ERROR, because the sync's own work is already committed and correct. Instead the index
@@ -729,7 +747,7 @@ def _alert_rebuild_failed(name: str, detail: str, active: bool):
             f'The {name} search index failed to rebuild: {detail}\n\n'
             'Search still returns correct results - it falls back to the slower unindexed '
             'scan while the index is unusable - so nothing is being hidden from you. It will '
-            'be retried at the end of the next account sync, or you can retry it now from '
+            'be retried automatically within 10 minutes, or you can retry it now from '
             'Maintenance -> Search index -> Rebuild now. If it keeps failing, the database may '
             'be out of disk space or the index tables may need to be dropped and recreated.'
             if active else ''
@@ -802,40 +820,26 @@ def readiness_map() -> dict:
 # Janitor
 # ---------------------------------------------------------------------------
 
-#: {index name: when THIS PROCESS first saw it unusable with nobody rebuilding it}.
-#:
-#: Per-process and deliberately not persisted. A restart is one of the events that strands
-#: staleness in the first place, so a clock that starts fresh at boot is the desired
-#: behavior, not a limitation: it gives the natural owner first crack, because APScheduler
-#: fires an account's missed sync interval immediately at startup and that sync ends with
-#: its own rebuild. The janitor only steps in when no such owner turned up.
-_stale_since = {}
-
-
-def run_index_janitor(grace_minutes: int) -> dict:
-    """Rebuild any search index that has been unusable for `grace_minutes` with no owner.
+def run_index_janitor() -> dict:
+    """Repair any search index that is unusable with nobody rebuilding it.
 
     **The gap this closes.** `rebuild_search_indexes()` is otherwise reachable from three
-    places only - a sync's `finally`, EPG cleanup, and the Maintenance button - so every
-    path that separates staleness from a live sync thread leaves the repair to nobody. A
-    hard restart mid-sync is the measured case: on 2026-08-15 account 2 committed its
-    channel upserts, the process was restarted four minutes later, and both indexes stayed
-    stale for 6.5 hours (worst case ~22, the sync interval) with every search on the LIKE
-    fallback over 2.2M rows. This bounds that window at grace + the job's interval instead
-    of at "whenever the next sync happens to arrive" (dev/changelog/680).
+    places only - a sync's `finally`, EPG cleanup, and the Maintenance button - so every path
+    that separates staleness from a live sync thread leaves the repair to nobody. A hard
+    restart mid-sync is the measured case: on 2026-08-15 both indexes stayed stale for 6.5
+    hours with every search on the LIKE fallback over 2.2M rows. An EPG key edit is the
+    ordinary one: it copies listings into epg_entries with no sync to rebuild afterward
+    (dev/changelog/680, 1431).
 
     Returns `{'due': [...], 'results': {name: bool}, 'refused': bool}`. `due` non-empty with
     an empty `results` means admission refused the rebuild - something heavier holds the
     database axis, which is a successful outcome for a job whose whole job is to yield.
 
-    `grace_minutes <= 0` disables the janitor. The grace exists so the owner that *should*
-    rebuild gets there first: a sync in flight already refuses this through admission, but a
-    sync that is about to start, or one whose close-out rebuild is seconds away, does not.
+    Repairs on sight, deliberately: the job's own interval is what spaces repairs, so a run of
+    key edits costs one repair per tick rather than one per edit. A sync in flight refuses it
+    through admission and repairs the index itself. A sync that starts just after a tick costs
+    one extra rebuild and nothing else, since the rebuilds serialize on _rebuild_lock.
     """
-    if grace_minutes <= 0:
-        return {'due': [], 'results': {}, 'refused': False}
-
-    now = datetime.utcnow()
     # One query for both names, and the only reason this reads the status column directly:
     # readiness reports BUILDING as "not ready", but an index someone is actively rebuilding
     # is the one kind of unusable that already has an owner.
@@ -844,27 +848,16 @@ def run_index_janitor(grace_minutes: int) -> dict:
     due = []
     for name in SEARCH_INDEX_NAMES:
         if name in building:
-            _stale_since.pop(name, None)
             continue
         ready, reason = search_index_readiness(name)
-        if ready:
-            _stale_since.pop(name, None)
-            continue
-        since = _stale_since.get(name)
-        if since is None:
-            _stale_since[name] = now
-            log.info('Search index janitor: %r is unusable (%s) - rebuilding in %dm if '
-                     'nothing else repairs it first', name, reason, grace_minutes)
-            continue
-        stale_minutes = int((now - since).total_seconds() // 60)
-        if stale_minutes >= grace_minutes:
-            due.append((name, reason, stale_minutes))
+        if not ready:
+            due.append((name, reason))
 
     if not due:
         return {'due': [], 'results': {}, 'refused': False}
 
-    names = [name for name, _, _ in due]
-    detail = '; '.join(f'{name} {mins}m ({reason})' for name, reason, mins in due)
+    names = [name for name, _ in due]
+    detail = '; '.join(f'{name} ({reason})' for name, reason in due)
     log.info('Search index janitor: rebuilding %s - unusable with no owner: %s',
              ', '.join(names), detail)
     # refusable=True is the whole point: this is the one caller that is genuinely optional
@@ -873,17 +866,7 @@ def run_index_janitor(grace_minutes: int) -> dict:
     # registration - never by reading active_kinds() here and then starting
     # (app/admission.py, dev/changelog/679).
     results = rebuild_search_indexes(f'index janitor ({detail})', names=tuple(names),
-                                     refusable=True)
-
-    # Restart the clock for the names that actually ran, which throttles an index that keeps
-    # FAILING to rebuild down to one attempt per grace window rather than one per tick - a
-    # programs rebuild is ~76s of CPU against a 10-minute tick. Deliberately keyed on what
-    # ran, not on what was due: a refusal did nothing at all, the blocker may be gone a tick
-    # later, and charging it a fresh grace window would extend the exact degraded window this
-    # job exists to cap. Timed from after the rebuild, since the rebuild itself is minutes.
-    finished = datetime.utcnow()
-    for name in results:
-        _stale_since[name] = finished
+                                     refusable=True, only_changes=True)
     return {'due': names, 'results': results, 'refused': not results}
 
 

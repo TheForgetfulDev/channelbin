@@ -43,9 +43,9 @@ parameters an API rather than an accident.
 **Standing options are not filters.** A filter is "I picked this, for this search"; a
 standing option is a preference that survives every search ("show duplicates", off by
 default). They gate the facet counts too, because a count that ignored them would promise
-rows the list then refuses to show. And per this project's founding principle, everything a
-standing option hides is counted and reported back in `standing_hidden` - nothing is hidden
-silently.
+rows the list then refuses to show. And per this project's founding principle, what a standing
+option hides is counted and reported back in `standing_hidden` - nothing is hidden silently. The
+one exception is `showpast`, whose field on `StandingOption` says why.
 
 **A facet count ignores its own dimension.** Picking `Category = Sports` must not drop every
 other category's count to zero, or the facet becomes unusable the moment it is used. So each
@@ -71,6 +71,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import (Integer, String, and_, case, cast, func, literal_column, not_, or_, select,
                         union)
+from sqlalchemy.orm import aliased
 
 from . import db, health_bands
 from .channel_groups import guide_scope_channel_ids, guide_scope_group_member_ids
@@ -406,6 +407,11 @@ DIMENSIONS = (
                    'EPG source on its channel page. It counts whether or not that source has '
                    'listings for the channel right now; the channel page says which.'),
     Dimension('chan', 'Channel', hidden=True),
+    # What the Programs tab's "no scheduled listings" notice links to, and what that notice
+    # counts. Channels only: on Programs every row is a listing, so the filter could only ever
+    # return nothing. Hidden so the rail does not pay for another count on every search
+    # (dev/changelog/1437).
+    Dimension('listings', 'Listings', hidden=True, grain=GRAIN_CHANNELS),
 )
 DIMENSION_BY_KEY = {d.key: d for d in DIMENSIONS}
 #: Every non-hidden dimension, in registry order, across both grains. `dimensions_for()` is
@@ -420,9 +426,9 @@ def dimensions_for(grain: str) -> tuple:
     it downstream. The one reordering is P9's: a dimension that exists only on the grain you
     just switched into leads, because it is the reason you switched.
     """
-    scoped = tuple(d for d in DIMENSIONS if d.grain == grain)
-    shared = tuple(d for d in DIMENSIONS if not d.grain)
-    return scoped + shared
+    scoped = tuple(d for d in DIMENSIONS if d.grain == grain and not d.hidden)
+    rest = tuple(d for d in DIMENSIONS if not d.grain or (d.grain == grain and d.hidden))
+    return scoped + rest
 
 
 def visible_dimensions_for(grain: str) -> tuple:
@@ -481,6 +487,8 @@ OTHER_SOURCE_OVERRIDE = 'srcoverride'
 OTHER_VALUES = (OTHER_REMOVED, OTHER_NEW, OTHER_IN_GUIDE, OTHER_GUIDE_OWN_ROW,
                 OTHER_GUIDE_VIA_GROUP, OTHER_DUP_URL, OTHER_PROVIDER, OTHER_MONITORED,
                 OTHER_SOURCE_OVERRIDE)
+LISTINGS_NONE = 'none'
+LISTINGS_LABELS = {LISTINGS_NONE: 'None scheduled'}
 #: The rail's wording for those four, from the approved mockup. Here rather than in the
 #: template because the values are a registry and their labels are part of it - a page that
 #: spelled them itself would be a second vocabulary to keep in step.
@@ -742,6 +750,14 @@ class StandingOption:
     #: their label already says what ticking them does. Everything reads this through
     #: `standing_applied()` - never test membership directly, or the two families diverge.
     hides_when_on: bool = True
+    #: Does `standing_hidden` report what this option took out? False for `showpast` alone.
+    #: chan_prog holds future showings only, so a narrowed search cannot see an ended listing
+    #: on a channel with no upcoming match, and the group and duplicate options go on hiding
+    #: some ended rows after the box is ticked: on prod's data "94 ended" brought back 134 and
+    #: "90,302 ended" brought back 86,281. The exact answer is a second scan of about 2s per
+    #: typed search, for a fact nobody is surprised by, so no number is given at all. The page
+    #: says so where it matters, on an empty result (dev/changelog/1439).
+    reported: bool = True
 
 
 STANDING_OPTIONS = (
@@ -788,7 +804,7 @@ STANDING_OPTIONS = (
     # back sync.epg_keep_days, and chan_prog holds future showings only, so including the past
     # forces the unindexed path.
     StandingOption('showpast', 'Show airings that have ended', False, grain=GRAIN_AIRINGS,
-                   noun='ended', hides_when_on=False),
+                   hides_when_on=False, reported=False),
     # The old modal's "Unique channels only". NOT the same as flipping to the channel grain,
     # which is what it looks like: the channel grain can say WHICH channels air something but
     # not WHEN, because chan_prog holds no times by construction.
@@ -1231,6 +1247,8 @@ def describe_value(key: str, value: str, *, account_names=None, channel_names=No
     if key == 'chan':
         name = (channel_names or {}).get(int(value)) if value.isdigit() else None
         return name or f'#{value}'
+    if key == 'listings':
+        return LISTINGS_LABELS.get(value, value)
     return value
 
 
@@ -2340,6 +2358,10 @@ def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str 
     if dim_key == 'chan':
         parsed = _optional_int(value)
         return db.false() if parsed is None else Channel.id == parsed
+    if dim_key == 'listings':
+        if value == LISTINGS_NONE:
+            return _no_scheduled_listing()
+        raise SearchStateError(f'unknown Listings value {value!r}')
     raise SearchStateError(f'unknown dimension {dim_key!r}')
 
 
@@ -2428,6 +2450,13 @@ def _provider_keyed(ctx: 'SearchContext'):
                 Channel.account_id.in_(sorted(ctx.provider_account_ids)))
 
 
+def _no_scheduled_listing():
+    """This channel has no listing that has not ended: "no EPG data" and "None scheduled"."""
+    return not_(select(EPGEntry.id).where(
+        EPGEntry.channel_id == Channel.id,
+        EPGEntry.stop_time >= datetime.utcnow()).correlate(Channel).exists())
+
+
 def _standing_reject(key: str, ctx: 'SearchContext', row_preds=(), state=None):
     """"What this standing option takes out" - the predicate, un-negated, so the same
     expression can both filter rows out and count what it took out.
@@ -2459,9 +2488,11 @@ def _standing_reject(key: str, ctx: 'SearchContext', row_preds=(), state=None):
         # re-derive any of them. Measured at +2ms on a 100ms channel-grain scan.
         return Channel.hidden.is_(True)
     if key == 'showdup':
-        # The stored answer, off the column (app/duplicate_streams.py): every member of a
-        # cluster except the copy kept. Ranking it here instead cost 6.6s a search once
-        # accounts were on a provider (dev/changelog/1172).
+        # What this search is ALLOWED to fold, not what it folds: `_fold_reject` adds "while the
+        # copy kept is still in the results". The stored answer, off the column
+        # (app/duplicate_streams.py): every member of a cluster except the copy kept. Ranking
+        # it here instead cost 6.6s a search once accounts were on a provider
+        # (dev/changelog/1172).
         loser = Channel.is_duplicate_loser.is_(True)
         if _folds_url_duplicates_only(state) and ctx.provider_account_ids:
             return and_(loser, not_(_provider_keyed(ctx)))
@@ -2483,9 +2514,7 @@ def _standing_reject(key: str, ctx: 'SearchContext', row_preds=(), state=None):
         # strips BOTH tables from this subquery (leaving it with no FROM clause of its own)
         # instead of just the intended Channel correlation - SQLAlchemy raises
         # InvalidRequestError. dev/docs/BUGS.md 2026-08-11.
-        return not_(select(EPGEntry.id).where(
-            EPGEntry.channel_id == Channel.id,
-            EPGEntry.stop_time >= datetime.utcnow()).correlate(Channel).exists())
+        return _no_scheduled_listing()
     if key == 'showuntested':
         return Channel.health_score.is_(None)
     if key == 'showmembers':
@@ -2554,7 +2583,8 @@ def _standing_reject(key: str, ctx: 'SearchContext', row_preds=(), state=None):
 #
 # `dup` ranks over the WHOLE channels table on purpose: which copy of a duplicated feed is
 # "the one kept" is an identity question, and it must not change because the user typed
-# something.
+# something. Whether the OTHER copies are hidden is a question about the result set, and
+# `_fold_reject` answers it there.
 #
 # These two are the opposite, and copying `dup`'s spelling here is a real defect rather than a
 # style difference. "Keep each channel's earliest MATCHING showing" and "keep the group's best
@@ -2746,9 +2776,11 @@ def _group_row_filters(state: SearchState, ctx: 'SearchContext') -> list:
     duration describe a stream or a showing, a group has none of them, and the count line says
     so when one of them is active rather than a group row quietly vanishing.
 
-    `chan` is the one channel-shaped dimension that must still be answered, with `false`: it
-    names one channel by primary key (the duplicate drill-in builds it), so leaving it
-    unanswered would put every group in the app into a three-row cluster view.
+    `chan` and `listings` are the channel-shaped dimensions that must still be answered, with
+    `false`. `chan` names one channel by primary key (the duplicate drill-in builds it), so
+    leaving it unanswered would put every group in the app into a three-row cluster view.
+    `listings` lands on the channels the Programs notice counted, and a group row would be one
+    more row than that number.
 
     The system group is excluded everywhere and permanently. Its membership is computed from
     `in_guide` + `test_enabled` rather than stored, so it has no `channel_group_members` rows
@@ -2771,7 +2803,7 @@ def _group_row_filters(state: SearchState, ctx: 'SearchContext') -> list:
                 preds.append(or_(*[_group_other_predicate(v, ctx) for v in f.values]))
             if f.ex:
                 preds.append(not_(or_(*[_group_other_predicate(v, ctx) for v in f.ex])))
-        elif f.key == 'chan':
+        elif f.key in ('chan', 'listings'):
             preds.append(db.false())
     return preds
 
@@ -2986,7 +3018,8 @@ def _cluster_scope(state: SearchState, ctx: 'SearchContext', narrowing: list) ->
 
     Cluster options are excluded from their own scope - `firstonly` must not be defined in
     terms of what `grpdedup` left, or the answer depends on which of the two is evaluated
-    first. On the channel grain this is unused: `dup` is deliberately whole-table.
+    first. On the channel grain this is unused: no option there ranks over the result set.
+    `_fold_scope` is the same idea for the duplicate fold, which also applies to that grain.
     """
     if state.grain != GRAIN_AIRINGS:
         return []
@@ -2994,16 +3027,104 @@ def _cluster_scope(state: SearchState, ctx: 'SearchContext', narrowing: list) ->
                               for s in active_standing(state) if not s.cluster]
 
 
+def _fold_scope(state: SearchState, ctx: 'SearchContext', narrowing: list) -> list:
+    """What the kept copy of a duplicate cluster has to pass to count as "in the results".
+
+    Everything the rows themselves have to pass, except three options that cannot take a kept
+    copy off the page while leaving its duplicate on it. `showhidden`: the keep rule's first
+    rung is "not hidden", so a hidden kept copy means the whole cluster is hidden.
+    `showmembers`: a kept copy folded into its group is still there, as the group's row.
+    `shownotnorm`, unless only some accounts normalize: copies share a URL, or a provider id
+    that only a normalizable URL has, so the option takes all of a cluster or none of it.
+
+    That last one is what lets the unfiltered channel grain skip the check. Checking there took
+    the standing breakdown from 41ms to 146ms on the production database, every load of the page,
+    to find one channel that was hidden either way (dev/changelog/1435).
+    """
+    ignored = {'showhidden', 'showmembers'}
+    if not 0 < len(ctx.normalizing_account_ids) < len(ctx.accounts_by_id):
+        ignored.add('shownotnorm')
+    return list(narrowing) + [not_(_standing_reject(s.key, ctx, state=state))
+                              for s in active_standing(state)
+                              if not s.cluster and s.key not in ignored]
+
+
+def _kept_copies(state: SearchState, ctx: 'SearchContext', scope: list, *columns):
+    """`columns` of the kept copies among the rows passing `scope`, in the clusters this search
+    folds.
+
+    On the airing grain being in the results means having a showing in them. Read from the
+    channels first, so the cost is bounded by the clusters this grain folds: measured on the
+    production database, 38ms against 2047ms for the same answer driven from `epg_entries`
+    (dev/changelog/1435).
+    """
+    kept = select(*columns).where(
+        Channel.duplicate_cluster_id.isnot(None), Channel.is_duplicate_loser.is_(False))
+    if _folds_url_duplicates_only(state) and ctx.provider_account_ids:
+        kept = kept.where(not_(_provider_keyed(ctx)))
+    if state.grain == GRAIN_AIRINGS:
+        return kept.where(select(EPGEntry.id)
+                          .where(EPGEntry.channel_id == Channel.id, *scope)
+                          .correlate(Channel).exists())
+    return kept.where(*scope)
+
+
+def _kept_in_results(state: SearchState, ctx: 'SearchContext', scope: list):
+    """"This channel's cluster has its kept copy among the rows passing `scope`."
+
+    The subquery asks about the kept copy, not the row being tested, so it reads `channels` on its
+    own even though the enclosing query has that table too. `correlate(None)` states that rather
+    than leaving it to what auto-correlation does with a subquery's only FROM.
+
+    A plain IN on the cluster id, never a row-value `(cluster, value) IN (...)`: that spelling
+    took the category facet from 46ms to 7.2s on the production database.
+    """
+    if state.grain == GRAIN_CHANNELS and not scope:
+        return db.true()
+    return Channel.duplicate_cluster_id.in_(
+        _kept_copies(state, ctx, scope, Channel.duplicate_cluster_id).correlate(None))
+
+
+def _fold_reject(state: SearchState, ctx: 'SearchContext', narrowing: list):
+    """"Show duplicates" off: hide a duplicate only while its kept copy is still in the results.
+
+    The kept copy is chosen across the whole table and stored, so a filter or a typed term can
+    remove it. Hiding the other copy as well would lose a channel both copies carry, and report
+    a duplicate of something the page does not show (dev/changelog/1435).
+    """
+    return and_(_standing_reject('showdup', ctx, state=state),
+                _kept_in_results(state, ctx, _fold_scope(state, ctx, narrowing)))
+
+
+def _reject_for_rows(option, state: SearchState, ctx: 'SearchContext', narrowing: list,
+                     scope: list):
+    """What one standing option takes out of THIS search's rows: `_standing_reject`, with the
+    duplicate fold answered against the result set. Rows and their count both read this, which
+    is what keeps the "N duplicates" line equal to what ticking the option gives back."""
+    if option.key == 'showdup':
+        return _fold_reject(state, ctx, narrowing)
+    return _standing_reject(option.key, ctx, scope, state)
+
+
 def standing_predicates(state: SearchState, ctx: 'SearchContext', narrowing=(),
-                        by_key: bool = False) -> list:
+                        by_key: bool = False, every_copy_folded: bool = False) -> list:
     """One NOT-reject predicate per active standing option, in registry order.
 
     `by_key=True` pairs each with its option key, for the same reason `dimension_predicates`
     offers it - see `_split_predicates()`.
+
+    `every_copy_folded=True` removes every foldable duplicate, whether or not its kept copy is
+    in the results. That is the facet counters' base: which duplicates stay depends on the value
+    being counted, so `_add_back_unfolded` adds those back value by value.
     """
-    scope = _cluster_scope(state, ctx, list(narrowing))
-    out = [(s.key, not_(_standing_reject(s.key, ctx, scope, state)))
-           for s in active_standing(state)]
+    narrowing = list(narrowing)
+    scope = _cluster_scope(state, ctx, narrowing)
+    if every_copy_folded:
+        out = [(s.key, not_(_standing_reject(s.key, ctx, scope, state)))
+               for s in active_standing(state)]
+    else:
+        out = [(s.key, not_(_reject_for_rows(s, state, ctx, narrowing, scope)))
+               for s in active_standing(state)]
     return out if by_key else [pred for _key, pred in out]
 
 
@@ -3341,11 +3462,15 @@ def base_predicates(state: SearchState, ctx: SearchContext, skip_dimension: str 
 
     `text_preds` is the one part that is identical for every dimension, so the facet counter
     builds it once and hands it in rather than re-deriving it six times.
+
+    The facet counters are its only callers, so every foldable duplicate is out of this set
+    (`standing_predicates`'s `every_copy_folded`) and `_add_back_unfolded` adds back the ones
+    that stay.
     """
     if text_preds is None:
         text_preds = text_predicates(state, ctx)
     narrowing = list(text_preds) + dimension_predicates(state, ctx, skip=skip_dimension)
-    return narrowing + standing_predicates(state, ctx, narrowing)
+    return narrowing + standing_predicates(state, ctx, narrowing, every_copy_folded=True)
 
 
 #: Which table a predicate narrows, for the split `_combined_facet_scan`'s tally shape needs.
@@ -3416,7 +3541,8 @@ def split_predicates(state: SearchState, ctx: SearchContext, text_preds: list):
     dim_sides = [_DIMENSION_SIDE.get(key) for key, _pred in keyed_dims]
     if any(side is None or side == _SIDE_CHANNEL for side in dim_sides):
         return None
-    keyed_standing = standing_predicates(state, ctx, narrowing, by_key=True)
+    keyed_standing = standing_predicates(state, ctx, narrowing, by_key=True,
+                                         every_copy_folded=True)
     if any(_STANDING_SIDE.get(key) == _SIDE_CHANNEL and key not in _SPLIT_SAFE_STANDING
            for key, _pred in keyed_standing):
         return None
@@ -3923,7 +4049,9 @@ def _standing_breakdown_compute(state: SearchState, ctx: SearchContext, narrowin
 
     Counted over rows that pass the text and the filters, so "412 duplicates hidden" means
     412 rows this search would give back by turning the option off - not 412 rows somewhere
-    in the database. A number the user cannot act on is worse than no number.
+    in the database. A number the user cannot act on is worse than no number. An option that
+    is not `reported` still has its bucket, because those rows must stay out of the visible
+    total, but its count is dropped.
 
     THE DISTINCT-CHANNEL COUNT IS THE AIRING GRAIN'S ONLY, and it comes off THIS scan rather
     than a second one. The count line names it beside the airing total in one sentence ("of
@@ -3950,7 +4078,8 @@ def _standing_breakdown_compute(state: SearchState, ctx: SearchContext, narrowin
         row = query.filter(*narrowing).one()
         return {}, (row[0] or 0), (row[1] or 0) if airings else None
 
-    bucket = db.case(*[(_standing_reject(s.key, ctx, scope, state), s.key) for s in active],
+    bucket = db.case(*[(_reject_for_rows(s, state, ctx, narrowing, scope), s.key)
+                       for s in active],
                      else_='')
     query = db.session.query(bucket.label('bucket'), func.count(counted),
                              *([channels] if airings else []))
@@ -3965,7 +4094,21 @@ def _standing_breakdown_compute(state: SearchState, ctx: SearchContext, narrowin
     visible = [row for row in rows if not row[0]]
     total = counts.pop('', 0)
     matched = ((visible[0][2] or 0) if visible else 0) if airings else None
-    return {k: n for k, n in counts.items() if n}, total, matched
+    return {k: n for k, n in counts.items() if n and STANDING_BY_KEY[k].reported}, total, matched
+
+
+def cluster_is_folded(row, state: SearchState, ctx: 'SearchContext') -> bool:
+    """Is this channel in a duplicate cluster this search hides copies of? The Python half of
+    `_standing_reject('showdup')`, for rows already on the page.
+
+    A page can hold group rows too, and a group has no stream to duplicate. Asked by attribute
+    rather than by isinstance so this keeps working for any row kind added later that is equally
+    not a channel."""
+    if (not standing_applied(state.standing, 'showdup')
+            or getattr(row, 'duplicate_cluster_id', None) is None):
+        return False
+    return not (_folds_url_duplicates_only(state) and row.provider_stream_id is not None
+                and row.account_id in ctx.provider_account_ids)
 
 
 def _kept_ids(state: SearchState, rows: list, ctx: 'SearchContext') -> frozenset:
@@ -3973,20 +4116,8 @@ def _kept_ids(state: SearchState, rows: list, ctx: 'SearchContext') -> frozenset
     the KEPT badge is drawn from. Only meaningful while duplicates are being hidden: with
     "Show duplicates" ticked every copy is shown and none of them is "the one kept". The
     same goes for a provider-keyed cluster on a search that leaves those unfolded."""
-    if not standing_applied(state.standing, 'showdup'):
-        return frozenset()
-    unfolded = _folds_url_duplicates_only(state)
-
-    def kept(row) -> bool:
-        # A page can hold group rows too, and a group has no stream to duplicate. Asked by
-        # attribute rather than by isinstance so this keeps working for any row kind added
-        # later that is equally not a channel.
-        if getattr(row, 'duplicate_cluster_id', None) is None or row.is_duplicate_loser:
-            return False
-        return not (unfolded and row.provider_stream_id is not None
-                    and row.account_id in ctx.provider_account_ids)
-
-    return frozenset(r.id for r in rows if kept(r))
+    return frozenset(r.id for r in rows
+                     if cluster_is_folded(r, state, ctx) and not r.is_duplicate_loser)
 
 
 # ---------------------------------------------------------------------------
@@ -4143,6 +4274,7 @@ def compute_facets(state: SearchState, ctx: SearchContext,
     for d in wanted:
         if d.key not in out:
             out[d.key] = _facet_counts(d, state, ctx, text_preds)
+    _add_back_unfolded(out, wanted, state, ctx, text_preds, filtered)
     # Registry order, not the order they were computed in - the rail renders this as given.
     return {d.key: out[d.key] for d in wanted}
 
@@ -4362,9 +4494,31 @@ def _weekday_counts(rows) -> dict:
     return counts
 
 
+def _facet_over(airings: bool, *cols):
+    """A facet aggregate's FROM: the channels, or their showings with the channel joined."""
+    query = db.session.query(*cols)
+    if airings:
+        return query.select_from(EPGEntry).join(Channel, Channel.id == EPGEntry.channel_id)
+    return query.select_from(Channel)
+
+
+def _group_facet_query(airings: bool, counted):
+    """(group name, count) per group, driven from the membership table - see `_facet_counts`
+    for why that end."""
+    query = (db.session.query(ChannelGroup.name,
+                              func.count(counted if airings else func.distinct(Channel.id)))
+             .select_from(ChannelGroupMember)
+             .join(Channel, Channel.id == ChannelGroupMember.channel_id))
+    if airings:
+        query = query.join(EPGEntry, EPGEntry.channel_id == Channel.id)
+    return query.join(ChannelGroup, ChannelGroup.id == ChannelGroupMember.group_id)
+
+
 def _facet_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
-                  text_preds: list) -> dict:
-    preds = base_predicates(state, ctx, skip_dimension=dim.key, text_preds=text_preds)
+                  text_preds: list, preds: list | None = None,
+                  channels_first: bool = False) -> dict:
+    if preds is None:
+        preds = base_predicates(state, ctx, skip_dimension=dim.key, text_preds=text_preds)
     airings = state.grain == GRAIN_AIRINGS
     # What one facet counts, and where the count is taken from. Every value below describes
     # the CHANNEL either way (§1); the grain only changes whether a channel is counted once
@@ -4372,11 +4526,7 @@ def _facet_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
     counted = EPGEntry.id if airings else Channel.id
 
     def over(*cols):
-        query = db.session.query(*cols)
-        if airings:
-            return query.select_from(EPGEntry).join(
-                Channel, Channel.id == EPGEntry.channel_id)
-        return query.select_from(Channel)
+        return (_unfolded_over if channels_first else _facet_over)(airings, *cols)
 
     if dim.key == 'when':
         # Never reached on the channel grain: `when` is grain-scoped out of `wanted`.
@@ -4455,14 +4605,8 @@ def _facet_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
         # the other way round - `select_from(Channel).join(members)` - the planner scans
         # every channel and this facet costs 88ms instead of 1.4ms. The airing grain hangs
         # epg_entries off the same small end rather than reversing it.
-        query = (db.session.query(ChannelGroup.name,
-                                  func.count(counted if airings else func.distinct(Channel.id)))
-                 .select_from(ChannelGroupMember)
-                 .join(Channel, Channel.id == ChannelGroupMember.channel_id))
-        if airings:
-            query = query.join(EPGEntry, EPGEntry.channel_id == Channel.id)
-        rows = (query.join(ChannelGroup, ChannelGroup.id == ChannelGroupMember.group_id)
-                .filter(*preds).group_by(ChannelGroup.name).all())
+        rows = _group_facet_query(airings, counted).filter(*preds).group_by(
+            ChannelGroup.name).all()
         counts = {name: n for name, n in rows}
         # "In any group at all" spans every membership a row has, so a channel in two groups
         # must count once. IN asks that with no COUNT(DISTINCT) over every membership's showings,
@@ -4493,3 +4637,187 @@ def _facet_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
         }
 
     raise SearchStateError(f'no facet count defined for dimension {dim.key!r}')
+
+
+#: The dimensions `_unfolded_scan` answers: one value per channel or a fixed list of yes/no
+#: values, so a kept copy's answer sits beside its duplicate's in one row. `acct` and `cat` are
+#: columns; `health` and `other` are expressions over the row.
+_UNFOLDED_SCAN_DIMENSIONS = ('acct', 'cat', 'health', 'other')
+
+
+def _unfolded_base(state: SearchState, ctx: SearchContext, text_preds: list, skip: str):
+    """(rows that could be added back, the fold's scope) with `skip`'s own filter off.
+
+    `grpdedup` is gated on the channel being in a group at all, because it is the one predicate
+    here that costs a materialization (`_group_collapse_losers`) and only a group member's
+    showing can lose. These statements read a few foldable channels, usually none in a group, and
+    this pass runs several of them per rail request.
+    """
+    narrowing = list(text_preds) + dimension_predicates(state, ctx, skip=skip)
+    base = list(narrowing)
+    for key, pred in standing_predicates(state, ctx, narrowing, by_key=True,
+                                         every_copy_folded=True):
+        if key == 'showdup':
+            base.append(_standing_reject('showdup', ctx, state=state))
+        elif key == 'grpdedup':
+            base.append(or_(Channel.id.notin_(ctx.group_member_channel_ids), pred))
+        else:
+            base.append(pred)
+    return base, _fold_scope(state, ctx, narrowing)
+
+
+def _unfolded_over(airings: bool, *cols):
+    """`_facet_over()` read from `channels` first, the way `_airing_rows_query` does it. Left to
+    itself the planner reads the showings and looks each channel up, which is 800ms on the
+    production database to reach the few channels these statements are about."""
+    query = db.session.query(*cols)
+    if airings:
+        return query.select_from(EPGEntry).join(
+            Channel, literal_column('+channels.id', Integer) == EPGEntry.channel_id)
+    return query.select_from(Channel)
+
+
+def _unfolded_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext, text_preds: list,
+                   skip: str = '') -> dict:
+    """{dimension key: {value: rows}} of the foldable duplicates that stay when a value is picked,
+    for the single-pass dimensions: the kept copies' answers, then the duplicates' own, set side by
+    side here because which rows count differs per dimension.
+
+    Two statements joined in Python rather than a LEFT JOIN on a subquery, because neither shape
+    of that join holds up. Flattened, it re-ran a typed search's FTS lookup per duplicate (2.5s
+    for q=ESPN on the production database); kept from flattening, it lost the cluster index on
+    a filtered search (1.7s for one account filter). Not a subquery per value either: that was
+    131ms for Health alone against the whole table's 14,031 duplicates (dev/changelog/1435).
+    """
+    airings = state.grain == GRAIN_AIRINGS
+    base, scope = _unfolded_base(state, ctx, text_preds, skip)
+    exprs = {}
+    if 'acct' in dim_keys:
+        exprs['acct'] = Channel.account_id
+    if 'cat' in dim_keys:
+        exprs['cat'] = Channel.category_name
+    if 'health' in dim_keys:
+        exprs['health'] = health_band_expr(ctx.cfg)
+    if 'other' in dim_keys:
+        exprs.update({i: case((_value_predicate('other', v, ctx), 1), else_=0)
+                      for i, v in enumerate(OTHER_VALUES)})
+    labeled = [e.label(f'answer_{name}') for name, e in exprs.items()]
+    cluster = Channel.duplicate_cluster_id.label('answer_cluster')
+
+    kept = {row[0]: row[1:]
+            for row in db.session.execute(_kept_copies(state, ctx, scope, cluster, *labeled))}
+    counted = EPGEntry.id if airings else Channel.id
+    rows = (_unfolded_over(airings, func.count(counted), cluster, *labeled)
+            .filter(*base).group_by(cluster.name, *[c.name for c in labeled]).all())
+
+    # Positions rather than names: this loop is over every duplicate the search can see, and on
+    # 14,031 of them a lookup per answer costs more than the two statements.
+    out = {key: {} for key in dim_keys}
+    tallies = list(enumerate(exprs))
+    for row in rows:
+        count, mine = row[0], row[2:]
+        theirs = kept.get(row[1])
+        for position, name in tallies:
+            value = mine[position]
+            # A blank category or a value the channel lacks is no facet value, the same as on
+            # the counts this adds to.
+            if not value or (theirs is not None and theirs[position] == value):
+                continue
+            if name == 'acct':
+                out['acct'][str(value)] = out['acct'].get(str(value), 0) + count
+            elif name in ('cat', 'health'):
+                out[name][value] = out[name].get(value, 0) + count
+            else:
+                other = OTHER_VALUES[name]
+                out['other'][other] = out['other'].get(other, 0) + count
+    return out
+
+
+def _unfolded_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
+                     text_preds: list) -> dict:
+    """{value: foldable duplicates that stay when it is picked}, for the dimensions
+    `_unfolded_scan` cannot put in one row. Added to what `_facet_counts` counted with all of them
+    out; `_add_back_unfolded` says what the count means.
+
+    When, Day of week, Time of day and Program length only ask that the kept copy has a showing
+    in the search, not one in that window. They differ only where two copies of one stream carry
+    different guides, which on the production database is 11 of the 221 channels the airing grain
+    folds (dev/changelog/1435).
+    """
+    base, scope = _unfolded_base(state, ctx, text_preds, dim.key)
+    airings = state.grain == GRAIN_AIRINGS
+    counted = EPGEntry.id if airings else Channel.id
+    kept = _kept_in_results(state, ctx, scope)
+
+    def count_stays_for(value_pred):
+        return (_unfolded_over(airings, func.count(counted))
+                .filter(*base, value_pred,
+                        not_(_kept_in_results(state, ctx, [*scope, value_pred])))
+                .scalar() or 0)
+
+    if dim.key == 'tag':
+        indexed = ctx.readiness_for(_TAG_FIELDS)[0]
+        narrow = airing_narrowing_decision(state, ctx)[0] if airings else False
+        hides_past = standing_applied(state.standing, 'showpast')
+        return {tag.name: count_stays_for(_tag_predicate(tag, indexed, state.grain, narrow,
+                                                         ctx.cfg, hides_past, ctx))
+                for tag in ctx.tags}
+
+    if dim.key in _SHOWING_DIMENSIONS:
+        return _facet_counts(dim, state, ctx, text_preds, preds=[*base, not_(kept)],
+                             channels_first=True)
+
+    if dim.key == 'group':
+        member = aliased(ChannelGroupMember)
+        copy = aliased(Channel)
+        shares_group = (select(member.id)
+                        .join(copy, copy.id == member.channel_id)
+                        .where(member.group_id == ChannelGroupMember.group_id,
+                               copy.duplicate_cluster_id == Channel.duplicate_cluster_id,
+                               copy.is_duplicate_loser.is_(False))
+                        .correlate(ChannelGroupMember, Channel).exists())
+        rows = (_group_facet_query(airings, counted)
+                .filter(*base, not_(and_(kept, shares_group)))
+                .group_by(ChannelGroup.name).all())
+        counts = {name: n for name, n in rows}
+        counts[GROUP_ANY] = count_stays_for(
+            Channel.id.in_(select(ChannelGroupMember.channel_id)))
+        return counts
+
+    raise SearchStateError(f'no facet count defined for dimension {dim.key!r}')
+
+
+def _add_back_unfolded(out: dict, wanted: list, state: SearchState, ctx: SearchContext,
+                       text_preds: list, filtered: set) -> None:
+    """Add to the facet counts the foldable duplicates that stay when each value is picked.
+
+    A facet count says what picking that value gives, and picking it can remove a kept copy. So a
+    duplicate is counted unless its kept copy passes the search with this dimension's own filter
+    off AND carries the value being counted. A filter on another value of the same dimension is
+    not part of that, so a value is counted as if picked on its own: with category A already
+    picked, B's count can include a duplicate whose kept copy is in A.
+
+    A separate pass rather than a term in the shared scan: which rows survive differs per
+    dimension, and the scan's whole saving is that they do not. Each statement here reads only
+    the foldable rows.
+    """
+    if not standing_applied(state.standing, 'showdup'):
+        return
+
+    def merge(key, counts):
+        for value, count in counts.items():
+            if count:
+                out[key][value] = out[key].get(value, 0) + count
+
+    keys = {d.key for d in wanted}
+    together = tuple(k for k in _UNFOLDED_SCAN_DIMENSIONS if k in keys and k not in filtered)
+    if together:
+        for key, counts in _unfolded_scan(together, state, ctx, text_preds).items():
+            merge(key, counts)
+    for d in wanted:
+        if d.key in _UNFOLDED_SCAN_DIMENSIONS:
+            if d.key in filtered:
+                merge(d.key, _unfolded_scan((d.key,), state, ctx, text_preds,
+                                            skip=d.key)[d.key])
+        else:
+            merge(d.key, _unfolded_counts(d, state, ctx, text_preds))

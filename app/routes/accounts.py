@@ -177,6 +177,7 @@ def accounts_list():
     Everything the old fat card needed and this one does not (recording totals, the preset
     color swatches, the debug flag) is gone rather than passed and ignored: an unused
     template variable is a query the page pays for on every load."""
+    from .. import sync_queue
     # Read BEFORE the rows. A sync that commits in between then shows up as a mismatch at the
     # next poll and costs one extra refresh; read after, the page would claim a signature
     # its rows do not reflect and never refresh for that change at all.
@@ -187,6 +188,7 @@ def accounts_list():
         # names the choices, never a silent fall back to some other window.
         abort(400, description=f"w must be one of {', '.join(WINDOWS)}")
     sync_sig = sync_signature()
+    queue = sync_queue.status()
     # First, before anything else is loaded: it may commit a ledger catch-up, which expires
     # every row already in the session. It also loads the accounts, so the rows' second
     # line and the stats section below the list come from one call (dev/changelog/1029).
@@ -211,6 +213,7 @@ def accounts_list():
         total_channels=total_channels,
         total_hidden_channels=total_hidden_channels,
         sync_sig=sync_sig,
+        sync_queue=queue,
         stats=stats,
         blocks=block_views(account_ids),
         conn_limits=account_limits(account_ids, cfg),
@@ -1349,6 +1352,54 @@ def sync_account_api(account_id):
             return jsonify({'error': message, 'conflict': True, 'conflicts': conflicts}), 409
         return jsonify({'error': message, 'conflict': False, 'conflicts': []}), 400
     return jsonify({'success': True, 'message': message})
+
+
+@accounts_bp.route('/api/accounts/sync-queue', methods=['GET'])
+def sync_queue_status_api():
+    """What the confirm needs before anyone clicks: every account in the Accounts list's order,
+    where a queue stands, what would hold a new one back right now, and how long it pauses
+    between accounts."""
+    from .. import sync_queue
+    from ..accounts import sync_conflicts
+    accounts = [{'id': account_id, 'name': name} for account_id, name in
+                db.session.query(Account.id, Account.name).order_by(Account.created_at)]
+    names = {a['id']: a['name'] for a in accounts}
+    queue = sync_queue.status()
+    sentence = None
+    if queue is not None:
+        sentence = sync_queue.describe(
+            queue, lambda account_id: names.get(account_id, f'account {account_id}'))
+    return jsonify({'success': True, 'accounts': accounts, 'queue': queue, 'sentence': sentence,
+                    'conflicts': sync_conflicts(None, other_syncs=False),
+                    'pause_seconds': sync_queue.PAUSE_SECONDS})
+
+
+@accounts_bp.route('/api/accounts/sync-queue', methods=['POST'])
+def sync_queue_api():
+    """Sync several accounts one at a time. Body: {account_ids, override?}. `override` is
+    "Sync anyway": recordings and health checks stop holding the queue back. Without it the
+    queue waits them out, so a conflict here is never a refusal (app/sync_queue.py)."""
+    from .. import sync_queue
+    data = request.get_json(silent=True) or {}
+    raw = data.get('account_ids')
+    if (not isinstance(raw, list) or not raw
+            or not all(isinstance(i, int) and not isinstance(i, bool) for i in raw)):
+        return jsonify({'error': 'account_ids must be a list of account ids'}), 400
+    account_ids = list(dict.fromkeys(raw))
+    found = {row[0] for row in db.session.query(Account.id).filter(Account.id.in_(account_ids))}
+    missing = [i for i in account_ids if i not in found]
+    if missing:
+        return jsonify({'error': f'No such account: {missing[0]}'}), 404
+    started, message = sync_queue.start(account_ids, override=_checkbox(data.get('override')))
+    if not started:
+        return jsonify({'error': message}), 409
+    return jsonify({'success': True, 'message': message})
+
+
+@accounts_bp.route('/api/accounts/sync-queue/stop', methods=['POST'])
+def sync_queue_stop_api():
+    from .. import sync_queue
+    return jsonify({'success': True, 'message': sync_queue.stop()})
 
 
 @accounts_bp.route('/api/accounts/<int:account_id>/sync/cancel', methods=['POST'])

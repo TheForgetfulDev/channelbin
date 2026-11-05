@@ -319,6 +319,23 @@ FINISHED_IMAGE_CHOICES = (FINISHED_IMAGE_POSTER, FINISHED_IMAGE_LAST_FRAME)
 POSTER_ANCHOR_PROGRAM = 'program start'
 POSTER_ANCHOR_CAPTURE = 'the start of the capture'
 
+#: How many frames one recording's poster will look at, the first included. It has to have a
+#: limit because every try happens inside the join: 5 tries bound the wait at about 3m50s on a
+#: wedged disk (three 12 s grabs and a 10 s check per try), and a normal try takes well under
+#: a second.
+POSTER_FRAME_TRIES = 5
+POSTER_FRAME_RETRY_STEP_SECONDS = 60.0
+
+#: extra_data['kind'] of the DIAGNOSTICS event written when a poster frame was skipped.
+DIAGNOSTIC_KIND_POSTER_FRAME = 'poster_frame'
+
+#: What is known about the final-frame thumbnail when every poster try was black. Each is
+#: named because each changes what the recording's cover turns out to be.
+FINAL_FRAME_PICTURE = 'picture'
+FINAL_FRAME_BLACK = 'black'
+FINAL_FRAME_MISSING = 'missing'
+FINAL_FRAME_UNCHECKED = 'unchecked'
+
 
 def poster_frame_path(recording_id: int, cfg: dict = None) -> str:
     """Where this recording's poster frame lives. The one spelling of that name, so the
@@ -327,6 +344,13 @@ def poster_frame_path(recording_id: int, cfg: dict = None) -> str:
 
     return os.path.join(image_dir(cfg if cfg is not None else load_config(), POSTER_FRAMES),
                         f'{recording_id}.jpg')
+
+
+def final_frame_path(recording_id: int, cfg: dict) -> str:
+    """Where this recording's final-frame thumbnail lives."""
+    from .storage_dirs import THUMBNAILS, image_dir
+
+    return os.path.join(image_dir(cfg, THUMBNAILS), f'{recording_id}.jpg')
 
 
 def _segment_span_end(seg):
@@ -380,6 +404,126 @@ def poster_frame_seek(candidates, target):
     return None, 0.0, None
 
 
+def _poster_retry_step(thumb_cfg: dict, recording_id: int) -> float:
+    """The configured retry step in seconds. A step of zero would grab the same frame on every
+    try, so anything that is not a positive number takes the default."""
+    step = thumb_cfg.get('poster_frame_retry_step_seconds', POSTER_FRAME_RETRY_STEP_SECONDS)
+    try:
+        step = float(step)
+    except (TypeError, ValueError):
+        step = 0.0
+    if step <= 0:
+        log.warning('Recording %d: poster_frame_retry_step_seconds is not a positive number '
+                    '(%r) - using %.0f', recording_id,
+                    thumb_cfg.get('poster_frame_retry_step_seconds'),
+                    POSTER_FRAME_RETRY_STEP_SECONDS)
+        return POSTER_FRAME_RETRY_STEP_SECONDS
+    return step
+
+
+def _find_poster_frame(recording_id, candidates, target, step, tmp_path, ffmpeg_path, timeout):
+    """Grab frames until one is not black. Returns `(found, skipped)`.
+
+    `found` is `(segment, seek, how, moment)` with the frame sitting at `tmp_path`, or None
+    when no try produced a usable frame. `skipped` names every black frame passed over.
+
+    Each new target is one step after the moment actually looked at, not after the moment
+    asked for: a target in a gap lands on the top of the next segment, and stepping from the
+    target would land there again until the gap ran out.
+    """
+    from .screenshot import capture_screenshot, frame_bright_percent, is_black_frame
+
+    skipped = []
+    for _try in range(POSTER_FRAME_TRIES):
+        seg, seek, how = poster_frame_seek(candidates, target)
+        # The past-end answer is the top of the last segment, which is earlier than the frame
+        # that was just rejected. A retry exists to look later, and earlier could be front
+        # padding or the previous show.
+        if skipped and how == POSTER_FRAME_PAST_END:
+            log.info('Recording %d: the next poster frame try would be past everything '
+                     'captured, so it stops at %s', recording_id,
+                     counted(len(skipped), 'black frame'))
+            return None, skipped
+        if not capture_screenshot(seg.file_path, tmp_path, ffmpeg_path,
+                                  seek_args=['-ss', f'{seek:.2f}'], timeout=timeout):
+            log.info('Recording %d: poster frame capture failed (segment %d at %.2fs) - it '
+                     'falls back to the final-frame thumbnail',
+                     recording_id, seg.segment_number, seek)
+            return None, skipped
+        bright = frame_bright_percent(tmp_path, ffmpeg_path)
+        if bright is None:
+            log.warning('Recording %d: the poster frame (segment %d at %.2fs) could not be '
+                        'checked for black, so it is kept unchecked',
+                        recording_id, seg.segment_number, seek)
+        if not is_black_frame(bright):
+            return (seg, seek, how, target), skipped
+        where = f'segment {seg.segment_number} at {seek:.2f}s'
+        skipped.append(where)
+        log.info('Recording %d: skipped a black poster frame, %s (%.2f%% of its pixels are '
+                 'above black)', recording_id, where, bright)
+        looked_at = seg.started_at if how == POSTER_FRAME_AFTER_TARGET else target
+        target = looked_at + timedelta(seconds=step)
+    return None, skipped
+
+
+def _final_frame_state(recording_id, cfg, ffmpeg_path):
+    """Is the final-frame thumbnail, which a recording with no poster frame falls back to, any
+    better? It is grabbed first, so it is already on disk when this asks."""
+    from .screenshot import frame_bright_percent, is_black_frame
+
+    path = final_frame_path(recording_id, cfg)
+    if not os.path.exists(path):
+        return FINAL_FRAME_MISSING
+    bright = frame_bright_percent(path, ffmpeg_path)
+    if bright is None:
+        return FINAL_FRAME_UNCHECKED
+    return FINAL_FRAME_BLACK if is_black_frame(bright) else FINAL_FRAME_PICTURE
+
+
+def _note_skipped_poster_frames(recording_id, skipped, used, final_frame):
+    """Say on the recording itself why its cover is not the frame the settings describe.
+
+    `used` names the frame kept, or is None when there is no poster frame, and `final_frame`
+    is a FINAL_FRAME_* state in that case. Runs after every ffmpeg, in its own retry closure,
+    and a database failure here is only a log line: the join is what matters at this point.
+    """
+    black = f'{counted(len(skipped), "black frame")} ({", ".join(skipped)})'
+    extra = {'kind': DIAGNOSTIC_KIND_POSTER_FRAME, 'black_frames': skipped}
+    if used is not None:
+        extra['frame_used'] = used
+        detail = f'Poster frame: skipped {black} and used {used}'
+    else:
+        extra['final_frame'] = final_frame
+        detail = f'No poster frame: found {black} and no usable frame, '
+        if final_frame == FINAL_FRAME_PICTURE:
+            detail += 'so the cover is the final frame'
+        elif final_frame == FINAL_FRAME_BLACK:
+            detail += 'and the final frame is black too, so the cover is black'
+        elif final_frame == FINAL_FRAME_MISSING:
+            detail += 'and there is no final frame either, so there is no cover'
+        elif final_frame == FINAL_FRAME_UNCHECKED:
+            detail += 'so the cover is the final frame, which could not be checked for black'
+        else:
+            log.error('Recording %d: unknown final frame state %r', recording_id, final_frame)
+            detail += f'and the final frame is {final_frame}'
+    if final_frame in (FINAL_FRAME_BLACK, FINAL_FRAME_MISSING, FINAL_FRAME_UNCHECKED):
+        log.warning('Recording %d: %s', recording_id, detail)
+    else:
+        log.info('Recording %d: %s', recording_id, detail)
+
+    @retry_on_locked()
+    def _note_and_commit():
+        add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
+        db.session.commit()
+
+    try:
+        _note_and_commit()
+    except SQLAlchemyError as exc:
+        db.session.rollback()
+        log.warning('Recording %d: could not record the skipped poster frames: %s',
+                    recording_id, exc)
+
+
 def persist_poster_frame(recording_id: int):
     """Capture the recording's poster: a frame from inside the program itself.
 
@@ -394,13 +538,15 @@ def persist_poster_frame(recording_id: int):
     poor cover - a ball game ends on a postgame graphic, a commercial or the provider's
     slate.
 
+    A black frame is not used: the target moves forward by the retry step and it grabs again,
+    up to POSTER_FRAME_TRIES (dev/changelog/1433).
+
     Best-effort: a failure only means the recording falls back to its thumbnail. Spawns
     ffmpeg, so callers must keep it OUTSIDE any retry_on_locked closure. Requires an app
     context.
     """
     from .concatenator import joinable_segments
     from .config import resolve_ffmpeg_path
-    from .screenshot import capture_screenshot
 
     cfg = load_config()
     thumb_cfg = cfg.get('recording', {}).get('live_thumbnail', {})
@@ -436,7 +582,6 @@ def persist_poster_frame(recording_id: int):
         offset = 0.0
     target = anchor + timedelta(seconds=offset)
 
-    seg, seek, how = poster_frame_seek(candidates, target)
     poster_path = poster_frame_path(recording_id, cfg)
     poster_dir = os.path.dirname(poster_path)
     try:
@@ -447,32 +592,45 @@ def persist_poster_frame(recording_id: int):
         return
     tmp_path = os.path.join(poster_dir, f'{recording_id}.{uuid.uuid4().hex}.tmp.jpg')
     ffmpeg_path = resolve_ffmpeg_path(cfg.get('ffmpeg', {}).get('path', 'ffmpeg'))
-    ok = capture_screenshot(
-        seg.file_path, tmp_path, ffmpeg_path,
-        seek_args=['-ss', f'{seek:.2f}'],
-        timeout=thumb_cfg.get('capture_timeout_seconds', 12),
-    )
-    if not ok:
-        log.info('Recording %d: poster frame capture failed (segment %d at %.2fs) - it '
-                 'falls back to the final-frame thumbnail',
-                 recording_id, seg.segment_number, seek)
-        return
     try:
-        os.replace(tmp_path, poster_path)
-    except OSError as exc:
-        log.warning('Recording %d: poster frame replace failed: %s', recording_id, exc)
-        return
+        found, skipped = _find_poster_frame(
+            recording_id, candidates, target, _poster_retry_step(thumb_cfg, recording_id),
+            tmp_path, ffmpeg_path, thumb_cfg.get('capture_timeout_seconds', 12))
+        if found is None:
+            if skipped:
+                _note_skipped_poster_frames(recording_id, skipped, None,
+                                            _final_frame_state(recording_id, cfg, ffmpeg_path))
+            return
+        try:
+            os.replace(tmp_path, poster_path)
+        except OSError as exc:
+            log.warning('Recording %d: poster frame replace failed: %s', recording_id, exc)
+            return
+    finally:
+        # A rejected frame is still sitting here, and so is a grab whose replace failed.
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning('Recording %d: could not remove %s: %s', recording_id, tmp_path, exc)
+
+    seg, seek, how, moment = found
+    after_anchor = (moment - anchor).total_seconds()
     if how == POSTER_FRAME_AT_TARGET:
         log.info('Recording %d: poster frame taken %.0fs after %s, %.2fs into segment %d',
-                 recording_id, offset, anchor_kind, seek, seg.segment_number)
+                 recording_id, after_anchor, anchor_kind, seek, seg.segment_number)
     elif how == POSTER_FRAME_AFTER_TARGET:
         log.info('Recording %d: nothing was captured %.0fs after %s, so the poster frame '
                  'is the first content after it, at the top of segment %d',
-                 recording_id, offset, anchor_kind, seg.segment_number)
+                 recording_id, after_anchor, anchor_kind, seg.segment_number)
     else:
         log.warning('Recording %d: %.0fs after %s is past everything this recording '
                     'captured, so the poster frame is the top of its last segment (%d)',
-                    recording_id, offset, anchor_kind, seg.segment_number)
+                    recording_id, after_anchor, anchor_kind, seg.segment_number)
+    if skipped:
+        _note_skipped_poster_frames(recording_id, skipped,
+                                    f'segment {seg.segment_number} at {seek:.2f}s', None)
 
 
 def finished_image_path(recording_id: int, cfg: dict = None) -> str:
@@ -496,9 +654,7 @@ def finished_image_path(recording_id: int, cfg: dict = None) -> str:
 
 def finished_image_candidates(recording_id: int, cfg: dict) -> list:
     """Both images a finished recording could show, preferred one first."""
-    from .storage_dirs import THUMBNAILS, image_dir
-
-    thumb = os.path.join(image_dir(cfg, THUMBNAILS), f'{recording_id}.jpg')
+    thumb = final_frame_path(recording_id, cfg)
     poster = poster_frame_path(recording_id, cfg)
     prefers_poster = (cfg.get('recording', {}).get('live_thumbnail', {})
                       .get('finished_image', FINISHED_IMAGE_POSTER) != FINISHED_IMAGE_LAST_FRAME)

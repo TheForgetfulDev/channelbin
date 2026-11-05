@@ -2640,7 +2640,7 @@ function showEmptyState(isEmpty) {
 // What the active filter is, in words. The counts alone cannot distinguish "this channel
 // only has four programs tonight" from "a filter is hiding the rest", which is the whole
 // reason the line exists.
-function filterModeText(terms) {
+function filterModeText(terms, whenNone = 'no filter') {
   const bits = [];
   if (terms.positives.length) bits.push(`text "${terms.positives.join(' ')}"`);
   if (terms.negatives.length) bits.push(`excluding "${terms.negatives.join(' ')}"`);
@@ -2650,7 +2650,7 @@ function filterModeText(terms) {
   const durState = durationFilterState();
   if (durationFilterActive(durState)) bits.push(durationFilterLabel(durState));
   if (isCollapseActive()) bits.push('gaps collapsed');
-  return bits.length ? bits.join(' · ') : 'no filter';
+  return bits.length ? bits.join(' · ') : whenNone;
 }
 
 // The colour key for the matched-tag dots on program cells. Only the tags actually on a
@@ -2697,28 +2697,42 @@ function renderHealthKey(channels) {
 }
 
 // Status bar counts (12.6 as amended - the account legend beside them is server-rendered,
-// since accounts do not change while the page is open).
-function updateStatusBar(shownChannels, shownPrograms, terms) {
+// since accounts do not change while the page is open). `matching` is the cells the filters
+// let through, placeholders included; only listings a provider sent are counted as programs,
+// because a slot the route made up for a channel with no listings is not one
+// (dev/changelog/1436).
+function updateStatusBar(shownChannels, matching, terms) {
   // The schedules card counts schedules and channels in its own words, in its own bar.
   if (EMBED === 'schedules') { schedStatusBar(); return; }
   const el = document.getElementById('guide-sb-counts');
   renderTagKey(terms);
   renderHealthKey(channelData);
   if (!el) return;
+  const onPlaceholders = ch => (ch.programs || []).some(p => p.is_dummy);
+  const shownListings = matching.filter(p => !p.is_dummy).length;
   // A single-channel card counts programs, not channels: "1 of 1 channels" says nothing.
   if (EMBED === 'channel') {
-    const total = channelData.reduce((n, ch) => n + (ch.programs || []).length, 0);
-    el.textContent = `${shownPrograms} of ${total} program${total === 1 ? '' : 's'}  ·  ${filterModeText(terms)}`;
+    const total = channelData.reduce((n, ch) => n + (ch.programs || []).filter(p => !p.is_dummy).length, 0);
+    if (!total && channelData.some(onPlaceholders)) {
+      // A filter can hide every slot, and then the line must not claim they are on screen.
+      const what = matching.length ? 'No listings for this time, showing placeholder slots' : 'No listings for this time';
+      const mode = filterModeText(terms, '');
+      el.textContent = mode ? `${what}  ·  ${mode}` : what;
+      return;
+    }
+    el.textContent = `${shownListings} of ${total} program${total === 1 ? '' : 's'}  ·  ${filterModeText(terms)}`;
     return;
   }
   const total = channelData.length;
-  const chanPart = shownChannels === total
+  const chanPart = shownChannels.length === total
     ? `${total} channel${total === 1 ? '' : 's'}`
-    : `${shownChannels} of ${total} channels`;
+    : `${shownChannels.length} of ${total} channels`;
+  const placeholderRows = shownChannels.filter(onPlaceholders).length;
   // Over the whole span the grid holds, not the part in view: "61 programs shown" with one
   // block on screen read as a count of what was visible (dev/changelog/1292).
-  el.textContent = `${chanPart}  ·  ${shownPrograms} program${shownPrograms === 1 ? '' : 's'} `
-    + `over ${WINDOW_DAYS} day${WINDOW_DAYS === 1 ? '' : 's'}`;
+  el.textContent = `${chanPart}  ·  ${shownListings} program${shownListings === 1 ? '' : 's'} `
+    + `over ${WINDOW_DAYS} day${WINDOW_DAYS === 1 ? '' : 's'}`
+    + (placeholderRows ? `  ·  ${placeholderRows} with no listings` : '');
 }
 
 // Single dispatcher for the whole render pipeline.
@@ -2763,13 +2777,13 @@ function renderGuide() {
   const tagState = tagFilterState();
   const durState = durationFilterState();
   const shown = channelData.filter(ch => channelMatches(ch, terms) && !isChannelHealthHidden(ch));
-  const shownPrograms = shown.reduce((n, ch) =>
-    n + (ch.programs || []).filter(p => programMatches(p, terms, tagState, durState)).length, 0);
+  const matching = shown.flatMap(ch =>
+    (ch.programs || []).filter(p => programMatches(p, terms, tagState, durState)));
   // A channel whose NAME matched still has a row worth showing even if none of its programs
   // matched, so that case is not the empty state.
   const nameOnlyMatch = hasTerms && shown.some(ch => wordsMatch(terms, ch.name));
-  showEmptyState((hasTerms || tagFilterActive() || durationFilterActive(durState)) && shownPrograms === 0 && !nameOnlyMatch);
-  updateStatusBar(shown.length, shownPrograms, terms);
+  showEmptyState((hasTerms || tagFilterActive() || durationFilterActive(durState)) && matching.length === 0 && !nameOnlyMatch);
+  updateStatusBar(shown, matching, terms);
   updateReadout();
   syncHeadTrack();
   stripGridTooltips();

@@ -58,6 +58,7 @@ RESET = {
     'app/account_stats.py': {'_catch_up'},
     'app/accounts.py': {'_sync_progress'},
     'app/admission.py': {'_active', '_next_seq'},
+    'app/sync_queue.py': {'_state'},
     'app/auth.py': {'_failures'},
     'app/channel_search.py': {'_tag_channel_ids_cache', '_standing_breakdown_cache',
                               '_now_tag_channel_ids_cache'},
@@ -73,7 +74,8 @@ RESET = {
     'app/probe.py': {'_missing_reported'},
     'app/readiness.py': {'_ondemand', '_nav_cache'},
     'app/routes/system.py': {'_last_stats'},
-    'app/search_index.py': {'_rebuilding', '_stale_since'},
+    'app/routes/sports.py': {'_checked_leagues', '_checked_teams'},
+    'app/search_index.py': {'_rebuilding'},
     'app/setup_steps.py': {'_nav_cache'},
     'app/toolchain.py': {'_gpu_trial'},
 }

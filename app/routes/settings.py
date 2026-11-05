@@ -118,9 +118,27 @@ def api_settings_validate():
                     'valid': not any(p['severity'] == 'error' for p in problems)})
 
 
+def _apply_sync_interval_change() -> str:
+    """Move every account that follows sync.sync_interval_hours to the new interval, live.
+    Returns the sentence that tells the user what it set off, or '' when nothing is about to
+    sync. Syncs start five minutes apart, the spacing scheduler._find_safe_next_run keeps."""
+    from ..scheduler import schedule_all_account_syncs
+    late = schedule_all_account_syncs(current_app._get_current_object(),
+                                      force_reschedule_defaults=True)
+    if not late:
+        return ''
+    if late == 1:
+        return '1 account is past the new interval, so it syncs in about a minute.'
+    return (f'{late} accounts are past the new interval, so they sync now, about five minutes '
+            'apart.')
+
+
 def _save_raw_yaml(data):
     """save_config() and the side effects a changed key needs; returns the flash text."""
     changed = save_config(data)
+    sync_note = ''
+    if any(path == 'sync.sync_interval_hours' for path, _, _ in changed):
+        sync_note = _apply_sync_interval_change()
     if any(path.startswith('auth.') for path, _, _ in changed):
         from ..auth import refresh_auth
         refresh_auth(current_app._get_current_object())
@@ -142,6 +160,8 @@ def _save_raw_yaml(data):
     _clear_unconfigured_storage_alerts(load_config())
     gpu = _refresh_gpu_after_save(changed)
     gpu_note = f' {_gpu_trial_sentence(gpu)}' if gpu else ''
+    if sync_note:
+        gpu_note = f' {sync_note}{gpu_note}'
     if any(path in RESTART_REQUIRED_KEYS for path, _, _ in changed):
         return ('Settings saved. Restart the service for all changes to take effect.'
                 + gpu_note)
@@ -307,12 +327,18 @@ def api_settings_field():
         'recording.post_process.progress_interval_seconds': (1, 60),
         # 0 is a real answer here - the program's own first moment - so no floor above it.
         'recording.live_thumbnail.poster_frame_offset_seconds': (0, None),
+        # 0 would grab the same frame on every try.
+        'recording.live_thumbnail.poster_frame_retry_step_seconds': (1, None),
         'recording.post_process.video_crf': (0, 51),
         'recording.post_process.vaapi_qp': (0, 51),
         'recording.post_process.vaapi_hevc_qp': (0, 51),
         # Per stereo pair since dev/changelog/1184: a 5.1 source gets three times this.
         'recording.post_process.audio_bitrate_kbps': (32, 320),
         'channel_testing.window.dispatch_interval_minutes': (1, None),
+        'sports_data.call_spacing_seconds': (12, None),
+        'sports_data.call_jitter_seconds': (0, None),
+        'sports_data.horizon_days': (1, 90),
+        'sports_data.history_keep_days': (1, None),
     }
     if path in _numeric_clamps:
         lo, hi = _numeric_clamps[path]
@@ -353,6 +379,13 @@ def api_settings_field():
     # freezing today's defaults into the file (dev/changelog/727).
     with config_write_lock:
         cfg, file_cfg = load_for_edit()
+
+        if path in ('sports_data.call_spacing_seconds', 'sports_data.call_jitter_seconds'):
+            from ..sports_data import pace_error
+            pace = dict(cfg.get('sports_data') or {}, **{path.split('.')[1]: value})
+            refused = pace_error(pace.get('call_spacing_seconds', 60), pace.get('call_jitter_seconds', 20))
+            if refused:
+                return jsonify({'error': refused}), 400
 
         # end < start is valid (the window crosses midnight, per app/check_window.py) - only a
         # zero-length window (start == end) is rejected, since it would never run anything.
@@ -549,10 +582,9 @@ def api_settings_field():
         report_read_timeout_state(load_config(), source='settings')
 
     # Changing the global sync interval immediately reschedules all Default accounts
-    if path == 'sync.sync_interval_hours':
-        from ..scheduler import schedule_all_account_syncs
-        schedule_all_account_syncs(current_app._get_current_object(),
-                                   force_reschedule_defaults=True)
+    sync_note = ''
+    if path == 'sync.sync_interval_hours' and changed:
+        sync_note = _apply_sync_interval_change()
 
     # The host check job is registered with its interval baked in, so a changed interval
     # re-arms it rather than waiting out the old one (app/account_links.py).
@@ -601,6 +633,8 @@ def api_settings_field():
 
     payload = {'success': True, 'restart_required': needs_restart,
                'changed_from_default': still_changed}
+    if sync_note:
+        payload['notice'] = sync_note
     gpu = _refresh_gpu_after_save(changed)
     if gpu is not None:
         from ..readiness import READY
@@ -1055,26 +1089,17 @@ def api_search_index_rebuild():
     and it cannot take a connection UI traffic needs. rebuild_search_indexes() never raises
     and owns its own retry_on_locked commits and alerting, so there is nothing to catch here.
     """
-    from ..database import Account
-    from ..search_index import rebuild_in_progress, rebuild_search_indexes
+    from ..search_index import manual_rebuild_refusal, rebuild_search_indexes
 
-    if rebuild_in_progress():
-        return jsonify({'error': 'A search index rebuild is already running.'}), 409
-
-    # Refused rather than queued: a sync ends with its own rebuild, so a manual one started
-    # mid-sync spends ~76s of CPU on an index the sync's next insert makes stale - during the
-    # exact window this whole batch exists to keep quiet.
-    syncing = Account.query.filter_by(status=ACCOUNT_STATUS_SYNCING).first()
-    if syncing is not None:
-        return jsonify({'error': (
-            f'"{syncing.name}" is syncing right now, and a sync rebuilds the search indexes '
-            'when it finishes. Wait for it rather than rebuilding twice.')}), 409
+    refusal = manual_rebuild_refusal()
+    if refusal:
+        return jsonify({'error': refusal}), 409
 
     app_obj = current_app._get_current_object()
 
     def _worker():
         with app_obj.app_context():
-            rebuild_search_indexes('manual rebuild from Maintenance')
+            rebuild_search_indexes('manual rebuild')
 
     threading.Thread(target=_worker, daemon=True, name='search-index-rebuild').start()
     return jsonify({'success': True})

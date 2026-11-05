@@ -24,8 +24,11 @@
       knows how a row looks. Because the rows are replaced wholesale, every handler above is
       delegated on document; a listener bound to a row would go with the row.
 
-   Depends on util.js (escHtml, buildModal, closeMenus, swapFromServer), account-actions.js
-   and account-modal.js (openAccountModal).
+   5. **Sync All** is the sync queue's shared confirm (sync-queue.js). The queue itself runs on
+      the server (app/sync_queue.py); the button only starts it and reports on it.
+
+   Depends on util.js (escHtml, buildModal, closeMenus, swapFromServer), account-actions.js,
+   account-modal.js (openAccountModal) and sync-queue.js (confirmSyncQueue).
 */
 (() => {
   'use strict';
@@ -120,23 +123,48 @@
   //      drift while nothing changes. Skipped in a background tab, where nobody reads them.
   // A refresh waits while a row's menu or phone sheet is open - swapping the row out from
   // under an open menu would close it mid-choice - and the next poll simply asks again.
-  const LIVE_REGIONS = ['#acct-live', '#acct-total'];
+  const LIVE_REGIONS = ['#acct-live', '#acct-total', '#acct-sync-all'];
   const RERENDER_MS = 60 * 1000;
   let renderedAt = Date.now();
   let inFlight = false;
 
   const busy = () => Boolean(document.querySelector('.acct-rows .menu.open, .acct-sheet'));
+  const queueRunning = () => Boolean(document.querySelector('#acct-sync-all [data-queue-running]'));
+
+  function refreshList({ announceEnd = true } = {}) {
+    if (inFlight) return;
+    inFlight = true;
+    const wasRunning = queueRunning();
+    swapFromServer(LIVE_REGIONS)
+      .then(() => {
+        renderedAt = Date.now();
+        if (announceEnd && wasRunning && !queueRunning()) {
+          showToast('The account syncs have finished. Each row shows how its sync went.');
+        }
+      })
+      .catch((err) => console.warn('Accounts list refresh failed; the next poll retries.', err))
+      .finally(() => { inFlight = false; });
+  }
+
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-sync-all]');
+    if (!btn) return;
+    confirmSyncQueue({
+      url: btn.dataset.url,
+      label: 'Sync all accounts',
+      alwaysConfirm: true,
+      // Starting or stopping says so in its own toast, and the end of a stopped queue is not
+      // the queue finishing.
+      onSettled: () => refreshList({ announceEnd: false }),
+    });
+  });
 
   window.__applyAccountSync = (sig) => {
     const live = document.getElementById('acct-live');
     if (!live || typeof sig !== 'string' || inFlight || busy()) return;
     const changed = sig !== live.dataset.syncSig;
     if (!changed && (Date.now() - renderedAt < RERENDER_MS || document.hidden)) return;
-    inFlight = true;
-    swapFromServer(LIVE_REGIONS)
-      .then(() => { renderedAt = Date.now(); })
-      .catch((err) => console.warn('Accounts list refresh failed; the next poll retries.', err))
-      .finally(() => { inFlight = false; });
+    refreshList();
   };
 // The call parens go OUTSIDE the wrapper, unlike account-detail.js's `(function () {}())`.
 // An arrow function is not a valid callee inside the group, so `(() => {}())` is a syntax

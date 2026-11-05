@@ -36,6 +36,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
+from app.config import set_restart_needed  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HARNESS = os.path.join(REPO, 'tests', 'support', 'maintenance_restart.mjs')
@@ -57,7 +58,13 @@ def _observe():
             bare = client.get('/maintenance').get_data(as_text=True)
         with patch.dict(os.environ, {'CHANNELBIN_DOCKER': '1'}):
             docker = client.get('/maintenance').get_data(as_text=True)
-        for name, html in (('page.html', bare), ('page_docker.html', docker)):
+        set_restart_needed(True)
+        try:
+            banner = client.get('/readiness').get_data(as_text=True)
+        finally:
+            set_restart_needed(False)
+        for name, html in (('page.html', bare), ('page_docker.html', docker),
+                           ('page_banner.html', banner)):
             with open(os.path.join(tmp, name), 'w', encoding='utf-8') as f:
                 f.write(html)
         proc = subprocess.run(['node', HARNESS, tmp, REPO],
@@ -186,6 +193,19 @@ class RefusalListsParkedApartTests(_Base, unittest.TestCase):
         self.assertIn('Live Match', self.obs['lists'][0])
         self.assertNotIn('Parked Game', self.obs['lists'][0])
         self.assertIn('Parked Game', self.obs['lists'][1])
+
+
+class RestartBannerButtonTests(_Base, unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-05 @ 06:50:41 AM: the banner's button, on a page that is not
+    Maintenance, runs the same restart."""
+    SCENARIO = 'banner'
+
+    def test_it_opens_the_restart_confirm(self):
+        self.assertIn('Restart the ChannelBin service now?', self.obs['text'])
+
+    def test_a_confirmed_restart_waits_for_the_new_process_and_reloads(self):
+        self.assertEqual(self.obs['reloads'], 1)
+        self.assertEqual(self.obs['status'], 'Back online - reloading...')
 
 
 if __name__ == '__main__':

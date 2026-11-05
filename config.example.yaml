@@ -16,7 +16,7 @@
 # logging.file, which appear below as commented-out examples because their defaults
 # are paths derived from wherever the app is installed.
 
-config_version: 7
+config_version: 8
 
 recording:
   # Where segments, the in-progress file and the finished recording are written.
@@ -116,6 +116,9 @@ recording:
     # Seconds after the PROGRAM's own start time to grab the poster frame, so a recording
     # with front padding does not put the previous show or a countdown clock on its cover.
     poster_frame_offset_seconds: 60
+    # When the poster frame comes out black, how many seconds later the next try looks. If
+    # every try is black, the recording uses its final frame instead.
+    poster_frame_retry_step_seconds: 60
     # Which image a finished recording shows: poster (the frame from inside the program)
     # or last_frame (the final-frame thumbnail). Whichever is missing falls back to the
     # other, so older recordings still show their thumbnail.
@@ -357,11 +360,6 @@ search:
   # reading the whole table. That state lasts as long as the option causing it stays set, so
   # the budget is about how long an optional number is worth waiting for. 0 = never attempt.
   full_scan_aggregate_timeout_seconds: 8
-  # How long a search index may sit unusable with nobody rebuilding it before a janitor job
-  # rebuilds it. A sync's own rebuild is the first resort and this is the last, so the grace
-  # leaves room for a sync that is about to start anyway. 0 = never, which leaves index repair
-  # to the next account sync alone.
-  index_janitor_grace_minutes: 15
 
 accounts:
   default_max_connections: 1            # per-account cap on simultaneous connections (recordings + tests)
@@ -523,6 +521,12 @@ channel_testing:
 
 alerts:
   keep_days: 90                          # daily sweep deletes dismissed alerts older than this; 0 = keep forever
+
+sports_data:                             # the schedules on the Sports Schedules page, from TheSportsDB
+  call_spacing_seconds: 60               # between calls; with the jitter, the shortest wait must be 12 or more
+  call_jitter_seconds: 20                # each wait is the spacing plus or minus up to this
+  horizon_days: 21                       # how far ahead a schedule is kept
+  history_keep_days: 30                  # how long a past game is kept
 
 auto_scheduling:                         # auto-record rules
   default_max_upcoming: 10               # per-rule cap on scheduled recordings when a rule sets none; 0 = uncapped

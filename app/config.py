@@ -306,6 +306,9 @@ _DEFAULTS = {
             # front padding does not put a countdown clock or the previous show on the
             # cover. 0 means the program's first moment.
             'poster_frame_offset_seconds': 60,
+            # How much later the next try looks when a poster frame comes out black
+            # (dev/changelog/1433).
+            'poster_frame_retry_step_seconds': 60,
             # Which of the two images a FINISHED recording shows: 'poster' (the frame from
             # inside the program) or 'last_frame' (the final-frame thumbnail). Either way
             # the other one is served when the chosen one does not exist, so a recording
@@ -704,19 +707,6 @@ _DEFAULTS = {
         # costs on this database (7.6s), i.e. the slowest wait this page already asks for;
         # past that the number is declined rather than waited on. 0 = never attempt.
         'full_scan_aggregate_timeout_seconds': 8,
-        # How long a search index may sit unusable with nobody rebuilding it before the
-        # index janitor rebuilds it itself (app/search_index.py::run_index_janitor, run every
-        # 10 minutes by scheduler.py::schedule_index_janitor). 0 = never, which puts index
-        # repair back on the next account sync alone.
-        #
-        # The grace is not a throttle, it is a right-of-way rule: the janitor is the LAST
-        # resort, and a sync's own close-out rebuild is the first. A sync already in flight
-        # refuses the janitor through admission, but one about to start does not - and at
-        # startup APScheduler fires every missed sync interval immediately, so the sync that
-        # will fix this is often seconds away. 15 minutes leaves that window clear while
-        # still capping the degraded window at 15-25 minutes, against the 6.5 hours measured
-        # on 2026-08-15 when a restart mid-sync left the repair to nobody (dev/changelog/680).
-        'index_janitor_grace_minutes': 15,
     },
     'accounts': {
         # Fallback per-account "max simultaneous connections" cap when an account's own
@@ -916,6 +906,18 @@ _DEFAULTS = {
         'keep_days': 90,
     },
     # Auto-record rules (app/auto_rules.py, DESIGN-autoschedule.md §9).
+    'sports_data': {
+        # Seconds between calls to TheSportsDB. Together with the jitter, a shortest possible
+        # wait under 12 seconds is refused: the fastest pace measured clean
+        # (dev/docs/DESIGN-sports-data.md 4.1).
+        'call_spacing_seconds': 60,
+        # Each wait is the spacing plus or minus a random amount up to this.
+        'call_jitter_seconds': 20,
+        # How far ahead a schedule is kept. Further ahead means more calls.
+        'horizon_days': 21,
+        # How long a past event is kept.
+        'history_keep_days': 30,
+    },
     'auto_scheduling': {
         # Per-rule cap on SCHEDULED recordings when the rule sets none of its own; a showing
         # past it is skipped and the rule's cap alert says so. 0 = uncapped.
@@ -1608,6 +1610,18 @@ def _cfg_m007_reference_minutes_follows_test_duration(cfg: dict) -> dict:
     return cfg
 
 
+def _cfg_m008_drop_index_janitor_grace(cfg):
+    """search.index_janitor_grace_minutes is gone: the index janitor repairs what it finds on
+    its first tick (dev/changelog/1431). Named in the log, since a stored 0 meant "never" and
+    that choice no longer exists."""
+    present, value = _pop_config_path(cfg, ('search', 'index_janitor_grace_minutes'))
+    if present:
+        log.warning('config migration: search.index_janitor_grace_minutes dropped (was %s) - '
+                    'the search index repair job now repairs on its first check, every 10 '
+                    'minutes, and can no longer be turned off', value)
+    return cfg
+
+
 CONFIG_MIGRATIONS = [
     (1, "rename legacy 'xtream' section to 'sync'", _cfg_m001_xtream_to_sync),
     (2, "channel_testing.failing_score_threshold -> failing_band", _cfg_m002_failing_band),
@@ -1621,6 +1635,8 @@ CONFIG_MIGRATIONS = [
      _cfg_m006_one_images_dir),
     (7, 'channel_testing.reference_minutes follows the 30s test duration',
      _cfg_m007_reference_minutes_follows_test_duration),
+    (8, 'search.index_janitor_grace_minutes dropped, the janitor repairs on its first tick',
+     _cfg_m008_drop_index_janitor_grace),
 ]
 
 CURRENT_CONFIG_VERSION = CONFIG_MIGRATIONS[-1][0]

@@ -87,6 +87,7 @@
       'hide': ep == 'channel_hide_rules.hide_rules_page',
       'tags': ep.startswith('tags.'),
       'epg': ep.startswith('epg_manager.'),
+      'sports': ep.startswith('sports.'),
       'accounts': ep.startswith('accounts.'),
       'rules': ep.startswith('auto_rules.'),
       'recprof': ep.startswith('profiles.'),
@@ -121,6 +122,7 @@
     <a class="nav-link{% if on['tags'] %} active{% endif %}" href="{{ url_for('tags.tags_list') }}">{{ icon('nav-tags', 'nav-i') }}<span class="nav-t">Tags</span></a>
     {# EPG Manager (dev/changelog/1325): the tools that work across every account's guide. #}
     <a class="nav-link{% if on['epg'] %} active{% endif %}" href="{{ url_for('epg_manager.epg_manager') }}">{{ icon('nav-epg-manager', 'nav-i') }}<span class="nav-t">EPG Manager</span></a>
+    <a class="nav-link{% if on['sports'] %} active{% endif %}" href="{{ url_for('sports.sports_page') }}">{{ icon('nav-sports', 'nav-i') }}<span class="nav-t">Sports Schedules</span></a>
     </div>
     {% call nav_fold('setup', 'Setup', ['Accounts', 'Auto-record', 'Recording Profiles', 'Health Check Profiles'],
                      on['accounts'] or on['rules'] or on['recprof'] or on['hcprof']) %}
@@ -246,8 +248,8 @@
          renderings of ONE message - set once here so a future edit can't drift
          them apart; the JS side clones #restart-banner-msg's innerHTML instead
          of carrying its own copy of the sentence. #}
-      {% set restart_banner_msg %}{{ icon('warning') }} Restart required - some changes won't take effect until the service is restarted.
-        Restart it from the <a href="{{ url_for('system.maintenance') }}">Maintenance</a> page.{% endset %}
+      {% set restart_banner_msg %}<span class="restart-banner-text">{{ icon('warning') }} Restart required - some changes won't take effect until the service is restarted.</span>
+        <button type="button" class="btn btn-sm btn-primary" data-restart-service{% if in_docker %} data-docker="1"{% endif %}>Restart now</button>{% endset %}
       <template id="restart-banner-msg">{{ restart_banner_msg | safe }}</template>
       {% if restart_needed %}
       <div id="restart-banner" class="restart-banner">{{ restart_banner_msg | safe }}</div>
@@ -370,6 +372,8 @@
         .catch(function() {});
     }
   </script>
+  {# The restart-required banner above carries a restart button on every page. #}
+  <script src="{{ url_for('static', filename='js/restart-service.js') }}"></script>
   {# Defines window.__applyAlerts, so it must load before the nav-status poller below. #}
   <script src="{{ url_for('static', filename='js/nav-alerts.js') }}"></script>
   <script>

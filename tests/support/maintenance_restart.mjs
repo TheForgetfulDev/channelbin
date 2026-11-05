@@ -19,7 +19,7 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 
 const [, , DIR, REPO] = process.argv;
 const read = (f) => fs.readFileSync(`${DIR}/${f}`, 'utf8');
-const JS = ['util.js', 'maintenance.js'].map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
+const JS = ['util.js', 'restart-service.js', 'maintenance.js'].map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
 
 const RESTART_STATUS = '/api/settings/restart-status';
 const RESTART_PARKED = '/api/settings/restart-parked';
@@ -119,6 +119,8 @@ function boot({
   };
   return ctx;
 }
+
+const click0 = (c, el) => el.dispatchEvent(new el.ownerDocument.defaultView.MouseEvent('click', { bubbles: true, cancelable: true }));
 
 const out = {};
 const record = async (name, fn) => {
@@ -222,6 +224,19 @@ await record('refusedWithParked', async () => {
   await c.restart();
   const lists = c.$$('.modal-panel .blocking-list').map((ul) => ul.textContent.replace(/\s+/g, ' ').trim());
   return { errors: c.errors, titles: c.modalTitles(), lists, text: c.confirmText() };
+});
+
+/* The restart-required banner's button, on a page that is not Maintenance: the same confirm,
+   and a confirmed restart posts and waits the same way. */
+await record('banner', async () => {
+  const c = boot({ page: 'page_banner.html', beats: ['old', 'old', 'new'] });
+  const btn = c.$('#restart-banner [data-restart-service]');
+  click0(c, btn);
+  await c.wait(10);
+  const text = c.confirmText();
+  click0(c, c.footButton('Restart now'));
+  await c.wait(200);
+  return { errors: c.errors, text, reloads: c.reloads(), status: c.statusText(), label: btn.textContent };
 });
 
 process.stdout.write(JSON.stringify(out));

@@ -156,6 +156,13 @@ and hands them to whatever you already use to watch them.
 
 ---
 
+**Sports schedules**
+
+- Follow a league or specific teams and see who is playing, when and where for the next three weeks,
+  in your own timezone. Schedule data comes from [TheSportsDB](https://www.thesportsdb.com/); ChannelBin
+  fetches it for you, slowly and only for what you follow, and ships none of it. For now the schedule
+  is read only: matching games to your guide and recording them from it is a work in progress.
+
 ## Install
 
 ### Docker (recommended)
