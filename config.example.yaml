@@ -527,6 +527,8 @@ sports_data:                             # the schedules on the Sports Schedules
   call_jitter_seconds: 20                # each wait is the spacing plus or minus up to this
   horizon_days: 21                       # how far ahead a schedule is kept
   history_keep_days: 30                  # how long a past game is kept
+  download_images: true                  # a matched recording's poster and background, for media servers
+  file_names: false                      # name a matched recording's file League YYYY-MM-DD Event
 
 auto_scheduling:                         # auto-record rules
   default_max_upcoming: 10               # per-rule cap on scheduled recordings when a rule sets none; 0 = uncapped

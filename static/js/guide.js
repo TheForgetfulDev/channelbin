@@ -418,7 +418,8 @@ function cellActiveFields(prog) {
   // On the schedules card a recording is the group's, so its chip is drawn on the group's
   // own row only, and tag dots are not offered there.
   const schedules = EMBED === 'schedules';
-  if (LAYOUT.rec_status && prog.has_recording && !(schedules && prog.on_schedule)) {
+  if (LAYOUT.rec_status && (prog.has_recording || prog.failed_recording_id)
+      && !(schedules && prog.on_schedule)) {
     on.add('rec_status');
   }
   if (LAYOUT.subtitle && real && prog.sub_title) on.add('subtitle');
@@ -498,7 +499,6 @@ function syncHeadTrack() {
     const room = seg.offsetWidth - label.offsetWidth;
     const offset = Math.max(0, Math.min(x - segLeft, room));
     label.style.transform = offset > 0 ? `translateX(${offset}px)` : '';
-    seg.classList.toggle('is-offscreen', segLeft + seg.offsetWidth < x || segLeft > x + vpWidth);
   });
 }
 
@@ -681,10 +681,11 @@ function renderTimeHeader() {
 // CONVERTING, the phase after them, read "Converting" - so the guide called a program
 // recorded during the two phases that can still fail (dev/changelog/1083).
 //
-// Every status in that vocabulary appears below, including the two the guide draws nothing
-// for: app/routes/guide.py excludes FAILED and ABORTED from the recordings matched to
-// cells, so a chip for them would have no data behind it. `null` says that deliberately -
-// an absent entry is a status nobody decided about, and recChipFor says so out loud.
+// Every status in that vocabulary appears below, including the two this table draws nothing
+// for: app/routes/guide.py never hands a cell a FAILED or ABORTED recording as ITS
+// recording, since that is what takes Record off a program. `null` says that deliberately -
+// an absent entry is a status nobody decided about, and recChipFor says so out loud. A
+// failed recording reaches the cell another way: `failed_recording_id` and REC_CHIP_FAILED.
 const REC_CHIP = {
   SCHEDULED:     { cls: 'rec-scheduled', badge: 'rec-badge-scheduled', icon: '',
                    detail: 'A recording is set up for this program but has not started yet.' },
@@ -720,6 +721,14 @@ const REC_CHIP_PARTIAL = { cls: 'rec-partial', badge: 'rec-badge-partial', icon:
 // Partial over the user's own Stop read as a fault (dev/changelog/1287). The cell keeps Done's
 // wash, which is drawn only over the part that was recorded.
 const REC_CHIP_STOPPED = { cls: 'rec-done', badge: 'rec-badge-stopped', icon: 'stop', word: 'Stopped early' };
+
+// A program a recording FAILED on, with nothing since recording it (`failed_recording_id`,
+// dev/changelog/1457). Not `has_recording`: the program is still offered Record, so it can be
+// recorded again, and every reader of that flag goes on meaning "a recording holds this slot".
+// A cancelled (ABORTED) recording gets no mark at all.
+const REC_CHIP_FAILED = { badge: 'rec-badge-failed', icon: 'failed', word: 'Failed',
+                          detail: 'A recording of this program failed, and nothing has recorded it since. '
+                            + 'You can still record it. Open the program to see the failed recording.' };
 
 // A SCHEDULED recording whose start time has come. Not a status of its own either: the
 // recorder flips it to IN_PROGRESS within seconds, and until it does "Scheduled" over a
@@ -788,17 +797,44 @@ function recStatusBadge(status, partial, stopped, starting, cellPx) {
   const chip = recChipFor(status, partial, stopped, starting);
   const word = recChipWord(status, partial, stopped, starting);
   if (!chip || !word) return '';
-  const iconOnly = Boolean(chip.icon) && !recBadgeFits(word, true, cellPx);
-  const text = iconOnly ? icon(chip.icon) : (chip.icon ? `${icon(chip.icon)} ${escHtml(word)}` : escHtml(word));
   let detail = chip.detail;
   if (chip === REC_CHIP_PARTIAL) {
     detail = `Recorded, but not the whole program: ${partial}\nOpen the recording to see what happened.`;
   } else if (chip === REC_CHIP_STOPPED) {
     detail = `${stopped} The file holds what was recorded up to then.`;
   }
+  return recBadgeHtml(chip, word, detail, cellPx);
+}
+
+// One chip's markup, for a recording's status and for the failed mark alike.
+function recBadgeHtml(chip, word, detail, cellPx) {
+  const iconOnly = Boolean(chip.icon) && !recBadgeFits(word, true, cellPx);
+  const text = iconOnly ? icon(chip.icon) : (chip.icon ? `${icon(chip.icon)} ${escHtml(word)}` : escHtml(word));
   const tip = `${word}\n${detail}`;
   const label = iconOnly ? ` aria-label="${escHtml(word)}"` : '';
   return `<div class="rec-badge ${chip.badge} tip-plain" data-tip="${escTipAttr(tip)}"${label}>${text}</div>`;
+}
+
+// The chip a program gets from `failed_recording_id`: a recording of it failed and nothing
+// since has recorded it.
+function recFailedBadge(cellPx) {
+  return recBadgeHtml(REC_CHIP_FAILED, REC_CHIP_FAILED.word, REC_CHIP_FAILED.detail, cellPx);
+}
+
+// A program cell's chip: its recording's status, or the failed mark when it has no recording.
+function progRecBadge(prog, cellPx) {
+  if (prog.has_recording) {
+    return recStatusBadge(prog.recording_status, prog.recording_partial, prog.recording_stopped,
+      recStarting(prog.recording_status, prog.recording_start_time), cellPx);
+  }
+  return prog.failed_recording_id ? recFailedBadge(cellPx) : '';
+}
+
+// The classes a program cell takes from its recording, with their leading space. A failed
+// program takes none: nothing holds its slot, so the cell stays plain and the chip says it.
+function progRecClass(prog) {
+  return prog.has_recording
+    ? ' has-recording ' + recCssClass(prog.recording_status, prog.recording_partial) : '';
 }
 
 // Tooltips travel through an HTML attribute, so newlines are encoded and the shared portal
@@ -964,8 +1000,7 @@ function programCellHtml(prog, ch, cellPx) {
 
 function cellFieldHtml(field, prog, ch, cellPx) {
   switch (field) {
-    case 'rec_status': return recStatusBadge(prog.recording_status, prog.recording_partial, prog.recording_stopped,
-      recStarting(prog.recording_status, prog.recording_start_time), cellPx);
+    case 'rec_status': return progRecBadge(prog, cellPx);
     case 'title':      return `<div class="guide-program-title">${escHtml(prog.title || ch.name)}</div>`;
     case 'subtitle':   return `<div class="guide-program-subtitle">${escHtml(prog.sub_title)}</div>`;
     case 'description':return `<div class="guide-program-desc">${escHtml(prog.description)}</div>`;
@@ -1046,8 +1081,7 @@ function renderProgramRows() {
       const widthPx = Math.max(2, (visStopMin - visStartMin) * PIXELS_PER_MINUTE - 2);
 
       const el = document.createElement('div');
-      const progRecClass = prog.has_recording ? (' has-recording ' + recCssClass(prog.recording_status, prog.recording_partial)) : '';
-      el.className = 'guide-program' + progRecClass + (prog.is_dummy ? ' is-dummy' : '');
+      el.className = 'guide-program' + progRecClass(prog) + (prog.is_dummy ? ' is-dummy' : '');
       if (widthPx < 60) el.classList.add('narrow');
       el.style.left  = leftPx + 'px';
       el.style.width = widthPx + 'px';
@@ -1728,6 +1762,8 @@ function progHeadHtml(prog, { withTitle = true } = {}) {
     sheetLine('Channel', prog.channel_name) +
     // Which EPG source this showing came from (DESIGN-epg-sources.md §9.4).
     sheetLine('Guide data', prog.source_name) +
+    // What the guide file itself marked this showing: Live, New (dev/changelog/1454).
+    sheetLine('Guide marks', (prog.guide_marks || []).join(', ')) +
     // A group row fills time its recording member's listings miss from another member
     // (dev/changelog/1116); this says whose listing the showing is when it is not that one.
     sheetLine('Listings from', prog.listings_from) +
@@ -2551,8 +2587,7 @@ function renderProgramRowsCollapsed(terms) {
         const widthPx = Math.max(2, ((ov.clEnd - ov.clStart) / 60000) * PIXELS_PER_MINUTE - 2);
 
         const el = document.createElement('div');
-        const progRecClass = prog.has_recording ? (' has-recording ' + recCssClass(prog.recording_status, prog.recording_partial)) : '';
-        el.className = 'guide-program' + progRecClass + (prog.is_dummy ? ' is-dummy' : '');
+        el.className = 'guide-program' + progRecClass(prog) + (prog.is_dummy ? ' is-dummy' : '');
         if (widthPx < 60) el.classList.add('narrow');
         el.style.left  = leftPx + 'px';
         el.style.width = widthPx + 'px';

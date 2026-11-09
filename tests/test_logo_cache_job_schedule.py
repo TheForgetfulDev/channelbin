@@ -25,6 +25,7 @@ import yaml  # noqa: E402
 
 from tests.support.app import make_test_app  # noqa: E402
 import app.config as cfgmod  # noqa: E402
+from app.config import _deep_merge  # noqa: E402
 from app.scheduler import get_scheduler  # noqa: E402
 
 JOB_ID = 'logo_cache_fetch'
@@ -166,25 +167,24 @@ class RollbackTests(_LogoCacheJobCase):
 
     def setUp(self):
         super().setUp()
-        # config_backup.backup_dir defaults to instance/config-backups under the APP ROOT,
-        # and neither make_test_app() nor ConfigSandbox redirects it - so a test that let
-        # get_backup_dir() answer for itself would deposit into (and list) the real
-        # install's backups. Point it at this test's temp dir before anything reads it.
-        self.backup_dir = os.path.join(self.t._tmpdir, 'config-backups')
-        os.makedirs(self.backup_dir, exist_ok=True)
-        cfgmod.save_config({'config_backup': {'backup_dir': self.backup_dir}})
+        # make_test_app()'s sandboxed config.yaml already points the backup dir at a temp
+        # dir (dev/changelog/1130).
         from app.config_backup import get_backup_dir
-        self.assertEqual(get_backup_dir(), self.backup_dir)
+        self.backup_dir = get_backup_dir()
+        self.assertTrue(self.backup_dir.startswith(self.t._tmpdir), self.backup_dir)
+        os.makedirs(self.backup_dir, exist_ok=True)
 
     def _backup_holding(self, enabled):
         """Write a config backup whose stored config has logo caching at `enabled`.
-        Carries backup_dir forward so the restored config still points here."""
+        Carries the app's sandboxed dirs forward so the restored config still keeps runtime
+        reads in the temp dir."""
         from app.config_backup import _BACKUP_SUFFIX
         name = f'2026-01-0{1 if enabled else 2}-00-00-00{_BACKUP_SUFFIX}'
+        body = _deep_merge({'config_version': cfgmod.CURRENT_CONFIG_VERSION,
+                            **self.t._sandbox_paths},
+                           {'recording': {'logo_cache': {'enabled': enabled}}})
         with open(os.path.join(self.backup_dir, name), 'w') as f:
-            yaml.dump({'config_version': cfgmod.CURRENT_CONFIG_VERSION,
-                       'config_backup': {'backup_dir': self.backup_dir},
-                       'recording': {'logo_cache': {'enabled': enabled}}}, f)
+            yaml.dump(body, f)
         return name
 
     def rollback(self, filename):

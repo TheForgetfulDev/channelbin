@@ -160,6 +160,21 @@ def _block(seed, station, index: int, shape: GuideShape) -> list:
     return out
 
 
+#: How long one filler block runs: the guide sources seen in prod repeat a name every 2 hours,
+#: on even UTC hours (dev/changelog/1470).
+FILLER_BLOCK = _dt.timedelta(hours=2)
+
+
+def filler_programs(title: str, start: _dt.datetime, end: _dt.datetime) -> list:
+    """`title` and nothing else, block after block from the even hour at or before `start`."""
+    at = start.replace(hour=start.hour - start.hour % 2, minute=0, second=0, microsecond=0)
+    out = []
+    while at < end:
+        out.append(Program(at, at + FILLER_BLOCK, title))
+        at += FILLER_BLOCK
+    return out
+
+
 def programs(seed, station, start: _dt.datetime, end: _dt.datetime, shape: GuideShape) -> list:
     """Every program of `station` that overlaps [start, end), in start order."""
     first = _block_index(seed, station.key, start)

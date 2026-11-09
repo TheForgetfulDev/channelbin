@@ -14,7 +14,7 @@ from ..database import (
     Account, Channel, ChannelGroup, ChannelGroupMember, EPGEntry, EpgAlternateEntry,
     EpgChannelKey, Recording,
     ChannelTest, ChannelEvent, ChannelHealthExclusion, OnDemandTestJob, Tag,
-    RecordingProfile, HealthCheckProfile,
+    RecordingProfile, HealthCheckProfile, SportsMatch,
     CHANNEL_REMOVED_FROM_GUIDE, CHANNEL_HEALTH_OVERRIDE_CHANGED,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_COMPLETED,
@@ -28,7 +28,7 @@ from ..accounts import (
 )
 from ..channel_groups import (clear_guide_listings_pins_on, group_channel_ids,
                               report_orphaned_guide_groups)
-from .. import channel_hiding, duplicate_streams
+from .. import channel_hiding, duplicate_streams, history_filter
 from ..config import load_config
 from ..db_utils import chunked, retry_on_locked
 from ..logo_cache import get_logo_cache_dir, resolve_logo_url
@@ -832,7 +832,17 @@ def channel_detail(channel_id):
         timeline_per_page = '25'
     timeline_page = request.args.get('timeline_page', 1, type=int)
 
-    all_timeline_entries = _build_channel_timeline(channel_id)
+    # The timeline's filter chips (app/history_filter.py): filtered before it is paged, so
+    # a chip's count is the whole timeline's and the pages are of what the chip keeps.
+    timeline_hist = history_filter.pick(request.args.get('hist'), history_filter.TIMELINE_FILTERS)
+    timeline_hist_qs = f'&hist={timeline_hist}' if timeline_hist != history_filter.ALL else ''
+    timeline_chips, all_timeline_entries = history_filter.apply(
+        _build_channel_timeline(channel_id),
+        lambda e: history_filter.TIMELINE_KIND_BUCKETS.get(e['kind']),
+        history_filter.TIMELINE_FILTERS, timeline_hist,
+        lambda key: url_for('channels.channel_detail', channel_id=channel_id,
+                            timeline_per_page=(timeline_per_page if timeline_per_page != '25' else None),
+                            hist=(key if key != history_filter.ALL else None)))
     if timeline_per_page == 'all':
         timeline_entries, timeline_pagination = all_timeline_entries, None
     else:
@@ -988,6 +998,10 @@ def channel_detail(channel_id):
         pace_realtime_default=bool(cfg.get('ffmpeg', {}).get('pace_realtime', False)),
         recording_observations=recording_observations,
         timeline_entries=timeline_entries,
+        timeline_total=timeline_chips[0]['count'],
+        timeline_chips=timeline_chips,
+        timeline_hist=timeline_hist,
+        timeline_hist_qs=timeline_hist_qs,
         timeline_pagination=timeline_pagination,
         timeline_per_page=timeline_per_page,
         recording_profiles=recording_profiles,
@@ -1385,6 +1399,10 @@ def missing_delete():
                 EpgAlternateEntry.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.query(EpgChannelKey).filter(
                 EpgChannelKey.channel_id.in_(chunk)).delete(synchronize_session=False)
+            # Channel ids are re-issued, so a match left behind would be inherited by the next
+            # channel to get this id (DESIGN-sports-data.md 9).
+            db.session.query(SportsMatch).filter(
+                SportsMatch.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.query(Channel).filter(
                 Channel.id.in_(chunk)).delete(synchronize_session=False)
 

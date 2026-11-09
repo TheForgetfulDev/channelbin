@@ -312,7 +312,7 @@ class PageTests(_Rig):
 
     def test_page_hands_the_player_the_vendored_hls_js(self):
         html = self._page(self._rec(output_path=os.path.join(self.dvr, 'a.ts')))
-        self.assertRegex(html, r'js/recording-player\.js[^>]*\s+data-hls-js="[^"]*vendor/hls\.js/hls\.light\.min\.js')
+        self.assertRegex(html, r'js/recording-player\.js[^>]*\s+data-hls-js="[^"]*vendor/hls\.js/hls\.min\.js')
 
     def test_a_scheduled_recording_offers_neither(self):
         """A recording still capturing offers Play (tests/test_playback_while_capturing.py)."""

@@ -3545,11 +3545,11 @@
     const rows = savedSearches.map((s, i) => `<div class="prow" data-load="${i}" style="cursor:pointer"
         data-tip="${tipAttr(`${s.name}\n${describeSaved(s.params)}\n\nClick to load it.`)}">
         <span class="pv">${esc(s.name)}${s.is_default ? ' <span class="badge b-auto">default</span>' : ''}</span>
-        <button class="btn btn-sm btn-ghost" data-default="${i}" data-tip="${tipAttr(s.is_default
+        <button class="btn btn-sm" data-default="${i}" data-tip="${tipAttr(s.is_default
           ? 'Stop opening this page with this search. A bare /channels then shows everything again.'
           : 'Open this page with this search already applied. The address bar shows it too, because the server redirects rather than applying it silently.')}"
           >${s.is_default ? 'clear default' : 'set default'}</button>
-        <button class="btn btn-sm btn-ghost" data-del="${i}" data-tip="Delete this saved search.">${icon('close')}</button>
+        <button class="btn btn-sm" data-del="${i}" data-tip="Delete this saved search.">${icon('close')}</button>
       </div>`).join('');
     return (rows || '<div class="pnote" style="margin-top:0">Nothing saved yet. Build a search, then name it here.</div>')
       + `<div class="psep"></div>
@@ -3817,6 +3817,7 @@
       case DURATION_KEY: return durationSet() ? [durationValue()] : [];
       case TOD_KEY:  return todSet() ? [todValue()] : [];
       case DOW_KEY:  return (CAT.dow_values || []).map((d) => d.value);
+      case 'mark':   return (CAT.mark_values || []).map((m) => m.value);
       case 'tag':    return CAT.tags.map((t) => t.name);
       case 'acct':   return CAT.accounts.map((a) => String(a.id));
       case 'health': return CAT.health_values.map((h) => h.value);
@@ -3847,6 +3848,7 @@
       case TOD_KEY:
         return String(value).startsWith(TOD_PREFIX) ? todLabel() : value;
       case DOW_KEY:  return byValue(CAT.dow_values || []) || value;
+      case 'mark':   return byValue(CAT.mark_values || []) || value;
       case 'chan': {
         const ch = pageChannels().find((c) => String(c.id) === String(value));
         return ch ? ch.name : `Channel #${value}`;
@@ -4546,13 +4548,26 @@
   // <value>" wording and bad tint; this page groups a field's values into one chip and
   // edits it in place, which the list pages' one-chip-per-value bar does not
   // (dev/changelog/1207).
-  function chipHtml({ label, neg, value, rm, tip, cls = '', edit = '' }) {
+  /* `phrase` is a chip that says its whole condition, both ways round, with no "is"/"is not"
+     between a name and a value - the listings filter, whose name-is-value form read "Listings is
+     None scheduled" (dev/changelog/1450). */
+  function chipHtml({ label, neg, value, rm, tip, cls = '', edit = '', phrase = '' }) {
     const ev = edit ? ` data-edit="${esc(edit)}"` : '';
-    return `<span class="cs-chip${neg ? ' neg' : ''}${cls ? ` ${cls}` : ''}" data-tip="${tipAttr(tip)}">
-      <span class="ck">${esc(label)}</span>
+    const body = phrase ? `<span class="cv">${esc(phrase)}</span>`
+      : `<span class="ck">${esc(label)}</span>
       <span class="cop">${neg ? 'is not' : 'is'}</span>
-      <span class="cv"${ev}>${esc(value)}</span>
+      <span class="cv"${ev}>${esc(value)}</span>`;
+    return `<span class="cs-chip${neg ? ' neg' : ''}${cls ? ` ${cls}` : ''}" data-tip="${tipAttr(tip)}">
+      ${body}
       <button class="cx" data-rm="${esc(rm)}" data-tip="Remove">${icon('close')}</button></span>`;
+  }
+
+  /* {said, tip} for a value of a phrase-worded dimension, picked or excluded - every
+     other dimension gets null. Only `listings` is one; its words come with the catalog. */
+  function dimPhrase(key, value, ex) {
+    if (key !== 'listings' || !CAT) return null;
+    const v = CAT.listings_values.find((x) => String(x.value) === String(value));
+    return v ? { said: ex ? v.label_ex : v.label, tip: ex ? v.tip_ex : v.tip } : null;
   }
 
   const dimByKey = (key) => (CAT ? CAT.dimensions.find((d) => d.key === key) : null) || null;
@@ -4561,6 +4576,14 @@
   function filterChipHtml(f, forceEx) {
     const list = forceEx ? f.ex : f.values;
     if (!list.length) return '';
+    const phrases = list.map((v) => dimPhrase(f.key, v, forceEx));
+    if (phrases.every(Boolean)) {
+      // Never the excluded tint: the phrase already says which way round it is, and a red
+      // "Has scheduled listings" would read as the opposite.
+      return chipHtml({ phrase: phrases.map((p) => p.said).join(' or '), neg: false,
+                        rm: f.key + (forceEx ? ':ex' : ''),
+                        tip: phrases.map((p) => p.tip).join('\n') });
+    }
     const labels = list.map((v) => String(dimLabel(f.key, v)));
     const shown = labels.slice(0, 2).join(', ') + (labels.length > 2 ? ` +${labels.length - 2}` : '');
     const dim = dimByKey(f.key);
@@ -4598,6 +4621,17 @@
   function parkedChipHtml(f, grain) {
     const list = f.values.concat(f.ex);
     if (!list.length) return '';
+    const phrases = f.values.map((v) => dimPhrase(f.key, v, false))
+      .concat(f.ex.map((v) => dimPhrase(f.key, v, true)));
+    if (phrases.every(Boolean)) {
+      return chipHtml({
+        phrase: phrases.map((p) => p.said).join(' or '), neg: false, cls: 'parked',
+        rm: `${f.key}:parked:${grain}`,
+        tip: `${phrases.map((p) => p.tip).join('\n')}\n\nThis filter belongs to ${grainUi(grain).label}, `
+           + 'which is not the tab you are on, so it is not narrowing this list. Switch back '
+           + 'and it applies again - or remove it here.',
+      });
+    }
     const labels = list.map((v) => String(dimLabel(f.key, v)));
     const shown = labels.slice(0, 2).join(', ') + (labels.length > 2 ? ` +${labels.length - 2}` : '');
     return chipHtml({

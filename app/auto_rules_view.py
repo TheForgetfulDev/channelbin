@@ -22,7 +22,9 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import func
 
-from . import admission, auto_rules, db
+from flask import url_for
+
+from . import admission, auto_rules, db, history_filter
 from .database import (
     Account, AutoRule, CANCEL_BEFORE_START, CANCEL_DURING_CAPTURE, CANCEL_GROUP_CHANGE,
     Channel, ChannelGroup, EPGEntry, REC_STATUS_ABORTED, REC_STATUS_COMPLETED,
@@ -66,7 +68,6 @@ HISTORY_FILTERS = (
     ('gone', 'Cancelled or deleted'),
     ('skip', 'Skipped'),
 )
-HISTORY_FILTER_KEYS = tuple(k for k, _label in HISTORY_FILTERS)
 #: How many History rows a page shows at first, and how many more each "Show more" adds.
 HISTORY_PAGE = 12
 
@@ -645,10 +646,10 @@ def page_context(rule_id, *, hist='all', shown=HISTORY_PAGE, now=None):
     cap = _cap_of(rule, default_cap)
     nxt = next((e for e in coming if e['scheduled']), None)
 
-    hist = hist if hist in HISTORY_FILTER_KEYS else 'all'
-    counts = {k: (len(aired) if k == 'all' else sum(1 for e in aired if e['bucket'] == k))
-              for k in HISTORY_FILTER_KEYS}
-    filtered = aired if hist == 'all' else [e for e in aired if e['bucket'] == hist]
+    hist = history_filter.pick(hist, HISTORY_FILTERS)
+    chips, filtered = history_filter.apply(
+        aired, lambda e: e['bucket'], HISTORY_FILTERS, hist,
+        lambda key: url_for('auto_rules.rule_page', rule_id=rule_id, hist=key))
     shown = max(HISTORY_PAGE, min(int(shown or HISTORY_PAGE), len(filtered) or HISTORY_PAGE))
 
     next_check_at = None if not rule.enabled else auto_rule_next_check()
@@ -710,7 +711,6 @@ def page_context(rule_id, *, hist='all', shown=HISTORY_PAGE, now=None):
         'history_filter': hist,
         'history_shown': shown,
         'history_page': HISTORY_PAGE,
-        'history_filters': [{'key': k, 'label': lbl, 'count': counts[k]}
-                            for k, lbl in HISTORY_FILTERS if k == 'all' or counts[k]],
+        'history_filters': chips,
         'keep_days': keep_days,
     }

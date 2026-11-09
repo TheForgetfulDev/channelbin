@@ -14,8 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db, duplicate_streams  # noqa: E402
 from app.channel_search import (  # noqa: E402
-    GRAIN_AIRINGS, GRAIN_CHANNELS, SearchContext, SearchState, describe_value, dimensions_for,
-    search, visible_dimensions_for)
+    GRAIN_AIRINGS, GRAIN_CHANNELS, SearchContext, SearchState, describe_state, describe_value,
+    dimensions_for, search, visible_dimensions_for)
 from app.database import EPGEntry  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
@@ -158,8 +158,21 @@ class OnlyOnTheChannelsTabTests(_Case):
 
     def test_the_catalog_serves_the_chips_wording(self):
         catalog = self.client.get('/api/channels/search/catalog').get_json()
-        self.assertEqual(catalog['listings_values'], [{'value': 'none', 'label': 'None scheduled'}])
-        self.assertEqual(describe_value('listings', 'none'), 'None scheduled')
+        self.assertEqual(catalog['listings_values'], [{
+            'value': 'none', 'label': 'No scheduled listings', 'label_ex': 'Has scheduled listings',
+            'tip': 'Channels with nothing in the guide that has not ended yet.',
+            'tip_ex': 'Channels with something in the guide that has not ended yet.'}])
+        self.assertEqual(describe_value('listings', 'none'), 'No scheduled listings')
+
+    def test_a_described_search_says_the_phrase_both_ways_round(self):
+        """Never "listings none scheduled" or "not listings ..." (dev/changelog/1450)."""
+        picked = describe_state(SearchState.from_params({'f.listings': 'none'}))
+        self.assertEqual(picked['summary'], 'no scheduled listings')
+        self.assertEqual(picked['lines'][0]['values'][0]['text'], 'No scheduled listings')
+        self.assertFalse(picked['lines'][0]['neg'])
+        excluded = describe_state(SearchState.from_params({'x.listings': 'none'}))
+        self.assertEqual(excluded['summary'], 'has scheduled listings')
+        self.assertFalse(excluded['lines'][0]['neg'])
 
 
 if __name__ == '__main__':

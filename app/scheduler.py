@@ -2294,6 +2294,29 @@ def _sports_worker_job():
         tick()
 
 
+SPORTS_MATCH_JOB_ID = 'sports_match'
+
+
+def queue_sports_match(delay_seconds: int = 60, reason: str = '') -> bool:
+    """Arm the one-shot that matches TheSportsDB's events to the guide (app/sports_match.py,
+    DESIGN-sports-data.md 6.6). A fixed id and replace_existing, so several imports finishing
+    together become one run. False, and nothing queued, when no scheduler is running."""
+    if not scheduler_is_live():
+        return False
+    run_date = datetime.utcnow() + timedelta(seconds=delay_seconds)
+    _add_job(func=_sports_match_job, trigger='date', run_date=run_date, id=SPORTS_MATCH_JOB_ID,
+             replace_existing=True, max_instances=2, kwargs={'reason': reason or None})
+    log.info('Sports schedule match queued for %s%s', run_date, f' ({reason})' if reason else '')
+    return True
+
+
+def _sports_match_job(reason: str = None):
+    """The queued match. `reason` only names why it was queued, for /jobs."""
+    with _app.app_context():
+        from .sports_match import run
+        run()
+
+
 def _auto_rule_sweep_admitted():
     """Run now's half of the sweep: the KIND_RULES ticket is already held by the request
     (run_system_job_now), so this runs the evaluation without asking again."""

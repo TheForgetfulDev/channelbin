@@ -94,15 +94,21 @@
     })
       .then(() => {
         if (close) close();
-        toast('Config rolled back - reloading the page...');
+        toast('Backup applied - restart to finish. Reloading the page...');
         setTimeout(() => window.location.reload(), 1300);
       })
-      .catch((e) => toast(`Rollback failed: ${e.message || 'unknown'}`, true));
+      .catch((e) => toast(`Applying the backup failed: ${e.message || 'unknown'}`, true));
+
+  // Every restore asks for a restart (app/config_backup.py::apply_backup), so the dialog
+  // says so before the click, whatever state the diff is in, rather than leaving the
+  // banner to explain it afterward.
+  const restartNote = `<p class="text-muted">Applying a backup asks for a restart, so every
+    restored setting takes effect.</p>`;
 
   const openDiffModal = (filename) => {
     const modal = buildModal({
       title: `Diff - ${filename}`,
-      body: '<p class="diff-empty">Loading...</p>',
+      body: `${restartNote}<p class="diff-empty">Loading...</p>`,
       panelClass: 'modal-wide',
       footer: [
         { label: 'Cancel', class: 'btn' },
@@ -117,15 +123,15 @@
     jsonFetch(`/api/settings/diff/${encodeURIComponent(filename)}`)
       .then((d) => {
         const lines = d.diff || [];
-        body.innerHTML = lines.length
+        body.innerHTML = restartNote + (lines.length
           ? `<p class="diff-legend"><span style="color:var(--bad)">- red</span> = removed from the
               current config when this backup is applied &nbsp;
               <span style="color:var(--ok)">+ green</span> = restored from the backup</p>
              <div class="diff-container">${lines.map(diffLineHtml).join('')}</div>`
-          : '<p class="diff-empty">No differences - this backup is identical to the current config.</p>';
+          : '<p class="diff-empty">No differences - this backup is identical to the current config.</p>');
       })
       .catch((e) => {
-        body.innerHTML = `<p class="diff-empty">Failed to load the diff: ${escHtml(e.message || 'unknown')}</p>`;
+        body.innerHTML = `${restartNote}<p class="diff-empty">Failed to load the diff: ${escHtml(e.message || 'unknown')}</p>`;
       });
   };
 

@@ -26,7 +26,7 @@ from ..channel_groups import clear_guide_listings_pins_on, report_orphaned_guide
 from ..channel_search import GROUP_ANY, OTHER_NEW, OTHER_REMOVED
 from ..config import load_config, config_default
 from ..database import (Account, AccountBlock, AccountStatDay, Channel, AccountSyncLog,
-                        ChannelGroupMember, ChannelTest, EpgSource, EpgSourceSubscription,
+                        ChannelGroupMember, ChannelTest, EpgSource, EpgSourceSubscription, SportsMatch,
                         EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, ACCOUNT_STATUS_SYNCING,
                         ACCOUNT_STATUS_UNSYNCED, SYNC_LOG_SUCCESS, SYNC_LOG_CANCELLED,
                         SYNC_LOG_IMPORTED)
@@ -44,7 +44,8 @@ from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, dir
                            use_source_again)
 from ..logo_cache import delete_cached_logos
 from ..storage_dirs import manual_screenshot_paths
-from ..tz_utils import format_local, get_display_tz, is_24h, parse_local_to_utc
+from ..tz_utils import format_local, get_display_tz, is_24h, parse_form_time
+from .. import account_activity, history_filter
 from ..account_blocks import (MAX_ACCOUNT_BLOCK_HOURS, account_limits, add_account_block,
                               block_views,
                               describe, end_account_block, rearm_waiting_starts,
@@ -72,8 +73,11 @@ HISTORY_SHOWN = 10
 _SYNC_HOURS_CHOICES = [1, 2, 4, 6, 12, 24]
 
 # How long a delete waits for a cancelled sync thread to exit before refusing. Bounded
-# because this runs inside the request: a sync only checks for the stop signal at phase
-# boundaries, so waiting longer would hold the request open without improving the odds.
+# because this runs inside the request. Measured on a simulated 60,000-channel account
+# (dev/changelog/1478): a cancel inside the channel loop or the guide import lands in under
+# 0.2 s, and the stretches that cannot see one - the provider downloads and working through
+# what they returned - run 8 to 50 s, which no in-request wait should cover. Five seconds is
+# every checkpointed case with room to spare, and the refusal names the rest.
 _SYNC_STOP_TIMEOUT_SECONDS = 5.0
 
 # One row in the generic user-prefs store holds this page's section order and hidden set,
@@ -390,9 +394,22 @@ def _account_detail_payload(account, cfg, stats):
     rows = _recent_logs_by_account(account_ids, limit=HISTORY_SHOWN).get(account.id, [])
     # Serialized in the SAME shape the syncs API returns, so the history region's first
     # paint and its expand-in-place fetch cannot disagree about what a run looked like.
-    # The Activity section renders the ORM rows directly - a different region, server-side,
-    # and Jinja's time filters want the datetimes rather than ISO strings.
     logs = [_sync_log_json(log) for log in rows]
+    # The Activity card: syncs, alerts and blocks over the last ACTIVITY_DAYS, bucketed by the
+    # history-filter chips and paged (app/account_activity.py). It renders ORM rows directly -
+    # a different region from the history table, server-side, so it works with no JS.
+    act_filter = history_filter.pick(request.args.get('hist'), account_activity.ACTIVITY_FILTERS)
+
+    def _activity_url(key, shown=None):
+        return url_for('accounts.account_detail', account_id=account.id,
+                       hist=(key if key != history_filter.ALL else None), shown=shown,
+                       w=request.args.get('w'))
+    act_chips, act_entries = history_filter.apply(
+        account_activity.entries(account), account_activity.bucket_of,
+        account_activity.ACTIVITY_FILTERS, act_filter, _activity_url)
+    page = account_activity.ACTIVITY_PAGE
+    act_shown = max(page, min(request.args.get('shown', page, type=int) or page,
+                              len(act_entries) or page))
     logins = login_views(account.id, cfg)
     total_syncs = _sync_log_totals(account_ids).get(account.id, 0)
     last_good = next((log for log in rows if log.status == SYNC_LOG_SUCCESS), None)
@@ -410,6 +427,13 @@ def _account_detail_payload(account, cfg, stats):
         'usage_all_time': usage_all_time,
         'logs': logs,
         'log_rows': rows,
+        'act_entries': act_entries[:act_shown],
+        'act_total': act_chips[0]['count'],
+        'act_chips': act_chips,
+        'act_more': max(0, len(act_entries) - act_shown),
+        'act_more_url': _activity_url(act_filter, act_shown + page),
+        'act_page': page,
+        'act_days': account_activity.ACTIVITY_DAYS,
         'total_syncs': total_syncs,
         'has_more_syncs': total_syncs > len(logs),
         'last_good_sync': last_good,
@@ -714,15 +738,19 @@ def _sync_still_running_message(account_id):
     """Why a delete was refused, naming the phase the sync is in when it reports one.
 
     The phase is what makes the refusal actionable: "still syncing" alone doesn't tell the
-    user whether they are waiting seconds or minutes."""
+    user whether they are waiting seconds or minutes. The reason it gives is the measured
+    one (dev/changelog/1478): a sync between checkpoints stops at once, so a thread still
+    alive after the wait is downloading from the provider or working through what it got."""
     from ..accounts import get_sync_progress
 
     account = db.session.get(Account, account_id)
     label = f'"{account.name}"' if account else 'This account'
     phase = (get_sync_progress(account_id) or {}).get('phase')
     where = f' ({phase} phase)' if phase else ''
-    return (f'{label} is still syncing{where} and has been told to stop. A sync can only '
-            'stop between phases - try the delete again in a moment.')
+    return (f'{label} is still syncing{where} and has been told to stop. It stops within a '
+            'moment once it is working through channels or listings, but not while it is '
+            'downloading from the provider or sorting out what it downloaded - try the '
+            'delete again in a minute.')
 
 
 def _delete_account_and_jobs(account_id):
@@ -833,6 +861,9 @@ def _delete_account_and_jobs(account_id):
         delete_sources_for_account(account_id)
         # A group pinned to one of these channels goes back to automatic, and says why.
         clear_guide_listings_pins_on(channel_ids)
+        # Not cascaded either, and channel ids are re-issued (DESIGN-sports-data.md 9).
+        for chunk in chunked(channel_ids, _DELETE_CHUNK_SIZE):
+            SportsMatch.query.filter(SportsMatch.channel_id.in_(chunk)).delete(synchronize_session=False)
         # hidden-recompute-ok: the cascade takes memberships only of channels it deletes
         # too, so no surviving channel loses a protection.
         db.session.delete(account)
@@ -1117,9 +1148,11 @@ def delete_account_api(account_id):
 @accounts_bp.route('/api/accounts/<int:account_id>/blocks', methods=['POST'])
 def block_account_api(account_id):
     """Block the account from now for a while (app/account_blocks.py). Body: `minutes`, or
-    `until` as a datetime-local value in the display timezone; optional `slots` (omitted or
-    null = every slot). Bounded at MAX_ACCOUNT_BLOCK_HOURS - a block is for a stretch of
-    time, and one long enough to forget about is the switch it exists to avoid."""
+    `until` as a datetime-local value in the display timezone beside `until_utc`, the instant
+    the field stands for (util.js::wallTimeField - a wall time a DST change repeats cannot
+    say which pass it means, dev/changelog/1477); optional `slots` (omitted or null = every
+    slot). Bounded at MAX_ACCOUNT_BLOCK_HOURS - a block is for a stretch of time, and one long
+    enough to forget about is the switch it exists to avoid."""
     account, err = _json_account(account_id)
     if err:
         return err
@@ -1127,7 +1160,7 @@ def block_account_api(account_id):
     now = datetime.utcnow()
     try:
         if data.get('until'):
-            stop = parse_local_to_utc(str(data['until']))
+            stop = parse_form_time(str(data['until']), str(data.get('until_utc') or ''))
         else:
             stop = now + timedelta(minutes=int(data.get('minutes')))
     except (TypeError, ValueError):

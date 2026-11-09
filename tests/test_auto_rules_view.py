@@ -94,7 +94,8 @@ class DescribeStateTests(unittest.TestCase):
 
     def test_standing_options_that_differ_from_the_default(self):
         d = describe_state(state('grain=airings&q=cup&standing=showhidden&standing=grpdedup'
-                                 '&standing=shownoepg&standing=showuntested'), tz=NY, h24=False)
+                                 '&standing=showdup&standing=shownoepg&standing=showuntested'),
+                           tz=NY, h24=False)
         self.assertEqual(lines(d)[2:], [('Show hidden channels', False, [('On', False)])])
         self.assertTrue(d['summary'].endswith('show hidden channels on'))
 

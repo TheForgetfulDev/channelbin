@@ -89,6 +89,19 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      # Lint before the suite, on the suite's tiers. flake8 runs pyflakes' checks only
+      # (.flake8 selects E9,F), so an unused import, an undefined name or a syntax error in a
+      # file no test imports is a red check here instead of a surprise on the first install
+      # that loads it. Installed from requirements-dev.txt, which pins it; requirements.txt
+      # is what an end-user install reads and never carries a linter (CONTRIBUTING.md,
+      # "Linting"). The paths are the shipped tree; this repo's private dev/ folder is
+      # linted at close-out, where it exists.
+      - name: Lint
+        if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'suite')
+        run: |
+          pip install -r requirements-dev.txt
+          flake8 app/ run.py tools/ tests/ docker/ sim/
+
       # jsdom lives in devDependencies; without node_modules the client-side tests skip.
       - name: Install Node dependencies
         run: npm ci

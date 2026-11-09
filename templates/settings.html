@@ -363,7 +363,7 @@
            'H.264 plays everywhere. HEVC makes a re-encoded file about two thirds the size of the source at the same picture quality, and keeps an HDR10 recording as HDR10 where H.264 tone-maps it to SDR. Recommended on a machine with a GPU; Plex played it cleanly on Android TV, 4K HDR10 included. HEVC is only encoded on the GPU: with a GPU that cannot encode it, re-encodes are H.264 and the recording event log says so.', pp.get('video_codec', 'h264'),
            [('h264','H.264 (plays everywhere)'), ('hevc','HEVC (GPU only, smaller files)')], gated_by=['recording.post_process.enabled', 'recording.post_process.format!=mkv', 'recording.post_process.reencode_mode!=never', 'recording.post_process.video_encoder!=software'], tier='advanced') }}
         {{ field_text('recording.post_process.vaapi_device', 'GPU device',
-           'The DRM render node the GPU encoder opens. /dev/dri/renderD128 on almost every machine with one GPU.', pp.get('vaapi_device', '/dev/dri/renderD128'), gated_by=['recording.post_process.enabled', 'recording.post_process.format!=mkv', 'recording.post_process.reencode_mode!=never', 'recording.post_process.video_encoder!=software'], tier='advanced') }}
+           'The DRM render node the GPU opens: for conversions set to GPU above, and for Try re-encoded in Preview and Play, which re-encodes a channel or recording the browser cannot decode whenever this device passes a test encode, whatever the conversions use. /dev/dri/renderD128 on almost every machine with one GPU.', pp.get('vaapi_device', '/dev/dri/renderD128'), gated_by=['recording.post_process.enabled', 'recording.post_process.format!=mkv', 'recording.post_process.reencode_mode!=never', 'recording.post_process.video_encoder!=software'], tier='advanced') }}
         {{ field_number('recording.post_process.vaapi_qp', 'GPU H.264 quality (QP)',
            'Constant quantizer for H.264 on the GPU (0-51; lower means better quality and a larger file). Not the same scale as the CRF above, but comparable: 26 here came out at 91% of the source size with picture quality slightly above CRF 20.', pp.get('vaapi_qp', 26), gated_by=['recording.post_process.enabled', 'recording.post_process.format!=mkv', 'recording.post_process.reencode_mode!=never', 'recording.post_process.video_encoder!=software'], tier='advanced') }}
         {{ field_number('recording.post_process.vaapi_hevc_qp', 'GPU HEVC quality (QP)',
@@ -414,7 +414,7 @@
         {{ field_text('recording.move_on_complete.destination', 'Move destination',
            'Absolute path to move the final file to. Directory is created if it does not exist.', mc.get('destination', ''), gated_by=['recording.move_on_complete.enabled'], tier='basic') }}
         {{ field_bool('recording.metadata_sidecar.enabled', 'Write a metadata file for media servers',
-           'Save a Kodi-format .nfo file and a poster image beside every finished recording, so Plex, Jellyfin, Emby and Kodi show its real title, synopsis, air date and genre instead of guessing from the filename. Nothing is sent anywhere - both files are written to local disk. In Plex this needs a Movie or TV Show library with the matching NFO agent selected; an Other Videos library ignores them. Turning this off later stops new files being written and leaves existing ones alone.', ms.get('enabled', False), tier='basic') }}
+           'Save a Kodi-format .nfo file and a poster image beside every finished recording, so Plex, Jellyfin, Emby and Kodi show its real title, synopsis, air date and genre instead of guessing from the filename. A game matched to TheSportsDB also carries its league, season, round and venue, its poster from TheSportsDB, and a background image as a third file. Nothing is sent anywhere - the files are written to local disk. In Plex this needs a Movie or TV Show library with the matching NFO agent selected; an Other Videos library ignores them. Turning this off later stops new files being written and leaves existing ones alone.', ms.get('enabled', False), tier='basic') }}
         {{ field_bool('recording.post_script.enabled', 'Run post-completion script',
            'Execute a shell script after the recording finishes all post-processing. Non-fatal: recording is marked COMPLETED regardless of script outcome.', ps.get('enabled', False), tier='advanced') }}
         {{ field_text('recording.post_script.path', 'Post-completion script path',
@@ -550,7 +550,7 @@
         {{ field_number('sync.epg_collapse_threshold_percent', 'EPG collapse guard threshold (%)',
            'Refuse an EPG import when the new data has fewer than this percent of the previous sync\'s entry count (protects against a transient empty/garbage feed wiping the guide). 0 = disabled.', sync_cfg.get('epg_collapse_threshold_percent', 20), tier='advanced') }}
         {{ field_number('sync.epg_coverage_lost_alert_percent', 'Lost-guide alert threshold (%)',
-           'Raise an alert when one EPG refresh leaves at least this percent of the channels that had a guide with none. A smaller loss is normal provider churn and is noted on the account\'s Activity instead. 0 = alert on every loss.', sync_cfg.get('epg_coverage_lost_alert_percent', 10), tier='advanced') }}
+           'Raise an alert when one EPG refresh leaves at least this percent of the channels that had a guide with none. A smaller loss is normal provider churn and is noted on the account\'s Activity instead. A source whose refreshes keep failing is judged on every channel its kept listings have run out for, not one refresh at a time. 0 = alert on every loss.', sync_cfg.get('epg_coverage_lost_alert_percent', 10), tier='advanced') }}
       </div>
       <div data-sub="stream-urls">
         <div class="sec-sub"><strong>Stream URLs</strong></div>
@@ -837,6 +837,12 @@
       {{ field_number('sports_data.history_keep_days', 'Days to keep past games',
          'A past game is deleted this long after it happened.',
          sportscfg.get('history_keep_days', 30), tier='advanced') }}
+      {{ field_bool('sports_data.download_images', 'Download posters and backgrounds',
+         'For a recording matched to a TheSportsDB event, download the event\'s poster and background once and use them in the files written beside the recording for Plex, Jellyfin and Kodi. An image pinned to the recording\'s profile still comes first. Off, nothing is downloaded, none already downloaded is used, and the poster is a frame from the program.',
+         sportscfg.get('download_images', true), tier='advanced') }}
+      {{ field_bool('sports_data.file_names', 'Name matched games from TheSportsDB',
+         'Name the file of a recording matched to a TheSportsDB event from the event: its league, its date and its name, such as "NASCAR Cup Series 2026-11-01 Xfinity 500", the way Plex\'s sports agents read it. This takes the place of the filename template, and of a name typed for the recording, for those recordings only. It is decided when the recording is saved, so a match found after it was scheduled still counts, and a file already saved is never renamed. A recording with no match, or whose match you removed, keeps its own name, and its page says so before it is saved.',
+         sportscfg.get('file_names', false), tier='advanced') }}
       </div>
     {% endcall %}
 

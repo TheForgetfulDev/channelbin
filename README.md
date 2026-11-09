@@ -113,8 +113,9 @@ and hands them to whatever you already use to watch them.
   channel with failover. Off by default.
 - A live preview: watch or listen to a channel's actual stream from its page, to confirm it is
   the right channel and that it plays before a recording relies on it. The stream is copied
-  into a short HLS window, never re-encoded, and a preview gives its connection up to any
-  recording that needs it.
+  into a short HLS window, and a preview gives its connection up to any recording that needs
+  it. When the browser cannot decode a channel or a recording, it says what the browser said,
+  and with a GPU set up ChannelBin offers to re-encode it so it plays.
 - A rolling health score per channel, weighted toward recent observations, fed by both health
   checks and what real recordings actually produced.
 - Health check profiles and a nightly maintenance window, so checks run when nothing else needs
@@ -278,6 +279,11 @@ device.
 If the GPU is missing or fails, the conversion still finishes in software with libx264. The
 recording's event log says which encoder did the work and why it fell back, and a device that
 fails its test encode also raises an alert naming the reason.
+
+The same device lets Preview and Play re-encode a channel or a recording the browser cannot
+decode as it is: after a decode failure the player offers **Try re-encoded**. It works whenever
+the device passes its test encode, whether or not conversions use the GPU, waits for any
+conversion to finish first, and never falls back to the CPU.
 
 Running without Docker, the same setting works if your ffmpeg has `h264_vaapi`, the VAAPI
 driver for your GPU is installed (`intel-media-va-driver` on Debian and Ubuntu), and the user
@@ -571,8 +577,9 @@ succeeded but you want to go back to the older release:
    same migration again - fine if you are retrying after fixing something like a full disk, wrong
    if you are trying to stay on the old version.
 4. **Restore the matching config backup** if the release also migrated `config.yaml` - pick the
-   newest file in `config_backup.backup_dir` from the moment of the upgrade, or use the config
-   backups UI on the Settings page once the app is running.
+   newest file in `config_backup.backup_dir` from the moment of the upgrade, or use Maintenance >
+   Backup & Restore once the app is running. A restore there always asks for a
+   restart, so every restored setting takes effect - take it when the banner appears.
 5. **Start the app** and confirm the version in the page footer.
 
 Anything recorded *after* the snapshot was taken is not in the snapshot. With automatic backups

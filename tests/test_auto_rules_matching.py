@@ -329,7 +329,7 @@ class SaveTimeRefusalTests(_RuleCase):
         keys = {k for k, _v in parse_qsl(values.search_params, keep_blank_values=True)}
         self.assertEqual(keys & {'sort', 'page', 'per_page', 'facets', 'add_to_group',
                                  'replace_rec'}, set())
-        self.assertEqual(values.search_params, 'q=nascar&in=name&in=epg-title&in=epg-sub&in=epg-desc&standing=grpdedup&standing=shownoepg&standing=showuntested&grain=airings')
+        self.assertEqual(values.search_params, 'q=nascar&in=name&in=epg-title&in=epg-sub&in=epg-desc&standing=grpdedup&standing=showdup&standing=shownoepg&standing=showuntested&grain=airings')
 
     def test_a_valid_search_is_stored_in_the_canonical_spelling(self):
         """What is stored is what SearchState.to_params(explicit=True) writes: the search
@@ -343,10 +343,10 @@ class SaveTimeRefusalTests(_RuleCase):
             ('grain=airings&q=NASCAR+Cup&standing=grpdedup',
              'q=NASCAR+Cup&in=name&in=epg-title&in=epg-sub&in=epg-desc&standing=grpdedup&grain=airings'),
             ('f.when=next%3A7%3Adays&grain=airings&q=NASCAR+Cup&x.tag=new',
-             'q=NASCAR+Cup&in=name&in=epg-title&in=epg-sub&in=epg-desc&f.when=next%3A7%3Adays&x.tag=new&standing=grpdedup&standing=shownoepg&standing=showuntested&grain=airings'),
+             'q=NASCAR+Cup&in=name&in=epg-title&in=epg-sub&in=epg-desc&f.when=next%3A7%3Adays&x.tag=new&standing=grpdedup&standing=showdup&standing=shownoepg&standing=showuntested&grain=airings'),
             ('grain=airings&q=x&standing=', 'q=x&in=name&in=epg-title&in=epg-sub&in=epg-desc&standing=&grain=airings'),
             ('grain=airings&in=epg-title&q=Cup&match=any',
-             'q=Cup&in=epg-title&match=any&standing=grpdedup&standing=shownoepg&standing=showuntested&grain=airings'),
+             'q=Cup&in=epg-title&match=any&standing=grpdedup&standing=showdup&standing=shownoepg&standing=showuntested&grain=airings'),
         ]
         for raw, expected in cases:
             with self.subTest(raw=raw):
@@ -568,9 +568,9 @@ class NamesRenameTests(_RuleCase):
         inc = db.session.get(AutoRule, included)
         exc = db.session.get(AutoRule, excluded)
         self.assertEqual(inc.search_params,
-                         'q=racing&in=name&in=epg-title&in=epg-sub&in=epg-desc&f.tag=motorsport&f.tag=live&standing=grpdedup&standing=shownoepg&standing=showuntested&grain=airings')
+                         'q=racing&in=name&in=epg-title&in=epg-sub&in=epg-desc&f.tag=motorsport&f.tag=live&standing=grpdedup&standing=showdup&standing=shownoepg&standing=showuntested&grain=airings')
         self.assertEqual(exc.search_params,
-                         'q=Tonight&in=name&in=epg-title&in=epg-sub&in=epg-desc&x.tag=motorsport&standing=grpdedup&standing=shownoepg&standing=showuntested&grain=airings')
+                         'q=Tonight&in=name&in=epg-title&in=epg-sub&in=epg-desc&x.tag=motorsport&standing=grpdedup&standing=showdup&standing=shownoepg&standing=showuntested&grain=airings')
         self.assertEqual(auto_rules.parse_search(inc.search_params).q, 'racing',
                          'the typed text must not be string-replaced')
         self.assertEqual((inc.revision, exc.revision), (1, 1))
@@ -601,7 +601,7 @@ class NamesRenameTests(_RuleCase):
         self.assertEqual(auto_rules.parse_search(exc.search_params).filter_for('group'),
                          DimensionFilter('group', (), ('Cup Series Feeds',)))
         self.assertEqual(inc.search_params,
-                         'q=Cup+Race&in=name&in=epg-title&in=epg-sub&in=epg-desc&f.group=Cup+Series+Feeds&standing=grpdedup&standing=shownoepg&standing=showuntested&grain=airings')
+                         'q=Cup+Race&in=name&in=epg-title&in=epg-sub&in=epg-desc&f.group=Cup+Series+Feeds&standing=grpdedup&standing=showdup&standing=shownoepg&standing=showuntested&grain=airings')
         self.assertEqual((inc.revision, exc.revision), (1, 1))
 
         self.evaluate(included)

@@ -874,7 +874,7 @@ class PageTests(SportsCase):
         self.t.sandbox_config({'sports_data': {'history_keep_days': 9}, 'display': {'timezone': self.display, 'time_format': '12h'}})
         SportsFollow.query.delete()
         db.session.commit()
-        self.assertIn('stay until 9 days after', self.league_html(league_id))
+        self.assertIn('deletes each one 9 days after', self.league_html(league_id))
 
     def test_a_refusal_everywhere_gets_a_banner_on_the_list(self):
         self.seed()
@@ -899,14 +899,27 @@ class PageTests(SportsCase):
         self.assertIn('Golds at Greens', text)
         self.assertIn('kept for 7 days', text)
 
-    def test_a_league_not_followed_says_no_calls(self):
+    def test_a_league_not_followed_says_it_is_not_checking(self):
         league_id = self.seed()
         SportsFollow.query.delete()
         db.session.commit()
         text = self.league_html(league_id)
         self.assertIn('Not followed.', text)
         self.assertIn('Follow again', text)
-        self.assertIn('No calls are being made', self.list_html())
+        self.assertIn('It still has 2 games', text)
+        self.assertIn('Not checking for games', self.list_html())
+
+    def test_a_league_not_followed_with_nothing_stored_mentions_no_games(self):
+        """dev/docs/BUGS.md 2026-11-07 10:31: a league with nothing stored read "Its 0 games stay until..."."""
+        league_id = self.seed()
+        SportsFollow.query.delete()
+        SportsEvent.query.delete()
+        db.session.commit()
+        text = self.league_html(league_id)
+        self.assertIn('Not followed.', text)
+        self.assertNotIn('0 games', text)
+        self.assertNotIn('after each one', text)
+        self.assertNotIn("after it&#39;s over", text)
 
     def test_a_race_with_a_placeholder_time_arrives_and_says_so(self):
         """Through the worker over HTTP, to the page: its day is its own, and its time is not invented."""

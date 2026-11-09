@@ -18,6 +18,7 @@ from app.accounts import _do_sync
 from app.alerts import ALERT_TYPES
 from app.database import (AccountSyncLog, Alert, Channel, EPGEntry, EpgSource, M3uAccount,
                           XtreamAccount)
+from app.config import load_config
 from app.epg_sources import add_url_source
 from sim import load_world, serve_for_test
 
@@ -95,7 +96,9 @@ class SimSyncCase(unittest.TestCase):
     def sync(self, account_id) -> AccountSyncLog:
         """One real sync. `self.asked` is what it asked the simulator, in order."""
         first = len(self.sim.ledger)
+        began = dt.datetime.utcnow()
         _do_sync(account_id, threading.Event())
+        self.sync_span = (began, dt.datetime.utcnow())
         db.session.expire_all()
         self.asked = self.sim.ledger.entries()[first:]
         return (AccountSyncLog.query.filter_by(account_id=account_id)
@@ -113,6 +116,28 @@ class SimSyncCase(unittest.TestCase):
     def entry_count(self, account_id) -> int:
         return (EPGEntry.query.join(Channel, Channel.id == EPGEntry.channel_id)
                 .filter(Channel.account_id == account_id).count())
+
+    def guide_keys(self, account_id) -> set:
+        """{(channel id, start, stop, title)} for every listing the account's channels hold."""
+        return set(db.session.query(EPGEntry.channel_id, EPGEntry.start_time, EPGEntry.stop_time, EPGEntry.title)
+                   .join(Channel, Channel.id == EPGEntry.channel_id)
+                   .filter(Channel.account_id == account_id).all())
+
+    def assertSameGuide(self, first: tuple, second: tuple):
+        """Two syncs imported the same listings, away from the import window's edges. Each argument
+        is (guide_keys, sync_span). The window runs from an hour behind ChannelBin's own clock to
+        epg_days_ahead past it, and that clock keeps moving between two syncs while the simulator's
+        is held still, so a listing crossing an edge in between is in one import and not the other
+        (dev/docs/BUGS.md 2026-11-07, comparing counts failed 1949 against 1953)."""
+        edge = dt.timedelta(seconds=90)
+        days = load_config()['sync']['epg_days_ahead']
+        lo = max(first[1][1], second[1][1]) - dt.timedelta(hours=1) + edge
+        hi = min(first[1][0], second[1][0]) + dt.timedelta(days=days) - edge
+
+        def inside(keys):
+            return {k for k in keys if k[2] >= lo and k[1] <= hi}
+        self.assertTrue(inside(first[0]), 'the first sync imported nothing inside the window')
+        self.assertEqual(inside(second[0]), inside(first[0]))
 
     def source_id(self, account_id) -> int:
         return EpgSource.query.filter_by(owner_account_id=account_id).one().id

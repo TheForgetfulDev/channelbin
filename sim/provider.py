@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from .faults import (EP_AUTH, EP_CATALOG, EP_CATEGORIES, EP_GUIDE, EP_LOGO, EP_OTHER,
                      EP_PLAYLIST, EP_STREAM, LAYER_ANSWER, LAYER_BYTES, LAYER_LOGIN,
                      LAYER_MODEL, LAYER_OPEN, LAYER_STREAM, LAYER_WIRE, Ask, FaultBook, View)
-from .guide import GuideShape, programs
+from .guide import GuideShape, filler_programs, programs
 from .ledger import split_target
 from .lineup import KIND_NO_ID, KIND_RADIO
 from .rand import derive
@@ -479,6 +479,9 @@ class Provider:
             progs = []
             for g in directory:
                 if not g.has_programs:
+                    continue
+                if g.filler:
+                    progs.extend((g.guide_id, p, None) for p in filler_programs(g.filler, start, end))
                     continue
                 for p in programs(seed, g.station, start, end, self.shape):
                     icon = f'{self.layout.origin(LOGO_HOST)}/art/{p.icon}.png' if p.icon else None

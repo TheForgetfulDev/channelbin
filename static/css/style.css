@@ -2372,6 +2372,17 @@ body.actbar-on #app-toast { bottom: 78px; }
 .player-status[data-kind="ok"] { color: var(--ok); }
 .player-status[data-kind="error"] { color: var(--bad); }
 .player-status[data-kind="warn"] { color: var(--warn); }
+/* After the browser could not decode the copy: the GPU re-encode, or why there is none
+   (util.js offerReencode, dev/changelog/1461). */
+.player-offer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 8px;
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+}
 /* The seek controls a file played through the preview pipeline needs, since the browser's own
    scrubber only spans the rolling window (recording-player.js, dev/changelog/1314). */
 .player-seek { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
@@ -2787,6 +2798,9 @@ body.actbar-on #app-toast { bottom: 78px; }
 .gd-chip:hover, a.gd-chip:hover { text-decoration: none; }
 
 .card-note { font-size: var(--fs-md); color: var(--text-muted); margin: 0 0 2px; max-width: 78ch; }
+/* The recording page's TheSportsDB line under the Program card's rows: the credit, the link and
+   Wrong match on one wrapping line (dev/changelog/1464). */
+.card-note.sports-credit { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-top: 10px; }
 /* The recording page's "What happened" card (dev/changelog/1270): plain sentences, read
    top to bottom, so a list rather than a stat grid. */
 .story { margin: 6px 0 8px; padding-left: 1.2em; max-width: 78ch; font-size: var(--fs-md); line-height: 1.5; }
@@ -4831,6 +4845,82 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .sp-team-filter { margin-top: 6px; }
 .sp-teams { max-height: 260px; overflow-y: auto; margin-top: 8px; padding-right: 4px; }
 .sp-radio { display: flex; align-items: center; gap: .5rem; min-height: var(--ctl-h); font-size: var(--fs-md); }
+.statlist .sv .sp-sub { display: block; color: var(--text-muted); font-size: var(--fs-sm); font-weight: 400; }
+
+/* A league page's games matched to the guide (app/sports_match.py, mockup 51): the Where it's on
+   column, both times when TheSportsDB and the guide disagree, and the row's menu. */
+.rl-when .sp-two { display: block; }
+.rl-when .sp-src { color: var(--text-faint); font-size: var(--fs-xs); margin-left: 4px; }
+.sp-onguide {
+  background: none; border: none; padding: 0; font: inherit; color: var(--accent-text);
+  cursor: pointer; text-align: left;
+}
+.sp-onguide:hover { text-decoration: underline; }
+.sp-none { color: var(--text-muted); }
+.sp-kebab { width: 1%; white-space: nowrap; text-align: right; }
+
+/* The listings dialog: one closed group per wording, the expand caret turned a quarter when open
+   (the Readiness rows' pattern), Wrong match on a group and on each channel. */
+.sp-dialog { max-width: 720px; }
+.sp-dialog-body { min-height: 2rem; }
+.sp-intro { font-size: var(--fs-md); color: var(--text-muted); margin: 0 0 8px; }
+.sp-intro.sp-faint { color: var(--text-faint); font-size: var(--fs-sm); }
+.sp-group { border-top: 1px solid var(--border-soft); padding: 10px 0 6px; }
+.sp-ghead { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.sp-gtoggle {
+  display: flex; align-items: baseline; gap: 6px; background: none; border: none; padding: 0;
+  font: inherit; font-weight: 600; color: var(--text); text-align: left; cursor: pointer;
+}
+.sp-caret { display: inline-block; width: .8rem; color: var(--text-faint); transition: transform .15s ease; flex: none; }
+.sp-group.open .sp-caret { transform: rotate(90deg); }
+.sp-gmeta { color: var(--text-muted); font-size: var(--fs-sm); white-space: nowrap; }
+.sp-gline { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding-left: calc(.8rem + 6px); }
+.sp-why { color: var(--text-muted); font-size: var(--fs-sm); margin: 4px 0 6px; }
+.sp-gact, .sp-cact { display: flex; gap: 8px; align-items: center; flex: none; }
+.sp-group.rejected .sp-gtoggle .t, .sp-group.rejected .sp-chans { opacity: .55; }
+.sp-chans { padding: 2px 0 4px calc(.8rem + 6px); }
+.sp-chan {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 5px 0; font-size: var(--fs-md); border-top: 1px dashed var(--border-soft);
+}
+.sp-chan.rejected .sp-cname { color: var(--text-faint); text-decoration: line-through; }
+.sp-cat { display: block; color: var(--text-faint); font-size: var(--fs-xs); }
+.sp-rej { color: var(--text-muted); font-size: var(--fs-sm); }
+.sp-foot { margin-top: 12px; color: var(--text-muted); font-size: var(--fs-sm); }
+/* Event channels (design 6.8): one row per channel, its name, category and why it matched. A
+   provider's event name runs past 100 characters, so it wraps anywhere rather than widening the row. */
+.sp-enames { border-top: 1px solid var(--border-soft); }
+.sp-ename .sp-cname { min-width: 0; overflow-wrap: anywhere; }
+.sp-ename .sp-why { display: block; margin: 2px 0 0; }
+
+/* Matching your guide: the league's names and its categories (design 5.1, 5.2). Its explainer runs
+   the card's width, not the 78ch a short note gets. */
+.sp-wide .card-note { max-width: none; }
+.sp-h3 { font-size: var(--fs-md); font-weight: 600; margin: 16px 0 8px; }
+.sp-h3 .cnt { color: var(--text-faint); }
+.sp-terms { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.sp-term { cursor: default; }
+.sp-term .chip-x { background: none; border: none; padding: 0; color: inherit; cursor: pointer; display: inline-flex; }
+.sp-addterm { display: inline-flex; gap: 6px; align-items: center; }
+.sp-addterm .form-control { width: 180px; height: var(--ctl-h); }
+.sp-hint { color: var(--text-muted); font-size: var(--fs-md); margin: 8px 0 0; }
+.sp-hint-top { margin: 0 0 10px; }
+.sp-suggest {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 10px;
+  padding: 8px 10px; background: var(--accent-soft); border-radius: var(--radius-sm); font-size: var(--fs-md);
+}
+.sp-catbar { margin-top: 10px; }
+.sp-offer { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+.sp-offer-row { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; padding: 4px 0; cursor: pointer; }
+@media (max-width: 960px) {
+  .sp-kebab { width: auto; text-align: left; }
+  .sp-addterm { width: 100%; }
+  .sp-addterm .form-control { flex: 1; width: auto; }
+  .sp-chan { align-items: flex-start; }
+  .sp-gline { flex-direction: column; gap: 4px; }
+  .sp-ghead { flex-direction: column; gap: 2px; }
+  .sp-gmeta { padding-left: calc(.8rem + 6px); }
+}
 
 /* What it searches for: one row per part of the search, one column, because a value is a
    phrase rather than a number - so the statlist's two-column border rule is undone. */

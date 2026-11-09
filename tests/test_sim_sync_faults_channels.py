@@ -427,14 +427,15 @@ class PlaylistFaultTests(SimSyncCase):
         """Characterization: every answer compressed with Content-Encoding is read exactly as
         the plain one."""
         aid = self.add_xtream()
-        plain = self.sync(aid)
+        self.sync(aid)
+        plain = (self.guide_keys(aid), self.sync_span)
         urls = {c.raw_stream_url for c in self.channels(aid)}
         self.sim.inject('gzip_encoding', 'north-tv')
         log = self.sync(aid)
         self.assertEqual(log.status, 'SUCCESS')
         self.assertTrue(all('gzip_encoding' in r.faults for r in self.asked))
         self.assertEqual({c.raw_stream_url for c in self.channels(aid)}, urls)
-        self.assertEqual(log.epg_entries_synced, plain.epg_entries_synced)
+        self.assertSameGuide(plain, (self.guide_keys(aid), self.sync_span))
 
 
 class LineupChangeTests(SimSyncCase):

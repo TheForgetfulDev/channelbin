@@ -10,14 +10,17 @@ against a temp config.yaml (same pattern as tests/test_config_cache.py) so the r
 config.yaml on this box is never touched.
 """
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 
+import yaml
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.config as config_mod  # noqa: E402
-from tests.support.app import make_test_app  # noqa: E402
+from tests.support.app import make_test_app, sandbox_runtime_paths  # noqa: E402
 
 
 class ConfigCommentPreservationTests(unittest.TestCase):
@@ -146,6 +149,7 @@ class LegacyChannelTestingKeyStripPreservesCommentsTests(unittest.TestCase):
     def setUp(self):
         fd, self._tmp_path = tempfile.mkstemp(suffix='.yaml')
         os.close(fd)
+        self._tmp_dir = tempfile.mkdtemp(prefix='dvr_test_comment_')
         self._orig_path = config_mod._CONFIG_PATH
         config_mod._CONFIG_PATH = self._tmp_path
         config_mod._yaml_cache = None
@@ -158,12 +162,16 @@ class LegacyChannelTestingKeyStripPreservesCommentsTests(unittest.TestCase):
                 "  schedule_hour: 3\n"
                 "  test_days: [1, 3, 5]\n"
             )
+            # The fixture's own temp dirs, so the app built below cannot reach the real
+            # /dvr or backup folder at run time.
+            yaml.safe_dump(sandbox_runtime_paths(self._tmp_dir), f)
         config_mod._yaml_cache = None
 
     def tearDown(self):
         config_mod._CONFIG_PATH = self._orig_path
         config_mod._yaml_cache = None
         os.unlink(self._tmp_path)
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
 
     def test_legacy_key_strip_does_not_crash_and_keeps_the_comment(self):
         t = make_test_app()

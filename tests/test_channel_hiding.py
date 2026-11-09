@@ -58,9 +58,10 @@ class _HidingTestCase(unittest.TestCase):
         db.session.commit()
 
     def search_names(self, standing=None):
-        """The default channel-grain search, which is what every picker inherits."""
+        """The default channel-grain search with duplicates folded, which is what these
+        tests are about; a bare search lists every copy since dev/changelog/1458."""
         if standing is None:
-            standing = default_standing_for(GRAIN_CHANNELS)
+            standing = default_standing_for(GRAIN_CHANNELS) - {'showdup'}
         state = SearchState(grain=GRAIN_CHANNELS, standing=frozenset(standing))
         return sorted(r.name for r in search_rows(state))
 

@@ -79,6 +79,11 @@ PROFILE_POSTER_ROLE = StorageRole(
     'A poster image cannot be uploaded to a recording profile, and recordings made under '
     'a profile that has one get a captured frame as their poster instead.')
 
+SPORTS_IMAGE_ROLE = StorageRole(
+    'TheSportsDB image directory',
+    'Posters and backgrounds cannot be downloaded from TheSportsDB, so a recording matched to '
+    'one of its events gets a frame from the program as its poster instead.')
+
 #: The folders the Readiness check's "Take screenshots and live thumbnails" answers for: the
 #: frames ChannelBin captures itself. Uploaded profile posters and cached logos are not
 #: captures, so they stay with the other folders (dev/changelog/1366).
@@ -98,6 +103,10 @@ POSTERS = 'posters'
 #: than a second name inside THUMBNAILS, because the recordings list reads that folder as a
 #: plain listing of "<recording id>.jpg" to decide which rows have an image.
 POSTER_FRAMES = 'poster-frames'
+#: The posters and backgrounds downloaded from TheSportsDB for recordings matched to one of its
+#: events (app/sports_images.py, dev/changelog/1465). One file per image, shared by every
+#: recording of that event.
+SPORTS_IMAGES = 'sports-images'
 
 
 def images_root(cfg: dict) -> str:
@@ -176,6 +185,9 @@ def configured_write_dirs(cfg: dict, capture_log_dir: str = None) -> list:
     # an install that has opted in rather than one that never asked for the feature.
     if (rec.get('metadata_sidecar', {}) or {}).get('enabled'):
         candidates.append((image_dir(cfg, POSTERS), PROFILE_POSTER_ROLE))
+        # Same gate, and the download switch: these too reach a library only through the sidecar.
+        if (cfg.get('sports_data', {}) or {}).get('download_images', True):
+            candidates.append((image_dir(cfg, SPORTS_IMAGES), SPORTS_IMAGE_ROLE))
     candidates.append((db_backup_dir(cfg), DB_BACKUP_ROLE))
     candidates.append((get_backup_dir(cfg), CONFIG_BACKUP_ROLE))
 

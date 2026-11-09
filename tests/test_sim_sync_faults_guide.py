@@ -9,16 +9,23 @@ cause allows it. A test that guards a past defect cites its dev/docs/BUGS.md ent
 other test is a characterization test, and says so.
 """
 import copy
+import json
 import os
+import re
 import sys
 import unittest
 from collections import defaultdict
+from datetime import datetime, timedelta
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import db  # noqa: E402
+from app import accounts, db, sports_match  # noqa: E402
 from app.config import load_config  # noqa: E402
-from app.database import Channel, EPGEntry, XtreamAccount  # noqa: E402
+from app.database import (SPORTS_MATCH_KIND_CHANNEL_NAME, Channel, EPGEntry,  # noqa: E402
+                          EpgAlternateEntry, EpgSource, EpgSourceChannel, SportsEvent, SportsLeague,
+                          SportsMatch, SportsTeam, XtreamAccount)
+from app.epg_sources import add_url_source  # noqa: E402
 from app.logo_cache import _fetch_one_logo  # noqa: E402
 from tests.support.sim_sync import FAULT_WORLD, SimSyncCase, names_a_cut_chunk  # noqa: E402
 
@@ -135,16 +142,84 @@ class GuideFetchFaultTests(_GuideCase):
         self.assertEqual(self.entry_count(aid), held)
 
 
+class GuideGoneForDaysTests(_GuideCase):
+    """A guide URL answering 404 on every refresh until the listings kept from its last
+    good one have all passed - a third-party guide URL on prod, 2026-10-25 onward."""
+
+    def _days_pass(self, sid, hours=96):
+        """What the clock does to a source that cannot be refreshed: everything it holds
+        and its directory's horizons are `hours` further in the past."""
+        shift = timedelta(hours=hours)
+        for model in (EPGEntry, EpgAlternateEntry):
+            for e in model.query.filter_by(source_id=sid):
+                e.start_time -= shift
+                e.stop_time -= shift
+        for d in EpgSourceChannel.query.filter(EpgSourceChannel.source_id == sid,
+                                               EpgSourceChannel.horizon_until.isnot(None)):
+            d.horizon_until -= shift
+        db.session.commit()
+
+    def test_channels_move_to_the_source_still_holding_listings_and_the_rest_are_named(self):
+        """Guards dev/docs/BUGS.md 2026-11-05 @ 07:25 PM: 291 channels stayed on a source
+        that held nothing, 61 of them with another source's listings unused, and nothing
+        said so. The account reads an XMLTV URL first (the same backend's guide through
+        north-plus) and its provider's own guide second; the URL is the one that dies."""
+        aid = self.add_xtream()
+        dying_id = add_url_source(self.account(aid), {
+            'name': 'URL guide', 'url': self.sim.account('north-plus').epg_url}).id
+        db.session.commit()
+        self.synced(aid)
+        provider_id = EpgSource.query.filter_by(owner_account_id=aid, kind='provider').one().id
+        on_dying = {c.id for c in self.channels(aid) if c.epg_source_id == dying_id}
+        spare = {cid for (cid,) in db.session.query(EpgAlternateEntry.channel_id).filter(
+            EpgAlternateEntry.source_id == provider_id).distinct()} & on_dying
+        self.assertTrue(spare, 'the world must give the provider guide listings to offer')
+        # One channel only the dying source lists, so the loss has someone to name.
+        alone = sorted(spare)[0]
+        spare.discard(alone)
+        EpgAlternateEntry.query.filter_by(channel_id=alone).delete()
+        EpgSourceChannel.query.filter(
+            EpgSourceChannel.source_id == provider_id,
+            db.func.lower(EpgSourceChannel.xml_id)
+            == db.session.get(Channel, alone).epg_channel_id.lower()).delete(
+            synchronize_session=False)
+        db.session.commit()
+
+        self._days_pass(dying_id)
+        self.t.sandbox_config({'sync': {'epg_coverage_lost_alert_percent': 0}})
+        self.sim.inject('nonstandard_status', 'north-plus', endpoints=['guide'], status=404)
+        with mock.patch('app.accounts._import_source', wraps=accounts._import_source) as imp:
+            log = self.sync(aid)
+
+        self.assertEqual(log.status, 'PARTIAL')
+        self.assertIn('fetch failed', log.error_message)
+        self.assertAlert('EPG_SOURCE_FETCH_FAILED', f'epg-source:{dying_id}:fetch')
+        moved_first = [c.args[0].id for c in imp.call_args_list]
+        self.assertEqual(moved_first, [provider_id], 'the dead source was never imported')
+        now_on = {c.id: c.epg_source_id for c in self.channels(aid)}
+        self.assertEqual({cid for cid in spare if now_on[cid] == provider_id}, spare,
+                         'every channel the provider guide holds listings for moved to it')
+        ahead = {cid for (cid,) in db.session.query(EPGEntry.channel_id).filter(
+            EPGEntry.channel_id.in_(spare), EPGEntry.source_id == provider_id,
+            EPGEntry.stop_time > datetime.utcnow()).distinct()}
+        self.assertEqual(ahead, spare, 'and each has listings ahead again')
+        alert = self.assertAlert('EPG_SOURCE_COVERAGE_LOST', f'epg-source:{dying_id}:coverage')
+        self.assertIn('have no guide from any source now', alert.body)
+        self.assertIn(db.session.get(Channel, alone).name, alert.body)
+        self.assertIn(f'{len(spare):,} now take their guide from another source', alert.body)
+
+
 class GuideGzipTests(_GuideCase):
     def test_a_guide_sent_as_a_gzip_file_imports_like_the_plain_one(self):
         """Guards dev/docs/BUGS.md 2026-08-09 12:08 PM: a .xml.gz answer (application/gzip,
         no Content-Encoding) imports exactly what the same guide does uncompressed."""
         aid = self.add_xtream()
-        plain = self.synced(aid)
+        self.synced(aid)
+        plain = (self.guide_keys(aid), self.sync_span)
         self.sim.inject('gzip_file', 'north-tv')
         log = self.sync(aid)
         self.assertEqual(log.status, 'SUCCESS')
-        self.assertEqual(log.epg_entries_synced, plain.epg_entries_synced)
+        self.assertSameGuide(plain, (self.guide_keys(aid), self.sync_span))
         self.assertEqual([r.faults for r in self.asked if r.endpoint == 'guide'], [('gzip_file',)])
 
     def test_a_gzip_file_that_will_not_decompress_is_a_failed_fetch(self):
@@ -364,6 +439,73 @@ class DeadLogoHostTests(_LogoCase):
         channel, url, _cache_dir = self.fetch_logo()
         self.assertIsNone(channel.logo_cache_path)
         self.assertEqual(channel.logo_cache_source_url, url)
+
+
+
+class FillerGuideTests(_GuideCase):
+    def test_a_guide_sources_filler_does_not_hide_an_event_slot(self):
+        """Guards dev/docs/BUGS.md 2026-11-08 10:07 through the simulator's filler_guide fault: a
+        real sync stores a guide that only repeats an event slot's name, and the slot is still
+        matched by its name, never by its filler."""
+        aid = self.add_xtream()
+        self.sim.inject('filler_guide', 'north-tv')
+        log = self.sync(aid)
+        self.assertEqual(log.status, 'SUCCESS', log.error_message)
+        filler = {g.filler for g in self.sim.view('north-tv', endpoint='guide').guide if g.filler}
+        slot = re.compile(r'\b([A-Za-z]+) (?:EVENT|GAME|MATCH|PPV) \d+: ([A-Za-z]+) vs ([A-Za-z]+)\b', re.I)
+        found = next(((ch, m) for ch in Channel.query.filter_by(account_id=aid).all()
+                      if ch.name in filler and (m := slot.search(ch.name))), None)
+        self.assertIsNotNone(found, 'the fault world carries no timed event slot')
+        ch, m = found
+        self.assertEqual({e.title for e in EPGEntry.query.filter_by(channel_id=ch.id)}, {ch.name})
+        sport, away, home = m.groups()
+        league = SportsLeague(tsdb_id=9100, name=sport, match_terms=json.dumps([sport]))
+        db.session.add(league)
+        for tid, team in ((901, home), (902, away)):
+            db.session.add(SportsTeam(tsdb_id=tid, full_name=team, names=json.dumps([team]), city='',
+                                      last_looked_up=self.now))
+        db.session.flush()
+        start = self.now + timedelta(hours=6)
+        event = SportsEvent(tsdb_id=7001, league_id=league.id, name=f'{home} vs {away}', home_team_id=901,
+                            away_team_id=902, home_name=home, away_name=away, start_at=start, local_date=start.date())
+        db.session.add(event)
+        db.session.commit()
+        sports_match.run(pause=0)
+        db.session.expire_all()
+        mine = SportsMatch.query.filter_by(event_id=event.id, channel_id=ch.id)
+        self.assertEqual({x.kind for x in mine}, {SPORTS_MATCH_KIND_CHANNEL_NAME})
+
+
+class TeamChannelTests(_GuideCase):
+    def test_a_providers_team_channel_is_not_read_as_a_game(self):
+        """Guards dev/docs/BUGS.md 2026-11-08 01:18 through the simulator's team_channels fault: a team
+        channel names its market's teams with nothing between them, and with only filler in its guide
+        it is a name-match candidate, but it is never the game between two of those teams."""
+        aid = self.add_xtream()
+        self.sim.inject('team_channels', 'north-tv')
+        log = self.sync(aid)
+        self.assertEqual(log.status, 'SUCCESS', log.error_message)
+        shape = re.compile(r'^([A-Z]+) TEAMS\| CBS ([A-Z]+) ([A-Z]+) METRO CITY$')
+        found = next(((ch, m) for ch in Channel.query.filter_by(account_id=aid).all()
+                      if (m := shape.match(ch.name))), None)
+        self.assertIsNotNone(found, 'the fault world carries no team channel')
+        ch, m = found
+        self.assertEqual({e.title for e in EPGEntry.query.filter_by(channel_id=ch.id)}, {ch.name})
+        sport, home, away = (x.title() for x in m.groups())
+        league = SportsLeague(tsdb_id=9101, name=sport, match_terms=json.dumps([sport]))
+        db.session.add(league)
+        for tid, team in ((911, home), (912, away)):
+            db.session.add(SportsTeam(tsdb_id=tid, full_name=team, names=json.dumps([team]), city='',
+                                      last_looked_up=self.now))
+        db.session.flush()
+        start = self.now + timedelta(hours=6)
+        event = SportsEvent(tsdb_id=7002, league_id=league.id, name=f'{home} vs {away}', home_team_id=911,
+                            away_team_id=912, home_name=home, away_name=away, start_at=start, local_date=start.date())
+        db.session.add(event)
+        db.session.commit()
+        sports_match.run(pause=0)
+        db.session.expire_all()
+        self.assertEqual(SportsMatch.query.filter_by(event_id=event.id, channel_id=ch.id).count(), 0)
 
 
 if __name__ == '__main__':

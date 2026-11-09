@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from '_macros.html' import csrf_field, status_badge, channel_pill, account_pill, stat_row %}
+{% from '_macros.html' import csrf_field, status_badge, channel_pill, account_pill, stat_row, history_chips %}
 {% block title %}{{ rec.name }} - ChannelBin{% endblock %}
 {% block main_class %}detail-page{% endblock %}
 
@@ -1067,6 +1067,27 @@
       {{ stat_row('Airs', rec.program_start_time | local_time,
                   tip='The program\'s own air time as the guide gave it when this recording was set up. It does not move, even if the recording started late or was trimmed.') }}
       {% endif %}
+      {#- TheSportsDB's event for this listing (app/sports_view.py::recording_context,
+          dev/changelog/1464): a snapshot, so it reads the same after the event is pruned. -#}
+      {% if sports and sports.state == 'linked' %}
+      {{ stat_row('Event', sports.event,
+                  tip='The event TheSportsDB says this listing is. It is what the guide\'s text claims, not something read from the video.') }}
+      {{ stat_row('Season', sports.season) }}
+      {% if sports.where %}{{ stat_row('Venue', sports.where) }}{% endif %}
+      {% if sports.start %}
+      {{ stat_row('Listed start', sports.start, sv_cls='warn',
+                  tip='When TheSportsDB says the event starts. It is shown because it differs from the guide, and it never changes when this recording starts or stops: only the guide does.') }}
+      {% endif %}
+      {{ stat_row('Matched', ('Strong' if sports.strong else 'Weak') ~ ', ' ~ sports.airing ~ '. ' ~ sports.reason,
+                  sv_cls=('ok' if sports.strong else 'warn'), wide=true) }}
+      {% if sports.file_name %}
+      {{ stat_row('File name', sports.file_name, wide=true,
+                  tip='What the file will be called when the recording is saved: TheSportsDB\'s league, the event\'s date and its name, the way Plex\'s sports agents read it. Settings names matched games this way. Wrong match keeps the recording\'s own name instead, and a file already saved is never renamed.') }}
+      {% endif %}
+      {#- Its poster and background from TheSportsDB (app/sports_view.py::_artwork, dev/changelog/1465).
+          duplicated from _macros.html stat_row - the value carries View links, which stat_row escapes. -#}
+      <div class="srow wide"><span class="sk">Artwork</span><span class="sv {{ sports.art.cls }} tip-plain" data-tip="Downloaded once from TheSportsDB to this server, and written beside the recording as its poster and background for Plex, Jellyfin and Kodi when its metadata file is on. An image pinned to the recording's profile comes first.">{{ sports.art.text }}{% for l in sports.art.links %} <a href="{{ url_for('recordings.recording_sports_image', recording_id=rec.id, role=l.role) }}" target="_blank" rel="noopener">View {{ l.label }}</a>{% endfor %}</span></div>
+      {% endif %}
       {% if rec.metadata_category %}{{ stat_row('Genre', rec.metadata_category) }}{% endif %}
       {% if rec.metadata_rating %}{{ stat_row('Rating', rec.metadata_rating) }}{% endif %}
       {% if rec.metadata_description %}
@@ -1077,7 +1098,7 @@
                   ('On' if meta_panel.sidecar_effective else 'Off')
                   ~ ({'recording': ' for this recording', 'profile': ' via its profile', 'global': ''}[meta_panel.sidecar_level]),
                   sv_cls=('ok' if meta_panel.sidecar_effective else 'na'),
-                  tip='Whether a .nfo file and poster are written beside this recording for Plex, Jellyfin, Emby and Kodi to read. Set per recording here, per profile on the Profiles page, or globally in Settings - the narrowest answer wins.') }}
+                  tip='Whether a .nfo file and poster (and for a matched game, a background) are written beside this recording for Plex, Jellyfin, Emby and Kodi to read. Set per recording here, per profile on the Profiles page, or globally in Settings - the narrowest answer wins.') }}
       {% endif %}
       {% if rec.metadata_locked %}
       {{ stat_row('Details', 'Locked', sv_cls='ok',
@@ -1087,6 +1108,20 @@
       <div class="empty-state">Nothing is known about what this recording contains. Edit details to write a title and a synopsis for your media server.</div>
       {% endif %}
     </div>
+    {% if sports %}
+    <p class="card-note sports-credit">
+      {% if sports.state == 'linked' %}
+      <span>Event details from TheSportsDB.</span>
+      <a href="{{ sports.tsdb_url }}" target="_blank" rel="noopener">Edit on TheSportsDB {{ icon('forward') }}</a>
+      <button class="btn btn-sm" data-sports-remove data-event="{{ sports.event }}">Wrong match</button>
+      {% elif sports.state == 'removed' %}
+      <span>You removed the match to the {{ sports.league }} event "{{ sports.event }}" ({{ sports.removed_on }}).{% if sports.keeps_name %} Its file will keep its normal name.{% endif %}</span>
+      <button class="btn btn-sm" data-sports-restore>Undo</button>
+      {% elif sports.state == 'none' %}
+      <span>TheSportsDB: {{ sports.note }}</span>
+      {% endif %}
+    </p>
+    {% endif %}
   </div>
 </div>
 {% endif %}
@@ -1261,6 +1296,7 @@
   'RESTART_SUCCEEDED': 'ok', 'CONCATENATION_DONE': 'ok', 'CONVERSION_DONE': 'ok',
   'CONVERSION_RESUMED': 'ok',
   'FILE_MOVED': 'ok', 'SCRIPT_EXECUTED': 'ok', 'METADATA_SIDECAR_WRITTEN': 'ok',
+  'RECORDING_SPORTS_LINKED': 'info', 'RECORDING_SPORTS_REMOVED': 'info',
   'METADATA_SIDECAR_FAILED': 'warn', 'CONVERTED_FILE_GAPS': 'warn', 'FILE_MOVE_FAILED': 'bad',
   'SOURCE_DELETED': 'info', 'SOURCE_KEPT': 'info',
   'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad', 'CAPTURE_GAVE_UP': 'bad',
@@ -1268,6 +1304,7 @@
   'RECORDING_START_NOT_ARMED': 'bad',
   'RECORDING_RESUME_REFUSED': 'bad', 'GROUP_FAILOVER': 'warn', 'PRE_CHECK_FAILED': 'warn',
   'RECORDING_STARTED_LATE': 'warn', 'RECORDING_HOST_ROLLED': 'warn', 'RECORDING_LOGIN_REFUSED': 'warn',
+  'PROVIDER_STALLS_CORRELATED': 'warn',
   'RECORDING_HANDOFF': 'info', 'RECORDING_URL_RERESOLVED': 'info', 'RECORDING_REPOINTED': 'info',
   'RECORDING_CREATED_AFTER_EVENT_START': 'info',
 } %}
@@ -1278,9 +1315,16 @@
   </div>
   <div class="card-body">
     {% if rec.events %}
-    {% set ev_clip = rec.events | length > 10 %}
+    {# The filter chips (app/history_filter.py, dev/changelog/1474). `ev_events` is the log
+       narrowed to the active chip; the heading's count and everything above this card still
+       read the whole log. #}
+    {{ history_chips(ev_chips) }}
+    {% if not ev_events %}
+    <p class="card-note">Nothing here for that filter.</p>
+    {% else %}
+    {% set ev_clip = ev_events | length > 10 %}
     <ul class="evlog{% if ev_clip %} ev-clip{% endif %}" id="evlog">
-      {% for evt in rec.events | reverse %}
+      {% for evt in ev_events | reverse %}
       {# data-ev-id keys the disclosure-state re-apply after the 15s panel swap. It must be
          the DB id, not the loop index: new events arriving shift every index. #}
       <li class="ev {{ ev_cls.get(evt.event_type, 'info') }}" data-ev-id="{{ evt.id }}">
@@ -1311,7 +1355,8 @@
       </li>
       {% endfor %}
     </ul>
-    {% if ev_clip %}<button type="button" class="btn btn-sm ev-more" id="ev-more">Show all {{ rec.events | length }} events</button>{% endif %}
+    {% if ev_clip %}<button type="button" class="btn btn-sm ev-more" id="ev-more">Show all {{ ev_events | length }} events</button>{% endif %}
+    {% endif %}
     {% else %}
     <div class="empty-state">No events yet.</div>
     {% endif %}
@@ -1368,7 +1413,7 @@ window.onScheduleSaved = () => window.location.reload();
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>
 <script src="{{ url_for('static', filename='js/recording-switch.js') }}"></script>
 <script src="{{ url_for('static', filename='js/recording-player.js') }}"
-        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.light.min.js') }}"></script>
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.min.js') }}"></script>
 <script>
 (() => {
   const RID = {{ rec.id }};
@@ -1613,6 +1658,16 @@ window.onScheduleSaved = () => window.location.reload();
     if (d.open) evOpen.add(id); else evOpen.delete(id);
     saveOpen('ev', evOpen);
   }, true);
+
+  // ── The Event log's filter chips (app/history_filter.py). The swap is the same one the
+  //    15s refresh makes, so the card keeps one updater; what it blows away is re-applied
+  //    exactly as after that refresh.
+  bindHistoryChips('#panel-eventlog', { after: () => {
+    if (window.__applySectionLayout) window.__applySectionLayout();
+    window.__applyEvOrder();
+    window.__applyEvShowAll();
+    window.__applyEvDisclosures();
+  } });
 })();
 </script>
 <script>
@@ -1972,7 +2027,7 @@ window.onScheduleSaved = () => window.location.reload();
       const sel = (v) => (m.sidecar_enabled === v ? ' selected' : '');
       sidecarRows.push(fieldRow({
         label: 'Metadata file', wide: true,
-        meta: 'Whether a .nfo file and a poster are written beside this recording. '
+        meta: 'Whether a .nfo file and a poster (and for a matched game, a background) are written beside this recording. '
             + 'Right now: <strong>' + (m.sidecar_effective ? 'On' : 'Off') + '</strong>'
             + (m.sidecar_level === 'global' ? ', from the global setting'
                : m.sidecar_level === 'profile' ? ', from its profile' : ', set here')
@@ -2060,6 +2115,43 @@ window.onScheduleSaved = () => window.location.reload();
       }
     }
   }
+
+  // Wrong match and its Undo (dev/changelog/1464). Delegated for the same reason as Edit
+  // details below: the card is swapped every 15s.
+  async function setSportsRemoved(removed, eventName) {
+    const el = card();
+    if (!el || !el.dataset.meta) return;
+    const m = JSON.parse(el.dataset.meta);
+    if (removed) {
+      const ok = await confirmModal({
+        title: 'Wrong match',
+        message: `This recording stops saying it is "${eventName}", and its listing is marked a wrong match on the league's page too.`,
+        consequence: m.nfo_exists ? `${m.nfo_name || 'Its metadata file'} is rewritten without the event's details, poster or background.` : '',
+        confirmLabel: 'Remove match',
+      });
+      if (!ok) return;
+    }
+    try {
+      const res = await jsonFetch(`/recordings/${m.recording_id}/sports-json`,
+                                  { method: 'POST', body: JSON.stringify({ removed }) });
+      const what = removed ? 'Match removed' : 'Match put back';
+      showToast(res.sidecar_rewritten
+        ? `${what}, and ${escHtml(m.nfo_name || 'the metadata file')} was rewritten.` : `${what}.`);
+      await swapFromServer(['#panel-program', '#panel-eventlog']);
+      if (window.__applySectionLayout) window.__applySectionLayout();
+      if (window.__applyEvOrder) window.__applyEvOrder();
+      if (window.__applyEvShowAll) window.__applyEvShowAll();
+      if (window.__applyEvDisclosures) window.__applyEvDisclosures();
+    } catch (e) {
+      showToast(e.message || 'Could not save.', { type: 'error' });
+    }
+  }
+
+  document.addEventListener('click', (e) => {
+    const wrong = e.target.closest('[data-sports-remove]');
+    if (wrong) setSportsRemoved(true, wrong.dataset.event);
+    else if (e.target.closest('[data-sports-restore]')) setSportsRemoved(false, '');
+  });
 
   // Delegated on document: the button rides on a card the 15s refresh replaces, so a
   // handler bound to the element itself would stop working after the first swap.

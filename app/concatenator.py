@@ -821,6 +821,8 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
     from . import events as ev
     from .recorder import _safe_name
     from .postprocessor import output_extension_family, reserve_concat_output_path
+    from .sports_data import recording_file_name
+    from .tz_utils import get_display_tz
     from .db_utils import retry_on_locked
 
     with app.app_context():
@@ -1064,7 +1066,11 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
             # the plain `{safe_name}.ts` can already be occupied by an earlier same-named
             # recording - directly, or via the converted sibling it left behind
             # (dev/changelog/643).
-            safe_name = _safe_name(rec.name)
+            # A matched game may be named from TheSportsDB instead (dev/changelog/1466). Decided
+            # here, when the file is first written, so a match that arrived after the recording
+            # was scheduled still counts, and a finished file is never renamed.
+            file_stem, name_note = recording_file_name(rec, cfg, get_display_tz())
+            safe_name = _safe_name(file_stem)
             output_path = reserve_concat_output_path(
                 dvr_dir, safe_name, output_extension_family(cfg))
             renamed_from = (f'{safe_name}.ts'
@@ -1212,6 +1218,7 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                                                       for i in kept_paths)})
                     add_recording_event(recording_id, CONCATENATION_DONE,
                                         detail=f'Concat complete: {output_path} ({_fmt_bytes(final_size)})'
+                                               + (f' - {name_note}' if name_note else '')
                                                + (f' - renamed, {renamed_from} was already taken'
                                                   if renamed_from else '')
                                                + (' - starting post-processing' if doing_postprocess else ''))

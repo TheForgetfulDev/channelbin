@@ -153,7 +153,7 @@ const RECORDING_PROFILE_SECTIONS = [
           'caught while there is still time to do something about it.' },
       { key: 'metadata_sidecar_enabled', label: 'Metadata file for media servers',
         type: 'tristate', inheritable: true, trueLabel: 'Enabled', falseLabel: 'Disabled',
-        meta: 'Saves a .nfo file and a poster beside each finished recording made with ' +
+        meta: 'Saves a .nfo file and a poster (and for a matched game, a background) beside each finished recording made with ' +
           'this profile, so Plex, Jellyfin, Emby and Kodi show its real title, synopsis ' +
           'and genre instead of guessing from the filename.' },
     ],

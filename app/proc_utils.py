@@ -13,6 +13,8 @@ from typing import NamedTuple, Optional
 from urllib.parse import urlsplit
 
 from .config import resolve_ffmpeg_path
+from .normalize import DEINTERLACE_SOFTWARE, fit_filter
+from .toolchain import vaapi_device_args, vaapi_encode_args
 from .url_utils import mask_creds_in_text
 
 log = logging.getLogger(__name__)
@@ -144,19 +146,25 @@ def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: i
 
 def build_preview_cmd(cfg: dict, url: str, out_dir: str, *, segment_seconds: int = 2,
                       list_size: int = 6, transcode_audio: bool = False,
-                      pace_realtime: bool = False) -> list:
+                      pace_realtime: bool = False, reencode_device: Optional[str] = None) -> list:
     """ffmpeg "connect + stream-copy to a rolling HLS window" command for the live channel
     preview (app/preview.py). The input half is input_args(), the SAME connect behavior
     every capture gets, so a provider sees a preview exactly as it sees a recording.
 
-    The output is deliberately a stream copy: re-encoding video measured 347% of this
-    box's 400% CPU at 1080p60 and fell behind real time, and a diagnostic must never be
-    able to starve the capture it sits beside (dev/changelog/1018). Only audio is ever
-    re-encoded, and only when the caller knows the browser cannot decode it (AC3/EAC3/MP2):
-    stereo AAC, ~5% of one core measured. One video and one audio stream, each optional
-    (`?`), so an audio-only channel - an Icecast radio mount - previews as sound alone
-    instead of failing on the missing video; subtitle and data tracks are dropped because
-    a teletext PID copied into a segment is something hls.js chokes on and nobody can see.
+    The output is a stream copy unless the viewer asked for a re-encode. Re-encoding video on
+    the CPU measured 347% of the dev box's 400% CPU at 1080p60 and fell behind real time, and a
+    diagnostic must never be able to starve the capture it sits beside (dev/changelog/1018), so
+    a copy is what every preview starts as. Audio is re-encoded when the caller knows the
+    browser cannot decode it (AC3/EAC3/MP2): stereo AAC, ~5% of one core measured. One video
+    and one audio stream, each optional (`?`), so an audio-only channel - an Icecast radio
+    mount - previews as sound alone instead of failing on the missing video; subtitle and data
+    tracks are dropped because a teletext PID copied into a segment is something hls.js chokes
+    on and nobody can see.
+
+    `reencode_device` (a VA-API render node) re-encodes instead, for a stream the browser could
+    not decode as copied - REENCODE_HEIGHT H.264 encoded on the GPU (reencode_args()). Only
+    app/preview.py decides it may be passed, after the device's trial encode has passed and
+    while no conversion holds the GPU.
 
     delete_segments keeps the window bounded on disk, omit_endlist keeps the playlist live,
     independent_segments lets the player start at any segment. hls_delete_threshold keeps
@@ -165,12 +173,67 @@ def build_preview_cmd(cfg: dict, url: str, out_dir: str, *, segment_seconds: int
     between the player's playlist fetch and its first segment request, and the browser
     verification saw exactly that 404 once (dev/changelog/1018). About 10 MB at 1080p all
     told. Segment length is bounded below by the source's keyframe interval under a copy,
-    so a provider with a 5 s GOP produces 5 s segments whatever segment_seconds says."""
+    so a provider with a 5 s GOP produces 5 s segments whatever segment_seconds says; a
+    re-encode places its own keyframes and cuts at segment_seconds."""
     cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
+    if reencode_device:
+        cmd += reencode_input_args(reencode_device)
     cmd += input_args(cfg, url, pace_realtime=pace_realtime)
     cmd += _hls_window_args(out_dir, segment_seconds=segment_seconds, list_size=list_size,
-                            transcode_audio=transcode_audio, live=True)
+                            transcode_audio=transcode_audio, live=True,
+                            reencode=bool(reencode_device))
     return cmd
+
+
+#: The picture a re-encoded preview or playback is fitted to, 16:9 and padded
+#: (normalize.fit_filter). One fixed size because the GPU's frame pool is sized once, at the
+#: first frame: a stream that changes size part-way kills any other shape (dev/changelog/1183).
+REENCODE_WIDTH = 1920
+REENCODE_HEIGHT = 1080
+#: h264_vaapi's constant quantizer for a re-encoded preview: a little finer than a
+#: conversion's default (26), since this one is watched to judge the picture.
+REENCODE_QP = 24
+
+
+def reencode_keyframes(seconds: int) -> str:
+    """-force_key_frames for a re-encode: a keyframe every `seconds`, so every segment the window
+    cuts starts on its one keyframe - the conversion's rule. Measured on 7.1 to hold for a file
+    session started past zero with -copyts too: from 20 s into a 60 fps file, three 2 s
+    segments of 120 frames, each with one keyframe, at 20, 22 and 24 s (dev/changelog/1461)."""
+    return f'expr:gte(t,n_forced*{max(int(seconds), 1)})'
+
+
+def reencode_input_args(device: str) -> list:
+    """Before -i: open the device for the upload filter and the encoder, and keep the video
+    filter graph built once - with the fixed-size fit before the upload, the shape measured to
+    survive a stream that changes size part-way (dev/changelog/1183)."""
+    return vaapi_device_args(device) + ['-reinit_filter:v', '0']
+
+
+def reencode_args(segment_seconds: int = 2) -> list:
+    """The video half of a re-encoded preview or playback (dev/changelog/1461): decoded on the
+    CPU, fitted to REENCODE_WIDTH x REENCODE_HEIGHT (field by field where a frame is
+    interlaced), deinterlaced where a frame is interlaced, uploaded, encoded with h264_vaapi.
+
+    Fitted BEFORE deinterlacing: bwdif cannot take a frame of a new size under
+    -reinit_filter:v 0 ("Failed to reallocate frame", ffmpeg exits 255 - measured on a 720p
+    stretch turning 1080p), while the per-frame fit hands it one fixed size throughout.
+
+    Decoding stays on the CPU on purpose. Measured in the GPU lab on an i5-14500: the GPU
+    decoder died 8 s into the field-coded 1080i stream this exists for (the stream whose
+    reference errors Chrome would not decode), while the CPU decoder played it at 27% of one
+    core; a 1080p60 H.264 source cost 24%, a 2160p50 10-bit HEVC source 160-172% and 1.1 GB.
+    A conversion encoding beside it on the same GPU kept its speed (244 fps alone, 271 beside).
+    No tone mapping: a live source's HDR is not known before it plays, so an HDR picture
+    plays as 8-bit with flat colors."""
+    fit = fit_filter(REENCODE_WIDTH, REENCODE_HEIGHT, interlaced_aware=True)
+    vf = f'{fit},{DEINTERLACE_SOFTWARE},format=nv12,hwupload'
+    # passthrough: the deinterlacer declares the field rate whether or not a frame was
+    # interlaced, and the HLS muxer's default constant rate then duplicated every frame of a
+    # progressive 59.94 source to make 120 (measured, dev/changelog/1461).
+    return (['-vf', vf] + vaapi_encode_args('h264', REENCODE_QP)
+            + ['-fps_mode:v', 'passthrough',
+               '-force_key_frames', reencode_keyframes(segment_seconds)])
 
 
 def build_relay_cmd(cfg: dict, url: str, *, pace_realtime: bool = False) -> list:
@@ -201,7 +264,8 @@ FILE_PLAYBACK_BURST_SECONDS = 10
 
 def build_file_playback_cmd(cfg: dict, path: str, out_dir: str, *, offset: float = 0.0,
                             segment_seconds: int = 2, list_size: int = 30,
-                            transcode_audio: bool = False, follow: bool = False) -> list:
+                            transcode_audio: bool = False, follow: bool = False,
+                            reencode_device: Optional[str] = None) -> list:
     """ffmpeg command that plays a finished recording's file from `offset` seconds through
     the preview's rolling HLS window (app/preview.py file sessions, dev/docs/DESIGN-playback.md).
 
@@ -236,8 +300,14 @@ def build_file_playback_cmd(cfg: dict, path: str, out_dir: str, *, offset: float
     file then stopped growing, never produced a segment. Any seek on a followed file that has
     stopped growing can wait forever for data past its end, which preview.py's start timeout
     names. A follower waiting at the end of the file does not act on ffmpeg's first SIGTERM,
-    so it is stopped with SIGKILL (preview._finish)."""
+    so it is stopped with SIGKILL (preview._finish).
+
+    `reencode_device` re-encodes the video on the GPU, as build_preview_cmd's does, for a file
+    the browser could not decode as copied; the timestamps are kept the same way, so a seek
+    lands where it does under a copy."""
     cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
+    if reencode_device:
+        cmd += reencode_input_args(reencode_device)
     if follow:
         cmd += ['-follow', '1']
     cmd += ['-readrate', '1', '-readrate_initial_burst', str(FILE_PLAYBACK_BURST_SECONDS)]
@@ -247,18 +317,22 @@ def build_file_playback_cmd(cfg: dict, path: str, out_dir: str, *, offset: float
     cmd += ['-i', f'file:{path}', '-copyts', '-start_at_zero', '-muxdelay', '0',
             '-muxpreload', '0']
     cmd += _hls_window_args(out_dir, segment_seconds=segment_seconds, list_size=list_size,
-                            transcode_audio=transcode_audio, live=follow)
+                            transcode_audio=transcode_audio, live=follow,
+                            reencode=bool(reencode_device))
     return cmd
 
 
 def _hls_window_args(out_dir: str, *, segment_seconds: int, list_size: int,
-                     transcode_audio: bool, live: bool) -> list:
+                     transcode_audio: bool, live: bool, reencode: bool = False) -> list:
     """The output half shared by build_preview_cmd and build_file_playback_cmd: one video and
     one audio stream copied (audio to stereo AAC only when the browser cannot decode it) into a
-    rolling HLS window. `live` keeps the playlist open forever (omit_endlist); a file's playlist
-    is ended by ffmpeg when the file is."""
-    cmd = ['-map', '0:v:0?', '-map', '0:a:0?', '-sn', '-dn', '-c:v', 'copy']
-    if transcode_audio:
+    rolling HLS window. `reencode` re-encodes the video on the GPU (reencode_args(), the device
+    opened by reencode_input_args() before -i) and the audio to AAC whatever it was, so nothing
+    in the window is left that a browser might not decode. `live` keeps the playlist open
+    forever (omit_endlist); a file's playlist is ended by ffmpeg when the file is."""
+    cmd = ['-map', '0:v:0?', '-map', '0:a:0?', '-sn', '-dn']
+    cmd += reencode_args(segment_seconds) if reencode else ['-c:v', 'copy']
+    if transcode_audio or reencode:
         cmd += ['-c:a', 'aac', '-b:a', '128k', '-ac', '2']
     else:
         cmd += ['-c:a', 'copy']

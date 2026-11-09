@@ -15,6 +15,7 @@ from .database import (
     FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED, FAILURE_FAST_DELIVERY_DETECTED,
 )
 from .db_utils import retry_on_locked
+from . import provider_stalls
 from .account_links import (is_credential_refusal, is_resolution_failure,
                             note_refusal_for_holder, roll_host_for_channel)
 from .probe import parse_ffprobe
@@ -1037,6 +1038,21 @@ class WatchdogThread(threading.Thread):
                                 'recording', self.recording_id,
                                 trigger=f'Recording {self.recording_id} (segment {seg_num})',
                                 stderr_tail=stderr_tail, recording_id=self.recording_id)
+                        # Stalls on two or more accounts of one provider inside a few
+                        # minutes are the provider's outage, said once
+                        # (app/provider_stalls.py). Outside the closure above because it
+                        # commits on its own, and guarded because a diagnostic must never
+                        # harm the capture it describes: a failure here is a warning and
+                        # the restart below goes ahead. What the guard does not cover is
+                        # time - a locked database can hold this for its retries, the same
+                        # exposure the stall's own commit and the two hooks above carry on
+                        # this path. A fast-delivery segment is not a stall.
+                        if fast_delivery is None:
+                            try:
+                                provider_stalls.note_stall(self.recording_id, seg_channel_id)
+                            except Exception:
+                                log.warning('Recording %d: provider stall correlation failed',
+                                            self.recording_id, exc_info=True)
 
                         if fast_delivery is not None:
                             ev.publish(self.recording_id, FAST_DELIVERY_DETECTED, {

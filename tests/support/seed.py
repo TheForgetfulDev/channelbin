@@ -203,7 +203,7 @@ def make_channel_test(channel, all_null=True, status='FAILED', **kw):
 
 def make_epg_entry(channel, title='Test Program', offset_minutes=0, duration_minutes=60,
                    sub_title=None, description=None, category=None, rating=None,
-                   start_time=None, source_id=None):
+                   start_time=None, source_id=None, is_live=None, is_new=None):
     """One showing. `sub_title`, `description`, `category` and `rating` default to NULL
     deliberately - that is the shape most provider rows have, and it is what the airing
     search's `-word` handling has to survive (tests/test_airing_search_negation.py).
@@ -220,7 +220,7 @@ def make_epg_entry(channel, title='Test Program', offset_minutes=0, duration_min
         source_id = owned.id if owned is not None else None
     entry = EPGEntry(
         channel_id=channel.id, title=title, sub_title=sub_title, description=description,
-        category=category, rating=rating, source_id=source_id,
+        category=category, rating=rating, source_id=source_id, is_live=is_live, is_new=is_new,
         start_time=start, stop_time=start + timedelta(minutes=duration_minutes))
     db.session.add(entry)
     db.session.flush()

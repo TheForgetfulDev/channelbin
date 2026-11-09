@@ -1103,6 +1103,9 @@
 .rec-badge-partial { color: var(--warn); }
 .rec-badge-stopped { color: var(--text-muted); }
 .rec-badge-scheduled { color: var(--accent-text); }
+/* A program a recording failed on. The chip alone: the cell keeps its plain background,
+   because nothing holds the slot and Record is still offered (dev/changelog/1457). */
+.rec-badge-failed { color: var(--bad); }
 
 /* 12.5: tag dots always take their own line when shown. There is one tag layout, not two. */
 .tag-badges {

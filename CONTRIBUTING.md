@@ -44,9 +44,9 @@ unnoticed.
 [`flake8`](https://pypi.org/project/flake8/) catches unused imports, undefined names, and unused
 local variables. `.flake8` restricts it to `E9,F` - the [`pyflakes`](https://pypi.org/project/pyflakes/)
 checks plus syntax errors - so it has no style opinions and will never argue with you about line
-length or whitespace. It's a dev-only, on-demand tool: `.github/workflows/tests.yml` runs the test
-suite on every push and pull request but no lint step, and there's no git hook, so run it yourself
-whenever you want:
+length or whitespace. It's a dev-only tool, and `.github/workflows/tests.yml` runs it on every push
+and pull request before the test suite, so a finding fails the check. There's no git hook, so run it
+yourself before you push:
 
 ```
 pip install -r requirements-dev.txt

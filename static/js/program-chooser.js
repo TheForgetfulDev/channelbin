@@ -18,9 +18,10 @@
 (() => {
   const REC = statusVocab('REC_STATUS');
 
-  // Every status named and none left to a default: FAILED and ABORTED never reach the guide
-  // (app/routes/guide.py leaves them out so Record stays offered), and read as no recording
-  // here for the same reason.
+  // Every status named and none left to a default: FAILED and ABORTED never reach a program
+  // as its recording (app/routes/guide.py, so Record stays offered), and read as no
+  // recording here for the same reason. A failed one arrives as `failed_recording_id`, which
+  // adds its page to the actions and changes nothing about what Record does.
   function recState(prog) {
     if (!prog.has_recording || !prog.recording_id) return 'none';
     switch (prog.recording_status) {
@@ -95,6 +96,10 @@
     if (rs !== 'none') {
       acts.push({ icon: 'recordings', label: 'Recording page',
         href: GUIDE_CONFIG.recDetailUrlBase + prog.recording_id });
+    } else if (prog.failed_recording_id) {
+      acts.push({ icon: 'recordings', label: 'Failed recording',
+        href: GUIDE_CONFIG.recDetailUrlBase + prog.failed_recording_id,
+        tip: 'A recording of this program failed. Its page says what happened' });
     }
     const airings = airingsUrl(prog);
     if (airings) {
@@ -123,10 +128,7 @@
     const air = airState(prog);
     const airWord = air === 'ended' ? '<span class="chooser-air">Ended</span>'
       : air === 'airing' ? '<span class="chooser-air is-on">On now</span>' : '';
-    const chip = prog.has_recording
-      ? recStatusBadge(prog.recording_status, prog.recording_partial, prog.recording_stopped,
-                       recStarting(prog.recording_status, prog.recording_start_time), Infinity)
-      : '';
+    const chip = progRecBadge(prog, Infinity);
     const state = chip || airWord ? `<div class="chooser-state">${chip}${airWord}</div>` : '';
     // A filler slot on a channel with no listings has no program to describe.
     const fmtT = (iso) => fmtTimeTz(utcIsoToDate(iso));

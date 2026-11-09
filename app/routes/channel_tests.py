@@ -29,7 +29,7 @@ from .. import channel_hiding
 from ..config import load_config, config_default
 from ..db_utils import retry_on_locked
 from ..logo_cache import resolve_logo_url
-from ..tz_utils import to_naive_utc, parse_local_to_utc, format_local, parse_hhmm, format_clock
+from ..tz_utils import to_naive_utc, parse_form_time, format_local, parse_hhmm, format_clock
 
 channel_tests_bp = Blueprint('channel_tests', __name__)
 
@@ -577,7 +577,10 @@ def _parse_schedule(data):
         if not scheduled_time_str:
             return None, (jsonify({'error': 'scheduled_time is required'}), 400)
         try:
-            scheduled_start_time = parse_local_to_utc(scheduled_time_str)
+            # The instant beside the wall text: a time a DST change repeats cannot say which
+            # pass it means (util.js::wallTimeField, dev/changelog/1477).
+            scheduled_start_time = parse_form_time(
+                scheduled_time_str, str(data.get('scheduled_time_utc') or ''))
         except ValueError:
             return None, (jsonify({'error': 'Invalid scheduled_time format'}), 400)
         if scheduled_start_time <= datetime.utcnow():

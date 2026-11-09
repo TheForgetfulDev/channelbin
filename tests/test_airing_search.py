@@ -49,7 +49,8 @@ from app.channel_search import (  # noqa: E402
     default_standing_for, dimensions_for, parse_duration, parse_terms, parse_when_custom,
     parse_when_next, search, standing_applied, standing_options_for, text_predicates,
     visible_dimensions_for,
-    WHEN_INDEX_DEFEAT_WIDTH, WHEN_TODAY, _facet_counts, clear_standing_breakdown_cache,
+    WHEN_INDEX_DEFEAT_WIDTH, WHEN_TODAY, _add_back_collapsed, _facet_counts,
+    clear_standing_breakdown_cache,
     _group_collapse_losers, _group_ranked_entries)
 from app.channel_search_rows import build_rows  # noqa: E402
 from app.search_index import rebuild_search_indexes  # noqa: E402
@@ -170,15 +171,16 @@ class GrainScopingTests(_AiringTestCase):
         is on by default is a `show*` key that is ABSENT. Pinning only the set would let a
         later edit flip `hides_when_on` and keep this green while both grains changed."""
         self.assertEqual(default_standing_for(GRAIN_CHANNELS),
-                         frozenset({'shownoepg', 'showuntested', 'showmembers'}))
+                         frozenset({'showdup', 'shownoepg', 'showuntested', 'showmembers'}))
         self.assertEqual(default_standing_for(GRAIN_AIRINGS),
-                         frozenset({'shownoepg', 'showuntested', 'grpdedup'}))
+                         frozenset({'showdup', 'shownoepg', 'showuntested', 'grpdedup'}))
         # `showmembers` is channel-grain only and since dev/changelog/860 does NOT hide by
         # default - a group member keeps a row of its own. It is therefore in the first set
         # and in neither `hiding` set below; the airing grain has no equivalent at all and
         # expresses the collapse through `grpdedup`, which does still hide by default.
-        for grain, expect in ((GRAIN_CHANNELS, {'showhidden', 'showdup', 'shownotnorm'}),
-                              (GRAIN_AIRINGS, {'showhidden', 'showdup', 'shownotnorm',
+        # Duplicates show by default on both since dev/changelog/1458.
+        for grain, expect in ((GRAIN_CHANNELS, {'showhidden', 'shownotnorm'}),
+                              (GRAIN_AIRINGS, {'showhidden', 'shownotnorm',
                                                'showpast', 'grpdedup'})):
             hiding = {s.key for s in standing_options_for(grain)
                       if standing_applied(default_standing_for(grain), s.key)}
@@ -1349,29 +1351,40 @@ class QueryPlanTests(_AiringTestCase):
         row path cannot move it.
 
         The duplicates a value would bring back are one more pass between the four, for the same
-        reason: two statements, the kept copies and the duplicates (dev/changelog/1435)."""
-        without = len(self._statements(facets=()))
-        with_four = len(self._statements(facets=('acct', 'cat', 'health', 'other')))
-        self.assertEqual(with_four - without, 3,
+        reason: two statements, the kept copies and the duplicates (dev/changelog/1435). The
+        showings "Collapse channel groups" hides that a value would bring back are one more pair:
+        the collapse's window, and the grouped channels' answers - asked whether or not anything
+        is hidden, so the count does not move with the data. A Group facet adds its memberships
+        (dev/changelog/1448)."""
+        # With duplicates hidden, which is no longer the default (dev/changelog/1458): that
+        # is the search that pays for the duplicates' pair.
+        folding = default_standing_for(GRAIN_AIRINGS) - {'showdup'}
+        without = len(self._statements(standing=folding, facets=()))
+        with_four = len(self._statements(standing=folding,
+                                         facets=('acct', 'cat', 'health', 'other')))
+        self.assertEqual(with_four - without, 5,
                          'the four single-scan facet dimensions should add one statement '
-                         'between them and one pair for the duplicates, not one each')
+                         'between them and one pair each for the duplicates and the collapse, '
+                         'not one each')
 
     def test_a_filtered_dimension_still_falls_back_to_its_own_aggregate(self):
         """The combined pass counts each dimension against the same base, so a dimension the
         user has filtered ON cannot join it - its own filter has to come off first. Filtering
         one of the four therefore costs two statements, not one, plus a pair for the duplicates
-        each of those passes would bring back (dev/changelog/1435).
+        and a pair for the collapsed showings each of those passes would bring back
+        (dev/changelog/1435, 1448).
 
         The baseline also carries the cat filter (facets=()) rather than being fully
         unfiltered: an unfiltered airing search takes the cached-breakdown path
         (dev/changelog/598), which pays its own fixed watermark-check cost that a filtered
         search never does. Isolating the facet-only cost means holding that variable equal on
         both sides, not comparing a cached-path baseline to an uncached one."""
-        state = dict(facets=('acct', 'cat', 'health', 'other'))
+        folding = default_standing_for(GRAIN_AIRINGS) - {'showdup'}
+        state = dict(standing=folding, facets=('acct', 'cat', 'health', 'other'))
         cat_filter = (DimensionFilter('cat', ('Sports',), ()),)
-        without = len(self._statements(filters=cat_filter, facets=()))
+        without = len(self._statements(filters=cat_filter, standing=folding, facets=()))
         filtered = len(self._statements(filters=cat_filter, **state))
-        self.assertEqual(filtered - without, 6)
+        self.assertEqual(filtered - without, 10)
 
     def test_the_combined_pass_returns_exactly_what_the_separate_aggregates_did(self):
         """The correctness half. Collapsing four aggregates into one grouped scan changes
@@ -1390,6 +1403,9 @@ class QueryPlanTests(_AiringTestCase):
         text_preds = text_predicates(state, ctx)
         separate = {key: _facet_counts(DIMENSION_BY_KEY[key], state, ctx, text_preds)
                     for key in ('acct', 'cat', 'health', 'other')}
+        # Both shapes get the same collapse add-back; what is compared is the scan itself.
+        _add_back_collapsed(separate, [DIMENSION_BY_KEY[k] for k in separate], state, ctx,
+                            text_preds, set())
         self.assertEqual(combined, separate)
         # And they are showing counts, not channel counts - the point of the grain.
         self.assertEqual(sum(combined['cat'].values()),

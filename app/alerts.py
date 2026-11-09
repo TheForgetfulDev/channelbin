@@ -64,6 +64,11 @@ ACCOUNT_HOST_ROLLED = 'ACCOUNT_HOST_ROLLED'
 #: at most once per refusal cooldown window per login (dev/changelog/1169).
 ACCOUNT_LOGIN_REFUSED = 'ACCOUNT_LOGIN_REFUSED'
 
+#: Recordings on two or more accounts of one provider stalled within a few minutes of each
+#: other - the provider's outage, said once per provider rather than once per recording
+#: (app/provider_stalls.py, dev/changelog/1476).
+PROVIDER_STALLS_CORRELATED = 'PROVIDER_STALLS_CORRELATED'
+
 # The three ways an auto-record rule cannot do its job (app/auto_rules.py,
 # DESIGN-autoschedule.md §6). A rule scheduling something is never an alert - its history and
 # the recording's own event show that (dev/changelog/923).
@@ -289,6 +294,13 @@ ALERT_TYPES = {
     # per login instead, and the user dismisses it.
     ACCOUNT_LOGIN_REFUSED: {
         'label': 'Account Login Refused', 'severity': 'WARN'},
+    # Stalls on two or more accounts of one provider inside five minutes. WARN: every
+    # recording restarts and fails over on its own; this is the one line that says the stalls
+    # are one outage. Refreshed while the window keeps filling, never stacked. NOT
+    # self-clearing, for the same reason as ACCOUNT_LOGIN_REFUSED: "the provider recovered"
+    # has no cheap signal, and a self-clearing alert cannot be dismissed by hand.
+    PROVIDER_STALLS_CORRELATED: {
+        'label': 'Provider Stalls Correlated', 'severity': 'WARN'},
     'RECORDING_MOVE_FAILED': {
         'label': 'Recording Move Failed', 'severity': 'ERROR', 'self_clearing': True},
     # The converted file is missing video its source has, so the source was kept rather than

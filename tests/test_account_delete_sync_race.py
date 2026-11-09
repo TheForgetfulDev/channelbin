@@ -90,6 +90,11 @@ class DeleteAccountSyncRaceTests(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 409)
         self.assertIn('still syncing', resp.get_json()['error'])
+        # The reason is the measured one (dev/changelog/1478): a sync between checkpoints
+        # stops at once, so what is still running is a download or the work on one - never
+        # the retired "can only stop between phases".
+        self.assertIn('downloading from the provider', resp.get_json()['error'])
+        self.assertNotIn('between phases', resp.get_json()['error'])
         self.assertTrue(stop_event.is_set(),
                         'the refused delete must still have signalled the sync to stop')
         db.session.expire_all()

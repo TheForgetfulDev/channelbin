@@ -500,11 +500,182 @@ class FieldControlInputRuleTests(unittest.TestCase):
         self.assertFalse(offends('.switch input'))
 
 
+# ── What a script shows on screen, and what the stylesheets style ──────────────────────
+
+# `class=\"...\"` is the same attribute written inside a double-quoted string.
+_JS_CLASS_ATTR_RE = re.compile(r'\bclass=\\?"([^"\\]*)\\?"')
+_CSS_COMMENT_RE = re.compile(r'/\*.*?\*/', re.S)
+_JS_CLASSNAME_RE = re.compile(r'''\.className\s*\+?=\s*(['"`])([^'"`]*)\1''')
+_JS_CLASSLIST_RE = re.compile(r'\.classList\.(add|toggle|replace)\(([^)]*)\)')
+_JS_SELECTOR_RE = re.compile(
+    r'''(?:querySelector(?:All)?|closest|matches)\(\s*(['"`])(.*?)\1''', re.S)
+_JS_CLASS_ARG_RE = re.compile(
+    r'''(?:getElementsByClassName|classList\.contains)\(\s*(['"`])([\w-]+)\1''')
+_STRING_ARG_RE = re.compile(r'''(['"])([\w-]+)\1''')
+_CLASS_TOKEN_RE = re.compile(r'^[a-zA-Z_][\w-]*$')
+_CSS_CLASS_RE = re.compile(r'\.([a-zA-Z_][\w-]*)')
+_INLINE_SCRIPT_RE = re.compile(r'<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>', re.S | re.I)
+_STYLE_BLOCK_RE = re.compile(r'<style[^>]*>(.*?)</style>', re.S | re.I)
+
+
+def _js_sources():
+    """Every script a page runs: the static/js files and each inline <script> body of a
+    template (never a src= include). Yields (path, text)."""
+    for p in _walk(JS_DIR, '.js'):
+        yield p, _read(p)
+    for p in _walk(TPL_DIR, '.html'):
+        for m in _INLINE_SCRIPT_RE.finditer(_read(p)):
+            yield p, m.group(1)
+
+
+def css_rule_classes():
+    """Every class name a selector names, in a stylesheet or a template's <style> block.
+    Comments are dropped first, so a class a comment mentions does not count as styled."""
+    names = set()
+    for p in _walk(CSS_DIR, '.css'):
+        names.update(_CSS_CLASS_RE.findall(_CSS_COMMENT_RE.sub(' ', _read(p))))
+    for p in _walk(TPL_DIR, '.html'):
+        for m in _STYLE_BLOCK_RE.finditer(_read(p)):
+            names.update(_CSS_CLASS_RE.findall(_CSS_COMMENT_RE.sub(' ', m.group(1))))
+    return names
+
+
+_LITERAL_RE = re.compile(r'''(['"`])((?:(?!\1).)*)\1''', re.S)
+
+
+def _template_expressions(value):
+    """(start, end) of each top-level `${...}` in a template literal's text, braces balanced
+    so a nested literal or object stays inside its expression."""
+    i, n = 0, len(value)
+    while i < n - 1:
+        if value[i] == '$' and value[i + 1] == '{':
+            depth, j = 0, i + 1
+            while j < n:
+                if value[j] == '{':
+                    depth += 1
+                elif value[j] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            yield i, j + 1
+            i = j + 1
+        else:
+            i += 1
+
+
+def _attribute_tokens(value):
+    """The class names in one class="..." value as a script writes it. A `${...}` holding a
+    string literal that begins with a space (`${open ? ' open' : ''}`) appends whole names:
+    those names count, and the token before the expression is whole. Any other `${...}` is
+    a value the scan cannot read, and a token it touches (`tone-${t}`) is a fragment, not a
+    name. A literal with no leading space inside a separator (`op === 'not'`) is an operand,
+    not a class, and is not harvested."""
+    out, pieces, last = set(), [], 0
+    for start, end in _template_expressions(value):
+        pieces.append(value[last:start])
+        literals = [m.group(2) for m in _LITERAL_RE.finditer(value[start + 2:end - 1])]
+        if any(lit[:1].isspace() for lit in literals):
+            for lit in literals:
+                if lit[:1].isspace():
+                    out |= _attribute_tokens(lit)
+            pieces.append(' ')
+        else:
+            pieces.append('\x00')
+        last = end
+    pieces.append(value[last:])
+    joined = ''.join(pieces)
+    if "'" in joined or '+' in joined:
+        return set()   # built by concatenation: names a variable, not a class
+    out.update(tok for tok in joined.split()
+               if '\x00' not in tok and _CLASS_TOKEN_RE.match(tok))
+    return out
+
+
+def js_emitted_classes(text):
+    """The class names a script puts on an element: a class="..." attribute in markup it
+    builds, a className assignment, a classList.add/toggle/replace. A token a `${...}` cuts
+    into is the prefix or suffix of a real name, not a name, and is skipped; an attribute
+    built by concatenation (`'class="' + cls + '"'`) names a variable, not a class, and is
+    skipped whole. toggle()'s later arguments are conditions, so only its first string
+    counts."""
+    out = set()
+    for m in _JS_CLASS_ATTR_RE.finditer(text):
+        out |= _attribute_tokens(m.group(1))
+    for m in _JS_CLASSNAME_RE.finditer(text):
+        out.update(t for t in m.group(2).split() if _CLASS_TOKEN_RE.match(t))
+    for m in _JS_CLASSLIST_RE.finditer(text):
+        literals = [lit for _q, lit in _STRING_ARG_RE.findall(m.group(2))]
+        out.update(literals[:1] if m.group(1) == 'toggle' else literals)
+    return out
+
+
+def js_selected_classes(text):
+    """The class names a script reads back: a selector in querySelector/closest/matches, a
+    getElementsByClassName or classList.contains argument. A class a script selects on is a
+    hook, and a hook needs no rule."""
+    out = set()
+    for m in _JS_SELECTOR_RE.finditer(text):
+        out.update(_CSS_CLASS_RE.findall(m.group(2)))
+    for m in _JS_CLASS_ARG_RE.finditer(text):
+        out.add(m.group(2))
+    return out
+
+
+class JsClassScanCorrectnessTests(unittest.TestCase):
+    """The shapes the scan above reads, each one present in static/js."""
+
+    def test_markup_classes_and_template_literal_fragments(self):
+        text = ('el.innerHTML = `<div class="card ${tone} tone-${t} ${open ? "open" : ""}">'
+                '<span class="b-ok"></span></div>`;')
+        self.assertEqual(js_emitted_classes(text), {'card', 'b-ok'})
+
+    def test_a_conditional_suffix_leaves_the_name_whole_and_counts_itself(self):
+        text = ('`<span class="mo-t${row.mono ? \' mono\' : \'\'}">` + '
+                '`<div class="rd-row s-${escHtml(status)}${open ? \' open\' : \'\'}'
+                '${row.ignored ? \' rd-muted\' : \'\'}">`')
+        self.assertEqual(js_emitted_classes(text),
+                         {'mo-t', 'mono', 'rd-row', 'open', 'rd-muted'})
+
+    def test_a_nested_template_literal_stays_inside_its_expression(self):
+        text = ('`<button class="menu-item fb-val${op ? ` on${op === \'not\' ? \' neg\' : \'\'}` '
+                ': \'\'}">`')
+        self.assertEqual(js_emitted_classes(text), {'menu-item', 'fb-val', 'on', 'neg'})
+
+    def test_toggle_takes_only_its_class_argument(self):
+        text = ("el.classList.toggle('btn-primary', mode === 'new');\n"
+                "el.classList.add('a', 'b'); el.classList.replace('c', 'd');")
+        self.assertEqual(js_emitted_classes(text), {'btn-primary', 'a', 'b', 'c', 'd'})
+
+    def test_a_concatenated_attribute_names_no_class(self):
+        text = 'html += \'<td class="\' + cls + \'">\';'
+        self.assertEqual(js_emitted_classes(text), set())
+
+    def test_classname_assignment(self):
+        text = "el.className = 'row open'; other.className += ' dim';"
+        self.assertEqual(js_emitted_classes(text), {'row', 'open', 'dim'})
+
+    def test_an_attribute_inside_a_double_quoted_string(self):
+        text = 'html = "<span class=\\"text-muted small\\">" + x + "</span>";'
+        self.assertEqual(js_emitted_classes(text), {'text-muted', 'small'})
+
+    def test_selected_classes_are_hooks(self):
+        text = ("root.querySelectorAll('.rows .row.open'); el.closest(`.card`);\n"
+                "x.classList.contains('dim'); document.getElementsByClassName('hook')")
+        self.assertEqual(js_selected_classes(text),
+                         {'rows', 'row', 'open', 'card', 'dim', 'hook'})
+
+
 class CssClassDefinedTests(unittest.TestCase):
     """Two sibling defects to the undefined-var one above, both shipped and both silent:
     a class emitted by JS but styled nowhere, and a class defined twice where the wrong
     copy wins (BUGS.md 2026-07-25 - the Channels table's good/warn/bad colouring was
-    absent entirely, and the group-detail page subtitle rendered at the table-cell size)."""
+    absent entirely, and the group-detail page subtitle rendered at the table-cell size).
+
+    The emitted-class half reads the scripts rather than a hand-kept list (dev/changelog/1481):
+    the list caught only a class somebody remembered to add, and the first run of the scan
+    found an account dot drawn with a class no stylesheet named, so it had no size and never
+    showed (dev/docs/BUGS.md 2026-11-09)."""
 
     # Emitted by static/js/group-detail.js on the score, bitrate, frame-delivery and
     # drop-count cells and three rows of the stream-profile drawer.
@@ -518,10 +689,22 @@ class CssClassDefinedTests(unittest.TestCase):
             'Class emitted by JS but defined in no stylesheet, so the state it signals '
             f'renders in plain body colour and is silently absent: {missing}')
 
-    # Emitted only from template literals in static/js/dropdown.js and
-    # static/js/notifications.js (dev/changelog/440), so a missing rule is invisible to
-    # a grep of templates/ - which is how the two shipped invisible-UI bugs above got in.
-    JS_EMITTED_CLASSES = ('msel', 'mlbl', 'mopt', 'mo-t', 'mo-s', 'btn-accent',
+    # Shown with no rule on purpose: a wrapper whose children or inline style carry the
+    # rendering, named so the markup reads. An entry is a decision, not a to-do, and one no
+    # script emits any more fails the test below.
+    UNSTYLED_BY_DESIGN = {
+        'gd-q-item': 'a cell of .gd-q-grid; .gd-q-lbl and .gd-q-val under it carry the rules',
+        'rclabel': 'the text beside .rcx inside .rcollapse, which carries the rules',
+        'rd-rows': "wraps a capability's .rd-row list; each row carries the rules",
+        'dup-transfer-label': 'styled inline where dup-modal.js builds it',
+        'ext-scope-label': 'styled inline where dup-modal.js and group-modal.js build it',
+    }
+
+    # The hand-kept list the scan replaced: classes emitted only from template literals in
+    # static/js/dropdown.js and static/js/notifications.js (dev/changelog/440), then one group
+    # per miss (767, 821, 950, 1038, 1345, 1346). Kept as the proof the scan still reads the
+    # scripts that emit them - a scan matching nothing would pass the test above vacuously.
+    HAND_LISTED_BEFORE = ('msel', 'mlbl', 'mopt', 'mo-t', 'mo-s',
                           'svc-enable', 'rt-cl', 'rt-none', 'alert-severity',
                           # The shared filter bar (static/js/filter-bar.js). Two of these
                           # shipped with no rule at all: the chip's remove glyph drew as
@@ -543,24 +726,71 @@ class CssClassDefinedTests(unittest.TestCase):
                           'rd-capact', 'rd-whylist', 'rd-row', 'rd-rname', 'rd-rcaret',
                           'rd-rfound', 'rd-ract', 'rd-muted', 'rd-detail', 'rd-dk', 'rd-dv',
                           'rd-comp', 'rd-progress', 'rd-bar', 'rd-intro',
-                          # The Readiness link's nav badges and rail pip. The markup
-                          # is in base.html, but only applyReadiness() ever shows them, and
-                          # both badges shipped with no rule, drawn grey like any plain
-                          # count (dev/docs/BUGS.md 2026-09-18 @ 09:48:43 PM,
-                          # dev/changelog/1038).
-                          'nav-count-ready-bad', 'nav-count-ready-warn', 'pip-ready',
                           # Columns tucked away for room on the channel search, and the
                           # group page's cards-for-room note and wrapping name cell
                           # (dev/changelog/1345, 1346).
                           'col-tucked', 'cols-tucked', 'gd-room-note', 'gd-c-name')
 
-    def test_js_emitted_component_classes_are_defined(self):
-        text = '\n'.join(t for _p, t in _css_sources())
-        missing = [c for c in self.JS_EMITTED_CLASSES if not re.search(rf'\.{c}\b\s*[,{{ ]', text)]
+    # Markup a template writes that only a script ever shows: the Readiness link's nav
+    # badges and rail pip in base.html, which applyReadiness() unhides. The scan above reads
+    # what scripts emit, so these stay a named list; both badges shipped with no rule, drawn
+    # grey like any plain count (dev/docs/BUGS.md 2026-09-18 @ 09:48:43 PM,
+    # dev/changelog/1038). `btn-accent` reaches its markup as a function argument
+    # (notifications.js -> dropdownTriggerHtml), which the scan cannot read either.
+    TEMPLATE_SHOWN_BY_SCRIPT = ('nav-count-ready-bad', 'nav-count-ready-warn', 'pip-ready',
+                                'btn-accent')
+
+    def test_template_classes_only_a_script_shows_are_defined(self):
+        defined = css_rule_classes()
+        missing = [c for c in self.TEMPLATE_SHOWN_BY_SCRIPT if c not in defined]
         self.assertEqual(
             missing, [],
-            'Class emitted by JS but defined in no stylesheet or <style> block, so the '
-            f'component renders unstyled and is silently wrong: {missing}')
+            'Class only a script ever shows but defined in no stylesheet or <style> block, '
+            f'so the state it signals renders as plain body text: {missing}')
+
+    def _emitted(self):
+        """{class: {script, ...}} over every script a page runs."""
+        emitted = {}
+        for path, text in _js_sources():
+            for name in js_emitted_classes(text):
+                emitted.setdefault(name, set()).add(_rel(path))
+        return emitted
+
+    def _selected(self):
+        selected = set()
+        for _path, text in _js_sources():
+            selected |= js_selected_classes(text)
+        # A class a test reaches for is a hook too: tests/support/*.mjs drive the pages.
+        for ext in ('.mjs', '.py'):
+            for path in _walk(os.path.join(ROOT, 'tests'), ext):
+                selected |= js_selected_classes(_read(path))
+        return selected
+
+    def test_every_class_a_script_shows_has_a_rule(self):
+        defined = css_rule_classes()
+        selected = self._selected()
+        missing = sorted(f'{name} ({", ".join(sorted(paths))})'
+                         for name, paths in self._emitted().items()
+                         if name not in defined and name not in selected
+                         and name not in self.UNSTYLED_BY_DESIGN)
+        self.assertEqual(
+            missing, [],
+            'Class a script puts on an element but defined in no stylesheet or <style> block, '
+            'so the component renders unstyled and is silently wrong. Give it its rule; a class '
+            'a script reads back is a hook and needs none; a wrapper that needs none goes in '
+            'UNSTYLED_BY_DESIGN with its reason:\n' + '\n'.join(missing))
+
+    def test_the_scan_still_sees_the_classes_the_list_named(self):
+        emitted = self._emitted()
+        unseen = [c for c in self.HAND_LISTED_BEFORE if c not in emitted]
+        self.assertEqual(unseen, [],
+                         'the scan no longer sees classes the scripts still emit - it has '
+                         f'stopped reading them rather than gone clean: {unseen}')
+
+    def test_an_unstyled_by_design_entry_is_still_emitted(self):
+        emitted = self._emitted()
+        stale = sorted(c for c in self.UNSTYLED_BY_DESIGN if c not in emitted)
+        self.assertEqual(stale, [], f'allowlisted but no script emits it any more: {stale}')
 
     def test_no_duplicate_top_level_class_definition(self):
         """A class defined twice at equal specificity silently resolves to whichever came
@@ -4079,6 +4309,52 @@ def find_defaulted_add_columns(source):
     return sorted(found)
 
 
+_CREATE_TABLE_STMT_RE = re.compile(
+    r'CREATE TABLE(?:\s+IF NOT EXISTS)?\s+(\w+)\s*\((.*)\)\s*$', re.I | re.S)
+_CREATE_DEFAULT_RE = re.compile(r"\bDEFAULT\s+('(?:[^']|'')*'|\S+)", re.I)
+_TABLE_CONSTRAINT_HEADS = ('CONSTRAINT', 'UNIQUE', 'PRIMARY', 'FOREIGN', 'CHECK')
+
+
+def _top_level_parts(body):
+    """A CREATE TABLE body split on the commas between its column and constraint definitions,
+    never on one inside a parenthesis (`UNIQUE (a, b)`, `VARCHAR(512)`)."""
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(body):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif ch == ',' and depth == 0:
+            parts.append(body[start:i])
+            start = i + 1
+    parts.append(body[start:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+def find_defaulted_create_table_columns(source):
+    """Every (table, column, DEFAULT literal) a CREATE TABLE in a string literal of `source`
+    declares - one statement per literal, or each statement of an executescript body. Table
+    constraints are not columns. The sibling of find_defaulted_add_columns(): a defaulted
+    column inside a step's CREATE TABLE was never compared with its model until
+    dev/docs/BUGS.md 2026-11-07 found twelve of them by hand."""
+    found = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        for stmt in node.value.split(';'):
+            m = _CREATE_TABLE_STMT_RE.match(stmt.strip())
+            if not m:
+                continue
+            for part in _top_level_parts(m.group(2)):
+                name = part.split(None, 1)[0]
+                if name.upper() in _TABLE_CONSTRAINT_HEADS:
+                    continue
+                default = _CREATE_DEFAULT_RE.search(part)
+                if default:
+                    found.add((m.group(1), name, default.group(1)))
+    return sorted(found)
+
+
 #: _model_server_default's answer for a column the current models no longer declare, which
 #: is not the same as a column declaring no server_default.
 NO_SUCH_COLUMN = object()
@@ -4124,8 +4400,9 @@ class MigrationServerDefaultParityTests(unittest.TestCase):
     """
 
     def _migration_defaults(self):
-        return find_defaulted_add_columns(
-            _read(os.path.join(APP_DIR, 'migrations.py')))
+        source = _read(os.path.join(APP_DIR, 'migrations.py'))
+        return sorted(set(find_defaulted_add_columns(source))
+                      | set(find_defaulted_create_table_columns(source)))
 
     def test_every_defaulted_migration_column_matches_its_model(self):
         offenders = []
@@ -4153,6 +4430,66 @@ class MigrationServerDefaultParityTests(unittest.TestCase):
         # whose name and DDL come from a loop over a list of tuples.
         self.assertIn(('channels', 'url_normalizable', '1'), found)
         self.assertIn(('accounts', 'account_type', "'m3u'"), found)
+        # And a column declared inside a CREATE TABLE, in an executescript body
+        # (dev/docs/BUGS.md 2026-11-09).
+        self.assertIn(('sports_leagues', 'match_terms', "'[]'"), found)
+        self.assertIn(('sports_images', 'tries', '0'), found)
+
+
+class CreateTableDefaultScanCorrectnessTests(unittest.TestCase):
+    """Regression coverage for find_defaulted_create_table_columns(), the shapes that exist in
+    app/migrations.py."""
+
+    def test_each_defaulted_column_of_an_executescript_body(self):
+        source = ('def step(conn, cur):\n'
+                  '    cur.executescript("""\n'
+                  '        CREATE TABLE IF NOT EXISTS widgets (\n'
+                  '            id INTEGER NOT NULL PRIMARY KEY,\n'
+                  '            tries INTEGER NOT NULL DEFAULT 0,\n'
+                  "            names TEXT NOT NULL DEFAULT '[]',\n"
+                  "            note VARCHAR(512) NOT NULL DEFAULT '',\n"
+                  '            CONSTRAINT uq_widget UNIQUE (tries, names)\n'
+                  '        );\n'
+                  '        CREATE INDEX IF NOT EXISTS ix_widgets_tries ON widgets (tries);\n'
+                  '        CREATE TABLE IF NOT EXISTS gadgets (\n'
+                  '            id INTEGER NOT NULL PRIMARY KEY,\n'
+                  '            flag BOOLEAN NOT NULL DEFAULT 0\n'
+                  '        );\n'
+                  '    """)\n')
+        self.assertEqual(find_defaulted_create_table_columns(source), [
+            ('gadgets', 'flag', '0'),
+            ('widgets', 'names', "'[]'"),
+            ('widgets', 'note', "''"),
+            ('widgets', 'tries', '0'),
+        ])
+
+    def test_a_whole_literal_statement_is_found_too(self):
+        source = ("def step(conn, cur):\n"
+                  "    cur.execute('''\n"
+                  "        CREATE TABLE IF NOT EXISTS widgets (\n"
+                  "            id INTEGER PRIMARY KEY,\n"
+                  "            position INTEGER NOT NULL DEFAULT 0\n"
+                  "        )\n"
+                  "    ''')\n")
+        self.assertEqual(find_defaulted_create_table_columns(source),
+                         [('widgets', 'position', '0')])
+
+    def test_columns_without_a_default_are_ignored(self):
+        source = ('def step(conn, cur):\n'
+                  '    cur.executescript("""\n'
+                  '        CREATE TABLE IF NOT EXISTS widgets (\n'
+                  '            id INTEGER NOT NULL PRIMARY KEY,\n'
+                  '            name VARCHAR(255) NOT NULL,\n'
+                  '            FOREIGN KEY (id) REFERENCES gadgets (id)\n'
+                  '        );\n'
+                  '    """)\n')
+        self.assertEqual(find_defaulted_create_table_columns(source), [])
+
+    def test_a_create_table_in_prose_is_not_a_statement(self):
+        source = ("def step(conn, cur):\n"
+                  "    '''CREATE TABLE IF NOT EXISTS is how this used to be written.'''\n"
+                  "    cur.execute('ALTER TABLE widgets ADD COLUMN flag INTEGER DEFAULT 1')\n")
+        self.assertEqual(find_defaulted_create_table_columns(source), [])
 
 
 class MigrationServerDefaultScanCorrectnessTests(unittest.TestCase):
@@ -4331,9 +4668,27 @@ class RedundantPrefixIndexTests(unittest.TestCase):
     tracked in the backlog, not worked around by scanning migration SQL for CREATE INDEX.
     """
 
+    @staticmethod
+    def _predicates():
+        """{(table, index name): its WHERE text, or ''} - a partial index holds only the rows
+        its predicate admits, so a column prefix across two different predicates is two
+        indexes over different rows, not one standing in for the other (sports_matches' two
+        anchors, dev/changelog/1462)."""
+        import importlib
+        importlib.import_module('app.database')
+        db = importlib.import_module('app').db
+        out = {}
+        for name, table in db.metadata.tables.items():
+            for idx in table.indexes:
+                where = idx.dialect_options['sqlite'].get('where')
+                out[(name, idx.name)] = '' if where is None else str(where)
+        return out
+
     def test_no_unmeasured_index_is_a_prefix_of_another(self):
+        where = self._predicates()
         offenders = [o for o in _prefix_redundant_indexes(_model_indexes())
-                     if o not in _MEASURED_PREFIX_EXEMPTIONS]
+                     if o not in _MEASURED_PREFIX_EXEMPTIONS
+                     and where.get((o[0], o[1]), '') == where.get((o[0], o[2]), '')]
         self.assertEqual(
             offenders, [],
             'these indexes can never answer anything the wider index cannot, and can be '
@@ -4968,6 +5323,27 @@ class CiWorkflowToolingTests(unittest.TestCase):
             self.text, r'\bnpm (ci|install)\b',
             'the workflow stopped installing node_modules, so every jsdom-backed '
             'client-side test now skips itself on the runner while CI still reports green')
+
+    def test_it_lints_before_the_suite(self):
+        """flake8 is a merge gate and not only a close-out habit (dev/changelog/1482): an
+        unused import or an undefined name in a file no test imports is red here. It installs
+        from requirements-dev.txt, so requirements.txt stays what an end-user install reads,
+        and it runs on the suite's tiers, never on the nightly capture tier."""
+        lint = self._step_containing('flake8 app/')
+        self.assertIsNotNone(lint, 'no workflow step runs flake8, so an outside pull request '
+                             'is linted by nobody')
+        self.assertIn('requirements-dev.txt', lint)
+        cond = re.search(r'^\s*if:\s*(.+)$', lint, re.M)
+        self.assertTrue(cond, 'the lint step has no if:, so it runs on the capture tier too')
+        self.assertIn('push', cond.group(1))
+        self.assertIn('pull_request', cond.group(1))
+        self.assertNotIn('schedule', cond.group(1))
+        steps = re.split(r'\n      - (?:name|uses):', self.text)
+        lint_at = next(i for i, s in enumerate(steps) if 'flake8 app/' in s)
+        suite_at = next(i for i, s in enumerate(steps)
+                        if re.search(r'run: \./run_tests\.sh\s*$', s, re.M))
+        self.assertLess(lint_at, suite_at,
+                        'lint runs after the suite, so a one-second finding waits twelve minutes')
 
     def test_the_capture_tier_runs_on_a_schedule_and_never_per_push(self):
         """DESIGN-simulator.md D9 (dev/changelog/1228): the capture tier is ten minutes of

@@ -11,7 +11,11 @@
    - a .ts or .mkv plays through the preview pipeline (app/preview.py file sessions): ffmpeg
      repackages the file into a rolling HLS window from a chosen position, and hls.js plays it.
      That window is not the whole file, so the modal's own controls do the seeking, and a seek
-     is a new session at the new position. Nothing is re-encoded but audio a browser lacks.
+     is a new session at the new position. Nothing is re-encoded but audio a browser lacks,
+     unless the viewer asks.
+   When the browser cannot decode either, the player says what the browser said and offers a
+   re-encode on the GPU, which plays through the pipeline whichever route Play took and stays
+   re-encoded through every seek (dev/changelog/1461).
 
    The page's delegated click handler hands `play` and `download` here through
    window.recordingDialogs; the TV Guide's program chooser calls the same `play` for a
@@ -83,35 +87,41 @@
     showToast(`Downloading ${info.name} (${fmtBytes(info.size)}).`);
   }
 
-  // The <video> element's own error, in words, with the codecs the file was measured to hold.
-  function mediaErrorText(err, info) {
-    const codecs = `video ${info.video_codec || 'unknown'}, audio ${info.audio_codec || 'unknown'}`;
-    const detail = err && err.message ? ` (${err.message})` : '';
-    const elsewhere = ' Download it and play it in VLC or another media player.';
-    const caveat = info.caveat ? `\n${info.caveat}` : '';
-    if (!err) return `Playback failed.${elsewhere}`;
-    if (err.code === MediaError.MEDIA_ERR_NETWORK) {
-      return `Lost the connection to ChannelBin while loading the file${detail}. Close this and press Play to try again.`;
-    }
-    if (err.code === MediaError.MEDIA_ERR_DECODE) {
-      return `This browser could not decode part of the file: ${codecs}${detail}.${caveat}\n${elsewhere.trim()}`;
-    }
-    if (err.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
-      return `This browser cannot play this file: ${codecs}${detail}.${caveat}\n${elsewhere.trim()}`;
-    }
-    return `Playback failed${detail}.${elsewhere}`;
+  // The file's codecs as the recording measured them - facts about the file, not a guess at
+  // what the browser objected to.
+  const holds = (info) => `The file holds video ${info.video_codec || 'of an unmeasured codec'}, audio ${info.audio_codec || 'of an unmeasured codec'}.`;
+  const ELSEWHERE = 'Or download it and play it in VLC or another media player.';
+
+  // The browser could not decode the file: what it said, what the file holds, and the caveat
+  // the server had for it. The re-encode is offered under it (offerReencode).
+  function undecodableText(said, info, reencoded) {
+    const caveat = info.caveat && !reencoded ? `\n${info.caveat}` : '';
+    return `This browser could not play ${reencoded ? 'the re-encoded video' : 'this file'}: ${said}.\n${holds(info)}${caveat}\n${ELSEWHERE}`;
   }
 
-  function playNative(player, data, isClosed) {
+  // `onReencode` switches the dialog to a re-encoded pipeline session.
+  function playNative(player, data, isClosed, onReencode) {
     const { video, setStatus, tryPlay } = player;
+    // False once the dialog has switched to a re-encoded pipeline session on the same
+    // <video>, whose events are that session's to answer.
+    let active = true;
+    let reported = false;   // the decode failure is on screen; a repeat asks nothing again
     const woke = data.opened_seconds >= WOKE_NOTE_AFTER_S
       ? ` The storage took ${Math.round(data.opened_seconds)}s to answer.` : '';
     video.addEventListener('loadedmetadata', tryPlay, { once: true });
     video.addEventListener('playing', () => {
-      if (!isClosed()) setStatus(`Playing ${data.name}.${woke}`, 'ok');
+      if (active && !isClosed()) setStatus(`Playing ${data.name}.${woke}`, 'ok');
     });
     video.addEventListener('error', () => {
-      if (!isClosed() && video.getAttribute('src')) setStatus(mediaErrorText(video.error, data), 'error');
+      if (!active || reported || isClosed() || !video.getAttribute('src')) return;
+      const err = video.error;
+      if (err && err.code === MediaError.MEDIA_ERR_NETWORK) {
+        setStatus(`Lost the connection to ChannelBin while loading the file (${playbackFailureText(video)}). Close this and press Play to try again.`, 'error');
+        return;
+      }
+      reported = true;
+      setStatus(undecodableText(playbackFailureText(video), data, false), 'error');
+      player.offerReencode(() => { active = false; player.detach(); onReencode(); });
     });
     setStatus(`Loading ${data.name}…${data.caveat ? `\n${data.caveat}` : ''}`);
     video.src = data.media_url;
@@ -155,6 +165,8 @@
     let dragging = false;
     let switching = false;    // our own detach, whose pause event is not the user's
     let recovered = false;
+    let failed = false;       // this session's decode failure has been reported
+    let reencode = !!data.reencode;   // the viewer asked for the GPU re-encode
     let pollTimer = null;
     let seekTimer = null;
     let holdTimer = null;
@@ -194,6 +206,11 @@
     };
 
     const playingText = () => {
+      if (session && session.reencode) {
+        const where = capture && atLive() ? 'Live, about ten seconds behind the capture. ' : '';
+        return `Playing. ${where}ChannelBin re-encodes the video on the GPU, and the audio to AAC, ` +
+          'so this browser can play it; skipping starts it again at the new spot.';
+      }
       const audio = session && session.transcode_audio
         ? ' Audio is re-encoded to AAC so the browser can decode it.' : '';
       if (capture) {
@@ -278,12 +295,41 @@
       showPosition();
     };
 
+    // The browser could not decode what it was given: its own words, then the re-encode -
+    // unless this already was one.
+    const undecodable = (d) => {
+      if (failed) return;
+      failed = true;
+      const said = playbackFailureText(video, d);
+      const reencoded = !!(session && session.reencode);
+      detach();
+      pauseBtn.textContent = 'Play';
+      setStatus(undecodableText(said, data, reencoded), 'error');
+      if (!reencoded) {
+        player.offerReencode(() => { reencode = true; note = ''; start(held); });
+      }
+    };
+    // A decode failure can reach the element alone, with hls.js never calling it fatal
+    // (live-preview.js, dev/changelog/1461): one recovery, then the failure.
+    const recoverOrFail = (d) => {
+      if (hls && !recovered) {
+        recovered = true;
+        hls.recoverMediaError();
+        return;
+      }
+      undecodable(d);
+    };
+    video.addEventListener('error', () => {
+      if (isClosed() || !attached || !video.error) return;
+      if (video.error.code === MediaError.MEDIA_ERR_NETWORK) return;   // the poll names a stop
+      recoverOrFail(null);
+    });
+
     const onHlsError = (_evt, d) => {
       if (!d || !d.fatal || !hls) return;
       const Hls = window.Hls;
-      if (d.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
-        recovered = true;
-        hls.recoverMediaError();
+      if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        recoverOrFail(d);
         return;
       }
       if (d.type === Hls.ErrorTypes.NETWORK_ERROR && serverDone) {
@@ -294,13 +340,10 @@
       }
       detach({ stopServer: d.type !== Hls.ErrorTypes.NETWORK_ERROR });
       pauseBtn.textContent = 'Play';
-      const codecs = `video ${data.video_codec || 'unknown'}, audio ${data.audio_codec || 'unknown'}`;
-      if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
-        setStatus(`This browser cannot decode this file: ${codecs} (${d.details}).${data.caveat ? `\n${data.caveat}` : ''}\nDownload it and play it in VLC or another media player.`, 'error');
-      } else if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
+      if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
         setStatus(`Lost the connection to ChannelBin while playing (${d.details}). Press Play to try again.`, 'error');
       } else {
-        setStatus(`Playback failed (${d.details}). Press Play to try again.`, 'error');
+        setStatus(`Playback failed: ${playbackFailureText(video, d)}. Press Play to try again.`, 'error');
       }
     };
 
@@ -348,7 +391,7 @@
           if (isClosed() || token !== gen || !session) return;
           if (s.state === 'STOPPED') { ended(s); return; }
           if (s.state === 'READY' && !attached && !hls) {
-            setStatus(atLive() ? 'Starting live…' : `Starting at ${fmtDur(held)}…`);
+            setStatus(`${reencode ? 'Starting the re-encode' : 'Starting'} ${atLive() ? 'live' : `at ${fmtDur(held)}`}…`);
             attach(token);
           }
           if (s.source_done) serverDone = true;
@@ -366,17 +409,20 @@
     function start(at, { live = false, movedFrom = null, stopped = '' } = {}) {
       const token = ++gen;
       clearTimeout(seekTimer);
+      player.clearOffer();
       pending = null;
       detach({ stopServer: false });
       held = live ? total() : clamp(at);
       finished = false;
       serverDone = false;
       recovered = false;
+      failed = false;
       pauseBtn.textContent = 'Pause';
-      setStatus(live ? 'Starting live…' : `Starting at ${fmtDur(held)}…`);
+      setStatus(`${reencode ? 'Starting the re-encode' : 'Starting'} ${live ? 'live' : `at ${fmtDur(held)}`}…`);
       showPosition();
       const body = { offset: held };
       if (live) body.live = true;
+      if (reencode) body.reencode = true;
       if (movedFrom !== null) body.moved_from = movedFrom;
       jsonFetch(data.playback_url, { method: 'POST', body: JSON.stringify(body) })
         .then((s) => {
@@ -514,8 +560,11 @@
         // Nothing to download while the recording is still capturing.
         dlBtn.disabled = data.download === false;
         dlBtn.hidden = data.download === false;
-        if (data.native) playNative(player, data, isClosed);
-        else if (data.pipeline || data.capture) pipeline = playPipeline(player, data, isClosed);
+        if (data.native) {
+          playNative(player, data, isClosed, () => {
+            pipeline = playPipeline(player, Object.assign({}, data, { reencode: true }), isClosed);
+          });
+        } else if (data.pipeline || data.capture) pipeline = playPipeline(player, data, isClosed);
         else setStatus(data.reason, 'warn');
       })
       .catch((e) => {

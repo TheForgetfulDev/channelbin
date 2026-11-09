@@ -101,12 +101,14 @@ class VodRow:
 
 class GuideChannel:
     """A channel element in a guide: its id, the name it is listed under, and whether the
-    guide carries programs for it (a real guide's directory often lists more than it fills)."""
-    __slots__ = ('guide_id', 'display_name', 'station', 'has_programs', 'icon')
+    guide carries programs for it (a real guide's directory often lists more than it fills).
+    `filler` is a title the guide repeats in place of programs, as some guide sources do for
+    an event channel: its own name, block after block (the filler_guide fault)."""
+    __slots__ = ('guide_id', 'display_name', 'station', 'has_programs', 'icon', 'filler')
 
-    def __init__(self, guide_id, display_name, station, has_programs, icon):
+    def __init__(self, guide_id, display_name, station, has_programs, icon, filler=None):
         self.guide_id, self.display_name, self.station = guide_id, display_name, station
-        self.has_programs, self.icon = has_programs, icon
+        self.has_programs, self.icon, self.filler = has_programs, icon, filler
 
 
 class PanelLineup:

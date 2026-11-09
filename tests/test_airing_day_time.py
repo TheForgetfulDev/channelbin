@@ -351,7 +351,7 @@ class DayTimeFacetTests(_DayTimeCase):
         shows - and nothing at all without One row per channel."""
         on = SearchState(grain=GRAIN_AIRINGS, standing=only_hiding('firstonly'), facets=None)
         uncounted = cs.uncounted_facets(on)
-        self.assertEqual(sorted(uncounted), ['dow', 'duration', 'tag', 'tod', 'when'])
+        self.assertEqual(sorted(uncounted), ['dow', 'duration', 'mark', 'tag', 'tod', 'when'])
         self.assertTrue(all('One row per channel' in why for why in uncounted.values()))
         counted = compute_facets(on, self.context())
         self.assertEqual(set(uncounted) & set(counted), set())

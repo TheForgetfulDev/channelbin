@@ -17,9 +17,9 @@ and bulk re-inserts 270k-410k rows about six times a day. Trigger-maintained FTS
 1.16M-row rewrite from 31.2s into 314.8s on insert and 6.1s into 89.1s on delete - a 10x
 write penalty holding SQLite's single write lock the whole time. Do not add triggers here
 later "for freshness". A sync close-out compares the programs index against epg_entries and
-writes only the difference, which ends at the same rows a full rebuild would; everything else
-rebuilds wholesale, and the daily EPG cleanup's full rebuild is also what compacts the
-segments the incremental passes leave behind (dev/changelog/1416).
+writes only the difference, which ends at the same rows a full rebuild would, and so does the
+daily EPG cleanup, which then compacts the segments those passes leave behind with FTS5's own
+incremental merge (dev/changelog/1416, 1460). Everything else rebuilds wholesale.
 
 **The programs rebuild is chunked, and that is a correctness constraint, not a tuning
 choice.** SQLite has one write lock and a 10s busy_timeout; populating chan_prog_fts in a
@@ -51,6 +51,7 @@ from datetime import datetime
 from itertools import groupby
 
 from sqlalchemy import Integer, column, func, or_, select, table, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from . import admission, db
 from .database import ACCOUNT_STATUS_SYNCING, Account, Channel, EPGEntry, SearchIndexState
@@ -100,9 +101,39 @@ FTS_CHUNK_ROWS = 10_000
 # chunk because one row here costs an FTS delete or an FTS insert on an index with live
 # segments: 3,000 rows measured under 1s held, against 1.5s for 10,000 inserts into an empty
 # index. An automerge that lands inside a chunk is not bounded by this either way - the worst
-# measured was 8.1s at 3,000 rows and 9.7s at 10,000, against 7.6-30s for the 'delete-all' every
-# full rebuild takes.
+# measured was 8.1s at 3,000 rows and 9.7s at 10,000, against 7.6-44s for the 'delete-all'
+# every full rebuild took before its clear read the index first (_CLEAR_PREREAD_SQL).
 DIFF_CHUNK_ROWS = 5_000
+
+# Read ahead of a full rebuild's 'delete-all', with no write lock held, so the pages it is
+# about to free are already in memory. 'delete-all' has to visit every page of the index's
+# shadow tables, and on a cold cache that reading is nearly all of its time: on a copy of the
+# production database's 580 MB index, on the dev box, another connection's write waited 32.7 s
+# behind it cold and 0.44 s after these reads (dev/changelog/1460). The reads themselves take
+# about as long, but a reader in WAL mode blocks no writer. If the pages are pushed out of
+# memory before the 'delete-all' runs, it is as slow as it would have been without them, never
+# slower. Each one reads every column it can so the overflow pages come in too.
+_CLEAR_PREREAD_SQL = (
+    'SELECT SUM(LENGTH(block)) FROM chan_prog_fts_data',
+    'SELECT COUNT(*), SUM(pgno) FROM chan_prog_fts_idx',
+    'SELECT SUM(LENGTH(sz)) FROM chan_prog_fts_docsize',
+)
+
+# What `PRAGMA secure_delete` reads back as, against what it has to be set to: it reads 2 for
+# FAST, and setting it to 2 means ON.
+_SECURE_DELETE_SETTING = {0: 'OFF', 1: 'ON', 2: 'FAST'}
+
+# Pages per FTS5 'merge' when the daily cleanup compacts the programs index: each call writes
+# about this many pages of merged index and commits. FTS5's documented way to optimize a large
+# index in steps - one 'merge' with -N, then 'merge' with N until a call changes nothing. On a
+# copy of the production database, cold, on the dev box: 51 transactions, the longest 0.74 s,
+# 27 s in all, 149,487 pages down to 103,642, and another connection's write waited 0.63 s at
+# most (dev/changelog/1460). 'optimize', the one-statement version, held 15-27 s.
+COMPACT_MERGE_PAGES = 2_000
+# A bound on the loop, not a target: at COMPACT_MERGE_PAGES a call, this is several times the
+# largest index measured. Reaching it stops the pass with a WARNING; the next day's pass
+# carries on from where the merge stands.
+_COMPACT_MAX_UNITS = 1_000
 
 # Past this many differing rows the comparison stops and the full rebuild runs instead. This
 # bounds memory and nothing else, since the rows to add are held until the write phase: holding
@@ -196,12 +227,8 @@ REBUILD_SQL = {
         ("INSERT INTO ch_fts(ch_fts) VALUES('rebuild')",),
     ),
     SEARCH_INDEX_PROGRAMS: (
-        # Clearing is its own unit because it is the one part that cannot be chunked. Measured
-        # 2.71s on a 260MB index in 2026-07, and 7.6-30s on 367MB in 2026-11 on a slower box, which
-        # can exceed busy_timeout. Since dev/changelog/1416 a healthy install pays this once a
-        # day rather than once per sync. Whether it needs section 5's chunked clear is tracked
-        # in the backlog.
-        ("INSERT INTO chan_prog_fts(chan_prog_fts) VALUES('delete-all')",),
+        # Clearing the FTS side comes first and is not in this table: `_clear_programs_units()`
+        # yields it, because how many chunks it takes is read from the index.
         (
             # IF EXISTS, not a bare DROP: a retry re-enters here with the temp table
             # possibly still present on this connection.
@@ -240,6 +267,8 @@ def rebuild_units(name: str, scalar):
     repopulated by the unit above, so its ids start at 1 and are contiguous - which is only
     true here. Between full rebuilds _apply_program_changes() leaves gaps.
     """
+    if name == SEARCH_INDEX_PROGRAMS:
+        yield from _clear_programs_units(scalar)
     for unit in REBUILD_SQL[name]:
         yield unit
     if name != SEARCH_INDEX_PROGRAMS:
@@ -251,6 +280,56 @@ def rebuild_units(name: str, scalar):
             'SELECT id, title, sub_title, description FROM chan_prog '
             f'WHERE id > {lo} AND id <= {lo + FTS_CHUNK_ROWS}',
         )
+
+
+def _clear_programs_units(scalar):
+    """Read the whole of chan_prog_fts with no write lock held, then yield the one unit that
+    empties it: FTS5's own 'delete-all', with `PRAGMA secure_delete` off for that statement.
+
+    Only documented interfaces: FTS5's 'delete-all' command, a pragma, and plain SELECTs.
+    Nothing here writes an FTS5 shadow table directly (dev/changelog/1460 replaced the version
+    that did). This is the rare path: a daily cleanup and every sync write only the difference,
+    so a full rebuild is a person's manual one, a repair of an index that is not STATUS_OK, or
+    a difference past DIFF_MAX_CHANGED_ROWS.
+
+    No documented way empties a large FTS5 index a bounded piece at a time. FTS5's per-row
+    'delete' only adds delete-keys, and the merge that then drops them frees every page in one
+    call (32 s on the production copy, after 79 s of deletes); with FTS5's 'secure-delete'
+    option on, one chunk of per-row deletes held the lock past 60 s. So the bound here is
+    the page cache: if the pages read below are pushed out before the 'delete-all' runs, it
+    holds the lock as long as it would have cold, which the rebuild's log line then names as
+    its longest transaction.
+
+    The two halves each take out one cost of 'delete-all' (numbers on the production copy,
+    dev box, a second connection writing every 50 ms):
+
+    - **The reading.** Freeing a table means visiting each of its pages, and cold that is
+      nearly all of the statement: 32.7 s held. `_CLEAR_PREREAD_SQL` has the detail.
+    - **The zeroing.** Debian's SQLite, which the shipped image and this box both use, is
+      built with SQLITE_SECURE_DELETE, so every freed page is overwritten with zeros: 600 MB
+      written into the WAL, and the other writer then waited 8.3 s behind the checkpoint even
+      with the pages read first. Off, for this one statement, it waited 0.44 s and the WAL
+      stayed at 3 MB. What secure_delete protects is deleted content lingering in free pages;
+      this content is listings text that chan_prog, epg_entries and the next build of this
+      index all hold in the same file anyway.
+
+    The setting goes back to what the connection had before the unit commits; pages are freed,
+    and zeroed or not, while the statement runs. If the unit fails between the two pragmas,
+    that one pooled connection keeps secure_delete off until it is closed, which is how SQLite
+    behaves wherever it was built without the option; nothing in this app depends on it.
+
+    The clear is one transaction, so the index goes from whole to empty with nothing in
+    between. It is still a window where a reader would get zero matches, which STATUS_BUILDING
+    covers.
+    """
+    for sql in _CLEAR_PREREAD_SQL:
+        scalar(sql)
+    restore = _SECURE_DELETE_SETTING.get(scalar('PRAGMA secure_delete'), 'ON')
+    yield (
+        'PRAGMA secure_delete=OFF',
+        "INSERT INTO chan_prog_fts(chan_prog_fts) VALUES('delete-all')",
+        f'PRAGMA secure_delete={restore}',
+    )
 
 
 def _diff_program_rows(want, have, max_changed: int):
@@ -555,15 +634,16 @@ def manual_rebuild_refusal() -> str:
 
 
 def rebuild_search_indexes(reason: str, names=SEARCH_INDEX_NAMES, refusable: bool = False,
-                           only_changes: bool = False) -> dict:
+                           only_changes: bool = False, compact: bool = False) -> dict:
     """Rebuild the named indexes and record the outcome. Returns {name: bool succeeded}.
 
     `only_changes=True` lets the programs index write just the rows that differ from
     epg_entries, when it can (see _why_programs_need_a_full_rebuild), and otherwise rebuilds it
     in full and logs why. The sync close-out asks for it because its cost is what grows with
     the install, and the janitor because the usual thing it finds is a few rows from a key edit.
-    The other callers stay full on purpose: a manual rebuild is a repair a person asked for, and
-    the daily EPG cleanup compacts the index.
+    The daily EPG cleanup asks for it too, with `compact=True`: after a successful rebuild the
+    programs index is compacted by `_compact_programs()`. A manual rebuild stays full on
+    purpose, because it is a repair a person asked for.
 
     Never raises: a rebuild failure must not turn an otherwise-successful sync into an
     ERROR, because the sync's own work is already committed and correct. Instead the index
@@ -601,11 +681,27 @@ def rebuild_search_indexes(reason: str, names=SEARCH_INDEX_NAMES, refusable: boo
                 results = {}
                 for name in names:
                     results[name] = _rebuild_one(name, reason, only_changes)
+                    if compact and name == SEARCH_INDEX_PROGRAMS and results[name]:
+                        _compact_programs(reason)
                 return results
             finally:
                 _rebuilding = False
     finally:
         admission.release(ticket)
+
+
+def _unit_label(statements) -> str:
+    """A rebuild unit in a few words, for the rebuild's log line."""
+    first = statements[0]
+    if any("'delete-all'" in stmt for stmt in statements):
+        return 'clearing the index'
+    if "'rebuild'" in first:
+        return 'rebuilding the channel index'
+    if 'chan_prog_stage' in first:
+        return 'restaging the program rows'
+    if first.startswith('INSERT INTO chan_prog_fts'):
+        return 'indexing a chunk of program rows'
+    return first[:60]
 
 
 def _rebuild_one(name: str, reason: str, only_changes: bool = False) -> bool:
@@ -619,6 +715,10 @@ def _rebuild_one(name: str, reason: str, only_changes: bool = False) -> bool:
         return db.session.execute(text(sql)).scalar()
 
     started = time.monotonic()
+    # (seconds, unit number, what it ran): the longest any one transaction of a full rebuild
+    # took, which is how long another writer could have waited behind it.
+    slowest = (0.0, 0, '')
+    units = 0
     try:
         # Read BEFORE the rebuild, never after. If the source moves while the rebuild is
         # running, a watermark read afterwards would describe data this index does not
@@ -648,8 +748,14 @@ def _rebuild_one(name: str, reason: str, only_changes: bool = False) -> bool:
             how = f'{len(add_rows)} rows added and {len(remove_ids)} removed'
         else:
             for statements in rebuild_units(name, _scalar):
+                unit_started = time.monotonic()
                 _run_unit_and_commit(statements)
+                units += 1
+                slowest = max(slowest, (time.monotonic() - unit_started, units,
+                                        _unit_label(statements)))
             how = f'full, because {why_full}' if why_full else 'full'
+            how += (f', {units} transactions, the longest {int(slowest[0] * 1000)}ms '
+                    f'(number {slowest[1]}: {slowest[2]})')
         row_count = _scalar(_ROW_COUNT_SQL[name])
     except Exception as exc:
         duration_ms = int((time.monotonic() - started) * 1000)
@@ -671,6 +777,59 @@ def _rebuild_one(name: str, reason: str, only_changes: bool = False) -> bool:
              fmt_bytes(current_wal_size_bytes()))
     _record_state(name, STATUS_OK, duration_ms, row_count, None, watermark)
     _alert_rebuild_failed(name, '', active=False)
+    return True
+
+
+def _compact_programs(reason: str) -> bool:
+    """Merge the programs index's segments with FTS5's 'merge' command, one bounded
+    transaction a call, until a call finds nothing left to merge. Returns whether it finished.
+
+    What a daily full rebuild used to do as a side effect. A sync writes only the rows that
+    changed, and FTS5 records a deleted row as a delete-key in a new segment rather than
+    removing it, so the index grows between compactions and a rare term gets slower (417-717 MB
+    against 367 MB compacted, 3-37 ms against 1-4 ms; DESIGN-search-indexes.md section 5). This
+    is FTS5's documented incremental form of 'optimize': 'merge' with -N once, which puts every
+    segment on one level, then 'merge' with N, each writing about N pages. A call that changes
+    fewer than two rows did nothing (the FTS5 documentation's own test), which ends the loop.
+
+    The content does not change, so the index stays STATUS_OK and readable throughout, and a
+    pass that stops partway leaves a consistent index that the next pass carries on with. A
+    failure is logged as a WARNING and leaves the index as it stood; nothing about the rows
+    is wrong, only their layout.
+    """
+    @retry_on_locked()
+    def _merge_and_commit(pages):
+        raw = db.session.connection().connection.driver_connection
+        before = raw.total_changes
+        db.session.execute(text(
+            f"INSERT INTO chan_prog_fts(chan_prog_fts, rank) VALUES('merge', {int(pages)})"))
+        changed = raw.total_changes - before
+        db.session.commit()
+        return changed
+
+    started = time.monotonic()
+    slowest, units, changed = 0.0, 0, 2
+    try:
+        while changed >= 2 and units < _COMPACT_MAX_UNITS:
+            unit_started = time.monotonic()
+            changed = _merge_and_commit(-COMPACT_MERGE_PAGES if units == 0
+                                        else COMPACT_MERGE_PAGES)
+            units += 1
+            slowest = max(slowest, time.monotonic() - unit_started)
+    except (sqlite3.Error, SQLAlchemyError) as exc:
+        db.session.rollback()
+        log.warning('Search index %r compaction (%s) failed after %d transactions: %s. The '
+                    'index is unchanged in content and stays in use; the next daily cleanup '
+                    'tries again.', SEARCH_INDEX_PROGRAMS, reason, units, exc)
+        return False
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if changed >= 2:
+        log.warning('Search index %r compaction (%s) stopped after %d transactions and %dms '
+                    'with merging still to do; the next daily cleanup carries on from here.',
+                    SEARCH_INDEX_PROGRAMS, reason, units, elapsed_ms)
+        return False
+    log.info('Search index %r compacted in %dms (%s): %d transactions, the longest %dms',
+             SEARCH_INDEX_PROGRAMS, elapsed_ms, reason, units, int(slowest * 1000))
     return True
 
 

@@ -501,6 +501,80 @@ tick(500); await settle();
 d.querySelector('.modal video').dispatchEvent(new w.Event('playing'));
 out.cap.paused = { ...capView(), posted: posted.slice() };
 closeModal();
+
+// ── The browser cannot decode it: its own words, then the GPU re-encode (dev/changelog/1461)
+const offerView = () => {
+  const box = d.querySelector('.modal .player-offer');
+  return { ...view(), offer: box ? box.textContent.trim() : null,
+    button: box && box.querySelector('button') ? box.querySelector('button').textContent : null };
+};
+let reencodeAnswer = { success: true, available: true, reason: '' };
+let reencodeAsked = 0;
+const reAnswer = (check) => (url) => {
+  if (url.endsWith('/file/check')) return respond(200, check);
+  if (url === '/api/preview/reencode') { reencodeAsked += 1; return respond(200, reencodeAnswer); }
+  if (url === '/api/recordings/7/playback') {
+    const s = session(`s${nextSid++}`);
+    return respond(200, { ...s, reencode: !!(posted.length && posted[posted.length - 1][1].reencode) });
+  }
+  const m = url.match(/^\/api\/preview\/(s\d+)\/status$/);
+  if (m) return respond(200, { success: true, session_id: m[1], state: 'READY' });
+  if (url.endsWith('/stop')) return respond(200, { success: true, stopped: true });
+  return respond(404, { error: `unexpected ${url}` });
+};
+const DECODE = { code: 3, message: 'PIPELINE_ERROR_DECODE: Failed to send video packet for decoding' };
+out.re = {};
+
+// A converted mp4 the browser's own player cannot decode: offered, then played re-encoded
+// through the pipeline from the start.
+answer = reAnswer(OK({ video_codec: 'hevc', duration: 7200, playback_url: '/api/recordings/7/playback',
+  caveat: 'The video is HEVC (H.265). Safari plays it, and Chrome or Edge do on hardware with an HEVC decoder; Firefox does not.' }));
+posted.length = 0;
+w.recordingDialogs.play(7);
+await settle();
+let rv = d.querySelector('.modal video');
+setMedia(rv, { error: DECODE });
+rv.dispatchEvent(new w.Event('error'));
+await settle();
+out.re.native = offerView();
+const reBtn = d.querySelector('.modal .player-offer button');
+if (reBtn) reBtn.click();   // absent is what the test reports, not a crash
+await settle();
+out.re.nativeClicked = { ...offerView(), posted: posted.slice() };
+tick(500); await settle();
+const reHls = hlsMade[hlsMade.length - 1] || new FakeHls({});
+rv.dispatchEvent(new w.Event('playing'));
+out.re.nativePlaying = offerView();
+// The re-encode fails as well: no second offer, and the failure says it was the re-encode.
+setMedia(rv, { error: DECODE });
+reHls.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferAppendError' });
+reHls.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferAppendError' });
+await settle();
+out.re.reencodeFailed = { ...offerView(), recovered: reHls.recovered || 0 };
+closeModal();
+
+// A .ts through the pipeline: the element's own decode error is acted on - one recovery,
+// then the failure - before hls.js has called anything fatal. No GPU here: the reason, no
+// button.
+reencodeAnswer = { success: true, available: false,
+  reason: 'ChannelBin re-encodes only on a GPU, and there is no GPU device at /dev/dri/renderD128 (recording.post_process.vaapi_device).' };
+reencodeAsked = 0;
+answer = reAnswer(PIPE);
+posted.length = 0;
+w.recordingDialogs.play(7);
+await settle();
+tick(500); await settle();
+rv = d.querySelector('.modal video');
+const pHls = hlsMade[hlsMade.length - 1];
+setMedia(rv, { error: DECODE });
+rv.dispatchEvent(new w.Event('error'));
+await settle();
+out.re.pipeFirst = { ...offerView(), recovered: pHls.recovered || 0 };
+rv.dispatchEvent(new w.Event('error'));
+await settle();
+out.re.pipeFailed = { ...offerView(), recovered: pHls.recovered || 0, asked: reencodeAsked,
+  stops: posted.filter(([u]) => u.endsWith('/stop')).length };
+closeModal();
 delete w.Hls;
 
 out.dialogsRegistered = Object.keys(w.recordingDialogs).sort();

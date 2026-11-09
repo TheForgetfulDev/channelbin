@@ -34,6 +34,7 @@ from tests.support.seed import make_recording  # noqa: E402
 _HAVE_FFMPEG = shutil.which('ffmpeg') is not None
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENDOR_DIR = os.path.join(REPO, 'static', 'vendor', 'hls.js')
+HLS_JS = 'hls.min.js'
 
 _CFG = {'ffmpeg': {'path': 'ffmpeg', 'read_timeout_seconds': 20}, 'http': {}}
 
@@ -258,24 +259,35 @@ class VendoredPlayerTests(unittest.TestCase):
     that is actually there, or the license compliance it documents is fiction."""
 
     def test_library_license_and_notice_are_present(self):
-        for name in ('hls.light.min.js', 'LICENSE', 'NOTICE.md'):
+        for name in (HLS_JS, 'LICENSE', 'NOTICE.md'):
             self.assertTrue(os.path.isfile(os.path.join(VENDOR_DIR, name)), name)
         with open(os.path.join(VENDOR_DIR, 'LICENSE'), encoding='utf-8') as fh:
             self.assertIn('Apache License', fh.read())
 
     def test_notice_names_the_hash_of_the_shipped_file(self):
-        with open(os.path.join(VENDOR_DIR, 'hls.light.min.js'), 'rb') as fh:
+        with open(os.path.join(VENDOR_DIR, HLS_JS), 'rb') as fh:
             digest = hashlib.sha256(fh.read()).hexdigest()
         with open(os.path.join(VENDOR_DIR, 'NOTICE.md'), encoding='utf-8') as fh:
             notice = fh.read()
         self.assertIn(digest, notice)
         self.assertRegex(notice, r'Version: \d+\.\d+\.\d+')
 
-    def test_page_loads_the_player_from_the_vendored_path_only(self):
-        with open(os.path.join(REPO, 'templates', 'channels', 'detail.html'), encoding='utf-8') as fh:
-            html = fh.read()
-        self.assertIn('vendor/hls.js/hls.light.min.js', html)
-        self.assertNotRegex(html, r'https?://[^"\']*hls')
+    def test_every_player_page_loads_the_vendored_file(self):
+        for page in ('guide.html', 'recording_detail.html', 'channels/detail.html',
+                     'channels/group_detail.html'):
+            with open(os.path.join(REPO, 'templates', page), encoding='utf-8') as fh:
+                html = fh.read()
+            refs = re.findall(r"data-hls-js=\"\{\{ url_for\('static', filename='([^']+)'\) \}\}\"",
+                              html)
+            self.assertTrue(refs, page)
+            self.assertEqual(set(refs), {f'vendor/hls.js/{HLS_JS}'}, page)
+            self.assertNotRegex(html, r'https?://[^"\']*hls')
+
+    def test_the_build_carries_hevc_in_mpeg_ts(self):
+        # The light build refuses HEVC in a .ts before the browser's decoder is asked (fatal
+        # fragParsingError, dev/docs/BUGS.md 2026-11-06), and every preview segment is a .ts.
+        with open(os.path.join(VENDOR_DIR, HLS_JS), encoding='utf-8') as fh:
+            self.assertNotIn('Unsupported HEVC in M2TS', fh.read())
 
 
 class _Live(unittest.TestCase):
@@ -901,3 +913,261 @@ class FilePlaybackRouteRefusalTests(_Live):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ── The GPU re-encode a viewer asks for after a decode failure (dev/changelog/1461) ─────────
+_DEVICE = '/dev/dri/renderD128'
+
+
+class BuildReencodeCmdTests(unittest.TestCase):
+    """The command half of a re-encode: the device is opened before the input, the video is
+    decoded on the CPU and encoded on the GPU, and the audio is AAC whatever it was."""
+
+    def _check(self, cmd):
+        joined = ' '.join(cmd)
+        i = cmd.index('-i')
+        self.assertLess(cmd.index('-vaapi_device'), i)
+        self.assertEqual(cmd[cmd.index('-vaapi_device') + 1], _DEVICE)
+        self.assertLess(cmd.index('-reinit_filter:v'), i)
+        self.assertNotIn('-c:v copy', joined)
+        self.assertNotIn('-hwaccel', joined)                 # decoding stays on the CPU
+        self.assertEqual(cmd[cmd.index('-c:v') + 1], 'h264_vaapi')
+        vf = cmd[cmd.index('-vf') + 1]
+        # Fitted (field by field) to one fixed size for the GPU's pool, THEN deinterlaced.
+        self.assertTrue(vf.startswith('scale='), vf)
+        self.assertIn(':interl=-1,', vf)
+        self.assertLess(vf.index('pad=w=1920:h=1080'), vf.index(',bwdif='))
+        self.assertTrue(vf.endswith('format=nv12,hwupload'), vf)
+        self.assertEqual(cmd[cmd.index('-fps_mode:v') + 1], 'passthrough')
+        self.assertEqual(cmd[cmd.index('-force_key_frames') + 1], 'expr:gte(t,n_forced*2)')
+        self.assertIn('-c:a aac', joined)
+        self.assertNotIn('libx264', joined)                  # never a CPU encode
+        return joined
+
+    def test_a_channel_preview_reencodes_on_the_device(self):
+        self._check(build_preview_cmd(_CFG, 'http://h/live/u/p/1', '/x', reencode_device=_DEVICE))
+
+    def test_a_file_reencode_keeps_the_recordings_timestamps(self):
+        joined = self._check(build_file_playback_cmd(_CFG, '/a.ts', '/x', offset=3600,
+                                                     reencode_device=_DEVICE))
+        self.assertIn('-copyts -start_at_zero -muxdelay 0 -muxpreload 0', joined)
+
+    def test_without_a_device_nothing_changes(self):
+        self.assertEqual(build_preview_cmd(_CFG, 'http://h/1', '/x'),
+                         build_preview_cmd(_CFG, 'http://h/1', '/x', reencode_device=None))
+        self.assertNotIn('-vaapi_device', build_file_playback_cmd(_CFG, '/a.ts', '/x'))
+
+
+@unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg not available')
+class ReencodeTimingTests(unittest.TestCase):
+    """The re-encode's filter, frame rate and keyframes, run for real with libx264 standing in
+    for h264_vaapi (no GPU in the suite; the GPU half is the lab job
+    dev/tools/gpu-lab/jobs/preview-reencode.sh). A progressive 60 fps file played from 20 s in:
+    every segment two seconds, starting on its one keyframe, at the source's 60 fps. Measured
+    before the fix: the HLS muxer's constant rate doubled it to 120."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='cb-reencode-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _clip(self, name, size, seconds, rate=60):
+        path = os.path.join(self.tmp, name)
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi',
+                        '-i', f'testsrc=size={size}:rate={rate}', '-t', str(seconds),
+                        '-c:v', 'libx264', '-preset', 'ultrafast', '-g', str(rate),
+                        '-pix_fmt', 'yuv420p', path], check=True, timeout=120)
+        return path
+
+    def _run(self, clip, offset, seconds):
+        """The app's re-encode command with the GPU's three pieces swapped for the CPU's:
+        no device, no upload, libx264 for h264_vaapi. Everything else - -reinit_filter:v 0, the
+        filter chain, the rate and keyframe options, the window - is the app's own."""
+        out = os.path.join(self.tmp, f'out-{offset}')
+        os.makedirs(out)
+        cmd = build_file_playback_cmd(_CFG, clip, out, offset=offset, reencode_device=_DEVICE)
+        i = cmd.index('-vaapi_device')
+        del cmd[i:i + 2]
+        r = cmd.index('-readrate')
+        del cmd[r:r + 4]
+        cmd = [c.replace(',format=nv12,hwupload', '') for c in cmd]
+        e = cmd.index('h264_vaapi')
+        cmd[e:e + 3] = ['libx264', '-preset', 'ultrafast', '-qp', '24']
+        cmd[cmd.index('-i'):cmd.index('-i')] = ['-t', str(seconds)]
+        return out, subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+    def test_a_source_that_changes_size_part_way_keeps_playing(self):
+        """Measured in the GPU lab: with the deinterlacer ahead of the fit, a 720p stretch
+        turning 1080p killed ffmpeg ("Failed to reallocate frame", exit 255)."""
+        small = self._clip('small.ts', '1280x720', 4)
+        big = self._clip('big.ts', '1920x1080', 4)
+        listing = os.path.join(self.tmp, 'list.txt')
+        with open(listing, 'w') as fh:
+            fh.write(f"file '{small}'\nfile '{big}'\n")
+        joined = os.path.join(self.tmp, 'joined.ts')
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', listing,
+                        '-c', 'copy', joined], check=True, timeout=60)
+        out, proc = self._run(joined, 0, 8)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        segs = sorted(f for f in os.listdir(out) if f.endswith('.ts'))
+        last = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                               'stream=width,height', '-of', 'csv=p=0',
+                               os.path.join(out, segs[-1])],
+                              capture_output=True, text=True, timeout=30).stdout.split()
+        self.assertEqual(last[0], '1920,1080')
+
+    def test_segments_start_on_their_keyframe_at_the_sources_rate(self):
+        clip = self._clip('p60.ts', '192x108', 30)
+        out, proc = self._run(clip, 20, 6)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        segs = sorted(f for f in os.listdir(out) if f.endswith('.ts'))
+        self.assertGreaterEqual(len(segs), 3)
+        for name in segs[:3]:
+            frames = subprocess.run(
+                ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                 'frame=pts_time,key_frame', '-of', 'csv=p=0', os.path.join(out, name)],
+                capture_output=True, text=True, timeout=30).stdout.split()
+            keys = [f for f in frames if f.startswith('1,')]
+            with self.subTest(segment=name):
+                self.assertEqual(len(frames), 120)
+                self.assertEqual(len(keys), 1)
+                self.assertEqual(frames[0], keys[0])
+                self.assertGreaterEqual(float(keys[0].split(',')[1]), 20.0)
+
+
+class ReencodeDeviceTests(unittest.TestCase):
+    """When a re-encode may start, and the words when it may not (preview.reencode_device)."""
+
+    def setUp(self):
+        self.trial = mock.Mock(return_value=mock.Mock(ok=True, error=''))
+        p = mock.patch('app.toolchain.check_gpu_encoder', self.trial)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _cfg(self, device=_DEVICE, encoder='software'):
+        return {'ffmpeg': {'path': 'ffmpeg'},
+                'recording': {'post_process': {'vaapi_device': device, 'video_encoder': encoder}}}
+
+    def _ask(self, cfg, exists=True, converting=()):
+        import app.postprocessor as pp
+        with mock.patch('app.preview.os.path.exists', return_value=exists), \
+                mock.patch.dict(pp._active_conversions, {rid: None for rid in converting}):
+            return preview.reencode_device(cfg)
+
+    def test_no_device_node_says_so_and_never_runs_the_trial(self):
+        device, why = self._ask(self._cfg(), exists=False)
+        self.assertEqual(device, '')
+        self.assertIn(f'no GPU device at {_DEVICE}', why)
+        self.trial.assert_not_called()
+
+    def test_a_conversion_comes_first_and_the_gpu_is_not_touched(self):
+        device, why = self._ask(self._cfg(), converting=(42,))
+        self.assertEqual((device, why), ('', preview.CONVERSION_FIRST))
+        self.trial.assert_not_called()
+
+    def test_a_failed_trial_quotes_ffmpeg(self):
+        self.trial.return_value = mock.Mock(ok=False, error='Failed to initialise VAAPI connection')
+        device, why = self._ask(self._cfg())
+        self.assertEqual(device, '')
+        self.assertIn('Failed to initialise VAAPI connection', why)
+
+    def test_the_trial_never_reports_to_the_alert_or_readiness(self):
+        """Both are per device for the conversions' codec: an H.264 pass here would clear the
+        alert an HEVC failure raised (dev/changelog/1184)."""
+        for encoder in ('software', 'vaapi'):
+            self.assertEqual(self._ask(self._cfg(encoder=encoder)), (_DEVICE, ''))
+            self.assertFalse(self.trial.call_args.kwargs['report'])
+            self.assertEqual(self.trial.call_args.args[1:], (_DEVICE, 'h264'))
+
+
+@unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg not available')
+class ReencodeSessionTests(_Live):
+    """A re-encoding session end to end. The suite has no GPU, so the command builder is
+    wrapped to run the stream copy while the session is still the re-encode the route asked
+    for - everything here is about the session, not the encoder."""
+
+    def setUp(self):
+        super().setUp()
+        self.built = []
+        real_live, real_file = preview.build_preview_cmd, preview.build_file_playback_cmd
+
+        def live(*a, **kw):
+            self.built.append(kw.get('reencode_device'))
+            return real_live(*a, **{**kw, 'reencode_device': None})
+
+        def file(*a, **kw):
+            self.built.append(kw.get('reencode_device'))
+            return real_file(*a, **{**kw, 'reencode_device': None})
+        for name, fn in (('build_preview_cmd', live), ('build_file_playback_cmd', file)):
+            p = mock.patch.object(preview, name, side_effect=fn)
+            p.start()
+            self.addCleanup(p.stop)
+        self.allow = mock.patch.object(preview, 'reencode_device', return_value=(_DEVICE, ''))
+        import app.postprocessor as pp
+        self.conversions = pp._active_conversions
+        self.addCleanup(self.conversions.clear)
+
+    def _reencode(self):
+        return self.client.post(f'/api/channels/{self.channel.id}/preview', json={'reencode': True})
+
+    def test_a_refused_reencode_says_why_and_leaves_the_copy_playing(self):
+        copy_sid = self._start().get_json()['session_id']
+        with mock.patch.object(preview, 'reencode_device', return_value=('', 'No GPU here.')):
+            resp = self._reencode()
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json(), {'error': 'No GPU here.'})
+        self.assertNotEqual(self._status(copy_sid)['state'], preview.STATE_STOPPED)
+        self.assertEqual(preview.live_session().id, copy_sid)
+
+    def test_a_reencode_runs_on_the_device_and_says_so(self):
+        with self.allow:
+            data = self._reencode().get_json()
+        self.assertTrue(data['reencode'])
+        self.assertEqual(self.built, [_DEVICE])
+        self.assertTrue(self._status(data['session_id'])['reencode'])
+        self.assertFalse(self._start().get_json()['reencode'])
+        self.assertEqual(self.built, [_DEVICE, None])
+
+    def test_a_conversion_starting_stops_a_reencode_by_name(self):
+        with self.allow:
+            sid = self._reencode().get_json()['session_id']
+        self._wait_state(sid, preview.STATE_READY)
+        self.conversions[99] = None
+        self._wait_state(sid, preview.STATE_STOPPED, timeout=5)
+        st = self._status(sid)
+        self.assertEqual(st['reason'], preview.REASON_CONVERSION_STARTED)
+        self.assertIn('conversion comes before', st['reason_text'])
+        self.assertIn('Recording 99', st['detail'])
+        self.assertEqual(self._holders(), [])
+
+    def test_a_copy_keeps_playing_beside_a_conversion(self):
+        sid = self._start().get_json()['session_id']
+        self._wait_state(sid, preview.STATE_READY)
+        self.conversions[99] = None
+        time.sleep(1.5)
+        self.assertEqual(self._status(sid)['state'], preview.STATE_READY)
+
+    def test_the_availability_route_answers_in_the_servers_words(self):
+        with mock.patch.object(preview, 'reencode_device', return_value=('', 'No GPU here.')):
+            self.assertEqual(self.client.get('/api/preview/reencode').get_json(),
+                             {'success': True, 'available': False, 'reason': 'No GPU here.'})
+        with self.allow:
+            self.assertEqual(self.client.get('/api/preview/reencode').get_json(),
+                             {'success': True, 'available': True, 'reason': ''})
+
+    def test_a_native_file_plays_reencoded_through_the_pipeline_only_when_asked(self):
+        dvr = os.path.join(self.t._tmpdir, 'dvr')
+        os.makedirs(dvr, exist_ok=True)
+        path = os.path.join(dvr, 'Race day.mp4')
+        shutil.copyfile(self.clip, path)
+        rec = make_recording(status='COMPLETED', name='Race day', output_path=path,
+                             recorded_video_codec='hevc', recorded_audio_codec='aac',
+                             recorded_duration_seconds=self.CLIP_SECONDS)
+        db.session.commit()
+        url = f'/api/recordings/{rec.id}/playback'
+        self.assertEqual(self.client.post(url, json={'offset': 0}).status_code, 409)
+        with self.allow:
+            resp = self.client.post(url, json={'offset': 0, 'reencode': True})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertTrue(resp.get_json()['reencode'])
+        self.assertEqual(self.built, [_DEVICE])
+        self.client.post(resp.get_json()['stop_url'])

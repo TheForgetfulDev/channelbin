@@ -747,6 +747,10 @@
     '#acct-logins-head', '#acct-logins-body', '#acct-content-body',
     '#acct-sources-body', '#acct-hist-head', '#acct-activity-body'];
   const RERENDER_MS = 60 * 1000;
+  // The Activity card's filter chips and "Show more" (app/history_filter.py). The body is one
+  // of LIVE_REGIONS, swapped from location.href, which the chip click updates - so the live
+  // refresh keeps the filter and the region keeps one updater.
+  bindHistoryChips('#acct-activity-body');
   let renderedAt = Date.now();
   let inFlight = false;
   let again = false;

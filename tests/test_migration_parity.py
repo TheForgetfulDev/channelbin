@@ -115,35 +115,93 @@ class EveryStepIsANoOpOnTheCurrentSchemaTests(unittest.TestCase):
 _CREATE_TABLE_RE = re.compile(r'CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\(', re.I)
 
 
+def _statements(literal):
+    """The statements of one string literal, split on the `;` between them: a literal holding
+    one statement comes back as itself, an executescript body as each statement it runs."""
+    return [s.strip() for s in literal.split(';') if s.strip()]
+
+
 def hand_written_create_tables(source):
-    """[(table, ddl)] for every string literal in `source` that is a whole CREATE TABLE
-    statement. Steps that build a table in pieces (f-strings over a loop) are not literal
-    statements and are not here; none of the dead bodies is written that way."""
+    """[(table, ddl)] for every CREATE TABLE statement in a string literal of `source` - a
+    literal that is one statement, or any statement of an executescript body. The sports
+    steps (112 onward) are executescripts, and a scan that read only whole-literal statements
+    saw none of them (dev/docs/BUGS.md 2026-11-09). Steps that build a table in pieces
+    (f-strings over a loop) are not literal statements and are not here; none of the dead
+    bodies is written that way."""
     found = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
-        text = node.value.strip()
-        m = _CREATE_TABLE_RE.match(text)
-        if m and text.endswith(')'):
-            found.append((m.group(1), text))
+        for text in _statements(node.value):
+            m = _CREATE_TABLE_RE.match(text)
+            if m and text.endswith(')'):
+                found.append((m.group(1), text))
     return found
 
 
+def _iterable_strings(iterable, pos, tree):
+    """The strings a `for` loop's literal iterable binds at `pos` of each element (-1: the
+    element itself). A name stands for the module-level tuple or list assigned to it."""
+    if isinstance(iterable, ast.Name):
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == iterable.id for t in n.targets):
+                iterable = n.value
+                break
+    if not isinstance(iterable, (ast.Tuple, ast.List)):
+        return set()
+    out = set()
+    for e in iterable.elts:
+        if pos >= 0 and isinstance(e, (ast.Tuple, ast.List)) and len(e.elts) > pos:
+            e = e.elts[pos]
+        elif pos >= 0:
+            continue
+        if isinstance(e, ast.Constant) and isinstance(e.value, str):
+            out.add(e.value)
+    return out
+
+
+def _loop_values(node, name, parents, tree):
+    """The strings the `for` loop enclosing `node` binds to `name`."""
+    scope = parents.get(node)
+    while scope is not None:
+        if isinstance(scope, ast.For):
+            target, pos = scope.target, None
+            if isinstance(target, ast.Name) and target.id == name:
+                pos = -1
+            elif isinstance(target, ast.Tuple):
+                pos = next((k for k, t in enumerate(target.elts)
+                            if isinstance(t, ast.Name) and t.id == name), None)
+            if pos is not None:
+                return _iterable_strings(scope.iter, pos, tree)
+        scope = parents.get(scope)
+    return set()
+
+
 def columns_added_later(source):
-    """Every column name an ALTER TABLE ... ADD COLUMN in `source` adds, whether spelled in
-    the statement or supplied by a loop over `(name, ddl)` tuples. A dead CREATE TABLE is
-    the model as of its own step, so a model column one of these adds is expected to be
-    absent from it."""
+    """Every column name an ALTER TABLE ... ADD COLUMN in `source` adds: spelled in the
+    statement, or bound by the loop around an f-string's `ADD COLUMN {name}` from the loop's
+    literal iterable - a tuple of bare names, or of `(name, ddl)` pairs, or a module-level
+    tuple it names. Only those loops: a string tuple that feeds no ADD COLUMN (a step's own
+    table of column defaults) names nothing a dead CREATE TABLE may lack. A dead CREATE
+    TABLE is the model as of its own step, so a model column one of these adds is expected
+    to be absent from it."""
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     names = set()
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            for m in re.finditer(r'ADD COLUMN\s+(\w+)', node.value):
-                names.add(m.group(1))
-        elif isinstance(node, (ast.Tuple, ast.List)) and node.elts \
-                and isinstance(node.elts[0], ast.Constant) \
-                and isinstance(node.elts[0].value, str):
-            names.add(node.elts[0].value)
+            names.update(re.findall(r'ADD COLUMN\s+(\w+)', node.value))
+            for placeholder in re.findall(r'ADD COLUMN\s+\{(\w+)\}', node.value):
+                names |= _loop_values(node, placeholder, parents, tree)
+        elif isinstance(node, ast.JoinedStr):
+            for i, part in enumerate(node.values[:-1]):
+                following = node.values[i + 1]
+                if (isinstance(part, ast.Constant) and isinstance(part.value, str)
+                        and re.search(r'ADD COLUMN\s*$', part.value)
+                        and isinstance(following, ast.FormattedValue)
+                        and isinstance(following.value, ast.Name)):
+                    names |= _loop_values(node, following.value.id, parents, tree)
     return names
 
 
@@ -177,6 +235,8 @@ class MigrationCreateTableParityTests(unittest.TestCase):
             return hand_written_create_tables(fh.read())
 
     def test_every_hand_written_create_table_matches_the_model(self):
+        import importlib
+        importlib.import_module('app.database')   # populates db.metadata when run alone
         offenders = []
         with open(MIGRATIONS_PATH, encoding='utf-8') as fh:
             added_later = columns_added_later(fh.read())
@@ -211,8 +271,37 @@ class MigrationCreateTableParityTests(unittest.TestCase):
     def test_the_scan_sees_the_dead_bodies(self):
         tables = {t for t, _ddl in self._hand_written()}
         for expected in ('channel_health_exclusions', 'account_hosts', 'account_logins',
-                         'epg_sources'):
+                         'epg_sources',
+                         # executescript bodies: several statements in one literal
+                         'sports_leagues', 'sports_events', 'sports_images'):
             self.assertIn(expected, tables)
+
+
+class AddedLaterScanCorrectnessTests(unittest.TestCase):
+    """columns_added_later() reads the loops that add columns and nothing else: a version
+    that harvested every string tuple in the file excused 24 columns of the sports dead
+    bodies through the step's own table of defaults (dev/docs/BUGS.md 2026-11-09)."""
+
+    def test_bare_names_pairs_and_a_named_tuple(self):
+        src = ("NEW = (('late', 'TEXT'), ('later', 'INTEGER'))\n"
+               "def step(conn, cur):\n"
+               "    for column in ('poster_url', 'thumb_url'):\n"
+               "        cur.execute(f'ALTER TABLE t ADD COLUMN {column} TEXT')\n"
+               "    for name, ddl in (('a', 'TEXT'), ('b', 'INTEGER')):\n"
+               "        cur.execute(f'ALTER TABLE t ADD COLUMN {name} {ddl}')\n"
+               "    for col, definition in NEW:\n"
+               "        cur.execute('ALTER TABLE t ADD COLUMN {col} {definition}'.format(\n"
+               "            col=col, definition=definition))\n"
+               "    cur.execute('ALTER TABLE t ADD COLUMN spelled INTEGER')\n")
+        self.assertEqual(columns_added_later(src),
+                         {'poster_url', 'thumb_url', 'a', 'b', 'late', 'later', 'spelled'})
+
+    def test_a_string_tuple_that_adds_nothing_names_nothing(self):
+        src = ("DEFAULTS = (('widgets', 'tries', '0'), ('widgets', 'names', \"'[]'\"))\n"
+               "def step(conn, cur):\n"
+               "    for table, column, literal in DEFAULTS:\n"
+               "        cur.execute(f'UPDATE {table} SET {column} = {literal}')\n")
+        self.assertEqual(columns_added_later(src), set())
 
 
 class CreateTableScanCorrectnessTests(unittest.TestCase):
@@ -232,6 +321,25 @@ class CreateTableScanCorrectnessTests(unittest.TestCase):
                "    '''CREATE TABLE IF NOT EXISTS is how this used to be written.'''\n"
                "    cur.execute('ALTER TABLE widgets ADD COLUMN flag INTEGER')\n")
         self.assertEqual(hand_written_create_tables(src), [])
+
+    def test_each_create_table_of_an_executescript_body_is_found(self):
+        """One literal, several statements: both tables, and the index between them is not
+        one (dev/docs/BUGS.md 2026-11-09)."""
+        src = ('def step(conn, cur):\n'
+               '    cur.executescript("""\n'
+               '        CREATE TABLE IF NOT EXISTS widgets (\n'
+               '            id INTEGER PRIMARY KEY,\n'
+               '            tries INTEGER NOT NULL DEFAULT 0\n'
+               '        );\n'
+               '        CREATE INDEX IF NOT EXISTS ix_widgets_tries ON widgets (tries);\n'
+               '        CREATE TABLE IF NOT EXISTS gadgets (\n'
+               '            id INTEGER PRIMARY KEY\n'
+               '        );\n'
+               '    """)\n')
+        found = hand_written_create_tables(src)
+        self.assertEqual([t for t, _ in found], ['widgets', 'gadgets'])
+        self.assertTrue(found[0][1].startswith('CREATE TABLE IF NOT EXISTS widgets'))
+        self.assertTrue(found[0][1].endswith(')'))
 
 
 # ---------------------------------------------------------------------------------------
@@ -360,6 +468,264 @@ class DuplicateExclusionIndexTests(unittest.TestCase):
 # ---------------------------------------------------------------------------------------
 # Migration 96: the stored default of channel_groups.format_strategy
 # ---------------------------------------------------------------------------------------
+
+class PositionDefaultRebuildTests(unittest.TestCase):
+    """Migration 114 (dev/docs/BUGS.md 2026-11-05 @ 07:46 PM): an install that crossed steps 84
+    and 85 before dev/changelog/1246 kept `position INTEGER NOT NULL` on account_hosts and
+    account_logins, where a fresh build has DEFAULT 0. A raw INSERT omitting the column -
+    what a future migration step is - aborted there and passed the suite."""
+
+    TABLES = ('account_hosts', 'account_logins')
+    # The stored DDL of a database that crossed 84/85 early, as prod's reads.
+    AGED = re.compile(r'(position\s+INTEGER)\s+DEFAULT 0\s+NOT NULL')
+
+    def _current_build(self):
+        t = make_test_app()
+        try:
+            return {table: db.session.execute(db.text(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=:t"),
+                {'t': table}).scalar() for table in self.TABLES}
+        finally:
+            t.cleanup()
+
+    def _scratch(self, ddl):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        conn = sqlite3.connect(os.path.join(td.name, 'scratch.db'))
+        self.addCleanup(conn.close)
+        cur = conn.cursor()
+        for sql in ddl.values():
+            cur.execute(sql)
+        cur.execute("INSERT INTO account_hosts (account_id, host, position, is_active, "
+                    "created_at) VALUES (1, 'a.example', 3, 1, '2026-01-01')")
+        cur.execute("INSERT INTO account_logins (account_id, login_id, position) "
+                    "VALUES (1, 2, 4)")
+        conn.commit()
+        return conn, cur
+
+    def _stored(self, cur):
+        # SQLite quotes the name it rewrites on RENAME; nothing else in the DDL differs.
+        return {table: cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND "
+                                   "name=?", (table,)).fetchone()[0]
+                .replace(f'CREATE TABLE "{table}"', f'CREATE TABLE {table}')
+                for table in self.TABLES}
+
+    def test_both_tables_gain_the_default_and_keep_everything_else(self):
+        fresh = self._current_build()
+        aged = {}
+        for table, sql in fresh.items():
+            self.assertRegex(sql, self.AGED, 'a fresh build carries the default')
+            aged[table] = self.AGED.sub(r'\1 NOT NULL', sql)
+            self.assertNotEqual(aged[table], sql)
+        conn, cur = self._scratch(aged)
+        with self.assertRaises(sqlite3.IntegrityError):
+            cur.execute("INSERT INTO account_logins (account_id, login_id) VALUES (5, 6)")
+        conn.rollback()
+
+        M._m114_position_defaults(conn, cur)
+
+        self.assertEqual(self._stored(cur), fresh, 'a migrated table reads as a fresh one')
+        self.assertEqual(cur.execute('SELECT host, position, is_active FROM account_hosts')
+                         .fetchall(), [('a.example', 3, 1)])
+        self.assertEqual(cur.execute('SELECT account_id, login_id, position FROM '
+                                     'account_logins').fetchall(), [(1, 2, 4)])
+        # The raw INSERT a later migration step would write.
+        cur.execute("INSERT INTO account_logins (account_id, login_id) VALUES (5, 6)")
+        cur.execute("INSERT INTO account_hosts (account_id, host, created_at) "
+                    "VALUES (1, 'b.example', '2026-01-01')")
+        self.assertEqual(cur.execute('SELECT position FROM account_logins WHERE account_id=5')
+                         .fetchone()[0], 0)
+        self.assertEqual(cur.execute("SELECT position FROM account_hosts WHERE "
+                                     "host='b.example'").fetchone()[0], 0)
+        # The unique constraint came across with the table.
+        with self.assertRaises(sqlite3.IntegrityError):
+            cur.execute("INSERT INTO account_hosts (account_id, host, created_at) "
+                        "VALUES (1, 'a.example', '2026-01-01')")
+
+    def test_tables_already_carrying_the_default_are_left_alone(self):
+        fresh = self._current_build()
+        conn, cur = self._scratch(fresh)
+        M._m114_position_defaults(conn, cur)
+        self.assertEqual(self._stored(cur), fresh)
+        self.assertEqual(cur.execute("SELECT name FROM sqlite_master WHERE name LIKE "
+                                     "'%default_new'").fetchall(), [])
+
+    def test_a_run_that_stopped_after_the_first_table_finishes_the_second(self):
+        fresh = self._current_build()
+        half = dict(fresh)
+        half['account_logins'] = self.AGED.sub(r'\1 NOT NULL', fresh['account_logins'])
+        conn, cur = self._scratch(half)
+        M._m114_position_defaults(conn, cur)
+        self.assertEqual(self._stored(cur), fresh)
+
+    def test_the_hand_written_ddl_of_steps_84_and_85_is_left_alone(self):
+        """A database that crossed 84 and 85 after dev/changelog/1246 carries
+        `NOT NULL DEFAULT 0`, the other order. It has its default and is not rebuilt."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        conn = sqlite3.connect(os.path.join(td.name, 'scratch.db'))
+        self.addCleanup(conn.close)
+        cur = conn.cursor()
+        M._m084_account_hosts(conn, cur)
+        M._m085_logins(conn, cur)
+        before = self._stored(cur)
+        M._m114_position_defaults(conn, cur)
+        self.assertEqual(self._stored(cur), before)
+
+
+class SportsDefaultRebuildTests(unittest.TestCase):
+    """Migration 118 (dev/docs/BUGS.md 2026-11-09): a database whose sports tables came from
+    create_all() between migration 112 and the models' server_defaults - every install that
+    crossed 112 before 2026-11-07, fresh or upgraded, since create_all() builds a new table
+    before the step's dead CREATE TABLE runs - has NOT NULL columns with no DEFAULT where a
+    build made since carries `DEFAULT 0` or `DEFAULT '[]'`. The rebuild gives each column its
+    default, derived from the stored DDL so every other character is kept."""
+
+    # A fresh build spells each defaulted column `name TYPE DEFAULT x NOT NULL`.
+    FRESH_DEFAULT = re.compile(r"\s+DEFAULT\s+('[^']*'|\S+)(?=\s+NOT NULL)")
+
+    @classmethod
+    def _tables(cls):
+        return sorted({table for table, _col, _lit in M._SPORTS_DEFAULTS})
+
+    def _current_build(self):
+        """{table: (create sql, [index sql])} from a real create_all()."""
+        t = make_test_app()
+        try:
+            out = {}
+            for table in self._tables():
+                rows = db.session.execute(db.text(
+                    "SELECT type, sql FROM sqlite_master WHERE tbl_name=:t AND sql IS NOT NULL "
+                    "ORDER BY type DESC, name"), {'t': table}).fetchall()
+                out[table] = ([sql for kind, sql in rows if kind == 'table'][0],
+                              [sql for kind, sql in rows if kind == 'index'])
+            return out
+        finally:
+            t.cleanup()
+
+    def _aged(self, table_sql, columns):
+        """`table_sql` with the DEFAULT stripped from each of `columns`, as a fresh build made
+        before the models declared them wrote it."""
+        for column in columns:
+            table_sql, n = re.subn(rf'(\b{column}\s+[A-Z]+(?:\(\d+\))?)' + self.FRESH_DEFAULT.pattern,
+                                   r'\1', table_sql, count=1)
+            self.assertEqual(n, 1, f'{column}: no `DEFAULT x NOT NULL` to strip in\n{table_sql}')
+        return table_sql
+
+    def _scratch(self, build):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        conn = sqlite3.connect(os.path.join(td.name, 'scratch.db'))
+        self.addCleanup(conn.close)
+        cur = conn.cursor()
+        for table_sql, index_sql in build.values():
+            cur.execute(table_sql)
+            for sql in index_sql:
+                cur.execute(sql)
+        cur.execute("INSERT INTO sports_leagues (tsdb_id, name, match_terms) "
+                    "VALUES (4387, 'NBA', '[\"nba\"]')")
+        cur.execute("INSERT INTO sports_fetches (target, kind, league_id, dropped_count) "
+                    "VALUES ('league:4387', 'league', 1, 2)")
+        conn.commit()
+        return conn, cur
+
+    def _stored(self, cur):
+        # SQLite quotes the name it rewrites on RENAME; nothing else in the DDL differs.
+        return {table: cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND "
+                                   "name=?", (table,)).fetchone()[0]
+                .replace(f'CREATE TABLE "{table}"', f'CREATE TABLE {table}')
+                for table in self._tables()}
+
+    def _fresh_tables(self, build):
+        return {table: sql for table, (sql, _idx) in build.items()}
+
+    def test_the_list_is_what_the_models_declare(self):
+        """The step's table is hand-written so it stays frozen; this holds it equal to the
+        sports models, so a sports column gaining a server_default lands in the step too."""
+        import importlib
+        importlib.import_module('app.database')
+        declared = set()
+        for name, tbl in db.metadata.tables.items():
+            if name.startswith('sports_') or name == 'recording_sports':
+                for c in tbl.columns:
+                    if c.server_default is not None:
+                        declared.add((name, c.name, str(c.server_default.arg.text)))
+        self.assertEqual(set(M._SPORTS_DEFAULTS), declared)
+        self.assertEqual(len(M._SPORTS_DEFAULTS), len(set(M._SPORTS_DEFAULTS)))
+
+    def test_every_table_gains_its_defaults_and_keeps_everything_else(self):
+        build = self._current_build()
+        fresh = self._fresh_tables(build)
+        aged = {}
+        for table in self._tables():
+            columns = [c for t, c, _l in M._SPORTS_DEFAULTS if t == table]
+            aged[table] = (self._aged(fresh[table], columns), build[table][1])
+            self.assertNotEqual(aged[table][0], fresh[table])
+        conn, cur = self._scratch(aged)
+        with self.assertRaises(sqlite3.IntegrityError):
+            cur.execute("INSERT INTO sports_leagues (tsdb_id, name) VALUES (4328, 'EPL')")
+        conn.rollback()
+
+        M._m118_sports_defaults(conn, cur)
+
+        self.assertEqual(self._stored(cur), fresh, 'a migrated table reads as a fresh one')
+        self.assertEqual(cur.execute('SELECT tsdb_id, name, match_terms FROM sports_leagues')
+                         .fetchall(), [(4387, 'NBA', '["nba"]')])
+        self.assertEqual(cur.execute('SELECT target, dropped_count FROM sports_fetches')
+                         .fetchall(), [('league:4387', 2)])
+        # The raw INSERT a later migration step would write now mints the default.
+        cur.execute("INSERT INTO sports_leagues (tsdb_id, name) VALUES (4328, 'EPL')")
+        self.assertEqual(cur.execute("SELECT match_terms FROM sports_leagues WHERE tsdb_id=4328")
+                         .fetchone()[0], '[]')
+        cur.execute("INSERT INTO sports_state DEFAULT VALUES")
+        self.assertEqual(cur.execute("SELECT backoff_seconds, clean_calls, daily_offset_seconds "
+                                     "FROM sports_state").fetchone(), (0, 0, 0))
+        # Indexes and the unique constraints came across with the tables.
+        carried = {r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")}
+        expected = {re.search(r'INDEX (\w+)', s).group(1)
+                    for _sql, idx in build.values() for s in idx}
+        self.assertTrue(expected, 'the sports tables carry no named index to check')
+        self.assertEqual(carried, expected)
+        with self.assertRaises(sqlite3.IntegrityError):
+            cur.execute("INSERT INTO sports_leagues (tsdb_id, name) VALUES (4387, 'again')")
+
+    def test_tables_already_carrying_the_defaults_are_left_alone(self):
+        build = self._current_build()
+        conn, cur = self._scratch(build)
+        M._m118_sports_defaults(conn, cur)
+        self.assertEqual(self._stored(cur), self._fresh_tables(build))
+        self.assertEqual(cur.execute("SELECT name FROM sqlite_master WHERE name LIKE "
+                                     "'%default_new'").fetchall(), [])
+
+    def test_a_run_that_stopped_after_one_table_finishes_the_rest(self):
+        build = self._current_build()
+        fresh = self._fresh_tables(build)
+        half = dict(build)
+        for table in ('sports_events', 'sports_images'):
+            columns = [c for t, c, _l in M._SPORTS_DEFAULTS if t == table]
+            half[table] = (self._aged(fresh[table], columns), build[table][1])
+        conn, cur = self._scratch(half)
+        M._m118_sports_defaults(conn, cur)
+        self.assertEqual(self._stored(cur), fresh)
+
+    def test_the_hand_written_ddl_of_the_sports_steps_is_left_alone(self):
+        """A database that crossed 112, 115 and 117 carries `NOT NULL DEFAULT x`, the other
+        order. It has its defaults and is not rebuilt."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        conn = sqlite3.connect(os.path.join(td.name, 'scratch.db'))
+        self.addCleanup(conn.close)
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE recordings (id INTEGER PRIMARY KEY)')
+        M._m112_sports_schedule(conn, cur)
+        M._m115_sports_matches(conn, cur)
+        M._m116_recording_sports(conn, cur)
+        M._m117_sports_images(conn, cur)
+        before = self._stored(cur)
+        M._m118_sports_defaults(conn, cur)
+        self.assertEqual(self._stored(cur), before)
+
 
 class ChannelGroupsDefaultRebuildTests(unittest.TestCase):
 

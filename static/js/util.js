@@ -838,6 +838,30 @@ async function swapFromServer(selectors, url = location.href) {
   return doc;
 }
 
+// The filter chips over a history or event-log card (app/history_filter.py, the
+// `history_chips` macro). The chips and "Show more" are links to the page with ?hist= (and
+// ?shown=), so they work with a plain or a new-tab click; a plain click swaps only the card
+// named by `selector` for the server's render of that URL and puts the URL in the address
+// bar, so a reload keeps the filter - and so does any live refresh the page runs from
+// location.href, which is what keeps the card on ONE updater. `after` re-applies whatever
+// client-held state the swap blew away (an order toggle, open disclosures). Delegated on
+// document, so the swapped-in chips need no rebinding.
+function bindHistoryChips(selector, { after = null } = {}) {
+  document.addEventListener('click', async (e) => {
+    const link = e.target.closest('[data-hist], [data-hist-more]');
+    if (!link || !link.closest(selector) || wantsNewTab(e)) return;
+    e.preventDefault();
+    try {
+      await swapFromServer([selector], link.href);
+    } catch (err) {
+      followHref(null, link.href);
+      return;
+    }
+    window.history.replaceState(null, '', link.href);
+    if (after) after();
+  });
+}
+
 /* ── App design-system behaviors (DESIGN.md sections 3.6/3.7/3.9/3.12) ──
    One delegated handler set per behavior, initialized once at load; pages only
    need the markup conventions (.tip[data-tip], [data-menu] + .menu, .thumb). */
@@ -1753,11 +1777,57 @@ function buildPlayerStage() {
     video.removeAttribute('src');
     video.load();
   };
-  return { el, video, setStatus, tryPlay, detach };
+  // Offer the GPU re-encode below the status, or say why there is none: asked of the server
+  // each time, since a GPU that failed its trial or a conversion that started changes the
+  // answer. `onReencode` runs on the button; the offer clears itself when it is pressed.
+  let offerGen = 0;
+  const clearOffer = () => {
+    offerGen += 1;
+    const old = el.querySelector('.player-offer');
+    if (old) old.remove();
+  };
+  const offerReencode = (onReencode) => {
+    clearOffer();
+    const gen = offerGen;
+    const box = document.createElement('div');
+    box.className = 'player-offer';
+    statusEl.after(box);
+    jsonFetch('/api/preview/reencode')
+      .then((r) => {
+        if (gen !== offerGen) return;
+        if (!r.available) {
+          box.textContent = r.reason;
+          return;
+        }
+        box.innerHTML = `<button type="button" class="btn btn-sm btn-primary">Try re-encoded</button>
+          <span>ChannelBin can re-encode the video on the GPU so this browser can play it.</span>`;
+        box.querySelector('button').addEventListener('click', () => { clearOffer(); onReencode(); });
+      })
+      .catch((e) => {
+        if (gen === offerGen) box.textContent = `Could not ask whether a re-encode is possible: ${e.message || e}`;
+      });
+  };
+  return { el, video, setStatus, tryPlay, detach, offerReencode, clearOffer };
+}
+
+// What the browser said when it could not play: the <video> element's own error first - it
+// carries the decoder's complaint, "PIPELINE_ERROR_DECODE: ..." - then hls.js's, never a guess
+// at which codec was to blame (dev/changelog/1461). `hlsData` is an hls.js error event's data,
+// or nothing on the browser's own player.
+function playbackFailureText(video, hlsData) {
+  const parts = [];
+  const err = video && video.error;
+  if (err && err.message) parts.push(err.message);
+  const h = hlsData || {};
+  const hlsMsg = h.error && h.error.message;
+  if (hlsMsg && !parts.includes(hlsMsg)) parts.push(hlsMsg);
+  if (h.details && !parts.some((p) => p.includes(h.details))) parts.push(h.details);
+  if (!parts.length && err) parts.push(`media error ${err.code}`);
+  return parts.join(' - ') || 'it gave no reason';
 }
 
 // hls.js is loaded on the first Play rather than with the page: it is the one third-party
-// script in the app (static/vendor/hls.js/NOTICE.md) and 386 KB nobody should pay for on every
+// script in the app (static/vendor/hls.js/NOTICE.md) and 620 KB nobody should pay for on every
 // page load. `src` is the vendored file's URL, which the page hands its player script.
 let _hlsLoading = null;
 function loadHlsJs(src) {

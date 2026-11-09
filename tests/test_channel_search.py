@@ -1223,7 +1223,7 @@ class StandingOptionTests(_EngineTestCase):
         self.assertEqual(result.standing_hidden, {})
         self.assertEqual(result.channel_total, Channel.query.count())
 
-    def test_hidden_dup_and_notnorm_are_what_hide_by_default(self):
+    def test_hidden_and_notnorm_are_what_hide_by_default(self):
         """A hider that is on by default is only legal because the count line names it, so
         which ones hide by default is part of the contract, not a preference.
 
@@ -1231,17 +1231,20 @@ class StandingOptionTests(_EngineTestCase):
         means it is not offered anywhere, so every surface built on this engine inherits the
         default and only the channel search itself can turn it off.
 
+        Duplicates left the list in dev/changelog/1458: a duplicate hidden by default was a
+        channel the page could not find for the person looking for it.
+
         Asserted twice on purpose since the inversion (dev/changelog/778). The BEHAVIOR is
-        the contract - these three remove rows from a link that says nothing about standing
+        the contract - these two remove rows from a link that says nothing about standing
         options - and `DEFAULT_STANDING` is now the near-inverse of it, because a default-on
         hider is spelled as a `show*` key that is absent. Pinning only the set would let a
         future edit flip `hides_when_on` and keep this green while the page changed."""
         self.assertEqual(
             {s.key for s in STANDING_OPTIONS if standing_applied(DEFAULT_STANDING, s.key)
              and not s.grain},
-            {'showhidden', 'showdup', 'shownotnorm'})
+            {'showhidden', 'shownotnorm'})
         self.assertEqual(DEFAULT_STANDING,
-                         frozenset({'shownoepg', 'showuntested', 'showmembers'}))
+                         frozenset({'showdup', 'shownoepg', 'showuntested', 'showmembers'}))
 
 
 class SourceOverrideFilterTests(_EngineTestCase):

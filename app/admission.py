@@ -57,6 +57,7 @@ KIND_HIDING = 'hiding'
 KIND_LEDGER = 'ledger'
 KIND_RULES = 'rules'
 KIND_EPG_SCAN = 'epg_scan'
+KIND_SPORTS_MATCH = 'sports_match'
 
 # Human prose for a refusal message, so a refused caller can hand the reason straight to a
 # user-facing surface without restating it. Keep these lowercase noun phrases - they are
@@ -70,6 +71,7 @@ KIND_LABELS = {
     KIND_LEDGER: 'an account stats catch-up',
     KIND_RULES: 'an auto-record rule check',
     KIND_EPG_SCAN: 'an EPG similarity scan',
+    KIND_SPORTS_MATCH: 'matching sports schedules to the guide',
 }
 
 # The yield order, as a table rather than as branches scattered across four modules.
@@ -115,9 +117,13 @@ KIND_LABELS = {
 #   to sync and to maintenance, the two things that rewrite the listings it reads, and to
 #   itself. Maintenance yields to it in turn: a scan is short, and EPG cleanup deleting
 #   rows under it would make its numbers describe nothing.
+# - **Sports match** - matching TheSportsDB's events to guide rows (app/sports_match.py). It
+#   yields to sync and to a rebuild, which rewrite the listings it reads, to maintenance,
+#   whose EPG cleanup deletes them, and to itself. Nothing yields to it but maintenance: it is
+#   a few seconds per league and queues itself again when refused (DESIGN-sports-data.md 6.6).
 # - **Maintenance** yields to everything but the ledger, itself included. It is the most
 #   deferrable work in the app (pruning, retention, WAL reporting) and the heaviest per run,
-#   because EPG cleanup drags a full `programs` rebuild behind it.
+#   because EPG cleanup drags a `programs` index update and compaction behind it.
 #
 # Recordings appear in no tuple by design - see the module docstring.
 BLOCKED_BY = {
@@ -128,8 +134,9 @@ BLOCKED_BY = {
     KIND_LEDGER: (KIND_SYNC, KIND_MAINTENANCE, KIND_LEDGER),
     KIND_RULES: (KIND_SYNC, KIND_REBUILD, KIND_MAINTENANCE, KIND_RULES),
     KIND_EPG_SCAN: (KIND_SYNC, KIND_MAINTENANCE, KIND_EPG_SCAN),
+    KIND_SPORTS_MATCH: (KIND_SYNC, KIND_REBUILD, KIND_MAINTENANCE, KIND_SPORTS_MATCH),
     KIND_MAINTENANCE: (KIND_TESTER, KIND_SYNC, KIND_REBUILD, KIND_HIDING, KIND_RULES,
-                       KIND_EPG_SCAN, KIND_MAINTENANCE),
+                       KIND_EPG_SCAN, KIND_SPORTS_MATCH, KIND_MAINTENANCE),
 }
 
 

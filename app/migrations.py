@@ -2591,7 +2591,9 @@ def _m072_epg_sources(conn, cur):
             start_time  DATETIME NOT NULL,
             stop_time   DATETIME NOT NULL,
             category    VARCHAR(255),
-            rating      VARCHAR(64)
+            rating      VARCHAR(64),
+            is_live     BOOLEAN,
+            is_new      BOOLEAN
         )
     ''')
     cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_alt_source_channel '
@@ -3301,6 +3303,60 @@ def _m111_recording_track_end_gap(conn, cur):
     conn.commit()
 
 
+def _m113_epg_live_new_marks(conn, cur):
+    """epg_entries + epg_alternate_entries: is_live and is_new, what the source's XMLTV
+    marked with <live/> and <new/> (dev/changelog/1454).
+
+    No backfill: the files are not kept, so a listing imported before this carries NULL
+    until its source's next refresh rewrites it. Adding a nullable column rewrites no row
+    (0.8 s on 1.6M listings, measured on a copy of the production database)."""
+    for table in ('epg_entries', 'epg_alternate_entries'):
+        cols = {r[1] for r in cur.execute(f'PRAGMA table_info({table})').fetchall()}
+        if not cols:
+            continue
+        for col in ('is_live', 'is_new'):
+            if col not in cols:
+                cur.execute(f'ALTER TABLE {table} ADD COLUMN {col} BOOLEAN')
+    conn.commit()
+
+
+_POSITION_NO_DEFAULT = re.compile(r'(\bposition"?\s+INTEGER)\s+NOT NULL(?!\s+DEFAULT)')
+
+
+def _m114_position_defaults(conn, cur):
+    """account_hosts + account_logins: `position` carries DEFAULT 0, as a fresh build does.
+
+    dev/changelog/1246 put the server default on both models and corrected the CREATE TABLE
+    text of migrations 84 and 85, which only a database crossing those steps afterward
+    reads. Every install that crossed them earlier kept `position INTEGER NOT NULL`. The
+    ORM always supplies the value; the writer that would not is a raw INSERT that omits the
+    column, which is what a future migration step is - and MigrationInsertVintageTests
+    checks such an INSERT against the model, which has the default, so it would pass the
+    suite and abort the upgrade on every real install.
+
+    Derived from the stored DDL so every other character is kept (dev/changelog/937), and
+    idempotent: a table whose column already carries a DEFAULT is left alone, so a fresh
+    build and a database this already ran on are no-ops, and a run interrupted between the
+    two tables finishes the second."""
+    for table in ('account_hosts', 'account_logins'):
+        row = cur.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        if row is None or not _POSITION_NO_DEFAULT.search(row[0]):
+            continue
+        tmp_name = f'{table}_default_new'
+        new_sql = re.sub(rf'^CREATE TABLE "?{table}"? \(', f'CREATE TABLE {tmp_name} (',
+                         row[0], count=1)
+        if new_sql == row[0]:
+            raise RuntimeError(f'Cannot rebuild {table}: its stored CREATE TABLE does not '
+                               f'carry the expected header. Stored DDL:\n{row[0]}')
+        new_sql = _POSITION_NO_DEFAULT.sub(r'\1 DEFAULT 0 NOT NULL', new_sql, count=1)
+        copied, carried = _rebuild_table(conn, cur, table, new_sql, tmp_name)
+        conn.commit()
+        log.warning('Migration 114: rebuilt %s so its stored DEFAULT for position is 0, as a '
+                    'fresh build has (%d row(s), %d index(es) carried over)', table, copied,
+                    carried)
+
+
 def _m112_sports_schedule(conn, cur):
     """The local schedule from TheSportsDB (app/sports_data.py, dev/docs/DESIGN-sports-data.md 9).
     Additive: nothing here is read until someone follows a league."""
@@ -3384,6 +3440,189 @@ def _m112_sports_schedule(conn, cur):
             ON sports_events (league_id, start_at);
     """)
     conn.commit()
+
+
+def _m115_sports_matches(conn, cur):
+    """The matcher's tables and columns (app/sports_match.py, dev/docs/DESIGN-sports-data.md 6, 7, 9).
+
+    No backfill and no obligation to register (dev/changelog/686): nothing has been matched before
+    this, and the matcher's first run fills everything from the tables already there. IF NOT EXISTS
+    and a column check throughout, so this step is re-runnable from the top."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS sports_league_categories (
+            id INTEGER NOT NULL PRIMARY KEY,
+            league_id INTEGER NOT NULL REFERENCES sports_leagues (id),
+            category_name VARCHAR(255) NOT NULL,
+            is_replay BOOLEAN NOT NULL DEFAULT 0,
+            created_at DATETIME,
+            CONSTRAINT uq_sports_league_category UNIQUE (league_id, category_name)
+        );
+        CREATE TABLE IF NOT EXISTS sports_matches (
+            id INTEGER NOT NULL PRIMARY KEY,
+            event_id INTEGER NOT NULL REFERENCES sports_events (id),
+            channel_id INTEGER NOT NULL,
+            kind VARCHAR(16) NOT NULL,
+            program_start_time DATETIME,
+            program_stop_time DATETIME,
+            title_key VARCHAR(512),
+            episode_key VARCHAR(512) NOT NULL DEFAULT '',
+            program_title VARCHAR(512),
+            program_sub_title VARCHAR(512),
+            strength VARCHAR(8) NOT NULL,
+            airing VARCHAR(8) NOT NULL,
+            reason TEXT NOT NULL,
+            first_seen DATETIME,
+            last_seen DATETIME,
+            gone_since DATETIME,
+            rejected_at DATETIME
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_sports_matches_guide
+            ON sports_matches (event_id, channel_id, program_start_time, title_key) WHERE kind = 'guide';
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_sports_matches_channel
+            ON sports_matches (event_id, channel_id) WHERE kind = 'channel_name';
+        CREATE INDEX IF NOT EXISTS ix_sports_matches_channel ON sports_matches (channel_id);
+    """)
+    for table, column, decl in (('sports_leagues', 'trust_sample', 'INTEGER'),
+                                ('sports_leagues', 'trust_agreed', 'INTEGER'),
+                                ('sports_leagues', 'trust_measured_at', 'DATETIME'),
+                                ('sports_events', 'guide_start', 'DATETIME'),
+                                ('sports_events', 'guide_channels', 'INTEGER'),
+                                ('sports_state', 'last_match_at', 'DATETIME'),
+                                ('sports_state', 'match_note', 'TEXT')):
+        cols = {r[1] for r in cur.execute(f'PRAGMA table_info({table})').fetchall()}
+        if cols and column not in cols:
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} {decl}')
+    conn.commit()
+
+
+def _m116_recording_sports(conn, cur):
+    """A recording's TheSportsDB event (app/sports_data.py::link_recording, dev/changelog/1464).
+
+    No backfill and no obligation to register (dev/changelog/686): a recording is linked when it is
+    created, after a matcher run while it is unfinished, and when it completes, and the table starts
+    empty. IF NOT EXISTS, so re-runnable from the top."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS recording_sports (
+            recording_id INTEGER NOT NULL PRIMARY KEY,
+            tsdb_event_id INTEGER NOT NULL,
+            league_name VARCHAR(255) NOT NULL,
+            event_name VARCHAR(255) NOT NULL,
+            home_name VARCHAR(255),
+            away_name VARCHAR(255),
+            season VARCHAR(32),
+            round INTEGER,
+            venue VARCHAR(255),
+            city VARCHAR(255),
+            event_start DATETIME,
+            local_date DATE,
+            strength VARCHAR(8) NOT NULL,
+            airing VARCHAR(8) NOT NULL,
+            reason TEXT NOT NULL,
+            linked_at DATETIME,
+            updated_at DATETIME,
+            removed_at DATETIME
+        );
+    """)
+    conn.commit()
+
+
+def _m117_sports_images(conn, cur):
+    """TheSportsDB's poster and thumb for a recording's event (app/sports_images.py,
+    dev/changelog/1465): the two addresses on recording_sports, and the downloads by address.
+
+    No backfill and no obligation to register (dev/changelog/686): a link takes its addresses the
+    next time it is brought up to date, and the worker downloads what an unfinished recording names.
+    Every step checks before it acts, so re-runnable from the top."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS sports_images (
+            id INTEGER NOT NULL PRIMARY KEY,
+            url TEXT NOT NULL UNIQUE,
+            file_name VARCHAR(64),
+            fetched_at DATETIME,
+            tried_at DATETIME,
+            tries INTEGER NOT NULL DEFAULT 0,
+            next_try_at DATETIME,
+            reason TEXT
+        );
+    """)
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recording_sports)').fetchall()}
+    for column in ('poster_url', 'thumb_url'):
+        if cols and column not in cols:
+            cur.execute(f'ALTER TABLE recording_sports ADD COLUMN {column} TEXT')
+    conn.commit()
+
+
+# Every NOT NULL sports column migrations 112, 115 and 117 give a DEFAULT in their (dead) CREATE
+# TABLE text, with the literal the model declares as its server_default. Hand-written so the step stays frozen;
+# tests/test_migration_parity.py holds it equal to the models, so a sports column gaining a
+# server_default lands here or the suite says so.
+_SPORTS_DEFAULTS = (
+    ('sports_leagues', 'match_terms', "'[]'"),
+    ('sports_league_categories', 'is_replay', '0'),
+    ('sports_follows', 'team_tsdb_id', '0'),
+    ('sports_follows', 'rule_id', '0'),
+    ('sports_teams', 'names', "'[]'"),
+    ('sports_fetches', 'dropped_count', '0'),
+    ('sports_state', 'backoff_seconds', '0'),
+    ('sports_state', 'clean_calls', '0'),
+    ('sports_state', 'daily_offset_seconds', '0'),
+    ('sports_events', 'home_team_id', '0'),
+    ('sports_events', 'away_team_id', '0'),
+    ('sports_events', 'postponed', '0'),
+    ('sports_matches', 'episode_key', "''"),
+    ('sports_images', 'tries', '0'),
+)
+
+
+def _m118_sports_defaults(conn, cur):
+    """Sports tables: every column migrations 112, 115 and 117 give a DEFAULT carries it on the
+    table the database actually holds.
+
+    create_all() runs before the migration runner and builds a new table in the model's shape,
+    so a step's CREATE TABLE IF NOT EXISTS is dead on every database and the DEFAULT in its text
+    reaches nobody. create_all() emits a DEFAULT only for a server_default, and the sports
+    models declared a Python-side default alone until dev/docs/BUGS.md 2026-11-07
+    (sports_images.tries until 2026-11-09), so every install that crossed migration 112 before
+    then - fresh v0.39.0 installs and upgraded databases alike - holds these columns `NOT NULL`
+    with no DEFAULT, while a build made since has one. The ORM always supplies the value; a raw
+    INSERT that omits the column - what a future migration step is - aborts on the old vintage
+    only, and passes the suite, whose tables have the default. The same repair migration 114
+    made for account_hosts and account_logins.
+
+    Derived from the stored DDL so every other character is kept (dev/changelog/937), and
+    idempotent: a column already carrying a DEFAULT, in either order, is left alone, so a
+    fresh build, an upgraded database and a run this already finished are no-ops, and a run
+    interrupted between two tables finishes the rest."""
+    by_table = {}
+    for table, column, literal in _SPORTS_DEFAULTS:
+        by_table.setdefault(table, []).append((column, literal))
+    for table, columns in by_table.items():
+        row = cur.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        if row is None:
+            continue
+        new_sql, added = row[0], []
+        for column, literal in columns:
+            # `name TYPE NOT NULL` with nothing after it: a fresh build's `DEFAULT x NOT
+            # NULL` and the step text's `NOT NULL DEFAULT x` both fail to match.
+            pattern = re.compile(rf'(\b{column}"?\s+[A-Z]+(?:\(\d+\))?)\s+NOT NULL(?!\s+DEFAULT)')
+            new_sql, n = pattern.subn(lambda m: f'{m.group(1)} DEFAULT {literal} NOT NULL',
+                                      new_sql, count=1)
+            if n:
+                added.append(column)
+        if not added:
+            continue
+        tmp_name = f'{table}_default_new'
+        renamed = re.sub(rf'^CREATE TABLE "?{table}"? \(', f'CREATE TABLE {tmp_name} (',
+                         new_sql, count=1)
+        if renamed == new_sql:
+            raise RuntimeError(f'Cannot rebuild {table}: its stored CREATE TABLE does not '
+                               f'carry the expected header. Stored DDL:\n{row[0]}')
+        copied, carried = _rebuild_table(conn, cur, table, renamed, tmp_name)
+        conn.commit()
+        log.warning('Migration 118: rebuilt %s so %s carry the DEFAULT a fresh build has '
+                    '(%d row(s), %d index(es) carried over)', table, ', '.join(added), copied,
+                    carried)
 
 
 def _m106_epg_scans(conn, cur):
@@ -3953,6 +4192,18 @@ SCHEMA_MIGRATIONS = [
      _m111_recording_track_end_gap),
     (112, 'sports_leagues + sports_follows + sports_teams + sports_fetches + sports_state + '
      'sports_events: the local schedule from TheSportsDB', _m112_sports_schedule),
+    (113, 'epg_entries + epg_alternate_entries: is_live and is_new, the XMLTV <live/> and '
+     '<new/> marks', _m113_epg_live_new_marks),
+    (114, 'account_hosts + account_logins: rebuild so position carries the DEFAULT 0 a fresh '
+     'build has', _m114_position_defaults),
+    (115, 'sports_matches + sports_league_categories, and the trust and guide-start columns: '
+     'matching TheSportsDB\'s events to the guide', _m115_sports_matches),
+    (116, 'recording_sports: the TheSportsDB event a recording is, as a snapshot for its page and '
+     'its .nfo', _m116_recording_sports),
+    (117, 'sports_images + recording_sports poster and thumb addresses: TheSportsDB\'s artwork for a '
+     'recording\'s event', _m117_sports_images),
+    (118, 'sports tables: rebuild so every defaulted column carries the DEFAULT a fresh build '
+     'has', _m118_sports_defaults),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

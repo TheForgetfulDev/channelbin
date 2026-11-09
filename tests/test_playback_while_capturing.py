@@ -189,15 +189,16 @@ class StartRouteTests(_Rig):
         super().setUp()
         self.calls = []
 
-        def fake_start(rid, name, path, offset, transcode_audio, capture=None):
+        def fake_start(rid, name, path, offset, transcode_audio, capture=None, reencode=False):
             self.calls.append(dict(path=path, offset=offset, capture=capture,
-                                   transcode_audio=transcode_audio))
+                                   transcode_audio=transcode_audio, reencode=reencode))
             return preview.PreviewSession(
                 id='sid', channel_id=None, channel_name='', account_id=None, dir='',
                 stderr_path='', transcode_audio=transcode_audio, idle_timeout=15,
                 max_seconds=None, connect_timeout=20, source=preview.SOURCE_FILE,
                 recording_id=rid, offset=offset, capture=capture,
-                following=bool(capture and capture.follow_state is not None))
+                following=bool(capture and capture.follow_state is not None),
+                reencode=reencode)
         patcher = mock.patch.object(preview, 'start_file_playback', side_effect=fake_start)
         patcher.start()
         self.addCleanup(patcher.stop)

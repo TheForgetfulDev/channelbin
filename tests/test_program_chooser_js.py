@@ -159,6 +159,39 @@ class ScheduledTests(_Base, unittest.TestCase):
                          {'panelOpen': False, 'recordModal': {'open': True, 'title': 'Edit recording'}})
 
 
+class FailedTests(_Base, unittest.TestCase):
+    """A program whose recording FAILED used to look unscheduled on the guide
+    (dev/changelog/1457). It gets a chip, keeps its Record, and offers the failed recording."""
+    SCENARIO = 'failed'
+
+    def test_the_cell_draws_a_failed_chip(self):
+        drawn = self.obs['drawn']
+        self.assertEqual(drawn['badgeText'], 'Failed')
+        self.assertIn('rec-badge-failed', drawn['badgeClass'])
+        self.assertEqual(drawn['badgeIcon'], 'failed')
+        self.assertTrue(drawn['badgeTip'].startswith('Failed\n'), drawn['badgeTip'])
+        self.assertIn('still record it', drawn['badgeTip'])
+
+    def test_the_cell_is_not_drawn_as_holding_a_recording(self):
+        self.assertNotIn('has-recording', self.obs['drawn']['cellClass'])
+
+    def test_record_is_still_the_first_action(self):
+        tiles = self.obs['tiles']
+        self.assertEqual(tiles[0]['label'], 'Schedule recording')
+        self.assertFalse(tiles[0]['disabled'])
+        self.assertEqual(self.obs['afterRecord'],
+                         {'panelOpen': False,
+                          'recordModal': {'open': True, 'title': 'Schedule recording'}})
+
+    def test_the_failed_recordings_page_is_offered(self):
+        tiles = self.obs['tiles']
+        self.assertEqual(_tile(tiles, 'Failed recording')['href'], '/recordings/91')
+        self.assertNotIn('Recording page', _labels(tiles))
+
+    def test_the_head_line_carries_the_chip(self):
+        self.assertEqual(self.obs['headChip'], 'Failed')
+
+
 class CapturingTests(_Base, unittest.TestCase):
     SCENARIO = 'capturing'
 
@@ -306,7 +339,7 @@ class WiringTests(unittest.TestCase):
                 self.assertIn(f"filename='js/{script}'", html, f'{rel} lacks {script}')
             self.assertGreater(html.index("filename='js/program-chooser.js'"), g, rel)
             for script in ('recording-player.js', 'live-preview.js'):
-                self.assertRegex(html, rf"js/{re.escape(script)}'\) }}}}\"\s+data-hls-js=\"[^\"]*hls\.light\.min\.js",
+                self.assertRegex(html, rf"js/{re.escape(script)}'\) }}}}\"\s+data-hls-js=\"[^\"]*hls\.min\.js",
                                  f'{rel}: {script} needs its data-hls-js')
             self.assertIn('programAiringsUrl:', html, rel)
 

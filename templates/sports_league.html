@@ -63,6 +63,8 @@
         <div class="srow"><span class="sk">Season</span><span class="sv">{{ league.current_season or '-' }}</span></div>
         <div class="srow"><span class="sk">Following</span><span class="sv sp-plain">{{ follow_text }}</span></div>
         <div class="srow"><span class="sk">Next update</span><span class="sv sp-plain">{{ next_update }}</span></div>
+        <div class="srow"><span class="sk">Start times</span><span class="sv sp-plain">{{ trust[0] }}{% if trust[1] %}<span class="sp-sub">{{ trust[1] }}</span>{% endif %}</span></div>
+        <div class="srow"><span class="sk">Checked against your guide</span><span class="sv sp-plain{{ ' text-warning' if match_waiting else '' }}">{{ match_note }}</span></div>
       </div>
     </div>
   </div>
@@ -70,8 +72,10 @@
   <div class="card" data-section="upcoming">
     <div class="card-head"><h2>Upcoming {{ many }}{% if games %} <span class="cnt">{{ games | length }}</span>{% endif %}</h2></div>
     <div class="card-body">
-      <p class="card-note">The next {{ horizon_days }} days. Times are what TheSportsDB lists, and they have not been checked against your guide.</p>
+      <p class="card-note">{{ upcoming_note }}</p>
       {% if picked_teams %}
+      {# duplicated from _macros.html::history_chips - a scope toggle between two pages of
+         games, not a filter with counts over one list, so it keeps its own two links. #}
       <div class="rl-filter">
         <a class="chip{{ ' active' if scope == 'followed' else '' }}" href="{{ url_for('sports.league_page', league_id=league.id) }}">Your teams<span class="n">{{ mine_total }}</span></a>
         <a class="chip{{ ' active' if scope == 'all' else '' }}" href="{{ url_for('sports.league_page', league_id=league.id, scope='all') }}">All {{ many }}<span class="n">{{ all_total }}</span></a>
@@ -80,13 +84,19 @@
       {% if games %}
       <div class="table-scroll">
         <table class="tbl tbl-cards rl-tbl">
-          <thead><tr><th>When</th><th>{{ one | capitalize }}</th><th>Where</th></tr></thead>
+          <thead><tr><th>When</th><th>{{ one | capitalize }}</th><th>Venue</th><th>Where it&rsquo;s on</th><th></th></tr></thead>
           <tbody>
             {% for g in games %}
             <tr>
-              <td data-label="When" class="rl-when"><span class="day">{{ g.day }}</span>{{ g.time or 'Time not listed' }}</td>
+              <td data-label="When" class="rl-when"><span class="day">{{ g.day }}</span>{% if g.guide_time %}<span class="sp-two">{{ g.guide_time }} <span class="sp-src">your guide</span></span><span class="sp-two text-warning">{{ g.time or 'Time not listed' }} <span class="sp-src">TheSportsDB</span></span>{% else %}{{ g.time or 'Time not listed' }}{% endif %}</td>
               <td data-label="{{ one | capitalize }}" class="rl-prog"><span class="t">{{ g.game }}</span>{% for n in g.notes %}<span class="sp-note">{{ n }}</span>{% endfor %}</td>
-              <td data-label="Where" class="rl-where">{{ g.where or '-' }}</td>
+              <td data-label="Venue" class="rl-where">{{ g.where or '-' }}</td>
+              <td data-label="Where it&rsquo;s on" class="rl-prog">{% if g.guide.open %}<button class="sp-onguide" data-act="listings" data-event="{{ g.id }}" data-name="{{ g.game }}" data-names-only="{{ 1 if g.guide.names_only else 0 }}">{{ g.guide.text }}</button>{% else %}<span class="sp-none">{{ g.guide.text }}</span>{% endif %}<span class="s{{ ' text-warning' if g.guide_time else '' }}">{% if g.guide_time %}At {{ g.guide_time }} in your guide, not TheSportsDB's {{ g.time }}{% else %}{{ g.guide.sub }}{% endif %}</span>{% if g.guide.also %}<span class="s">{{ g.guide.also }}</span>{% endif %}</td>
+              <td data-label="" class="sp-kebab"><span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
+                <div class="menu pop-left">
+                  <button class="menu-item" data-act="listings" data-event="{{ g.id }}" data-name="{{ g.game }}" data-names-only="{{ 1 if g.guide.names_only else 0 }}"{{ ' disabled' if not g.guide.open else '' }}>{{ 'Event channels naming it' if g.guide.names_only else 'Listings on your guide' }}</button>
+                  <a class="menu-item" href="{{ g.tsdb_url }}" target="_blank" rel="noopener">Edit on TheSportsDB {{ icon('forward') }}</a>
+                </div></span></td>
             </tr>
             {% endfor %}
           </tbody>
@@ -95,6 +105,45 @@
       {% else %}
       <p class="card-note">{{ no_games_note }}</p>
       {% endif %}
+    </div>
+  </div>
+
+  <div class="card sp-wide" data-section="matching" id="sp-matching" data-terms="{{ matching.terms | tojson | forceescape }}">
+    <div class="card-head"><h2>Matching your guide</h2></div>
+    <div class="card-body">
+      <p class="card-note">ChannelBin finds this league's {{ many }} in your guide by reading each listing's title for two things: a name for the league (one of the names below) and, for a game, the names of both teams. When a listing has both, it counts as that {{ one }}.</p>
+      <h3 class="sp-h3">Names for this league</h3>
+      <div class="sp-terms">
+        {% for t in matching.terms %}<span class="chip sp-term">{{ t }}<button class="chip-x" data-act="remove-term" data-term="{{ t }}" aria-label="Remove {{ t }}">{{ icon('close') }}</button></span>{% endfor %}
+        <form class="sp-addterm" data-act="add-term"><input class="form-control" name="term" maxlength="120" placeholder="Add a name" aria-label="Add a name for this league"><button class="btn btn-sm" type="submit">{{ icon('add') }}Add</button></form>
+      </div>
+      <p class="sp-hint">These came from TheSportsDB. Add one when your provider calls the league something else. For example, TheSportsDB says "NASCAR Truck Series" but guides say "NASCAR Craftsman Truck Series", so those races are missed until that name is added.</p>
+      {% for t in matching.suggested %}
+      <div class="sp-suggest"><span>Guides often call this league <strong>{{ t }}</strong>, and TheSportsDB does not list that name. Add it?</span>
+        <button class="btn btn-sm" data-act="accept-term" data-term="{{ t }}">Add</button></div>
+      {% endfor %}
+      <h3 class="sp-h3">Categories (optional)</h3>
+      <p class="sp-hint sp-hint-top">If your provider has a category just for this league, such as "NFL Sunday Ticket", add it. A listing on a channel in that category counts as this league even when its title does not name it. A game still has to name both teams. Turn on Replays only for a category that only shows old {{ many }}.</p>
+      {% if matching.categories %}
+      <div class="table-scroll">
+        <table class="tbl tbl-cards rl-tbl">
+          <thead><tr><th>Category</th><th>Channels</th><th>Replays only</th><th></th></tr></thead>
+          <tbody>
+            {% for c in matching.categories %}
+            <tr>
+              <td data-label="Category" class="rl-prog"><span class="t">{{ c.name }}</span>{% if not c.channels %}<span class="s text-warning">Not on any of your accounts right now. Kept, since providers often bring a name back.</span>{% endif %}</td>
+              <td data-label="Channels">{{ c.channels }}</td>
+              <td data-label="Replays only"><label class="switch"><input type="checkbox" data-act="replay" data-name="{{ c.name }}"{{ ' checked' if c.replay else '' }}><span class="knob"></span></label></td>
+              <td data-label="" class="sp-kebab"><button class="btn btn-sm" data-act="untie" data-name="{{ c.name }}">Remove</button></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="sp-hint">None added.</p>
+      {% endif %}
+      <div class="sp-catbar"><button class="btn btn-sm" data-act="tie">{{ icon('add') }}Add a category</button></div>
     </div>
   </div>
 
@@ -119,7 +168,7 @@
         </table>
       </div>
       {% else %}
-      <p class="card-note">No calls are being made for this league.</p>
+      <p class="card-note">ChannelBin isn't checking TheSportsDB for this league.</p>
       {% endif %}
     </div>
   </div>

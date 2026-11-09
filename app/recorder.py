@@ -275,11 +275,13 @@ def recording_disk_paths(recording_id: int, cfg: dict = None) -> list:
 
 
 def recording_image_paths(recording_id: int, cfg: dict = None) -> list:
-    """The images ChannelBin itself made for a recording: the thumbnail and the poster
-    frame, plus any temp capture a failed or interrupted grab left beside either.
+    """The images ChannelBin itself holds for a recording: the thumbnail and the poster
+    frame, plus any temp capture a failed or interrupted grab left beside either, and the
+    TheSportsDB images no other recording shares.
 
-    Removed on EVERY delete, including one that keeps the recording's files: both are named
-    by the row's id and only the row's pages ever show them, so once the row is gone nothing
+    Removed on EVERY delete, including one that keeps the recording's files: the thumbnail and
+    poster frame are named by the row's id, the TheSportsDB images are listed only when no other
+    recording names them, and only the row's pages ever show them, so once the row is gone nothing
     will display or delete them again - and the keep-files dialog promises that only what
     ChannelBin holds is removed (dev/changelog/1041). The COPY of the poster written beside
     the video is a different file and deliberately not here: it describes the video the user
@@ -295,6 +297,10 @@ def recording_image_paths(recording_id: int, cfg: dict = None) -> list:
         folder = image_dir(cfg, kind)
         paths.append(os.path.join(folder, f'{recording_id}.jpg'))
         paths.extend(glob.glob(os.path.join(folder, f'{recording_id}.*.tmp.jpg')))
+    # The images downloaded from TheSportsDB for its event, when no other recording names them
+    # (app/sports_images.py, dev/changelog/1465). Read while its link row still exists.
+    from .sports_images import owned_paths
+    paths.extend(owned_paths(recording_id, cfg))
     return paths
 
 

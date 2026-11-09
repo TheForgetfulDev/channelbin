@@ -56,6 +56,7 @@ APP_DIR = os.path.join(REPO, 'app')
 RESET = {
     'app/account_links.py': {'_last_roll_attempt'},
     'app/account_stats.py': {'_catch_up'},
+    'app/provider_stalls.py': {'_recent'},
     'app/accounts.py': {'_sync_progress'},
     'app/admission.py': {'_active', '_next_seq'},
     'app/sync_queue.py': {'_state'},

@@ -44,6 +44,11 @@
     <div class="form-group" style="margin:0; flex:1; min-width:200px;">
       <label style="font-size:var(--fs-sm);">{{ oneoff_label }} <span class="tz-label" data-tz-label></span></label>
       <input type="datetime-local" id="{{ prefix }}-dt" class="form-control">
+      {# The instant the field stands for and the note that says which pass of a repeated
+         hour it means (util.js::wallTimeField, dev/changelog/1477); schedule-fields.js
+         posts the instant as scheduled_time_utc beside the text. #}
+      <input type="hidden" id="{{ prefix }}-dt-utc">
+      <div class="text-muted small" id="{{ prefix }}-dt-note" style="display:none; margin-top:4px;"></div>
     </div>
   </div>
   <div id="{{ prefix }}-recurring-row" style="display:none; flex-direction:column; gap:0.5rem; margin-bottom:0.5rem;">
@@ -309,6 +314,19 @@
 {% call field_shell(path, label, description, restart, tier=tier, gated_by=gated_by, overridable_by=overridable_by) %}
 <textarea data-setting-path="{{ path }}" data-setting-type="list" rows="3">{{ value | join('\n') if value else '' }}</textarea>
 {% endcall %}
+{% endmacro %}
+
+{% macro history_chips(rows) %}
+  {# The filter chips over a history or event-log card (app/history_filter.py): one per kind
+     of entry with its count, All always first, a zero-count chip already left out by
+     apply(). Links, so a reload and a Ctrl-click keep working; the page's script swaps
+     only the card on a plain click (util.js::bindHistoryChips). The markup is the rule
+     page's (mockup 42, dev/changelog/1189); .rl-filter is style.css's. #}
+  <div class="rl-filter">
+    {% for c in rows %}
+    <a class="chip{{ ' active' if c.active else '' }}" data-hist="{{ c.key }}" href="{{ c.href }}">{{ c.label }}<span class="n">{{ c.count }}</span></a>
+    {% endfor %}
+  </div>
 {% endmacro %}
 
 {% macro field_readonly(path, label, description, value, secret=false, tier=none, gated_by=none, overridable_by=none) %}

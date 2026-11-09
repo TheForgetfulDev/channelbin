@@ -917,6 +917,13 @@ _DEFAULTS = {
         'horizon_days': 21,
         # How long a past event is kept.
         'history_keep_days': 30,
+        # Download the event's poster and background for a recording matched to one, for the
+        # files written beside it for media servers (app/sports_images.py, dev/changelog/1465).
+        # Off, nothing is downloaded and none already downloaded is used.
+        'download_images': True,
+        # Name a matched recording's file `League YYYY-MM-DD Event` from TheSportsDB when the
+        # join writes it, in place of the recording's own name (dev/changelog/1466).
+        'file_names': False,
     },
     'auto_scheduling': {
         # Per-rule cap on SCHEDULED recordings when the rule sets none of its own; a showing

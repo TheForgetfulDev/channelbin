@@ -5,6 +5,86 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.40.0 - 2026-11-09
+
+Sports games matched to your guide, Live and New marks, and a player that says what went wrong.
+
+**Added**
+
+- Sports Schedules now connects to your guide. Each followed game says where it is on your
+  channels, both in guide listings and in event channels that name the game, such as
+  `NHL TORONTO - MONTREAL | Sat 07 Nov 19:05 EST`. A dialog lists every match, grouped by how
+  it is worded, with a Wrong match button for a group or a single channel. Where TheSportsDB's
+  time and the guide disagree, the game shows both, and every game links to its event on
+  TheSportsDB. **Sports Schedules is still a work in progress** and will keep improving from
+  release to release; recording a game from its page is not there yet.
+- A Matching your guide card on each league page teaches it the names your provider uses for
+  the league and ties your categories to it.
+- A recording of a matched game shows the event on its page: league, season, round, venue,
+  TheSportsDB's start time when it differs from the guide, and why it matched, with Wrong match
+  to take it off. Its `.nfo` carries the league and season as a collection, the league as a
+  tag, and the event id.
+- TheSportsDB's poster and background become a matched recording's media-server artwork, the
+  portrait poster as `-poster` and the landscape thumb as `-fanart`, which Plex, Kodi and
+  Jellyfin all read. Each image is downloaded once and shared by every recording of the event.
+  A new setting turns this off.
+- A new Advanced setting, `sports_data.file_names`, names a matched recording's file
+  `League YYYY-MM-DD Event`, such as `NASCAR Cup Series 2026-11-01 Xfinity 500`, the shape
+  Plex's sports agents read. The recording's page says beforehand what the file will be
+  called.
+- The guide's Live and New marks are kept on every listing, shown in a program's details, and
+  available as a Guide mark filter in Search Programs, which an auto-record rule can use.
+- When the browser cannot play a channel preview or a recording, the player shows what the
+  browser said instead of guessing, and, with a GPU set up, offers Try re-encoded: a new
+  session that decodes on the CPU and encodes H.264 on the GPU so the browser can play it. It is
+  never automatic and gives way to any conversion.
+- The account page's Activity card shows everything that happened on the account in the last
+  30 days, its syncs, the alerts about it and the blocks set on it, newest first, with filter
+  chips to cut it to one kind. The same chips sit on a recording's Event log, a channel's
+  Activity Timeline and a group's Activity timeline.
+- When recordings on two or more accounts of one provider stall within five minutes of each
+  other, one alert names the provider, the accounts and the recordings, and each recording's
+  events say its stall is most likely the provider's.
+- A failed EPG refresh whose kept listings have all run out moves the channel to a source that
+  still has listings for it, and an alert names any channel left with no guide at all. The
+  Sources card and the channel page say the listings ran out.
+- A program whose recording failed shows a red Failed chip in the TV Guide, is still offered
+  Record, and links to the failed recording's page.
+
+**Changed**
+
+- Show duplicates is on by default in Search Channels and Search Programs. Hiding them is one
+  untick away and the count line says how many that took out.
+- The nightly guide cleanup and the Programs index rebuild no longer hold the database for most
+  of a minute at a time. The cleanup writes only the difference and compacts the index in
+  small steps; another writer waits under a second.
+- Applying a config backup always asks for a restart, since a restore can move settings a save
+  would have applied live.
+- The account block's "Until a time..." field and the one-off health check's time field keep
+  the instant they stand for across a DST change. A time in the repeated 1 AM hour says which
+  pass it means and can be switched to the other.
+- flake8 runs in CI on every push and pull request, before the test suite.
+
+**Fixed**
+
+- With Collapse channel groups on, every Programs facet count (Account, Category, Health,
+  Other, Group, Tag) now equals what clicking it returns.
+- The Programs "N duplicates" count no longer counts ended airings that ticking Show
+  duplicates would not bring back.
+- The "no scheduled listings" chip on Search Channels reads as one phrase, "No scheduled
+  listings", with a tooltip saying what it means.
+- A guide that only repeats a channel's own name in 2-hour blocks is no longer read as
+  listings by the sports matcher, which had shown every Sunday NFL game with phantom replays.
+- Hidden channels are never matched to a game, in listings or by name, and a hide leaves the
+  league page right away.
+- A provider's team channels, which list a market's teams side by side, are no longer read as
+  games. A name match requires the two teams with only vs, v, at, @, x or a dash between them.
+- A league that is not followed says ChannelBin isn't checking TheSportsDB for it, instead of
+  "0 games".
+- Databases migrated from older versions get the column defaults a fresh install has, on
+  `account_hosts`, `account_logins` and the sports tables.
+- The account dot in the group suggestion dialog has its size and shows.
+
 ## 0.39.0 - 2026-11-05
 
 Sports schedules from TheSportsDB, a Sync All button, and search counts that add up.

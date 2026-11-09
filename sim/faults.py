@@ -34,11 +34,12 @@ channel reads it as it plays and applies it by channel time, so a stream stays a
 of channel time and one already playing picks up a fault that starts later.
 """
 import datetime as _dt
+import re
 import threading
 from collections import Counter
 from dataclasses import dataclass
 
-from .lineup import (KIND_LIVE, KIND_SEPARATOR, TRIPLET_KINDS, BackendChannel, GuideChannel,
+from .lineup import (KIND_EVENT, KIND_LIVE, KIND_SEPARATOR, TRIPLET_KINDS, BackendChannel, GuideChannel,
                      PanelRow, channel_label, frac)
 from .content import TS_PROFILES
 from .names import invented_stem
@@ -702,12 +703,49 @@ def _model_guide_id_twins(view, f):
     twins = []
     for i, g in enumerate(guide):
         twin = _flip_case(g.guide_id)
-        if twin == g.guide_id or not g.has_programs:
+        if twin == g.guide_id or not g.has_programs or g.filler:
             continue
         if frac(seed, 'fault-twin', view.name, g.guide_id) < share:
             other = guide[(i + 1) % len(guide)].station
+            if other is None:
+                continue
             twins.append(GuideChannel(twin, g.display_name, other, True, g.icon))
     view.guide = guide + twins
+
+
+def _model_filler_guide(view, f):
+    """Each event slot gets a guide id and a guide whose only program is its own name."""
+    share, seed = f.params['share'], view.world.seed
+    rows, extra = [], []
+    for row in view.rows:
+        if row.channel.kind == KIND_EVENT and frac(seed, 'fault-filler', view.name, row.channel.stream_id) < share:
+            tvg = row.tvg_id or f'filler{row.channel.stream_id}.slot'
+            row = _row(row, tvg_id=tvg)
+            extra.append(GuideChannel(tvg, row.name, None, True, None, filler=row.name))
+        rows.append(row)
+    view.rows = rows
+    view.guide = list(view.guide) + extra
+
+
+#: An event slot naming a game, as lineup.py writes one: `Hockey EVENT 3: Gulls vs Bears`.
+_GAME_SLOT = re.compile(r'\b([A-Za-z]+) (?:EVENT|GAME|MATCH|PPV) \d+: ([A-Za-z]+) vs ([A-Za-z]+)\b', re.I)
+
+
+def _model_team_channels(view, f):
+    """Event slots naming a game become a provider's team channels: the league, then a market's teams
+    side by side with nothing between them, and a guide that only repeats the name."""
+    share, seed = f.params['share'], view.world.seed
+    rows, extra = [], []
+    for row in view.rows:
+        m = _GAME_SLOT.search(row.name) if row.channel.kind == KIND_EVENT else None
+        if m and frac(seed, 'fault-teams', view.name, row.channel.stream_id) < share:
+            name = f'{m[1].upper()} TEAMS| CBS {m[2].upper()} {m[3].upper()} METRO CITY'
+            tvg = row.tvg_id or f'teams{row.channel.stream_id}.slot'
+            row = _row(row, name=name, tvg_id=tvg)
+            extra.append(GuideChannel(tvg, name, None, True, None, filler=name))
+        rows.append(row)
+    view.rows = rows
+    view.guide = list(view.guide) + extra
 
 
 def _model_shared_guide_id(view, f):
@@ -1044,6 +1082,16 @@ _KINDS = (
           'twin',
           'playlist guide ids spelled in another case than the guide\'s',
           {'share': (0.5, _share)}, apply=_model_guide_id_case),
+    _kind('filler_guide', SCOPE_PANEL, LAYER_MODEL, _ROWS + (EP_GUIDE,), MEASURED,
+          'dev/changelog/1470, BUGS.md 2026-11-08 10:07 AM; about 10,700 channels on two of '
+          'prod\'s three accounts, each a 2-hour block repeating the channel\'s name',
+          'every event slot gets a guide whose only program is its own name, repeated in '
+          '2-hour blocks', {'share': (1.0, _share)}, apply=_model_filler_guide),
+    _kind('team_channels', SCOPE_PANEL, LAYER_MODEL, _ROWS + (EP_GUIDE,), MEASURED,
+          'dev/changelog/1473, BUGS.md 2026-11-08 01:18 PM; 38 NFL TEAMS| channels on one of prod\'s '
+          'accounts, each with only filler in its guide, two naming more than one team',
+          'event slots renamed as team channels naming a market\'s teams with nothing between them, '
+          'each with a guide that only repeats its name', {'share': (1.0, _share)}, apply=_model_team_channels),
     _kind('guide_id_twins', SCOPE_PANEL, LAYER_MODEL, (EP_GUIDE,), MEASURED,
           'dev/changelog/1139 (2,297 channels), BUGS.md 2026-09-26 06:15 PM',
           'the guide lists a channel under a second id differing only in case, carrying '

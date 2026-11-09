@@ -30,15 +30,19 @@ def _cfg(enabled=True):
 
 
 class SidecarPathTests(unittest.TestCase):
-    """The names, spelled in one place: the .nfo, then every name a poster can take."""
+    """The names, spelled in one place: the .nfo, then every name a poster and a background
+    can take."""
 
     def test_both_sidecars_hang_off_the_video_stem(self):
-        nfo, poster, poster_png = sidecar_paths('/dvr/Race Day.mp4')
+        nfo, poster, poster_png, fanart, fanart_png = sidecar_paths('/dvr/Race Day.mp4')
         self.assertEqual(nfo, '/dvr/Race Day.nfo')
         self.assertEqual(poster, '/dvr/Race Day-poster.jpg')
         # A poster pinned to the profile keeps its own format, so teardown has to know
         # the PNG name too (dev/changelog/1059).
         self.assertEqual(poster_png, '/dvr/Race Day-poster.png')
+        # TheSportsDB's background (dev/changelog/1465).
+        self.assertEqual(fanart, '/dvr/Race Day-fanart.jpg')
+        self.assertEqual(fanart_png, '/dvr/Race Day-fanart.png')
 
     def test_the_stem_is_taken_without_the_extension_not_by_appending(self):
         """A .ts source and its .mp4 conversion must resolve to the SAME sidecar names, or

@@ -77,6 +77,7 @@ SAMPLE_IDS = {
     ('queue_auto_rule_evaluation', 'AUTO_RULES_EVALUATE_JOB_ID'): ['auto_rules_evaluate'],
     ('schedule_auto_rule_sweep', 'AUTO_RULE_SWEEP_JOB_ID'): ['auto_rule_sweep'],
     ('schedule_sports_worker', 'SPORTS_WORKER_JOB_ID'): ['sports_worker'],
+    ('queue_sports_match', 'SPORTS_MATCH_JOB_ID'): ['sports_match'],
     ('_register_window_close_job', "'hc_window_close'"): ['hc_window_close'],
     ('schedule_check_window_jobs', "'hc_window_dispatch'"): ['hc_window_dispatch'],
     ('schedule_config_backup', "'config_backup_daily'"): ['config_backup_daily'],

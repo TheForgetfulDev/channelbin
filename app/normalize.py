@@ -345,7 +345,7 @@ def audio_filter(gain_db):
 
 # ── Video filter chains ──────────────────────────────────────────────────────────────────
 
-def fit_filter(width, height):
+def fit_filter(width, height, interlaced_aware=False):
     """Scale every frame to fit width x height at its true aspect ratio, pad the rest, and
     mark the result square-pixel.
 
@@ -355,12 +355,18 @@ def fit_filter(width, height):
     after a 4:3 SD one came out squeezed into the SD's 1440-wide pillarbox. One scale whose
     expressions read the current frame, plus a pad that does too, gives an SD stretch its
     pillarbox and the HD stretch the full frame within one fixed output size
-    (dev/changelog/1184)."""
+    (dev/changelog/1184).
+
+    `interlaced_aware` scales a frame flagged interlaced field by field (scale's interl=-1), for
+    a chain that deinterlaces AFTER fitting - the re-encoded preview's, whose deinterlacer cannot
+    survive a size change under -reinit_filter:v 0 (dev/changelog/1461). The frame stays flagged,
+    so the deinterlacer still sees it."""
     W, H = int(width), int(height)
     ratio = f'{W}/{H}'
     w_expr = f"if(gt(iw*sar/ih,{ratio}),{W},trunc({H}*iw*sar/ih/2)*2)"
     h_expr = f"if(gt(iw*sar/ih,{ratio}),trunc({W}*ih/(iw*sar)/2)*2,{H})"
-    return (f"scale=w='{w_expr}':h='{h_expr}':eval=frame,"
+    interl = ':interl=-1' if interlaced_aware else ''
+    return (f"scale=w='{w_expr}':h='{h_expr}':eval=frame{interl},"
             f"pad=w={W}:h={H}:x=(ow-iw)/2:y=(oh-ih)/2:eval=frame,setsar=1")
 
 

@@ -22,6 +22,11 @@ Rules this module enforces, each of which a test in tests/test_preview.py guards
   exiting on its own, connect timeout, preemption, replacement, app shutdown.
 * Nothing here feeds the health score or writes a database row. A preview is not an
   observation.
+* Video is a stream copy unless the viewer asks for a re-encode after the browser could not
+  decode the copy (dev/changelog/1461). A re-encode runs on the GPU only, never as a CPU
+  encode; it is refused, with the reason, when no GPU encodes here or while a recording is
+  being converted, and a re-encoding session is stopped by name the moment a conversion
+  starts, because the conversion comes first. Every other rule above applies to it unchanged.
 * "Capture screenshot" on the channel page is a preview too (capture_frame): it reads a
   frame out of the live preview of that channel when one is playing, and otherwise opens a
   short capture session through the same start path - same slot, same refusals, same
@@ -61,6 +66,7 @@ from . import connection_limits as connlim
 from .account_links import (is_credential_refusal, is_resolution_failure,
                             note_refusal_for_holder, render_held_login,
                             roll_host_for_channel)
+from .config import resolve_ffmpeg_path
 from .proc_utils import (PREVIEW_PLAYLIST, PREVIEW_SEGMENT_RE, build_file_playback_cmd,
                          build_preview_cmd, read_stderr_tail, stderr_cause, terminate_or_kill)
 from .recording_story import http_answer, plain_cause
@@ -93,6 +99,8 @@ REASON_READ_FAILED = 'read_failed'
 # Sessions following a segment the recorder is writing (dev/changelog/1316).
 REASON_SEGMENT_CHANGED = 'segment_changed'
 REASON_CAPTURE_STOPPED = 'capture_stopped'
+# Re-encoding sessions only (dev/changelog/1461).
+REASON_CONVERSION_STARTED = 'conversion_started'
 
 REASON_TEXT = {
     REASON_USER: 'Stopped.',
@@ -110,6 +118,8 @@ REASON_TEXT = {
     REASON_READ_FAILED: 'ffmpeg stopped reading the recording\'s file.',
     REASON_SEGMENT_CHANGED: 'The recording moved on to a new segment file.',
     REASON_CAPTURE_STOPPED: 'The recording stopped capturing.',
+    REASON_CONVERSION_STARTED: ('Stopped - a recording started converting, and a conversion comes '
+                                'before a re-encoded picture. Try again once it has finished.'),
 }
 
 # Where a channel's wording does not fit a recording's file.
@@ -179,6 +189,41 @@ def audio_needs_transcode(codec) -> bool:
     return str(codec).strip().lower() not in BROWSER_AUDIO_CODECS
 
 
+CONVERSION_FIRST = ('A recording is being converted right now, and a conversion comes before a '
+                    're-encoded picture. Try again once it has finished.')
+
+
+def reencode_device(cfg: dict) -> tuple:
+    """May a re-encode start right now: (device, '') when it may, ('', why not) when it may not.
+
+    Asked in this order so the answer is the true one and the GPU is never touched while a
+    conversion runs: the configured render node must exist, no conversion may be running
+    (a conversion comes first, on the GPU or the CPU), and the node must pass the trial encode
+    the conversion itself runs (toolchain.check_gpu_encoder, cached once it passes). There is
+    no CPU encode to fall back to: one measured 347% of the dev box's CPU at 1080p60
+    (dev/changelog/1018). The trial never reports to the GPU alert or Readiness: both are kept
+    per device for the codec conversions use, so an H.264 pass here would clear an alert that
+    HEVC fails (the defect report=False exists for, dev/changelog/1184), and a box that chose
+    the CPU would be told its conversions fell back to it. The refusal says what failed."""
+    from .postprocessor import has_active_conversion
+    from .toolchain import check_gpu_encoder
+
+    pp = (cfg.get('recording') or {}).get('post_process') or {}
+    device = str(pp.get('vaapi_device') or '').strip()
+    if not device or not os.path.exists(device):
+        where = f' at {device}' if device else ''
+        return '', ('ChannelBin re-encodes only on a GPU, and there is no GPU device'
+                    f'{where} (recording.post_process.vaapi_device).')
+    if has_active_conversion():
+        return '', CONVERSION_FIRST
+    trial = check_gpu_encoder(resolve_ffmpeg_path(cfg['ffmpeg']['path']), device, 'h264',
+                              report=False)
+    if not trial.ok:
+        return '', (f'ChannelBin re-encodes only on a GPU, and a test encode through {device} '
+                    f'failed: {trial.error}')
+    return device, ''
+
+
 class PreviewRefused(Exception):
     """A preview could not start; `message` is user-facing prose, `status` the HTTP code."""
 
@@ -235,6 +280,9 @@ class PreviewSession:
     # reads a segment file the recorder is still writing, and so never reaches an end.
     capture: Optional[CapturePlace] = field(default=None, repr=False)
     following: bool = False
+    # The video is re-encoded on the GPU (dev/changelog/1461); the session yields to a
+    # conversion.
+    reencode: bool = False
     # _finish() claims a session under _lock and tears it down under _teardown_lock, so a
     # second finisher blocks until the first is done rather than returning early.
     _finishing: bool = False
@@ -286,6 +334,7 @@ class PreviewSession:
             'reason_text': self.reason_text(),
             'detail': self.detail,
             'transcode_audio': self.transcode_audio,
+            'reencode': self.reencode,
             'elapsed_seconds': round(now - self.started_mono, 1) if self.started_mono else 0,
             'max_seconds': self.max_seconds,
         }
@@ -325,15 +374,16 @@ def _prune_ended_locked():
         _sessions.pop(s.id, None)
 
 
-def start_preview(channel_id: int) -> PreviewSession:
+def start_preview(channel_id: int, reencode: bool = False) -> PreviewSession:
     """Start previewing `channel_id`, stopping any preview already being watched. Raises
     PreviewRefused with a user-facing message (404 unknown channel, 409 account at its
-    connection limit, 500 the directory or ffmpeg could not be created). Requires an app
-    context; the returned session is already registered and reaped."""
-    return _launch(channel_id, PURPOSE_WATCH)
+    connection limit or a re-encode that may not start, 500 the directory or ffmpeg could not
+    be created). Requires an app context; the returned session is already registered and
+    reaped. `reencode` re-encodes the video on the GPU (reencode_device())."""
+    return _launch(channel_id, PURPOSE_WATCH, reencode=reencode)
 
 
-def _launch(channel_id: int, purpose: str) -> PreviewSession:
+def _launch(channel_id: int, purpose: str, reencode: bool = False) -> PreviewSession:
     """The one start path for both purposes: slot, refusal prose, ffmpeg, the
     acquire-to-Popen preemption window and the reaper are identical for a capture."""
     from . import db
@@ -347,6 +397,12 @@ def _launch(channel_id: int, purpose: str) -> PreviewSession:
     if channel is None:
         raise PreviewRefused('Channel not found', 404)
     account = channel.account
+    device = ''
+    if reencode:
+        # Asked before the watched session is replaced, so a refusal leaves it playing.
+        device, why = reencode_device(cfg)
+        if not device:
+            raise PreviewRefused(why, 409)
     if purpose == PURPOSE_WATCH:
         latest = (ChannelTest.query.filter_by(channel_id=channel_id)
                   .order_by(ChannelTest.id.desc()).first())
@@ -377,6 +433,7 @@ def _launch(channel_id: int, purpose: str) -> PreviewSession:
         started_mono=time.monotonic(),
         purpose=purpose,
         app=current_app._get_current_object(),
+        reencode=bool(device),
     )
     # Registered BEFORE the slot is taken, so a recording preempting in the window between
     # acquire and Popen finds something to flag rather than nothing (see `preempted`).
@@ -412,10 +469,10 @@ def _launch(channel_id: int, purpose: str) -> PreviewSession:
                                                      'preview', session.id)
     cmd = build_preview_cmd(cfg, launch_url, session.dir,
                             segment_seconds=int(pcfg.get('segment_seconds', 2)),
-                            transcode_audio=transcode_audio, pace_realtime=pace)
+                            transcode_audio=transcode_audio, pace_realtime=pace,
+                            reencode_device=device or None)
     log.info('Preview %s (%s): channel %d (%s)%s - %s', session.id, purpose, channel.id,
-             channel.name, ' with audio re-encoded to AAC' if transcode_audio else '',
-             mask_creds_in_text(' '.join(cmd)))
+             channel.name, _encoding_note(session), mask_creds_in_text(' '.join(cmd)))
     try:
         # stderr to a file, never a pipe: an undrained pipe once deadlocked every recording
         # in this app (dev/changelog/430), and the tail is what the modal shows on exit.
@@ -439,9 +496,16 @@ def _launch(channel_id: int, purpose: str) -> PreviewSession:
     return session
 
 
+def _encoding_note(session: PreviewSession) -> str:
+    if session.reencode:
+        return ' re-encoded on the GPU'
+    return ' with audio re-encoded to AAC' if session.transcode_audio else ''
+
+
 def start_file_playback(recording_id: int, recording_name: str, path: str, offset: float,
                         transcode_audio: bool,
-                        capture: Optional[CapturePlace] = None) -> PreviewSession:
+                        capture: Optional[CapturePlace] = None,
+                        reencode: bool = False) -> PreviewSession:
     """Play a recording's finished file from `offset` seconds, replacing whatever session is
     being watched - a channel preview, or this recording's own session at its old offset,
     which is what a seek is. The caller has already decided the file may be played and
@@ -454,12 +518,19 @@ def start_file_playback(recording_id: int, recording_name: str, path: str, offse
     so two readers never share the file.
 
     `capture` places a session over a recording that is still capturing; with a
-    `follow_state` the file is the segment being written and ffmpeg follows it from `offset`."""
+    `follow_state` the file is the segment being written and ffmpeg follows it from `offset`.
+    `reencode` re-encodes the video on the GPU (reencode_device()); a refusal is a
+    PreviewRefused (409) raised before the session being watched is touched."""
     from .config import load_config
 
     cfg = load_config()
     pcfg = cfg.get('preview', {}) or {}
     segment_seconds = int(pcfg.get('segment_seconds', 2))
+    device = ''
+    if reencode:
+        device, why = reencode_device(cfg)
+        if not device:
+            raise PreviewRefused(why, 409)
     watched = live_session(PURPOSE_WATCH)
     if watched is not None:
         _finish(watched, REASON_REPLACED)
@@ -483,6 +554,7 @@ def start_file_playback(recording_id: int, recording_name: str, path: str, offse
         offset=float(offset),
         capture=capture,
         following=bool(capture and capture.follow_state is not None),
+        reencode=bool(device),
     )
     if session.following:
         session.connect_timeout = max(session.connect_timeout, FOLLOW_START_SECONDS)
@@ -500,9 +572,10 @@ def start_file_playback(recording_id: int, recording_name: str, path: str, offse
     list_size = max(6, -(-FILE_WINDOW_SECONDS // max(segment_seconds, 1)))
     cmd = build_file_playback_cmd(cfg, path, session.dir, offset=session.offset,
                                   segment_seconds=segment_seconds, list_size=list_size,
-                                  transcode_audio=transcode_audio, follow=session.following)
-    log.info('Playback %s: %s%s - %s', session.id, session.label,
-             ' with audio re-encoded to AAC' if transcode_audio else '', ' '.join(cmd))
+                                  transcode_audio=transcode_audio, follow=session.following,
+                                  reencode_device=device or None)
+    log.info('Playback %s: %s%s - %s', session.id, session.label, _encoding_note(session),
+             ' '.join(cmd))
     try:
         # stderr to a file, never a pipe (dev/changelog/430); its tail names a read failure.
         with open(session.stderr_path, 'wb') as err:
@@ -559,7 +632,7 @@ def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
         session._teardown_lock.release()
     level = (logging.INFO if reason in (REASON_USER, REASON_REPLACED, REASON_CAPTURED,
                                         REASON_FILE_END, REASON_SEGMENT_CHANGED,
-                                        REASON_CAPTURE_STOPPED)
+                                        REASON_CAPTURE_STOPPED, REASON_CONVERSION_STARTED)
              else logging.WARNING)
     log.log(level, 'Preview %s: %s stopped - %s%s', session.id, session.label, reason,
             f' ({detail})' if detail else '')
@@ -778,7 +851,23 @@ def _playlist_is_playable(path: str) -> bool:
     return any(float(d) > 0 for d in _EXTINF_RE.findall(text))
 
 
+def _yielded_to_conversion(session: PreviewSession) -> bool:
+    """End a re-encoding session the moment a conversion starts; True if it did. A conversion
+    never waits for a preview, so the preview gives way."""
+    if not session.reencode:
+        return False
+    from .postprocessor import active_conversion_ids
+    ids = active_conversion_ids()
+    if not ids:
+        return False
+    _finish(session, REASON_CONVERSION_STARTED,
+            detail=f'Recording {ids[0]} is being converted.')
+    return True
+
+
 def _check(session: PreviewSession):
+    if _yielded_to_conversion(session):
+        return
     if session.source == SOURCE_FILE:
         _check_file(session)
         return
