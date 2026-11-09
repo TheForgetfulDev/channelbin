@@ -26,6 +26,7 @@ from ..channel_groups import (effective_score, rank_members, member_channels,
 from ..epg_sources import (Listing, listing_agreement, keys_read, case_sensitive_matching,
                            AGREE_DOUBLED, AGREE_PAST, AGREE_REFERENCE, COMPARE_VERDICTS)
 from .. import channel_hiding
+from ..channel_search import mark_labels
 from ..fmt_utils import iso_seconds_or_none
 from ..recording_story import partial_note, stopped_early_note
 from ..config import load_config
@@ -223,12 +224,15 @@ def epg_source_names() -> dict:
 
 def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, rec, all_tags,
                   tags_by_name, tz, source_names, display_name=None, group_id=None,
-                  listings_from=None):
+                  listings_from=None, failed_rec=None):
     """Serialize one guide/search program cell (guide grid + extended search).
 
     entry=None → dummy filler slot for a channel with no EPG data.
     rec is the already-matched overlapping Recording (or None) - matching stays at
     call sites because the candidate set is built differently per route.
+    failed_rec is the newest FAILED recording overlapping the slot, given only when rec is
+    None. It is a fact of its own and never `has_recording`: that flag is what takes Record
+    off the program, and a failed program stays recordable (dev/changelog/1457).
     display_name/group_id: set for channel-group rows - ch is then the group's
     active member (real recording target), display_name the group's name.
     source_names is epg_source_names(), read once per request: the record dialog names the
@@ -258,6 +262,7 @@ def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, 
         'stop_time': stop.strftime('%Y-%m-%dT%H:%M:%S'),
         'category': category,
         'rating': (entry.rating or '') if entry else '',
+        'guide_marks': mark_labels(entry) if entry else [],
         'source_name': source_names.get(entry.source_id) if entry else None,
         # The group member whose listing this is, when it is not the member the row
         # records from (dev/changelog/1116). None on a channel row and on the serving
@@ -281,6 +286,7 @@ def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, 
         'recording_start_time': rec.start_time.strftime('%Y-%m-%dT%H:%M:%S') if has_rec else None,
         'recording_stop_time': rec.stop_time.strftime('%Y-%m-%dT%H:%M:%S') if has_rec else None,
         'recording_profile_id': rec.profile_id if has_rec else None,
+        'failed_recording_id': failed_rec.id if failed_rec is not None and not has_rec else None,
         'is_dummy': entry is None,
         'matched_tags': _matched_tags(all_tags, entry.title, entry.sub_title, entry.description) if entry else [],
     }
@@ -746,11 +752,17 @@ def epg_api():
     # Load all recordings in the time window for has_recording check
     # Segments come with them: partial_note() reads a finished recording's capture spans,
     # and a lazy load per recording would make the grid one query per recording.
-    window_recordings = Recording.query.options(selectinload(Recording.segments)).filter(
+    # A cancelled (ABORTED) recording never reaches the guide. A FAILED one does, as a mark
+    # of its own beside a Record that is still offered (dev/changelog/1457).
+    in_window = Recording.query.options(selectinload(Recording.segments)).filter(
         Recording.start_time < window_end,
         Recording.stop_time > window_start,
-        Recording.status.notin_([REC_STATUS_ABORTED, REC_STATUS_FAILED]),
+        Recording.status != REC_STATUS_ABORTED,
     ).all()
+    window_recordings = [r for r in in_window if r.status != REC_STATUS_FAILED]
+    # Newest first, so a program that failed twice names its latest attempt.
+    failed_indexes = _build_rec_indexes(sorted(
+        (r for r in in_window if r.status == REC_STATUS_FAILED), key=lambda r: -r.id))
 
     # group_id/channel_id/URL indexes (a channel can have more than one recording in
     # the window). Group-backed recordings key off group_id because failover can rewrite
@@ -836,6 +848,13 @@ def epg_api():
 
         stream_url = normalize_url(ch.stream_url, ch.account, cfg)
         channel_recs = _candidate_recs(rec_indexes, ch, stream_url, group)
+        failed_recs = _candidate_recs(failed_indexes, ch, stream_url, group)
+
+        def recs_for(start, stop, live=channel_recs, failed=failed_recs):
+            """{'rec', 'failed_rec'} for one slot: the live recording, else the failed one."""
+            rec = _match_recording(live, start, stop)
+            return {'rec': rec,
+                    'failed_rec': None if rec else _match_recording(failed, start, stop)}
 
         programs = []
 
@@ -844,11 +863,10 @@ def epg_api():
             slot = window_start.replace(minute=0, second=0, microsecond=0)
             while slot < window_end:
                 slot_end = slot + timedelta(hours=1)
-                rec = _match_recording(channel_recs, slot, slot_end)
                 programs.append(_program_dict(
                     ch, None, slot, slot_end,
                     stream_url=stream_url, template=template,
-                    tag_cleanup=tag_cleanup, rec=rec, all_tags=all_tags,
+                    tag_cleanup=tag_cleanup, **recs_for(slot, slot_end), all_tags=all_tags,
                     tags_by_name=tags_by_name, tz=tz, source_names=source_names,
                     display_name=display_name,
                     group_id=group.id if group is not None else None,
@@ -856,11 +874,11 @@ def epg_api():
                 slot = slot_end
         else:
             for entry in entries:
-                rec = _match_recording(channel_recs, entry.start_time, entry.stop_time)
                 programs.append(_program_dict(
                     ch, entry, entry.start_time, entry.stop_time,
                     stream_url=stream_url, template=template,
-                    tag_cleanup=tag_cleanup, rec=rec, all_tags=all_tags,
+                    tag_cleanup=tag_cleanup,
+                    **recs_for(entry.start_time, entry.stop_time), all_tags=all_tags,
                     tags_by_name=tags_by_name, tz=tz, source_names=source_names,
                     display_name=display_name,
                     group_id=group.id if group is not None else None,
@@ -943,8 +961,7 @@ def epg_api():
                 return _program_dict(
                     ch, entry, entry.start_time, entry.stop_time, stream_url=stream_url,
                     template=template, tag_cleanup=tag_cleanup,
-                    rec=_match_recording(channel_recs, entry.start_time, entry.stop_time),
-                    all_tags=all_tags, tags_by_name=tags_by_name, tz=tz,
+                    **recs_for(entry.start_time, entry.stop_time), all_tags=all_tags, tags_by_name=tags_by_name, tz=tz,
                     source_names=source_names, display_name=group.name, group_id=group.id)
             schedules_payload = _schedules_payload(
                 group, row, entries, chain[0], cell, entries_by_channel, cfg, group_records,

@@ -115,11 +115,12 @@ def clean_search(raw_params: str):
     The page-only parts are dropped and the result re-serialized through to_params(), so what
     is stored is the canonical spelling - explicit, so the rule's fields and standing options
     are its own and not whatever the defaults are when it runs. The four refusals of §3.1 come with a sentence each,
-    and so does a When, Day of week, Time of day or Program length value that does not parse
+    and so does a When, Day of week, Time of day, Guide mark or Program length value that does not parse
     - it would match nothing or stop the rule, which is the one outcome a rule running with
     nobody watching must never be allowed."""
     from .channel_search import (
         DEFAULT_PAGE_SIZE, DEFAULT_SORT_BY_GRAIN, DOW_LABELS, DUR_PREFIX, GRAIN_AIRINGS,
+        MARK_LABELS,
         SearchStateError, TOD_PREFIX, WHEN_CUSTOM_PREFIX, WHEN_NEXT_PREFIX, WHEN_NOW,
         WHEN_STATIC_VALUES, parse_duration, parse_time_of_day, parse_when_custom,
         parse_when_next, standing_applied)
@@ -164,6 +165,12 @@ def clean_search(raw_params: str):
             if value not in DOW_LABELS:
                 raise RuleError(f'"{value}" is not a day of the week, so the rule cannot '
                                 'run. Pick the day again or remove it.')
+    marks = state.filter_for('mark')
+    if marks is not None:
+        for value in marks.values + marks.ex:
+            if value not in MARK_LABELS:
+                raise RuleError(f'"{value}" is not a guide mark, so the rule cannot run. '
+                                'Pick Live or New again or remove it.')
     clock = state.filter_for('tod')
     if clock is not None:
         for value in clock.values + clock.ex:

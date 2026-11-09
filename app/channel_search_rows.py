@@ -69,7 +69,7 @@ from .channel_search import (FIELDS, GRAIN_AIRINGS, GRAIN_CHANNELS,
                              cluster_is_folded,
                              HEALTH_UNTESTED, SearchStateError, effective_health,
                              field_hit_predicate, in_any_group_expr, include_terms,
-                             matching_programs, tag_hit_predicate)
+                             mark_labels, matching_programs, tag_hit_predicate)
 from .logo_cache import resolve_logo_url
 from .database import (Channel, ChannelGroup, ChannelGroupMember, EPGEntry, Provider,
                        Recording,
@@ -374,6 +374,7 @@ def _airing_rows(result, state, ctx) -> list:
             # airing row draws the channel's in its own column.
             'program_category': entry.category or '',
             'rating': entry.rating or '',
+            'guide_marks': mark_labels(entry),
             # Naive-UTC ISO, the shape every other JSON surface in this app sends; the page
             # converts to the display timezone.
             'start_time': iso_seconds_or_none(entry.start_time),

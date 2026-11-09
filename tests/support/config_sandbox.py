@@ -7,9 +7,12 @@ backup dirs (dev/changelog/1130), so this class is no longer the only thing stan
 a test and the real repo-root file. Reach for `ConfigSandbox` now specifically when a test
 needs to (a) control the whole of what the sandboxed file contains - the `_write_cfg()`
 below; `TestApp.sandbox_config()` covers the usual case of adding values - or (b) sandbox
-`load_config()` outright, with no `make_test_app()`/Flask app involved at all. Under this
-class the runtime output and backup dirs are NOT sandboxed: they resolve to the real `/dvr`
-and the real config-backups folder unless `_write_cfg()` names them.
+`load_config()` outright, with no `make_test_app()`/Flask app involved at all. The runtime
+output and backup dirs are sandboxed here too: the file starts out naming temp dirs of this
+class's own, and `_write_cfg()` merges them under whatever the test writes, so a runtime read
+never resolves the real `/dvr` or config-backups folder. A test about the defaults or about
+the file's exact contents passes `keep_sandbox_paths=False`, and a `make_test_app()` built
+on top refuses to start while any of them points outside the temp dir.
 
 Before the default existed, this was the *only* fix: `make_test_app()` passed
 `extra_overrides` to `create_app()` once, and those overrides were never stored - so any
@@ -33,31 +36,37 @@ Subclass it for any test that asserts on config-derived behavior:
             super().setUp()
             self._write_cfg({'integrations': {'home_assistant': {'enabled': True}}})
 
-With no `_write_cfg()` call the sandbox carries only a config_version stamp, i.e. pure
-`_DEFAULTS` once merged - which is what "the defaults" tests should assert against.
+With no `_write_cfg()` call the sandbox carries a config_version stamp and the temp dirs,
+i.e. `_DEFAULTS` everywhere but those four paths - which is what "the defaults" tests should
+assert against, unless the default they assert on is one of the paths.
 `_write_cfg()` overwrites the stamp too, so a test that wants to force a real migration
 must put `config_version` back deliberately (or omit it) rather than relying on the
 sandbox default.
 """
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
 
 from app import config as cfgmod
-from tests.support.app import write_sandbox_config
+from app.config import _deep_merge
+from tests.support.app import sandbox_runtime_paths, write_sandbox_config
 
 
 class ConfigSandbox(unittest.TestCase):
     """Point app.config at a temp config.yaml for the life of one test."""
 
     def setUp(self):
+        self._sandbox_dir = tempfile.mkdtemp(prefix='dvr_cfg_sandbox_')
+        self.addCleanup(shutil.rmtree, self._sandbox_dir, ignore_errors=True)
+        self._sandbox_paths = sandbox_runtime_paths(self._sandbox_dir)
         fd, self._cfg_path = tempfile.mkstemp(suffix='.yaml')
         os.close(fd)
         # Stamped at the current config_version so a make_test_app() built on top of this
         # sandbox doesn't take migrate_config()'s backup-then-migrate branch on every build
         # (dev/changelog/620) - matches tests/support/app.py::TestApp's own default sandbox.
-        write_sandbox_config(self._cfg_path, {'config_version': cfgmod.CURRENT_CONFIG_VERSION})
+        self._write_cfg({'config_version': cfgmod.CURRENT_CONFIG_VERSION})
         self._cfg_patch = mock.patch.object(cfgmod, '_CONFIG_PATH', self._cfg_path)
         self._cfg_patch.start()
         # The mtime cache keys on the path it last parsed, so it has to be dropped both on
@@ -68,5 +77,12 @@ class ConfigSandbox(unittest.TestCase):
         self.addCleanup(lambda: setattr(cfgmod, '_yaml_cache', None))
         self.addCleanup(lambda: os.path.exists(self._cfg_path) and os.remove(self._cfg_path))
 
-    def _write_cfg(self, data):
+    def _write_cfg(self, data, keep_sandbox_paths=True):
+        """Replace the sandboxed file with `data`, merged over this sandbox's temp output
+        and backup dirs - a dir `data` names itself wins. keep_sandbox_paths=False writes
+        `data` alone, for a test about the defaults or the file's exact contents; runtime
+        reads then resolve those dirs to the real ones, so such a test must not reach a
+        capture, a probe or a config backup."""
+        if keep_sandbox_paths:
+            data = _deep_merge(self._sandbox_paths, data)
         write_sandbox_config(self._cfg_path, data)

@@ -17,15 +17,18 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 
 const [, , REPO] = process.argv;
 const SCHEDULE_FIELDS_JS = fs.readFileSync(`${REPO}/static/js/schedule-fields.js`, 'utf8');
+// util.js is loaded too: the one-off field is a wallTimeField (dev/changelog/1477), which
+// reads the display timezone from base.html's meta tag, so the fixture carries one.
+const UTIL_JS = fs.readFileSync(`${REPO}/static/js/util.js`, 'utf8');
 
-const PAGE = `<!doctype html><html><body>
+const PAGE = `<!doctype html><html><head><meta name="display-tz" content="America/New_York"><meta name="display-hour12" content="true"></head><body>
 <div id="host"></div>
 <template id="tpl">
   <div class="form-group" style="margin:0 0 0.5rem;">
     <label><input type="checkbox" id="x-recurring-cb"> Recurring</label>
   </div>
   <div id="x-oneoff-row" style="display:flex;">
-    <div class="form-group"><input type="datetime-local" id="x-dt" class="form-control"></div>
+    <div class="form-group"><input type="datetime-local" id="x-dt" class="form-control"><input type="hidden" id="x-dt-utc"><div id="x-dt-note" style="display:none"></div></div>
   </div>
   <div id="x-recurring-row" style="display:none; flex-direction:column; gap:0.5rem;">
     <div class="form-group">
@@ -62,6 +65,7 @@ function boot() {
 
   const dom = new JSDOM(PAGE, { runScripts: 'dangerously', virtualConsole: vc });
   const { window } = dom;
+  window.eval(UTIL_JS);
   window.eval(SCHEDULE_FIELDS_JS);
 
   const host = window.document.getElementById('host');
@@ -136,6 +140,21 @@ function boot() {
     timeFieldHidden: q('x-recur-time-field').style.display === 'none',
     payload: sched.payload(),
   };
+
+  // 7. The one-off field keeps the instant it stands for (dev/changelog/1477). Typed wall
+  //    text on the night DST ends reads as the first pass and says so; a stored moment in
+  //    the second pass prefills as the same text but keeps its instant, and the payload
+  //    carries it beside the text.
+  sched.setMode('once');
+  q('x-dt').value = '2027-11-07T01:30';
+  q('x-dt').dispatchEvent(new window.Event('input', { bubbles: true }));
+  results.onceTyped = { payload: sched.payload(), note: q('x-dt-note').textContent,
+                        noteShown: q('x-dt-note').style.display !== 'none' };
+  sched.prefill({ oneoff_utc: '2027-11-07T06:30:00Z' });
+  results.oncePrefilled = { value: q('x-dt').value, payload: sched.payload(),
+                            hidden: q('x-dt-utc').value };
+  sched.prefill({ oneoff_value: '2027-11-08T09:00' });
+  results.oncePrefilledBare = { value: q('x-dt').value, payload: sched.payload() };
 
   results.errors = errors;
   return results;

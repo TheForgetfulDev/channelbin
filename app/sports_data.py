@@ -17,15 +17,22 @@ from datetime import datetime, time, timedelta
 
 import requests
 from sqlalchemy import and_, or_
+from sqlalchemy.exc import SQLAlchemyError
 
 from . import db
 from .config import load_config
 from .database import (
+    REC_ENDED_STATUSES, RECORDING_SPORTS_LINKED, RECORDING_SPORTS_REMOVED, SPORTS_MATCH_KIND_GUIDE,
+    SPORTS_MATCH_STRONG, SPORTS_MATCH_WEAK, ChannelGroupMember, Recording, RecordingEvent, RecordingSports,
+    add_recording_event,
     SPORTS_FETCH_EMPTY, SPORTS_FETCH_OK, SPORTS_FETCH_RATE_LIMITED, SPORTS_FETCH_REFUSED,
     SPORTS_FETCH_SHRUNK, SPORTS_KIND_LEAGUE, SPORTS_KIND_NEXT, SPORTS_KIND_ROUND, SPORTS_KIND_TEAM,
-    SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsState, SportsTeam,
+    SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsLeagueCategory, SportsMatch, SportsState,
+    SportsTeam,
 )
 from .db_utils import retry_on_locked
+from .program_titles import title_key
+from .tz_utils import to_local
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +50,7 @@ CLEAN_CALLS_TO_EASE = 5
 MISSING_KEEP_DAYS = 7
 EMPTY_RECHECK_DAYS = 3
 REFUSED_RETRY_HOURS = 6
+MATCH_AFTER_REFRESH_SECONDS = 180
 
 #: The Add a league picks, in the order the dialog shows them: alphabetical. Names and numbers only,
 #: ChannelBin ships no event data (design 8), and following one is always the user's own click.
@@ -54,6 +62,15 @@ SHIPPED_LEAGUES = (
     {'tsdb_id': 4391, 'name': 'NFL', 'sport': 'American Football'},
     {'tsdb_id': 4380, 'name': 'NHL', 'sport': 'Ice Hockey'},
 )
+
+#: Names guides use for a league that TheSportsDB does not list, by TheSportsDB's league number
+#: (design 5.1). Both were seen in prod's guide: TheSportsDB calls 5093 `NASCAR Truck Series`, and
+#: still calls 4573 `NASCAR Xfinity Series` after its 2025 rename. Seeded when a league is added,
+#: and offered on its page while missing.
+KNOWN_EXTRA_TERMS = {
+    5093: ('NASCAR Craftsman Truck Series',),
+    4573: ("NASCAR O'Reilly Auto Parts Series",),
+}
 
 _client_lock = threading.Lock()
 
@@ -510,8 +527,9 @@ def tick(now: datetime = None) -> str:
         return 'busy'
     try:
         now = now or datetime.utcnow()
-        settings = _settings()
-        _prune_if_due(settings, now)
+        cfg = load_config()
+        settings = _settings(cfg)
+        _prune_if_due(cfg, settings, now)
         state = db.session.get(SportsState, 1)
         if state is not None:
             if state.next_call_at and state.next_call_at > now:
@@ -524,7 +542,10 @@ def tick(now: datetime = None) -> str:
                .order_by(SportsFetch.next_due_at, SportsFetch.id).first())
         db.session.rollback()  # holds no read transaction across the outbound call
         if due is None:
-            return 'idle'
+            # With no schedule call due, the turn goes to an image a recording is waiting on, at the
+            # same pace (app/sports_images.py).
+            from .sports_images import fetch_next
+            return fetch_next(cfg, settings, now) or 'idle'
         fetch_id, target, kind, league_tsdb_id = due
         answer = _call_for(kind, target, league_tsdb_id)
         log.info('TheSportsDB %s: %s%s', target, answer.outcome, f' ({answer.reason})' if answer.reason else '')
@@ -537,6 +558,10 @@ def tick(now: datetime = None) -> str:
             log.exception('TheSportsDB %s: the answer could not be stored', target)
             _record_unstorable(fetch_id, answer, type(exc).__name__, settings, now)
             return SPORTS_FETCH_REFUSED
+        if kind == SPORTS_KIND_ROUND and answer.rows:
+            # Longer than the call spacing, so a first fill's rounds become one match after the last.
+            from .scheduler import queue_sports_match
+            queue_sports_match(MATCH_AFTER_REFRESH_SECONDS, f'{target} refreshed')
         return answer.outcome
     finally:
         _client_lock.release()
@@ -585,11 +610,13 @@ def _record_unstorable(fetch_id: int, answer: Answer, what: str, settings: dict,
     db.session.commit()
 
 
-def _prune_if_due(settings: dict, now: datetime):
+def _prune_if_due(cfg: dict, settings: dict, now: datetime):
     state = db.session.get(SportsState, 1)
     if state is None or (state.last_pruned_at and now - state.last_pruned_at < timedelta(days=1)):
         return
     _prune(settings, now)
+    from .sports_images import prune
+    prune(cfg)
 
 
 @retry_on_locked()
@@ -604,6 +631,9 @@ def _prune(settings: dict, now: datetime):
         or_(SportsEvent.start_at < cutoff,
             and_(SportsEvent.start_at.is_(None), SportsEvent.local_date < cutoff.date()),
             SportsEvent.missing_since < now - timedelta(days=MISSING_KEEP_DAYS)))
+    # A match goes with its event, rejected ones included (design 9).
+    SportsMatch.query.filter(SportsMatch.event_id.in_(old.with_entities(SportsEvent.id).scalar_subquery())
+                             ).delete(synchronize_session=False)
     old.delete(synchronize_session=False)
     SportsFetch.query.filter(SportsFetch.kind == SPORTS_KIND_ROUND, SportsFetch.next_due_at.is_(None),
                              SportsFetch.last_at < cutoff).delete(synchronize_session=False)
@@ -627,6 +657,12 @@ def _seed_terms(raw: dict) -> list:
             seen.add(term.lower())
             out.append(term)
     return out
+
+
+def with_known_terms(tsdb_id: int, terms: list) -> list:
+    """`terms` plus any known extra name for this league it lacks, compared without case."""
+    seen = {t.lower() for t in terms}
+    return list(terms) + [t for t in KNOWN_EXTRA_TERMS.get(tsdb_id, ()) if t.lower() not in seen]
 
 
 def _person_call(endpoint: str, params: dict, list_key: str) -> Answer:
@@ -731,7 +767,8 @@ def follow_league(payload: dict, team: dict = None) -> int:
     if league is None:
         league = SportsLeague(tsdb_id=payload['tsdb_id'], name=payload['name'], sport=payload.get('sport'),
                               current_season=payload.get('season'),
-                              match_terms=json.dumps(payload.get('terms') or []), created_at=now)
+                              match_terms=json.dumps(with_known_terms(payload['tsdb_id'], payload.get('terms') or [])),
+                              created_at=now)
         db.session.add(league)
         db.session.flush()
     if team:
@@ -793,6 +830,10 @@ def delete_league(league_id: int) -> bool:
         return False
     SportsFollow.query.filter_by(league_id=league_id).delete(synchronize_session=False)
     SportsFetch.query.filter_by(league_id=league_id).delete(synchronize_session=False)
+    SportsLeagueCategory.query.filter_by(league_id=league_id).delete(synchronize_session=False)
+    SportsMatch.query.filter(SportsMatch.event_id.in_(
+        db.session.query(SportsEvent.id).filter(SportsEvent.league_id == league_id).scalar_subquery())
+    ).delete(synchronize_session=False)
     SportsEvent.query.filter_by(league_id=league_id).delete(synchronize_session=False)
     # Whatever no remaining league has events or a follow for, which also reaches a team added from
     # a search before any of its games arrived, or whose games have since been pruned.
@@ -807,6 +848,335 @@ def delete_league(league_id: int) -> bool:
 
 def worker_needed() -> bool:
     """Something is queued, or stored events still have retention to run: pruning is the worker's,
-    and "they stay until retention prunes them" (design 3) has to stay true after the last follow."""
+    and "they stay until retention prunes them" (design 3) has to stay true after the last follow. An
+    unfinished recording's artwork still to download is work too (app/sports_images.py)."""
+    from .sports_images import needed
     return (db.session.query(SportsFetch.id).first() is not None
-            or db.session.query(SportsEvent.id).first() is not None)
+            or db.session.query(SportsEvent.id).first() is not None
+            or needed())
+
+
+# ---------------------------------------------------------------------------
+# A recording's event (design 9, `recording_sports`)
+# ---------------------------------------------------------------------------
+
+#: What link_recording() did. Every value is named where it is read.
+LINK_LINKED = 'linked'          # a new link, or one that moved to another event
+LINK_REFRESHED = 'refreshed'    # the same event, its snapshot brought up to date
+LINK_REMOVED = 'removed'        # a person removed it, so it is left alone
+LINK_AMBIGUOUS = 'ambiguous'    # the listing matched more than one event equally well
+LINK_NONE = 'none'              # no listing, or no match for it
+LINK_DROPPED = 'dropped'        # its listing was marked a wrong match on the league page
+LINK_FAILED = 'failed'          # something went wrong, and it was logged
+
+_STRENGTH_RANK = {SPORTS_MATCH_STRONG: 0, SPORTS_MATCH_WEAK: 1}
+
+#: How far back the unfinished-recordings pass looks: a recording still capturing or joining
+#: whose program started this long ago is still worth bringing up to date.
+_UNFINISHED_LOOKBACK = timedelta(hours=24)
+
+
+def recording_channel_ids(rec) -> list:
+    """The channels a recording's listing can be on: its own, and every member of its group, since
+    a group's guide row comes from one member and the recording may be on another."""
+    ids = {rec.channel_id} if rec.channel_id else set()
+    if rec.group_id:
+        ids |= {i for (i,) in db.session.query(ChannelGroupMember.channel_id).filter(
+            ChannelGroupMember.group_id == rec.group_id)}
+    return sorted(ids)
+
+
+def recording_matches(rec, rejected: bool = False) -> list:
+    """The guide matches for the listing a recording was made from: any of its channels, at its
+    program's start. The anchor is the start and the channel, not the title, because a provider can
+    reword a title after the recording was set up; a channel lists one program at a time."""
+    if rec.program_start_time is None:
+        return []
+    ids = recording_channel_ids(rec)
+    if not ids:
+        return []
+    q = SportsMatch.query.filter(SportsMatch.kind == SPORTS_MATCH_KIND_GUIDE, SportsMatch.channel_id.in_(ids),
+                                 SportsMatch.program_start_time == rec.program_start_time)
+    if not rejected:
+        q = q.filter(SportsMatch.rejected_at.is_(None))
+    return q.all()
+
+
+def pick_match(matches: list, wanted_title: str) -> tuple:
+    """(match, ambiguous). Still listed beats gone, strong beats weak, and a match on the
+    recording's own title wins a tie. Two events tied at the best still-listed strength is not a
+    choice to make for a person: neither is linked."""
+    if not matches:
+        return None, False
+
+    def tier(m):
+        return (m.gone_since is not None, _STRENGTH_RANK.get(m.strength, 2))
+    best = min(tier(m) for m in matches)
+    top = [m for m in matches if tier(m) == best]
+    if len({m.event_id for m in top}) > 1:
+        return None, True
+    return min(top, key=lambda m: (m.title_key != wanted_title, m.id)), False
+
+
+def event_title(link) -> str:
+    """How a linked event reads: `Away at Home` for a matchup, the way guides list it and the
+    league page shows it, and the event's own name for a race."""
+    if link.home_name and link.away_name:
+        return f'{link.away_name} at {link.home_name}'
+    return link.event_name
+
+
+def link_recording(recording_id: int) -> str:
+    """Link a recording to the event its listing was matched to, or bring its snapshot up to date.
+    Runs when a recording is created, after each matcher run while it is unfinished, and when it
+    completes. Returns one of the LINK_* outcomes.
+
+    Nothing here may fail or delay a recording: its callers are the create path and the post-process
+    chain one step from COMPLETED. So no error leaves here, and the recording is never written to. A
+    removed link is never touched, and no match leaves an existing link alone, since the listing aging
+    out of the guide is no reason to forget what it was. A listing marked a wrong match on the league
+    page is a person's answer, so it drops the link."""
+    try:
+        return _link_recording(recording_id)
+    except SQLAlchemyError:
+        # The database stayed locked past every retry. The next matcher run or the completion tries again.
+        db.session.rollback()
+        log.warning('Recording %d: could not link it to a TheSportsDB event', recording_id, exc_info=True)
+        return LINK_FAILED
+    except Exception:
+        # Anything else is a defect here. Logged at ERROR, which raises an alert naming the recording,
+        # and still kept from the post-process chain, which would otherwise never reach COMPLETED.
+        db.session.rollback()
+        log.error('Recording %d: linking it to a TheSportsDB event failed', recording_id, exc_info=True,
+                  extra={'recording_id': recording_id})
+        return LINK_FAILED
+
+
+def _link_recording(recording_id: int) -> str:
+    rec = db.session.get(Recording, recording_id)
+    if rec is None or rec.program_start_time is None:
+        return LINK_NONE
+    existing = db.session.get(RecordingSports, recording_id)
+    if existing is not None and existing.removed_at is not None:
+        return LINK_REMOVED
+    matches = recording_matches(rec, rejected=True)
+    live = [m for m in matches if m.rejected_at is None]
+    match, ambiguous = pick_match(live, title_key(rec.program_title))
+    if match is None and existing is not None:
+        linked = {i for (i,) in db.session.query(SportsEvent.id).filter(SportsEvent.tsdb_id == existing.tsdb_event_id)}
+        if any(m.event_id in linked for m in matches) and not any(m.event_id in linked for m in live):
+            tsdb_event_id = existing.tsdb_event_id
+            db.session.rollback()
+            return _drop_link(recording_id, tsdb_event_id)
+    if match is None:
+        if ambiguous:
+            log.info('Recording %d: its listing matched more than one TheSportsDB event, so it was not linked',
+                     recording_id)
+        db.session.rollback()
+        return LINK_AMBIGUOUS if ambiguous else LINK_NONE
+    event = db.session.get(SportsEvent, match.event_id)
+    league = db.session.get(SportsLeague, event.league_id) if event is not None else None
+    if league is None:
+        db.session.rollback()
+        return LINK_NONE
+    snap = {'tsdb_event_id': event.tsdb_id, 'league_name': league.name, 'event_name': event.name,
+            'home_name': event.home_name if event_shape_is_matchup(event) else None,
+            'away_name': event.away_name if event_shape_is_matchup(event) else None,
+            'season': event.season, 'round': event.round, 'venue': event.venue, 'city': event.city,
+            'event_start': event.start_at, 'local_date': event.local_date,
+            'strength': match.strength, 'airing': match.airing, 'reason': match.reason,
+            # Its artwork, downloaded for it by app/sports_images.py (dev/changelog/1465).
+            'poster_url': event.poster_url, 'thumb_url': event.thumb_url}
+    db.session.rollback()
+    return _write_link(recording_id, snap)
+
+
+@retry_on_locked()
+def _write_link(recording_id: int, snap: dict) -> str:
+    if db.session.get(Recording, recording_id) is None:
+        db.session.rollback()
+        return LINK_NONE
+    row = db.session.get(RecordingSports, recording_id)
+    if row is not None and row.removed_at is not None:
+        db.session.rollback()
+        return LINK_REMOVED
+    now = datetime.utcnow()
+    was = event_title(row) if row is not None and row.tsdb_event_id != snap['tsdb_event_id'] else None
+    moved = row is None or was is not None
+    if row is None:
+        row = RecordingSports(recording_id=recording_id, linked_at=now)
+        db.session.add(row)
+    for key, value in snap.items():
+        setattr(row, key, value)
+    row.updated_at = now
+    if moved:
+        detail = (f'Matched to TheSportsDB\'s {row.league_name} event "{event_title(row)}", a {row.strength} '
+                  f'match: {row.reason}')
+        if was is not None:
+            detail += f' It was matched to "{was}" before.'
+        add_recording_event(recording_id, RECORDING_SPORTS_LINKED, detail=detail)
+    db.session.commit()
+    return LINK_LINKED if moved else LINK_REFRESHED
+
+
+@retry_on_locked()
+def _drop_link(recording_id: int, tsdb_event_id: int) -> str:
+    """Deleted rather than marked removed, so a listing later matched to the right event links again."""
+    row = db.session.get(RecordingSports, recording_id)
+    if row is None or row.removed_at is not None or row.tsdb_event_id != tsdb_event_id:
+        db.session.rollback()
+        return LINK_NONE
+    add_recording_event(recording_id, RECORDING_SPORTS_REMOVED,
+                        detail=f'Its listing was marked a wrong match on the {row.league_name} page, so it is no '
+                               f'longer matched to TheSportsDB\'s event "{event_title(row)}".')
+    db.session.delete(row)
+    db.session.commit()
+    return LINK_DROPPED
+
+
+def link_unfinished_recordings(now: datetime = None) -> int:
+    """After a matcher run: link or refresh every recording that has not finished, so one set up
+    before its game was matched says what it is before it airs rather than only when it completes.
+    Returns how many were newly linked."""
+    now = now or datetime.utcnow()
+    ids = [i for (i,) in db.session.query(Recording.id).filter(
+        Recording.status.notin_(REC_ENDED_STATUSES), Recording.program_start_time.isnot(None),
+        Recording.program_start_time >= now - _UNFINISHED_LOOKBACK).all()]
+    db.session.rollback()
+    return sum(link_recording(i) == LINK_LINKED for i in ids)
+
+
+def set_link_removed(recording_id: int, removed: bool):
+    """A person says this recording is not its event, or takes that back. The listing matches it
+    marked wrong are marked too, so the league page agrees and the matcher works the event out again,
+    and an undo puts back only those: a listing someone marked wrong on the league page stays wrong.
+    Returns the link, or None when the recording has none."""
+    from .sports_match import mark_wrong
+    rec = db.session.get(Recording, recording_id)
+    link = db.session.get(RecordingSports, recording_id)
+    if rec is None or link is None:
+        return None
+    event = SportsEvent.query.filter_by(tsdb_id=link.tsdb_event_id).first()
+    event_id = event.id if event is not None else None
+    if removed:
+        ids = [m.id for m in recording_matches(rec) if m.event_id == event_id]
+    else:
+        ids = _ids_marked_by_removal(recording_id)
+    db.session.rollback()
+    changed = _write_removed(recording_id, removed, ids)
+    if changed is None:
+        return None
+    if changed and event_id is not None and ids:
+        mark_wrong(event_id, ids, removed)
+    return db.session.get(RecordingSports, recording_id)
+
+
+def _ids_marked_by_removal(recording_id: int) -> list:
+    """The listing matches the recording's last Wrong match marked, from its event."""
+    ev = (RecordingEvent.query.filter_by(recording_id=recording_id, event_type=RECORDING_SPORTS_REMOVED)
+          .order_by(RecordingEvent.id.desc()).first())
+    try:
+        return list((json.loads(ev.extra_data) if ev is not None and ev.extra_data else {}).get('match_ids') or [])
+    except (ValueError, TypeError) as exc:
+        log.warning('Recording %d: its Wrong match event carries unreadable data: %s', recording_id, exc)
+        return []
+
+
+@retry_on_locked()
+def _write_removed(recording_id: int, removed: bool, match_ids: list):
+    """True when it moved, False when it was already so, None when there is no link. `match_ids` are
+    the listing matches the removal marks wrong, kept on its event so an undo reverses only those."""
+    row = db.session.get(RecordingSports, recording_id)
+    if row is None:
+        db.session.rollback()
+        return None
+    if (row.removed_at is not None) == removed:
+        db.session.rollback()
+        return False
+    row.removed_at = datetime.utcnow() if removed else None
+    if removed:
+        add_recording_event(recording_id, RECORDING_SPORTS_REMOVED,
+                            detail=f'You said this is not TheSportsDB\'s {row.league_name} event "{event_title(row)}", '
+                                   f'so the recording no longer carries its details and its listing was marked a '
+                                   f'wrong match.', extra={'match_ids': match_ids})
+    else:
+        add_recording_event(recording_id, RECORDING_SPORTS_LINKED,
+                            detail=f'You put back the match to TheSportsDB\'s {row.league_name} event '
+                                   f'"{event_title(row)}".')
+    db.session.commit()
+    return True
+
+
+def link_facts(link) -> str:
+    """One sentence of what TheSportsDB says about a linked event, with its credit: what a media
+    server shows under the synopsis. A round outside 1 to 99 is one of TheSportsDB's codes for a
+    preseason or playoff round (0, 125, 160, 500), which means nothing to a viewer, so it is left out."""
+    parts = [link.league_name]
+    if link.season:
+        parts.append(f'{link.season} season')
+    if link.round and 0 < link.round < 100:
+        parts.append(f'round {link.round}')
+    where = ', '.join(x for x in (link.venue, link.city) if x)
+    text = ', '.join(parts) + (f', at {where}' if where else '')
+    return f'{text}. Event details from TheSportsDB.'
+
+
+# ---------------------------------------------------------------------------
+# A matched recording's file name (design 11, dev/changelog/1466)
+# ---------------------------------------------------------------------------
+
+def file_names_on(cfg: dict) -> bool:
+    """sports_data.file_names: name a matched recording's file from TheSportsDB. Off by default."""
+    return bool((cfg.get('sports_data') or {}).get('file_names', False))
+
+
+def link_has_time(link) -> bool:
+    """Whether a link's start is a real time. A field event at exactly 00:00 has none: that is
+    TheSportsDB's placeholder, and moved into a time zone it lands on the wrong day (design 7)."""
+    start = link.event_start
+    return start is not None and (bool(link.home_name and link.away_name) or (start.hour, start.minute) != (0, 0))
+
+
+def file_name(link, tz) -> str | None:
+    """`League YYYY-MM-DD Event`, the shape of TheSportsDB's own strFilename and what Plex's sports
+    agents read, built from the link's fields. Never strFilename itself, whose date was wrong on 4 of
+    6 Truck rows. The league is TheSportsDB's name for it, since that is what an agent looks it up by,
+    even where a guide uses another (`NASCAR Xfinity Series`, not `NASCAR O'Reilly Auto Parts
+    Series`). The date is the event's day in the display timezone, or TheSportsDB's own date when it
+    gives no real time. None when the link has no date at all."""
+    if link_has_time(link):
+        day = to_local(link.event_start, tz).date()
+    else:
+        day = link.local_date
+    if day is None:
+        return None
+    return f'{link.league_name} {day.isoformat()} {link.event_name}'
+
+
+def recording_file_name(rec, cfg: dict, tz) -> tuple:
+    """(name, note): what the join names a recording's file, and the sentence its event carries
+    about that, or None to say nothing. With sports_data.file_names off, or no link, the recording's
+    own name and nothing said. A link a person removed keeps the recording's own name and says so.
+
+    Read-only, and it never raises: the join is one step from a recording's only file, and a
+    name is never worth losing that."""
+    own = rec.name
+    if not file_names_on(cfg):
+        return own, None
+    try:
+        link = db.session.get(RecordingSports, rec.id)
+    except SQLAlchemyError:
+        db.session.rollback()
+        log.warning('Recording %d: could not read its TheSportsDB event, so its file keeps its own name',
+                    rec.id, exc_info=True)
+        return own, 'its TheSportsDB event could not be read, so the file keeps the recording\'s own name'
+    if link is None:
+        return own, None
+    if link.removed_at is not None:
+        return own, (f'not named from TheSportsDB\'s {link.league_name} event, since its match was '
+                     f'removed')
+    name = file_name(link, tz)
+    if not name:
+        return own, None
+    weak = '' if link.strength == SPORTS_MATCH_STRONG else ', a weak match'
+    return name, f'named from TheSportsDB\'s {link.league_name} event "{event_title(link)}"{weak}'

@@ -69,6 +69,9 @@ class FakeSportsDB:
         self.next_event = {}  # league -> [rows]
         self.teams = {}      # id -> row
         self.team_search = {}  # lowercased name -> [rows]
+        # The image host: path -> (status, body bytes, content type, extra headers, send a length). Images are made
+        # up by the test (tests/support/images.py), never TheSportsDB's (dev/changelog/1465).
+        self.images = {}
         self.calls = []
         self.fault = None
         fake = self
@@ -77,16 +80,29 @@ class FakeSportsDB:
             def log_message(self, *args):
                 pass
 
-            def _send(self, status, body, ctype='application/json'):
-                data = body.encode()
+            def _send(self, status, body, ctype='application/json', headers=None, length=True):
+                data = body.encode() if isinstance(body, str) else body
                 self.send_response(status)
                 self.send_header('Content-Type', ctype)
-                self.send_header('Content-Length', str(len(data)))
+                if length:
+                    self.send_header('Content-Length', str(len(data)))
+                for key, value in (headers or {}).items():
+                    self.send_header(key, value)
                 self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # the app stopped reading on purpose: an image over its size cap
 
             def do_GET(self):
                 url = urlparse(self.path)
+                if url.path.startswith('/images/'):
+                    fake.calls.append(('image', {}, url.path))
+                    if fake.fault == 'rate_limited':
+                        return self._send(429, 'error code: 1015', 'text/plain')
+                    status, body, ctype, headers, length = fake.images.get(
+                        url.path, (404, '<html>Not Found</html>', 'text/html', None, True))
+                    return self._send(status, body, ctype, headers, length)
                 query = {k: v[0] for k, v in parse_qs(url.query).items()}
                 endpoint = url.path.rsplit('/', 1)[-1].replace('.php', '')
                 fake.calls.append((endpoint, query, url.path))
@@ -102,6 +118,13 @@ class FakeSportsDB:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         self.base_url = f'http://127.0.0.1:{self._server.server_address[1]}/api/v1/json'
+        self.image_base = f'http://127.0.0.1:{self._server.server_address[1]}/images/media/event'
+
+    def image(self, name, body, ctype='image/jpeg', status=200, headers=None, length=True) -> str:
+        """Serve `body` as an event image and return its address. `length=False` sends no
+        Content-Length, so the body ends when the connection closes."""
+        self.images[f'/images/media/event/{name}'] = (status, body, ctype, headers, length)
+        return f'{self.image_base}/{name}'
 
     def answer(self, endpoint, query):
         if endpoint == 'lookupleague':

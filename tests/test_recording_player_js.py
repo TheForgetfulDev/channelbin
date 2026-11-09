@@ -20,6 +20,9 @@ dev/changelog/1312. What the browser half promises:
     what was captured and returns with Live, carries on across the end of a finished segment,
     asks again while the capture is between segments, and says what became of a capture that
     stopped under it
+  * a file the browser cannot decode is reported in the browser's own words, and a GPU
+    re-encode is offered - or the reason there is none - and plays through the pipeline
+    (dev/changelog/1461)
 
 jsdom plays no media and computes no layout; the browser verification in the changelog
 covers what it cannot.
@@ -140,9 +143,51 @@ class RecordingPlayerTests(unittest.TestCase):
         self.assertIn('HEVC', self.obs['hevcLoading']['status'])
         err = self.obs['hevcError']
         self.assertEqual(err['kind'], 'error')
-        self.assertIn('video hevc, audio aac', err['status'])
+        self.assertIn('The file holds video hevc, audio aac.', err['status'])
         self.assertIn('DEMUXER_ERROR_NO_SUPPORTED_STREAMS', err['status'])
         self.assertIn('VLC', err['status'])
+
+    # ── the browser cannot decode it: its words, then the GPU re-encode (dev/changelog/1461)
+    def test_a_decode_failure_says_what_the_browser_said_and_guesses_nothing(self):
+        """dev/docs/BUGS.md 2026-11-06 - the players blamed HEVC or audio without knowing."""
+        for key in ('native', 'pipeFailed'):
+            st = self.obs['re'][key]['status']
+            self.assertTrue(st.startswith('This browser could not play this file: '
+                                          'PIPELINE_ERROR_DECODE: Failed to send video packet'), st)
+            self.assertNotIn('usual reason', st)
+        # The pipeline's file is H.264 with no caveat: nothing in the text names HEVC.
+        self.assertNotIn('HEVC', self.obs['re']['pipeFailed']['status'])
+
+    def test_a_decode_failure_offers_the_reencode_when_the_server_can(self):
+        n = self.obs['re']['native']
+        self.assertEqual(n['button'], 'Try re-encoded')
+        self.assertIn('re-encode the video on the GPU', n['offer'])
+
+    def test_the_reencode_plays_through_the_pipeline_from_the_start(self):
+        c = self.obs['re']['nativeClicked']
+        self.assertEqual(c['posted'], [['/api/recordings/7/playback', {'offset': 0, 'reencode': True}]])
+        self.assertIsNone(c['offer'])
+        self.assertIn('re-encodes the video on the GPU', self.obs['re']['nativePlaying']['status'])
+        self.assertEqual(self.obs['re']['nativePlaying']['kind'], 'ok')
+
+    def test_a_failed_reencode_says_so_and_offers_nothing_more(self):
+        f = self.obs['re']['reencodeFailed']
+        self.assertEqual(f['recovered'], 1)
+        self.assertIn('could not play the re-encoded video', f['status'])
+        self.assertIsNone(f['offer'])
+
+    def test_the_elements_own_decode_error_is_recovered_once_then_reported(self):
+        self.assertEqual(self.obs['re']['pipeFirst']['recovered'], 1)
+        self.assertNotEqual(self.obs['re']['pipeFirst']['kind'], 'error')
+        f = self.obs['re']['pipeFailed']
+        self.assertEqual(f['kind'], 'error')
+        self.assertEqual(f['stops'], 1)       # the useless session is let go at once
+
+    def test_without_a_gpu_the_offer_is_the_servers_reason_not_a_button(self):
+        f = self.obs['re']['pipeFailed']
+        self.assertIsNone(f['button'])
+        self.assertIn('there is no GPU device', f['offer'])
+        self.assertEqual(f['asked'], 1)
 
     def test_closing_before_the_answer_leaves_nothing_running(self):
         self.assertEqual(self.obs['closedEarly'], {'modals': 0, 'intervalsLeft': 0})

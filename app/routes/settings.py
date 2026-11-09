@@ -987,8 +987,9 @@ def api_rollback():
     # A restored config can carry a different recording.logo_cache.enabled, and the job is
     # registered only while the feature is on - so this path has to move the job too, or a
     # rollback that turns logo caching on leaves it doing nothing with nothing saying why
-    # (dev/changelog/1056). The other live-config hooks this route does not fire (auth,
-    # toolchain, the search caches) are a pre-existing gap and are not widened here.
+    # (dev/changelog/1056). The other live-config hooks (auth, toolchain, the search
+    # caches) are not fired here: apply_backup() raises the restart banner instead, and the
+    # restart applies them all (dev/changelog/1452).
     from ..scheduler import apply_logo_cache_schedule
     apply_logo_cache_schedule()
     _clear_unconfigured_storage_alerts(load_config())

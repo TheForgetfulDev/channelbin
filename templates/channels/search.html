@@ -150,7 +150,7 @@
       <div class="well" id="well"><span class="slot" id="well-lbl-slot"></span><span class="slot" id="addf-slot-head"><span class="menu-wrap" id="addfpw2">
           <button class="fadd" id="addf2" type="button" data-menu>&#43; Filter</button>
         </span></span><span id="wellbody"></span><span class="slot" id="addf-slot-tail"></span><div class="tbar-right">
-          <button class="btn btn-sm btn-ghost" id="cs-clear" type="button">Clear all</button>
+          <button class="btn btn-sm" id="cs-clear" type="button">Clear all</button>
         </div></div>
 
       {# The toolbar row is empty in this layout and collapses: its + Filter is the well's
@@ -193,7 +193,7 @@
        from the server's own lookup, never from anything in the URL. #}
     <div class="cs-replace-bar" id="replace-bar" style="display:none">
       <span class="cs-replace-lbl" id="replace-lbl"></span>
-      <button class="btn btn-sm btn-ghost" id="replace-x" type="button"
+      <button class="btn btn-sm" id="replace-x" type="button"
               data-tip="Stop replacing that recording. The search itself is left alone, and the scheduled recording stays as it is.">{{ icon('close') }}</button>
     </div>
 
@@ -203,7 +203,7 @@
     <div class="cs-replace-bar" id="rule-bar" style="display:none">
       <span class="cs-replace-lbl" id="rule-lbl"></span>
       <button class="btn btn-sm btn-primary" id="rule-save" type="button" style="display:none">Save to rule</button>
-      <button class="btn btn-sm btn-ghost" id="rule-x" type="button">{{ icon('close') }}</button>
+      <button class="btn btn-sm" id="rule-x" type="button">{{ icon('close') }}</button>
     </div>
 
     <div class="cb-all">
@@ -264,7 +264,7 @@
         <span class="sel-ctx" id="sel-ctx" style="display:none">
           <span class="sel-ctx-lbl" id="sel-ctx-lbl"></span>
           <button class="btn btn-sm btn-primary" id="sel-ctx-add" type="button">+ Add Channels</button>
-          <button class="btn btn-sm btn-ghost" id="sel-ctx-x" type="button"
+          <button class="btn btn-sm" id="sel-ctx-x" type="button"
                   data-tip="Stop adding to that group. The search itself is left alone.">{{ icon('close') }}</button>
         </span>
         {# The guide action leads and is the only primary on this bar: putting a channel in

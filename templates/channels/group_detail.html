@@ -497,20 +497,24 @@
 
   {% if whatson %}{% include 'channels/_group_whats_on.html' %}{% endif %}
 
-  <div class="card" data-section="activity">
+  <div class="card" data-section="activity" id="gd-activity">
     <div class="card-head"><h2>Activity timeline</h2></div>
     <div class="card-body">
       {# What this list is scoped to, said rather than inferred - a reader taking a page
          for a log of one check's work alone is the defect this replaced
          (dev/changelog/790). #}
       <p class="text-muted small">{{ timeline_scope }}</p>
-      {% if not timeline_entries %}
+      {% if not timeline_total %}
       <p class="text-muted small">No activity recorded for this group yet.</p>
+      {% else %}
+      {{ m.history_chips(timeline_chips) }}
+      {% if not timeline_entries %}
+      <p class="card-note">Nothing here for that filter.</p>
       {% else %}
       <div class="test-history-controls">
         <select class="form-control" style="width:auto"
                 {# nav-ok: per-page select #}
-                onchange="window.location.href = '{{ request.path }}?timeline_per_page=' + this.value">
+                onchange="window.location.href = '{{ request.path }}?timeline_per_page=' + this.value + '{{ timeline_hist_qs }}'">
           {% for size in page_sizes %}
           <option value="{{ size }}" {% if size == timeline_per_page %}selected{% endif %}>{{ 'All' if size == 'all' else size + ' per page' }}</option>
           {% endfor %}
@@ -518,11 +522,11 @@
         {% if timeline_pagination and timeline_pagination.pages > 1 %}
         <div class="test-history-pagination">
           {% if timeline_pagination.has_prev %}
-          <a href="{{ request.path }}?timeline_per_page={{ timeline_per_page }}&timeline_page={{ timeline_pagination.prev_num }}" class="btn btn-sm">{{ icon('back') }} Prev</a>
+          <a href="{{ request.path }}?timeline_per_page={{ timeline_per_page }}&timeline_page={{ timeline_pagination.prev_num }}{{ timeline_hist_qs }}" class="btn btn-sm">{{ icon('back') }} Prev</a>
           {% endif %}
           <span class="text-muted small">Page {{ timeline_pagination.page }} of {{ timeline_pagination.pages }}</span>
           {% if timeline_pagination.has_next %}
-          <a href="{{ request.path }}?timeline_per_page={{ timeline_per_page }}&timeline_page={{ timeline_pagination.next_num }}" class="btn btn-sm">Next {{ icon('forward') }}</a>
+          <a href="{{ request.path }}?timeline_per_page={{ timeline_per_page }}&timeline_page={{ timeline_pagination.next_num }}{{ timeline_hist_qs }}" class="btn btn-sm">Next {{ icon('forward') }}</a>
           {% endif %}
         </div>
         {% endif %}
@@ -530,6 +534,7 @@
       {% set entries = timeline_entries %}
       {% set show_source = true %}
       {% include 'channels/_timeline.html' with context %}
+      {% endif %}
       {% endif %}
     </div>
   </div>
@@ -655,7 +660,7 @@ const GUIDE_CONFIG = {
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>
 <script src="{{ url_for('static', filename='js/guide-schedules.js') }}"></script>
 <script src="{{ url_for('static', filename='js/recording-player.js') }}"
-        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.light.min.js') }}"></script>
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.min.js') }}"></script>
 <script src="{{ url_for('static', filename='js/program-chooser.js') }}"></script>
 {% endif %}
 {% endblock %}

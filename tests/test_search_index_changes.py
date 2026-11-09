@@ -331,11 +331,14 @@ class WhoAsksForWhatTests(_Rig):
             cleanup_old_epg_entries(self.t.app)
         return rebuild
 
-    def test_the_daily_cleanup_stays_full_because_it_is_what_compacts(self):
+    def test_the_daily_cleanup_writes_the_difference_and_compacts(self):
+        """A full rebuild empties the whole index, the one step no documented FTS5 command
+        bounds; the compaction it used to provide is FTS5's 'merge' now (dev/changelog/1460)."""
         self._air(self.one, 'Old', hours=-1000)
         rebuild = self._cleanup_rebuilds()
         self.assertEqual(rebuild.call_count, 1)
-        self.assertNotIn('only_changes', rebuild.call_args.kwargs)
+        self.assertTrue(rebuild.call_args.kwargs.get('only_changes'))
+        self.assertTrue(rebuild.call_args.kwargs.get('compact'))
 
     def test_the_daily_rebuild_runs_on_a_day_nothing_aged_out(self):
         self._air(self.one, 'Upcoming')

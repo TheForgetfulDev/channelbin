@@ -36,6 +36,7 @@ from ..recording_metadata import (
     EDITABLE_FIELDS, MAX_LENGTHS, UNSET, apply_user_edit, validate_edit,
 )
 from ..db_utils import retry_on_locked
+from .. import history_filter
 from ..scheduler import schedule_recording, unschedule_recording
 from ..recorder import (
     abort_recording, get_state, stop_recording, pause_recording, resume_recording,
@@ -1584,6 +1585,13 @@ def recording_detail(recording_id):
         return redirect(url_for('recordings.index'))
     state = get_state(recording_id)
     is_active = state is not None
+    # The Event log's filter chips (app/history_filter.py): the whole log is still read, since
+    # the Run timeline and the story are built from every event; only the list is narrowed.
+    ev_filter = history_filter.pick(request.args.get('hist'), history_filter.RECORDING_FILTERS)
+    ev_chips, ev_events = history_filter.apply(
+        rec.events, lambda e: history_filter.RECORDING_BUCKETS.get(e.event_type),
+        history_filter.RECORDING_FILTERS, ev_filter,
+        lambda key: url_for('recordings.recording_detail', recording_id=rec.id, hist=key))
     if rec.status == REC_STATUS_COMPLETED:
         # A finished recording's storage may be asleep and a stat wakes it, so this page reads
         # the row and leaves the disk to the click, whose route still says when a file is gone
@@ -1810,12 +1818,14 @@ def recording_detail(recording_id):
         live_seg_id=live_seg_id, live_seg_bytes=live_seg_bytes,
         distinct_accounts=distinct_accounts,
         event_channel_links=event_channel_links,
+        ev_chips=ev_chips, ev_events=ev_events, ev_filter=ev_filter,
         shot_mtime=shot_mtime, has_shot=has_shot,
         stop_utc_iso=rec.stop_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
         thumb_enabled=thumb_enabled,
         thumb_auto_refresh_seconds=thumb_cfg.get('auto_refresh_seconds', 60),
         find_airing_url=find_airing_url,
         meta_panel=_metadata_panel(rec, cfg),
+        sports=_sports_panel(rec, now, cfg),
         profiles=profiles,  # _record_modal.html + GUIDE_CONFIG.profiles expect this name
         blocked_accounts=_recording_block_labels(rec.id),
     )
@@ -1826,6 +1836,55 @@ def recording_detail(recording_id):
     resp = make_response(page)
     resp.headers['Cache-Control'] = 'no-store'
     return resp
+
+
+def _sports_panel(rec, now, cfg):
+    """The Program card's TheSportsDB rows (app/sports_view.py::recording_context), or None."""
+    from ..sports_view import recording_context
+    from ..tz_utils import get_display_tz, is_24h
+    return recording_context(rec, now, get_display_tz(), is_24h(), cfg)
+
+
+@recordings_bp.route('/recordings/<int:recording_id>/sports-image/<role>')
+def recording_sports_image(recording_id, role):
+    """TheSportsDB's poster or background for the recording's event, as downloaded to this install
+    (app/sports_images.py, dev/changelog/1465). 404 for a removed link, a role it has no image for,
+    or downloading switched off, so the page's View link and this agree."""
+    from ..metadata_sidecar import active_sports_link
+    from ..sports_images import BACKGROUND, POSTER, READY, artwork
+    if role not in (POSTER, BACKGROUND):
+        abort(404)
+    state, path, _ = artwork(load_config(), active_sports_link(recording_id)).get(role, (None, None, None))
+    if state != READY:
+        abort(404)
+    resp = send_file(path, mimetype='image/png' if path.endswith('.png') else 'image/jpeg')
+    # Bytes from a third party, checked by their header only: never let a browser read them as anything else.
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    return resp
+
+
+@recordings_bp.route('/recordings/<int:recording_id>/sports-json', methods=['POST'])
+def recording_sports_json(recording_id):
+    """Remove the recording's TheSportsDB match (`{"removed": true}`), or put it back (`false`), and
+    rewrite its sidecar if it has one, so a library stops showing a wrong event's details. The
+    rewrite is outside every retry closure: writing a file is not idempotent (CLAUDE.md)."""
+    from ..sports_data import set_link_removed
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return jsonify({'error': 'Recording not found'}), 404
+    removed = (request.get_json(silent=True) or {}).get('removed')
+    if not isinstance(removed, bool):
+        return jsonify({'error': 'Say whether the match is removed: true or false.'}), 400
+    link = set_link_removed(recording_id, removed)
+    if link is None:
+        return jsonify({'error': 'This recording is not matched to a TheSportsDB event.'}), 404
+    rewrote = False
+    rec = db.session.get(Recording, recording_id)
+    # A click, so waking the recording's storage to look is allowed here and nowhere on the page.
+    if _metadata_phase(rec) == 'after' and rec.output_path and os.path.exists(rec.output_path):
+        from ..metadata_sidecar import write_sidecar
+        rewrote = write_sidecar(recording_id, rec.output_path, load_config())
+    return jsonify({'success': True, 'removed': link.removed_at is not None, 'sidecar_rewritten': rewrote})
 
 
 def _recording_block_labels(recording_id):
@@ -2187,7 +2246,10 @@ def start_recording_playback(recording_id):
                                  'now.'}), 409
     kept = _kept_ts_on_disk(rec)
     o = playback.offer(rec, kept_source_on_disk=kept)
-    if not o.pipeline:
+    reencode = bool(body.get('reencode'))
+    # A file the browser's own player could not decode goes through the pipeline once the
+    # viewer asks for a re-encode (dev/changelog/1461).
+    if not (o.pipeline or (reencode and o.native)):
         return jsonify({'error': (
             'This recording plays in the browser\'s own player.' if o.native
             else (o.reason or 'This recording has no finished file to play.'))}), 409
@@ -2200,7 +2262,8 @@ def start_recording_playback(recording_id):
         path = playback.resolve_file(rec, load_config(), kept_source_on_disk=kept)
         session = preview.start_file_playback(
             rec.id, rec.name, path, offset,
-            transcode_audio=preview.audio_needs_transcode(rec.recorded_audio_codec))
+            transcode_audio=preview.audio_needs_transcode(rec.recorded_audio_codec),
+            reencode=reencode)
     except playback.PlaybackRefused as exc:
         return jsonify({'error': exc.message}), exc.status
     except preview.PreviewRefused as exc:
@@ -2258,7 +2321,7 @@ def _start_capture_playback(rec, body: dict, offset: float):
         session = preview.start_file_playback(
             rec.id, rec.name, path, at,
             transcode_audio=preview.audio_needs_transcode(acodec),
-            capture=place)
+            capture=place, reencode=bool(body.get('reencode')))
     except playback.PlaybackRefused as exc:
         return jsonify({'error': exc.message}), exc.status
     except preview.PreviewRefused as exc:
@@ -2745,6 +2808,13 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
 
     from flask import current_app
     schedule_recording(current_app._get_current_object(), rec.id, start_utc, stop_utc)
+
+    # Last, once the start is armed: a link only describes the recording, so a locked database it
+    # waits out must never hold up the arming. Its one writer swallows its own failures
+    # (DESIGN-sports-data.md 9, dev/changelog/1464).
+    if entry is not None:
+        from ..sports_data import link_recording
+        link_recording(rec.id)
 
     return rec
 

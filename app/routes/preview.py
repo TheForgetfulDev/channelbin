@@ -9,7 +9,7 @@ response - the browser only ever learns this app's own URLs (dev/changelog/1018)
 import logging
 import os
 
-from flask import Blueprint, jsonify, send_file, url_for
+from flask import Blueprint, jsonify, request, send_file, url_for
 
 from .. import preview
 
@@ -31,11 +31,22 @@ def session_urls(session_id: str) -> dict:
 
 @preview_bp.route('/api/channels/<int:channel_id>/preview', methods=['POST'])
 def start_channel_preview(channel_id):
+    body = request.get_json(silent=True) or {}
     try:
-        session = preview.start_preview(channel_id)
+        session = preview.start_preview(channel_id, reencode=bool(body.get('reencode')))
     except preview.PreviewRefused as exc:
         return jsonify({'error': exc.message}), exc.status
     return jsonify({'success': True, **session.to_dict(), **session_urls(session.id)})
+
+
+@preview_bp.route('/api/preview/reencode')
+def reencode_available():
+    """Could a re-encode start right now, and if not, why not - asked by a player whose
+    browser could not decode the copy, so it offers the re-encode or says why it cannot
+    (dev/changelog/1461). The start routes ask again: the answer can change in between."""
+    from ..config import load_config
+    device, why = preview.reencode_device(load_config())
+    return jsonify({'success': True, 'available': bool(device), 'reason': why})
 
 
 @preview_bp.route('/api/channels/<int:channel_id>/screenshot', methods=['POST'])

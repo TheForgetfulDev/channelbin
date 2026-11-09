@@ -63,6 +63,26 @@ _REAL_CONFIG_PATH = cfgmod._CONFIG_PATH
 # sandboxed config.yaml a runtime load_config() reads.
 _SANDBOXED_RECORDING_DIRS = ('dvr_output_dir', 'capture_log_dir', 'images_dir')
 
+
+def sandbox_runtime_paths(root):
+    """The output and backup dirs a runtime load_config() resolves, pointed under `root`
+    and created there. The one spelling of "these paths stay out of the real /dvr and
+    instance/config-backups", shared by TestApp's own sandbox and ConfigSandbox
+    (dev/changelog/1130)."""
+    paths = {
+        'recording': {
+            'dvr_output_dir': os.path.join(root, 'dvr'),
+            # Capture stderr spools (dev/changelog/430): its default is app-root-relative,
+            # so without this a test that reaches _launch_segment spools into the repo.
+            'capture_log_dir': os.path.join(root, 'capture-logs'),
+            'images_dir': os.path.join(root, 'images'),
+        },
+        'config_backup': {'backup_dir': os.path.join(root, 'config-backups')},
+    }
+    for d in paths['recording'].values():
+        os.makedirs(d, exist_ok=True)
+    return paths
+
 # Schema template: built once per process, copied per test. See _template_db_path().
 _template_lock = threading.Lock()
 _template_dir = None
@@ -357,6 +377,7 @@ def reset_module_globals():
     this list from rotting the next time one is added.
     """
     import app.account_links as account_links
+    import app.provider_stalls as provider_stalls
     import app.account_stats as account_stats
     import app.accounts as accounts
     import app.connection_limits as connection_limits
@@ -414,6 +435,7 @@ def reset_module_globals():
     # A roll attempt recorded by one module's stall test puts the next module's roll inside
     # the cooldown, so its resolution failure rolls nothing.
     account_links._last_roll_attempt.clear()
+    provider_stalls._recent.clear()
     # Where each held seat was counted. A seat a module's test took and never released
     # would otherwise be released into the wrong pool by the next module's teardown; the
     # holder lists themselves are cleared by the tests that take seats.
@@ -554,22 +576,33 @@ def _assert_runtime_paths_are_sandboxed(sandbox_paths):
     backups (dev/changelog/1130). Checked through the same readers production uses. The
     bound is the system temp dir rather than this app's own, because a test may redirect a
     dir into a temp dir of its own through extra_overrides (test_capture_stderr does).
+
+    `sandbox_paths=None` is the outer-sandbox form (ConfigSandbox, a hand-patched
+    _CONFIG_PATH): that file is the test's own fixture, so the paths are not required to
+    equal this app's, only to stay under the temp dir.
     """
     from app.config_backup import get_backup_dir
     rec = cfgmod.load_config()['recording']
-    wanted = {f'recording.{k}': v for k, v in sandbox_paths['recording'].items()}
-    wanted['config_backup.backup_dir'] = sandbox_paths['config_backup']['backup_dir']
     found = {f'recording.{k}': rec[k] for k in _SANDBOXED_RECORDING_DIRS}
     found['config_backup.backup_dir'] = get_backup_dir()
     temp_root = os.path.realpath(tempfile.gettempdir())
+    if sandbox_paths is None:
+        wanted = dict(found)
+        fix = (f'expected each under {temp_root!r}. The outer sandbox at '
+               f'{cfgmod._CONFIG_PATH} must name them: ConfigSandbox._write_cfg() merges '
+               'its own temp dirs in unless told not to, and a hand-patched _CONFIG_PATH '
+               'writes sandbox_runtime_paths() into its file.')
+    else:
+        wanted = {f'recording.{k}': v for k, v in sandbox_paths['recording'].items()}
+        wanted['config_backup.backup_dir'] = sandbox_paths['config_backup']['backup_dir']
+        fix = (f'expected {wanted!r} under {temp_root!r}. TestApp must write them into its '
+               'sandboxed config.yaml.')
     escaped = {k: v for k, v in found.items()
                if v != wanted[k] or not os.path.realpath(v).startswith(temp_root + os.sep)}
     if escaped:
         raise AssertionError(
-            f'Runtime config paths escaped the test sandbox: {escaped!r}, expected '
-            f'{wanted!r} under {temp_root!r}. TestApp must write them into its sandboxed '
-            'config.yaml, or a runtime load_config() writes into (and prunes) the real '
-            'directories.')
+            f'Runtime config paths escaped the test sandbox: {escaped!r}, {fix} Otherwise '
+            'a runtime load_config() writes into (and prunes) the real directories.')
 
 
 def _assert_engines_are_sandboxed(app, wanted_path):
@@ -609,14 +642,6 @@ class TestApp:
         reset_module_globals()
         self._tmpdir = tempfile.mkdtemp(prefix='dvr_test_')
         self.db_path = os.path.join(self._tmpdir, 'dvr.db')
-        dvr_dir = os.path.join(self._tmpdir, 'dvr')
-        images_dir = os.path.join(self._tmpdir, 'images')
-        # Capture stderr spools (dev/changelog/430). Sandboxed like every other output dir:
-        # its default is app-root-relative, so without this override a test that reaches
-        # _launch_segment would spool into the real repo.
-        cap_log_dir = os.path.join(self._tmpdir, 'capture-logs')
-        for d in (dvr_dir, images_dir, cap_log_dir):
-            os.makedirs(d, exist_ok=True)
 
         overrides = {
             'database': {
@@ -626,12 +651,7 @@ class TestApp:
                 'pre_migration_backup': False,
                 'backup_dir': os.path.join(self._tmpdir, 'db-backups'),
             },
-            'recording': {
-                'dvr_output_dir': dvr_dir,
-                'capture_log_dir': cap_log_dir,
-                'images_dir': images_dir,
-            },
-            'config_backup': {'backup_dir': os.path.join(self._tmpdir, 'config-backups')},
+            **sandbox_runtime_paths(self._tmpdir),
             'logging': {'file': os.path.join(self._tmpdir, 'test.log')},
             # No real webhooks ever fire from a test.
             'notifications': {'base_url': ''},
@@ -706,14 +726,22 @@ class TestApp:
             cfgmod._CONFIG_PATH = self._cfg_path
             cfgmod._yaml_cache = None
             # Before create_app(), so a failure leaves nothing built and hands _CONFIG_PATH
-            # back. Only for a sandbox this app owns: an outer one (ConfigSandbox, a
-            # hand-patched _CONFIG_PATH) holds a fixture its test wrote on purpose.
+            # back.
             try:
                 _assert_runtime_paths_are_sandboxed(self._sandbox_paths)
             except AssertionError:
                 cfgmod._CONFIG_PATH = self._orig_cfg_path
                 cfgmod._yaml_cache = None
                 os.remove(self._cfg_path)
+                shutil.rmtree(self._tmpdir, ignore_errors=True)
+                raise
+        elif not (_missing_config_is_deliberate and not os.path.exists(cfgmod._CONFIG_PATH)):
+            # An outer sandbox holds a fixture its test wrote on purpose, so its paths are
+            # its own - but they still may not resolve to the real dirs. A deliberately
+            # missing file cannot name any path at all, and is the one exemption.
+            try:
+                _assert_runtime_paths_are_sandboxed(None)
+            except AssertionError:
                 shutil.rmtree(self._tmpdir, ignore_errors=True)
                 raise
 

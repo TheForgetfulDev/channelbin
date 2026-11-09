@@ -17,6 +17,8 @@ What this file pins, and why each matters:
   - FoldFollowsTheResultsTests, FoldFollowsTheResultsOnAiringsTests,
     AddBackRespectsGroupCollapseTests, FacetsAgreeWithTheirFilterTests: a duplicate is hidden only while its kept copy is in the
     results, and the count line and the facets say the same (dev/docs/BUGS.md 2026-11-04).
+  - DuplicateCountLeavesEndedAiringsOutTests: "N duplicates" on Programs never counts an ended
+    airing that ticking the box would not bring back (dev/docs/BUGS.md 2026-11-05).
 
 URL-key flagging itself is tests/test_duplicate_flag_recompute.py. No network, no ffmpeg.
 Run standalone:
@@ -34,7 +36,8 @@ from app import account_links as links  # noqa: E402
 from app import channel_hiding  # noqa: E402
 from app.channel_search import (  # noqa: E402
     GRAIN_AIRINGS, GRAIN_CHANNELS, GROUP_ANY, OTHER_DUP_URL, OTHER_PROVIDER, DimensionFilter,
-    SearchContext, SearchState, search, search_counts, search_facets)
+    SearchContext, SearchState, clear_standing_breakdown_cache, default_standing_for, search,
+    search_counts, search_facets)
 from app.channel_search_rows import (  # noqa: E402
     KEEP_REASON_HEALTH, KEEP_REASON_ID, KEEP_REASON_IN_FEED, build_rows)
 from app.accounts import NORM_DISABLED, NORM_MPEGTS  # noqa: E402
@@ -452,9 +455,9 @@ class WhereTheFoldIsOffTests(_Case):
                                   'Show on url kept'])
 
     def test_the_picker_endpoint_carries_the_same_answer(self):
-        from tests.support.search import unfolded_query
+        hiding = '&'.join(f'standing={k}' for k in sorted(only_hiding('showdup')))
         resp = self.client.get(
-            f'/api/channels/search?add_to_group={self.group.id}&{unfolded_query()}')
+            f'/api/channels/search?add_to_group={self.group.id}&{hiding}')
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         names = sorted(r['name'] for r in resp.get_json()['rows'] if r['kind'] == 'channel')
         self.assertEqual(names, ['provider copy', 'provider kept', 'url kept'])
@@ -734,13 +737,60 @@ class AddBackRespectsGroupCollapseTests(_Case):
         self.assertEqual([e.channel_id for e in rows], [self.copy.id])
 
 
+class DuplicateCountLeavesEndedAiringsOutTests(_Case):
+    """"N duplicates" on Programs is what ticking Show duplicates gives back, and an ended airing
+    on a duplicate is not: ended airings stay hidden. Counted first-in-registry-order it was, and
+    prod's Programs page read "13,924 duplicates" beside 6,163 that the box brought back
+    (dev/docs/BUGS.md 2026-11-05)."""
+
+    def setUp(self):
+        super().setUp()
+        self.kept = self.channel(self.other, 1, host='shared.example', name='NHL Network',
+                                 in_guide=True)
+        self.copy = self.channel(self.other, 1, host='shared.example', name='NHL Network copy')
+        self.fold()
+        for ch in (self.kept, self.copy):
+            seed.make_epg_entry(ch, title='Tonight', offset_minutes=60)
+            seed.make_epg_entry(ch, title='This morning', offset_minutes=-300)
+            seed.make_epg_entry(ch, title='Earlier', offset_minutes=-180)
+        db.session.commit()
+
+    def counts(self, standing, **kw):
+        clear_standing_breakdown_cache()
+        state = SearchState(grain=GRAIN_AIRINGS, standing=standing, facets=(), **kw)
+        hidden, total, *_ = search_counts(state, SearchContext.build())
+        return hidden, total
+
+    def assert_count_is_what_ticking_gives_back(self, **kw):
+        # Duplicates hidden, which the default no longer does (dev/changelog/1458).
+        default = default_standing_for(GRAIN_AIRINGS) - {'showdup'}
+        hidden, total = self.counts(default, **kw)
+        _hidden, ticked = self.counts(default | {'showdup'}, **kw)
+        self.assertEqual(hidden.get('showdup', 0), ticked - total)
+        return hidden
+
+    def test_unfiltered(self):
+        self.assertEqual(self.assert_count_is_what_ticking_gives_back(), {'showdup': 1})
+
+    def test_typed(self):
+        self.assertEqual(self.assert_count_is_what_ticking_gives_back(q='NHL'), {'showdup': 1})
+
+    def test_with_ended_airings_shown_every_copy_counts(self):
+        default = (default_standing_for(GRAIN_AIRINGS) - {'showdup'}) | {'showpast'}
+        hidden, total = self.counts(default)
+        _hidden, ticked = self.counts(default | {'showdup'})
+        self.assertEqual(hidden, {'showdup': 3})
+        self.assertEqual(ticked - total, 3)
+
+
 class FacetsAgreeWithTheirFilterTests(_Case):
     """A facet count says what picking that value gives. On the production database the obvious
     count read 11,925 for an account whose filter returned 14,285 (dev/docs/BUGS.md 2026-11-04)."""
 
     GRAIN_DIMENSIONS = {
         GRAIN_CHANNELS: ('acct', 'cat', 'health', 'other', 'group', 'tag'),
-        GRAIN_AIRINGS: ('acct', 'cat', 'health', 'other', 'group', 'tag', 'when', 'dow'),
+        GRAIN_AIRINGS: ('acct', 'cat', 'health', 'other', 'group', 'tag', 'mark', 'when',
+                        'dow'),
     }
 
     def setUp(self):
@@ -782,8 +832,9 @@ class FacetsAgreeWithTheirFilterTests(_Case):
         self.fold()
         for ch in Channel.query.all():
             title = f'Hockey on {ch.name}' if 'Linked' in ch.name else f'Show on {ch.name}'
-            seed.make_epg_entry(ch, title=title, offset_minutes=-10)
-            seed.make_epg_entry(ch, title=title, offset_minutes=120)
+            # A copy's guide can mark what its kept copy's does not.
+            seed.make_epg_entry(ch, title=title, offset_minutes=-10, is_live='copy' in ch.name)
+            seed.make_epg_entry(ch, title=title, offset_minutes=120, is_new='kept' in ch.name)
         # The kept copy of this cluster has no guide at all.
         EPGEntry.query.filter_by(channel_id=missing_kept.id).delete()
         db.session.commit()

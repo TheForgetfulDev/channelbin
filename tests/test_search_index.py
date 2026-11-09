@@ -377,6 +377,8 @@ class ChunkedRebuildTests(unittest.TestCase):
     def test_every_chunk_is_bounded_by_fts_chunk_rows(self):
         """The bound is the whole safety property: a chunk that can grow without limit is a
         one-shot rebuild wearing a loop."""
+        # A 250,000-row table to index. The clear's own reads get the same answer and
+        # ignore it.
         units = list(SI.rebuild_units(SI.SEARCH_INDEX_PROGRAMS, lambda sql: 250_000))
         chunks = [u[0] for u in units if 'INSERT INTO chan_prog_fts(rowid' in u[0]]
         self.assertEqual(len(chunks), 25, 'a 250,000-row table must chunk at 10,000 per batch')

@@ -9,7 +9,7 @@ from datetime import datetime
 from flask import Blueprint, render_template, request, jsonify, url_for, abort
 from sqlalchemy.orm import selectinload
 
-from .. import db, health_bands, channel_hiding, duplicate_streams
+from .. import db, health_bands, channel_hiding, duplicate_streams, history_filter
 from ..database import (
     Channel, ChannelGroup, ChannelGroupMember, ChannelEvent, ChannelTest, Tag,
     Recording, RecordingEvent, RecordingProfile, HealthCheckProfile, OnDemandTestJob,
@@ -1396,6 +1396,10 @@ def _schedule_ctx(job, ct_cfg=None):
         'use_window': None if no_window_opinion else bool(job.recur_use_window),
         'oneoff_value': (local_input_value(job.scheduled_start_time)
                          if job.scheduled_start_time else ''),
+        # The instant the wall text above stands for, so the field keeps it across a DST
+        # change (util.js::wallTimeField, dev/changelog/1477).
+        'oneoff_utc': (job.scheduled_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+                       if job.scheduled_start_time else ''),
         'paused': job.recur_paused,
         'next_run_et': (_fmt_et(job.scheduled_start_time)
                         if mode != 'manual' and not job.recur_paused else None),
@@ -1510,7 +1514,6 @@ def build_group_detail_context(group):
     resolution_options, fps_options = _format_option_sets(
         group_format or {'resolution': '', 'fps': None})
 
-    all_entries = _build_group_timeline(group)
     # What the timeline is scoped to, said rather than left to be inferred - the whole
     # defect it replaces was a reader taking these entries for one check's own work
     # (dev/changelog/790).
@@ -1520,6 +1523,17 @@ def build_group_detail_context(group):
     if per_page not in CHANNEL_HEALTH_PAGE_SIZES:
         per_page = '25'
     page = request.args.get('timeline_page', 1, type=int)
+    # The timeline's filter chips (app/history_filter.py): filtered before it is paged, so
+    # a chip's count is the whole timeline's and the pages are of what the chip keeps.
+    timeline_hist = history_filter.pick(request.args.get('hist'), history_filter.TIMELINE_FILTERS)
+    timeline_hist_qs = f'&hist={timeline_hist}' if timeline_hist != history_filter.ALL else ''
+    timeline_chips, all_entries = history_filter.apply(
+        _build_group_timeline(group),
+        lambda e: history_filter.TIMELINE_KIND_BUCKETS.get(e['kind']),
+        history_filter.TIMELINE_FILTERS, timeline_hist,
+        lambda key: url_for('channel_groups.group_detail', group_id=group.id,
+                            timeline_per_page=(per_page if per_page != '25' else None),
+                            hist=(key if key != history_filter.ALL else None)))
     if per_page == 'all':
         entries, pagination = all_entries, None
     else:
@@ -1644,6 +1658,10 @@ def build_group_detail_context(group):
         'columns': list(GROUP_DETAIL_COLUMNS[col_key]),
         'columns_off': list(GROUP_DETAIL_COLUMNS_OFF),
         'timeline_entries': entries,
+        'timeline_total': timeline_chips[0]['count'],
+        'timeline_chips': timeline_chips,
+        'timeline_hist': timeline_hist,
+        'timeline_hist_qs': timeline_hist_qs,
         'timeline_scope': timeline_scope,
         'timeline_per_page': per_page,
         'timeline_pagination': pagination,

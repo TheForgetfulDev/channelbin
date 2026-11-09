@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
-from tests.support.search import show_all_query, unfolded_query  # noqa: E402
+from tests.support.search import only_hiding, show_all_query, unfolded_query  # noqa: E402
 from app import db, duplicate_streams  # noqa: E402
 from app.accounts import NORM_DISABLED, NORM_MPEGTS  # noqa: E402
 from app.channel_search import (DEFAULT_FIELDS, DIMENSIONS, FIELDS, GRAIN_CHANNELS,  # noqa: E402
@@ -48,6 +48,10 @@ from app.search_index import rebuild_search_indexes  # noqa: E402
 #: The query fragment that leaves every standing option NOT removing rows - what a bare
 #: `standing=` used to mean before the inversion (dev/changelog/778).
 SHOW_ALL = show_all_query()
+# The default search with duplicates hidden, which was the default itself until
+# dev/changelog/1458. The fold is still one untick away and still has to be right.
+HIDE_DUPLICATES = '&'.join(f'standing={k}' for k in sorted(only_hiding(
+    'showhidden', 'showdup', 'shownotnorm')))
 
 SEARCH_URL = '/api/channels/search'
 COUNTS_URL = '/api/channels/search/counts'
@@ -417,6 +421,12 @@ class DuplicateBadgeTests(_ApiTestCase):
     a different one kept - and both look plausible on screen.
     """
 
+    def get(self, query='', expect=200):
+        """This class is about the fold, so a search naming no standing set asks for it."""
+        if 'standing=' not in query:
+            query = '&'.join(x for x in (query, HIDE_DUPLICATES) if x)
+        return super().get(query, expect)
+
     def test_the_dup_badge_carries_the_cluster_size_and_the_other_members(self):
         row = self.row_named('US| ESPN2 HD')
         self.assertEqual(row['dup']['count'], 3)
@@ -624,8 +634,10 @@ class PagingAndFacetTests(_ApiTestCase):
     def test_standing_hidden_is_reported_per_option(self):
         """Nothing is hidden silently: what a default-on option took out is named and
         counted, and the number is of THIS search's rows so the user can act on it."""
-        payload = self.get()
+        payload = self.get(HIDE_DUPLICATES)
         self.assertEqual(payload['standing_hidden']['showdup'], 2)
+        # Duplicates show by default (dev/changelog/1458), so a bare search hides none.
+        self.assertNotIn('showdup', self.get()['standing_hidden'])
         # `channel_total`, not `total`: the standing options count what they took out of the
         # CHANNELS table, and `total` is the merged number the pager pages, group rows
         # included. Adding the two would be exactly the blended number

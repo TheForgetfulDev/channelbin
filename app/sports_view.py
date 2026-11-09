@@ -5,18 +5,20 @@ format are read once and handed down, and nothing is asked per row. Status comes
 recorded, never from a count of what is stored. "Round" is TheSportsDB's word for one call's worth of
 games and means nothing to a viewer, so it appears only beside the dates in Schedule updates.
 """
+import json
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_
 
-from . import db
+from . import db, sports_match
 from .database import (
     SPORTS_FETCH_EMPTY, SPORTS_FETCH_OK, SPORTS_FETCH_RATE_LIMITED, SPORTS_FETCH_REFUSED,
     SPORTS_FETCH_SHRUNK, SPORTS_KIND_LEAGUE, SPORTS_KIND_NEXT, SPORTS_KIND_ROUND, SPORTS_KIND_TEAM,
-    SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsState, SportsTeam,
+    SPORTS_AIRING_UNKNOWN, SPORTS_MATCH_STRONG, EPGEntry, SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsLeagueCategory, SportsState, SportsTeam,
 )
+from .config import load_config
 from .fmt_utils import counted
-from .sports_data import SHIPPED_LEAGUES, _settings, event_shape_is_matchup
+from .sports_data import SHIPPED_LEAGUES, _settings, event_shape_is_matchup, file_name, file_names_on, link_has_time
 from .tz_utils import ago, date_label, day_label, format_local, get_display_tz, is_24h, to_local
 
 STATUS_OK = 'ok'
@@ -37,7 +39,7 @@ STATUSES = {
     STATUS_FILLING: ('b-running', 'Getting schedule', 'rs-new', 3,
                      'ChannelBin is still making the first set of calls for this league.'),
     STATUS_OK: ('b-done', 'Up to date', 'rs-on', 4, 'The last update was answered and looked right.'),
-    STATUS_OFF: ('b-paused', 'Not followed', 'rs-paused', 5, 'No calls are being made for this league.'),
+    STATUS_OFF: ('b-paused', 'Not followed', 'rs-paused', 5, "ChannelBin isn't checking TheSportsDB for this league."),
 }
 
 #: outcome: (badge class, label)
@@ -49,8 +51,9 @@ RESULTS = {
     SPORTS_FETCH_RATE_LIMITED: ('b-warn', 'Slowed down'),
 }
 
-SECTIONS = ('about', 'upcoming', 'updates')
-SECTION_NAMES = {'about': 'This league', 'upcoming': 'Upcoming games', 'updates': 'Schedule updates'}
+SECTIONS = ('about', 'upcoming', 'matching', 'updates')
+SECTION_NAMES = {'about': 'This league', 'upcoming': 'Upcoming games', 'matching': 'Matching your guide',
+                 'updates': 'Schedule updates'}
 SECTIONS_PREF_KEY = 'sports_league_sections'
 #: The latest queue rows Schedule updates shows. Team lookups only show when one has a problem.
 UPDATES_SHOWN = 12
@@ -64,7 +67,7 @@ NO_GAME_HEAD = {
     STATUS_FILLING: ('Not known yet', 'Still getting the schedule'),
     STATUS_LOOK: ('Nothing listed', 'In the days this schedule covers'),
     STATUS_OK: ('Nothing listed', 'In the days this schedule covers'),
-    STATUS_OFF: ('Not followed', 'No calls are being made'),
+    STATUS_OFF: ('Not followed', 'Not checking for games'),
 }
 
 
@@ -94,12 +97,17 @@ def _noun(league, events=()) -> tuple:
     return ('event', 'events') if events else ('game', 'games')
 
 
+def event_noun(league, event) -> str:
+    """What one event is called in prose: game, race or event."""
+    return _noun(league, [event])[0] if league is not None else 'game'
+
+
 def event_when(event, now, tz, h24) -> tuple:
     """(day, time) for a game. The time is strTimestamp, which is UTC, in the display timezone. A
     field event at exactly 00:00 has no real time, so it says so, and its day is TheSportsDB's own
-    date: that placeholder moved into a time zone can land on the wrong day (design 7). No league
-    has a trust measurement until the matcher exists, so a matchup at 00:00 shows as listed, since
-    that is a real 7pm ET for half the NHL."""
+    date: that placeholder moved into a time zone can land on the wrong day (design 7). The
+    league's trust measurement (sports_match.league_trusted()) is not read here, so a matchup at
+    00:00 shows as listed, since that is a real 7pm ET for half the NHL."""
     start = event.start_at
     if start is None or (not event_shape_is_matchup(event) and (start.hour, start.minute) == (0, 0)):
         return date_label(event.local_date, now, tz), ''
@@ -348,7 +356,8 @@ def _notices(league, status, fetches, missing_events, one, many, stored, keep_da
     """Why the league's badge says what it says: (tone, strong, text). Each failure names itself."""
     out = []
     if status == STATUS_OFF:
-        out.append(('info', 'Not followed.', f'No calls are being made. Its {counted(stored, one, many)} stay until {counted(keep_days, "day")} after each one.'))
+        kept = f" It still has {counted(stored, one, many)}, and deletes each one {counted(keep_days, 'day')} after it's over." if stored else ''
+        out.append(('info', 'Not followed.', f"ChannelBin isn't checking TheSportsDB for new {many}.{kept}"))
     if any(f.kind == SPORTS_KIND_LEAGUE and f.outcome == SPORTS_FETCH_EMPTY for f in fetches):
         out.append(('warn', 'TheSportsDB no longer lists this league.', 'What is stored has not changed.'))
     for f in fetches:
@@ -385,7 +394,7 @@ def _no_games_note(status: str, horizon_days: int) -> str:
         STATUS_FILLING: 'Nothing yet. ChannelBin is still getting this schedule.',
         STATUS_LOOK: f'TheSportsDB lists nothing in the next {horizon_days} days, and its last update came back different. See above.',
         STATUS_OK: f'TheSportsDB lists nothing in the next {horizon_days} days. That does not prove the season is over, so ChannelBin keeps checking.',
-        STATUS_OFF: f'Nothing stored for the next {horizon_days} days, and no calls are being made.',
+        STATUS_OFF: f"Nothing stored for the next {horizon_days} days, and ChannelBin isn't checking for more.",
     }[status]
 
 
@@ -425,17 +434,28 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED):
         (f for f in fetches if f.kind != SPORTS_KIND_TEAM or f.outcome in (SPORTS_FETCH_REFUSED, SPORTS_FETCH_RATE_LIMITED)),
         key=lambda f: (f.last_at is None, -(f.last_at.timestamp() if f.last_at else 0)))[:UPDATES_SHOWN]
     next_update = _next_update(fetches, now, tz, h24) if follows else 'None'
+    state = db.session.get(SportsState, 1)
+    checked_at = state.last_match_at if state is not None else None
+    counts = sports_match.game_counts([e.id for e in all_events])
+    names = sports_match.name_counts([e.id for e in shown])
     if follows:
         message = (f'Updated {ago(updated, now)}. Next update: {next_update.lower()}.' if updated
                    else f'Not updated yet. Next update: {next_update.lower()}.')
     else:
-        message = f'Last updated {ago(updated, now)}.' if updated else 'No calls are being made.'
+        message = f'Last updated {ago(updated, now)}.' if updated else 'Not checking for games.'
     return {
         'league': league, 'status': status, 'badge': badge, 'label': label, 'tip': tip, 'lead': f'{lead} {", ".join(bits)}.' if bits else lead,
         'added': format_local(league.created_at, 'date', tz=tz, h24=h24), 'message': message, 'followed': bool(follows),
         'notices': _notices(league, status, fetches, missing_events, one, many, stored, settings['history_keep_days'], now, tz),
         'no_games_note': _no_games_note(status, settings['horizon_days']),
-        'games': [_game_row(e, now, tz, h24) for e in shown], 'one': one, 'many': many,
+        'games': _enrich_games([_game_row(e, now, tz, h24) for e in shown], shown, counts, names, checked_at,
+                               now, tz, h24),
+        'one': one, 'many': many,
+        'trust': _trust_text(league), 'upcoming_note': _upcoming_note(league, many, settings['horizon_days']),
+        'match_note': _match_note(state, sum(1 for e in all_events if (counts.get(e.id) or {}).get('channels')),
+                                  len(all_events), one, many, now, tz, h24),
+        'match_waiting': bool(state and (state.match_note or '').startswith(('Waiting', 'The last run'))),
+        'matching': _matching_context(league),
         'picked_teams': picked_teams, 'scope': SCOPE_ALL if scope == SCOPE_ALL and picked_teams else SCOPE_FOLLOWED,
         'mine_total': len(mine), 'all_total': len(all_events), 'follow_text': follow_text if follows else 'Nothing',
         'next_update': next_update, 'horizon_days': settings['horizon_days'],
@@ -447,6 +467,130 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED):
     }
 
 
+def _match_note(state, found: int, total: int, one: str, many: str, now, tz, h24) -> str:
+    """The Checked against your guide row: this league's own figure and when the matcher last ran, or
+    what it is waiting for, with the last good run's time kept (6.6). The run's stored note is across
+    every league, so only its waiting or failure sentence is shown here."""
+    if state is None or state.last_match_at is None:
+        lead = state.match_note if state is not None and state.match_note else 'Not yet.'
+        return f'{lead} It runs after the next guide update.' if lead == 'Not yet.' else lead
+    when = _when_text(day_label(state.last_match_at, now, tz), format_local(state.last_match_at, 'clock', tz=tz, h24=h24))
+    figure = f'Found {found} of {counted(total, "upcoming " + one, "upcoming " + many)} in your guide.' if total else ''
+    note = state.match_note or ''
+    if note.startswith(('Waiting', 'The last run')):
+        return f'{note} Last checked {when.lower() if when[:1] in "TY" else when}. {figure}'.strip()
+    return f'{when}. {figure}'.strip()
+
+
+def _trust_text(league) -> tuple:
+    """(value, note) for the Start times row (design 7)."""
+    sample, agreed = league.trust_sample or 0, league.trust_agreed or 0
+    if not sample:
+        return 'Not measured yet', ''
+    text = f'Match your guide on {agreed} of the last {counted(sample, "event")}'
+    if sports_match.league_trusted(league):
+        return text, ''
+    if sample < sports_match.TRUST_MIN_SAMPLE:
+        return text, 'Too few checked yet to rely on'
+    return text, 'Not enough to rely on'
+
+
+def _upcoming_note(league, many, horizon_days) -> str:
+    sample, agreed = league.trust_sample or 0, league.trust_agreed or 0
+    head = f'The next {horizon_days} days. Times are what TheSportsDB lists.'
+    if not sample:
+        return (f'{head} ChannelBin has not checked enough of these {many} against your guide to rely on them yet, '
+                'so the earliest listing of each counts as its first airing.')
+    if sports_match.league_trusted(league):
+        return (f'{head} They matched your guide on {agreed} of the last {sample}. Where TheSportsDB and your guide '
+                'disagree, both times are shown.')
+    if sample < sports_match.TRUST_MIN_SAMPLE:
+        return (f'{head} They matched your guide on {agreed} of the {sample} checked so far, too few to rely on yet, so '
+                'ChannelBin goes by the earliest listing to tell a first airing from a replay.')
+    return (f'{head} They matched your guide on only {agreed} of the last {sample}, so ChannelBin shows them but '
+            'goes by the earliest listing to tell a first airing from a replay.')
+
+
+def _airing_text(c: dict) -> str:
+    """How a game's live listings air, every combination named."""
+    first, replay, unknown = c['first'], c['replay'], c['unknown']
+    if first:
+        tail = [x for x in (counted(replay, 'replay') if replay else '', f'{unknown} not known' if unknown else '') if x]
+        return f'Live, and {" and ".join(tail)} later' if replay and not unknown else (
+            f'Live, {", ".join(tail)}' if tail else 'Live')
+    if replay and unknown:
+        return f'{counted(replay, "replay")}, {unknown} not known if live'
+    if replay:
+        return 'Replays only'
+    if unknown:
+        return 'Not known yet if live or replay'
+    raise ValueError(f'a game with live listings and no airing: {c!r}')
+
+
+def _guide_cell(event, c, n, checked_at, guide_end, now, tz) -> dict:
+    """What the Where it's on column says for one event: its guide listings, else the event channels
+    naming it (design 6.8), else why there are none. Every state is named, so an empty cell is never the
+    rendering of "not checked". `names_only` picks the dialog's title and the row menu's wording."""
+    kept, wrong_names = (n['channels'], n['wrong']) if n else (0, 0)
+    also = f'Also named by {counted(kept, "event channel")}' if kept else ''
+    if c and c['channels']:
+        return {'state': 'found', 'text': f'On {counted(c["channels"], "channel")}', 'sub': _airing_text(c),
+                'also': also, 'open': True, 'names_only': False}
+    if c and c['wrong']:
+        return {'state': 'all_wrong', 'text': 'On 0 channels', 'open': True, 'also': also, 'names_only': False,
+                'sub': f'All {counted(c["wrong"], "listing")} marked a wrong match. Open to undo.'}
+    start = event.start_at or datetime.combine(event.local_date, datetime.min.time())
+    past_guide = guide_end is None or start > guide_end
+    if kept:
+        where = (f'Not in your guide yet: it reaches {day_label(guide_end, now, tz)}.' if guide_end and past_guide
+                 else 'Not in your guide yet.' if past_guide else 'No listing in your guide names it.')
+        read = 'Read from its name.' if kept == 1 else 'Read from their names.'
+        return {'state': 'names', 'text': f'On {counted(kept, "event channel")}', 'sub': f'{read} {where}',
+                'also': '', 'open': True, 'names_only': True}
+    if wrong_names:
+        return {'state': 'names_wrong', 'text': 'On 0 event channels', 'also': '', 'open': True, 'names_only': True,
+                'sub': f'All {counted(wrong_names, "event channel")} marked a wrong match. Open to undo.'}
+    if checked_at is None or (event.first_seen is not None and event.first_seen > checked_at):
+        return {'state': 'unchecked', 'text': 'Not checked yet', 'open': False,
+                'sub': 'ChannelBin looks for it in your guide after the next guide update.'}
+    if past_guide:
+        reach = f'Your guide reaches {day_label(guide_end, now, tz)}. ' if guide_end else ''
+        return {'state': 'later', 'text': 'Not in your guide yet', 'open': False,
+                'sub': f'{reach}Checked again after each guide update.'}
+    what = ('No listing names the league and both teams near this time.' if event_shape_is_matchup(event)
+            else 'No listing names the series on this day.')
+    return {'state': 'missing', 'text': 'Not found in your guide', 'open': False, 'sub': what}
+
+
+def _enrich_games(rows, events, counts, names, checked_at, now, tz, h24) -> list:
+    """The league page's extra columns, from counts read once for every shown event. Both times show
+    only for a game with live listings and a real time from TheSportsDB: a race's 00:00 placeholder is
+    not a time to disagree with (7)."""
+    guide_end = db.session.query(func.max(EPGEntry.start_time)).scalar()
+    for row, event in zip(rows, events):
+        c = counts.get(event.id)
+        row['id'] = event.id
+        row['tsdb_url'] = f'https://www.thesportsdb.com/event/{event.tsdb_id}'
+        row['guide'] = _guide_cell(event, c, names.get(event.id), checked_at, guide_end, now, tz)
+        row['guide_time'] = (format_local(event.guide_start, 'clock', tz=tz, h24=h24)
+                             if row['guide']['state'] == 'found' and row['time'] and sports_match.time_disagrees(event)
+                             else '')
+    return rows
+
+
+def _matching_context(league) -> dict:
+    """The Matching your guide card: the league's names, a known name it lacks, and its categories with
+    how many channels each has now. A category gone from every account is kept and says so (5.2)."""
+    counts = sports_match.category_counts()
+    cats = SportsLeagueCategory.query.filter_by(league_id=league.id).order_by(SportsLeagueCategory.category_name).all()
+    return {
+        'terms': json.loads(league.match_terms or '[]'),
+        'suggested': sports_match.suggested_terms(league),
+        'categories': [{'name': c.category_name, 'channels': counts.get(c.category_name, 0),
+                        'replay': c.is_replay} for c in cats],
+    }
+
+
 def add_dialog_config() -> dict:
     """The shipped list, for Add a league. Which are followed already comes with the page."""
     followed = {tsdb for (tsdb,) in db.session.query(SportsLeague.tsdb_id).join(
@@ -454,3 +598,165 @@ def add_dialog_config() -> dict:
     return {'shipped': [{'tsdb_id': s['tsdb_id'], 'name': s['name'], 'sport': s['sport'],
                          'followed': s['tsdb_id'] in followed} for s in SHIPPED_LEAGUES],
             'site': 'https://www.thesportsdb.com/'}
+
+
+# ---------------------------------------------------------------------------
+# A recording's event, on its page (design 11)
+# ---------------------------------------------------------------------------
+
+#: Within this of the program's own start, TheSportsDB's start is not shown again.
+_START_SHOWN_PAST = timedelta(minutes=5)
+
+
+def _differs(minutes: int, later: bool) -> str:
+    if minutes >= 120 and minutes % 60 == 0:
+        amount = counted(minutes // 60, 'hour')
+    else:
+        amount = counted(minutes, 'minute')
+    return f'{amount} {"after" if later else "before"} the guide'
+
+
+def recording_context(rec, now, tz, h24, cfg=None):
+    """What the recording page's Program card says about TheSportsDB, or None to say nothing.
+
+    A fixed handful of queries for one recording. A recording with no link says nothing unless a
+    followed league's text or category is on its listing, and then says why it was not matched."""
+    from .database import RecordingSports
+    from .sports_data import event_title
+    cfg = cfg if cfg is not None else load_config()
+    link = db.session.get(RecordingSports, rec.id)
+    if link is not None and link.removed_at is not None:
+        return {'state': 'removed', 'event': event_title(link), 'league': link.league_name,
+                'removed_on': date_label(to_local(link.removed_at, tz).date(), now, tz),
+                'keeps_name': _file_not_named_yet(rec, cfg)}
+    if link is not None:
+        season = ' '.join(x for x in (link.league_name, link.season) if x)
+        if link.round and 0 < link.round < 100:
+            season += f', round {link.round}'
+        start = None
+        if link_has_time(link) and rec.program_start_time is not None:
+            gap = link.event_start - rec.program_start_time
+            if abs(gap) > _START_SHOWN_PAST:
+                start = (f'{day_label(link.event_start, now, tz)} '
+                         f'{format_local(link.event_start, "clock", tz=tz, h24=h24)}, '
+                         f'{_differs(int(abs(gap).total_seconds() // 60), gap > timedelta(0))}')
+        return {'state': 'linked', 'event': event_title(link), 'season': season,
+                'where': ', '.join(x for x in (link.venue, link.city) if x), 'start': start,
+                'strong': link.strength == SPORTS_MATCH_STRONG,
+                'airing': sports_match.AIRING_LABELS.get(link.airing, sports_match.AIRING_LABELS[SPORTS_AIRING_UNKNOWN]),
+                'reason': link.reason,
+                'tsdb_url': f'https://www.thesportsdb.com/event/{link.tsdb_event_id}',
+                'art': _artwork(rec, link, cfg, now, tz, h24),
+                'file_name': _future_file_name(rec, link, cfg, tz)}
+    note = _unlinked_note(rec)
+    if note and _file_not_named_yet(rec, cfg):
+        note += ' Its file will keep its normal name.'
+    return {'state': 'none', 'note': note} if note else None
+
+
+def _file_not_named_yet(rec, cfg) -> bool:
+    """Whether naming matched games from TheSportsDB is on and this recording's file is still to be
+    written, so what the join will call it is worth saying (dev/changelog/1466). Once written, the
+    page shows the file itself and its join event says how it was named."""
+    from .database import REC_ENDED_STATUSES
+    return file_names_on(cfg) and not rec.output_path and rec.status not in REC_ENDED_STATUSES
+
+
+def _future_file_name(rec, link, cfg, tz):
+    """The name the join will give a linked recording's file, as it will be on disk, or None."""
+    from .recorder import _safe_name
+    if not _file_not_named_yet(rec, cfg):
+        return None
+    name = file_name(link, tz)
+    return _safe_name(name) if name else None
+
+
+def _artwork(rec, link, cfg, now, tz, h24):
+    """The Artwork row: which of TheSportsDB's images this recording has, and for each it does not,
+    why (app/sports_images.py, dev/changelog/1465). `links` are the roles a View link opens."""
+    from .database import REC_ENDED_STATUSES
+    from .metadata_sidecar import sidecar_enabled
+    from .sports_images import BACKGROUND, MISSED, OFF, POSTER, READY, REFUSED, UNUSED, artwork, images_for
+    art = artwork(cfg, link, finished=rec.status in REC_ENDED_STATUSES,
+                  used=sidecar_enabled(cfg, rec.profile, rec))
+    if not art:
+        return {'text': 'TheSportsDB has no poster or background for this event.', 'cls': 'na', 'links': []}
+    if any(state == OFF for state, _, _ in art.values()):
+        return {'text': 'Downloading posters and backgrounds is off in Settings.', 'cls': 'na', 'links': []}
+    # With no poster the thumb is both, one file: it is named once, as the background.
+    roles = ([POSTER] if link.poster_url else []) + ([BACKGROUND] if link.thumb_url else [])
+    names = {POSTER: 'poster', BACKGROUND: 'background'}
+    ready = [r for r in roles if art[r][0] == READY]
+    out = []
+    if ready:
+        what = ' and '.join(names[r] for r in ready).capitalize()
+        out.append(f'{what} from TheSportsDB.' if link.poster_url else
+                   f'{what} from TheSportsDB, also used as the poster, since the event has none.')
+    known = images_for(link)
+    unused = False
+    for role in roles:
+        state, _, reason = art[role]
+        if state == READY:
+            continue
+        name = names[role].capitalize()
+        why = f' {reason}' if reason else ''
+        if state == REFUSED:
+            out.append(f'{name} not downloaded.{why}')
+        elif state == UNUSED:
+            unused = True
+        elif state == MISSED:
+            out.append(f'{name} was not downloaded before the recording finished.{why}')
+        else:
+            img = known.get(link.poster_url if role == POSTER else link.thumb_url)
+            when = (f' Tries again {day_label(img.next_try_at, now, tz)} '
+                    f'{format_local(img.next_try_at, "clock", tz=tz, h24=h24)}.'
+                    if img is not None and img.next_try_at and img.next_try_at > now else '')
+            out.append(f'{name} not downloaded yet.{why}{when}')
+    if unused:
+        out.append('Not downloaded: this recording writes no metadata file, the one place they are used.')
+    profile = rec.profile
+    if profile is not None and profile.poster_file:
+        out.append(f'The image pinned to profile "{profile.name}" is the poster.')
+    return {'text': ' '.join(out), 'cls': 'ok' if len(ready) == len(roles) else 'warn',
+            'links': [{'role': r, 'label': names[r]} for r in ready]}
+
+
+def _unlinked_note(rec):
+    """Why a recording whose listing is in a followed league has no event, in one sentence. None, and
+    the page says nothing, when no followed league's terms or tied categories are on its listing."""
+    from .program_titles import title_key
+    from .sports_data import pick_match, recording_matches
+    if rec.program_start_time is None or not rec.program_title:
+        return None
+    followed = {i for (i,) in db.session.query(SportsFollow.league_id).distinct()}
+    category = rec.channel.category_name if rec.channel is not None else None
+    leagues = [lg for lg in sports_match.leagues_for_listing(rec.program_title, rec.program_sub_title, category)
+               if lg.id in followed]
+    if not leagues:
+        return None
+    league = leagues[0]
+    matches = recording_matches(rec, rejected=True)
+    if any(m.rejected_at is not None for m in matches) and not any(m.rejected_at is None for m in matches):
+        return (f'Its listing was marked a wrong match on the {league.name} page, so it is not linked to a '
+                f'{league.name} event.')
+    match, ambiguous = pick_match([m for m in matches if m.rejected_at is None], title_key(rec.program_title))
+    if ambiguous:
+        return (f'Its listing matched more than one {league.name} event equally well, so it was not linked to '
+                f'either.')
+    if match is not None:
+        return ('Its listing matches a TheSportsDB event that is not linked yet. The next match run links it, '
+                'and so does the recording finishing.')
+    pst = rec.program_start_time
+    lo, hi = pst - sports_match.WINDOW, pst + sports_match.WINDOW
+    nearby = SportsEvent.query.filter(
+        SportsEvent.league_id == league.id,
+        or_(SportsEvent.start_at.between(lo, hi),
+            (SportsEvent.start_at.is_(None) & SportsEvent.local_date.between(lo.date(), hi.date())))).count()
+    if not nearby:
+        hours = int(sports_match.WINDOW.total_seconds() // 3600)
+        return (f'No {league.name} event within {hours} hours of this program is stored from TheSportsDB, so '
+                f'there was nothing to match it to.')
+    lead = (f'The one {league.name} event around then did not match its listing.' if nearby == 1 else
+            f'None of the {nearby} {league.name} events around then matched its listing.')
+    return (f'{lead} A match needs the league and both teams, or for a race the series and the date, in the '
+            f'title or episode name, and the description is never read.')

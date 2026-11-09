@@ -183,12 +183,7 @@
     <div class="card-body">
       {% if history_total %}
       <p class="card-note">What this rule did with showings that have aired, newest first.{% if keep_days %} Kept for {{ keep_days }} days.{% endif %}</p>
-      <div class="rl-filter">
-        {% for f in history_filters %}
-        <a class="chip{{ ' active' if f.key == history_filter else '' }}" data-hist="{{ f.key }}"
-           href="{{ url_for('auto_rules.rule_page', rule_id=rule.id, hist=f.key) }}">{{ f.label }}<span class="n">{{ f.count }}</span></a>
-        {% endfor %}
-      </div>
+      {{ m.history_chips(history_filters) }}
       {% if history %}
       {{ ledger(history, true) }}
       {% else %}

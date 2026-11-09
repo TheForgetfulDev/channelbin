@@ -4,7 +4,7 @@ import time
 
 from flask import Blueprint, abort, jsonify, render_template, request
 
-from .. import sports_data, sports_view
+from .. import sports_data, sports_match, sports_view
 
 sports_bp = Blueprint('sports', __name__)
 
@@ -139,4 +139,88 @@ def delete_league(league_id):
     if not sports_data.delete_league(league_id):
         return jsonify({'error': 'That league no longer exists.'}), 404
     sports_data.ensure_worker()
+    return jsonify({'success': True})
+
+
+# ---------------------------------------------------------------------------
+# Matches, names and categories (app/sports_match.py, design 5.1, 5.2, 11)
+# ---------------------------------------------------------------------------
+
+def _ids(raw):
+    if not isinstance(raw, list):
+        raise ValueError('match_ids must be a list.')
+    return [int(i) for i in raw]
+
+
+@sports_bp.route('/api/sports/events/<int:event_id>/listings')
+def event_listings(event_id):
+    """The listings dialog: every guide listing matched to this event, grouped by wording, and the
+    event channels whose names name it."""
+    from ..database import SportsEvent, SportsLeague
+    from ..tz_utils import get_display_tz, is_24h
+    from .. import db
+    event = db.session.get(SportsEvent, event_id)
+    if event is None:
+        return jsonify({'error': 'That event is no longer stored.'}), 404
+    groups = sports_match.listing_groups(event_id, get_display_tz(), is_24h())
+    league = db.session.get(SportsLeague, event.league_id)
+    return jsonify({'success': True, 'groups': groups, 'names': sports_match.name_rows(event_id),
+                    'one': sports_view.event_noun(league, event),
+                    'listings': sum(1 for g in groups for c in g['channels'] if not c['wrong']),
+                    'channels': len({c['channel_id'] for g in groups for c in g['channels'] if not c['wrong']}),
+                    'tsdb_url': f'https://www.thesportsdb.com/event/{event.tsdb_id}'})
+
+
+@sports_bp.route('/api/sports/events/<int:event_id>/wrong', methods=['POST'])
+def mark_wrong(event_id):
+    """Mark listings a wrong match for this event (`wrong: true`), or undo it."""
+    data = request.get_json(silent=True) or {}
+    try:
+        ids = _ids(data.get('match_ids'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'match_ids must be a list of numbers.'}), 400
+    if not ids:
+        return jsonify({'error': 'No listings were named.'}), 400
+    changed = sports_match.mark_wrong(event_id, ids, bool(data.get('wrong', True)))
+    if changed is None:
+        return jsonify({'error': 'That event is no longer stored.'}), 404
+    return jsonify({'success': True, 'changed': changed})
+
+
+@sports_bp.route('/api/sports/leagues/<int:league_id>/terms', methods=['PUT'])
+def set_terms(league_id):
+    """The names that mean this league in the guide (design 5.1)."""
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get('terms'), list):
+        return jsonify({'error': 'terms must be a list.'}), 400
+    try:
+        saved = sports_match.set_terms(league_id, data['terms'])
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    if saved is None:
+        return jsonify({'error': 'That league no longer exists.'}), 404
+    return jsonify({'success': True, 'terms': saved})
+
+
+@sports_bp.route('/api/sports/leagues/<int:league_id>/categories/offer')
+def category_offer(league_id):
+    from ..database import SportsLeague
+    from .. import db
+    league = db.session.get(SportsLeague, league_id)
+    if league is None:
+        return jsonify({'error': 'That league no longer exists.'}), 404
+    return jsonify({'success': True, 'categories': sports_match.category_offer(league)})
+
+
+@sports_bp.route('/api/sports/leagues/<int:league_id>/categories', methods=['PUT'])
+def change_categories(league_id):
+    """Tie categories (`add`), untie them (`remove`), or set Replays only (`replay`: {name: bool})."""
+    data = request.get_json(silent=True) or {}
+    add, remove, replay = data.get('add') or [], data.get('remove') or [], data.get('replay') or {}
+    if (not isinstance(add, list) or not isinstance(remove, list) or not isinstance(replay, dict)
+            or not all(isinstance(n, str) for n in add + remove + list(replay))
+            or not all(isinstance(v, bool) for v in replay.values())):
+        return jsonify({'error': 'add and remove must be lists of names, replay a map of name to true or false.'}), 400
+    if not sports_match.change_categories(league_id, add, remove, replay):
+        return jsonify({'error': 'That league no longer exists.'}), 404
     return jsonify({'success': True})

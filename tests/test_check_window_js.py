@@ -114,6 +114,24 @@ class ScheduleFieldsWindowModeTests(unittest.TestCase):
         self.assertEqual(from_window['payload'],
                          {'recurring': True, 'recur_day': 4, 'use_window': True})
 
+    def test_the_one_off_field_keeps_the_instant_it_stands_for(self):
+        """dev/docs/BUGS.md 2026-11-08 @ 09:26:53 PM ET: typed wall text on the night DST ends
+        reads as the first pass and the note says so; a stored moment in the second 1 AM hour
+        prefills as the same text, keeps its instant, and the payload posts it beside the
+        text as scheduled_time_utc."""
+        typed = self.r['onceTyped']
+        self.assertEqual(typed['payload'], {'recurring': False, 'scheduled_time': '2027-11-07T01:30',
+                                            'scheduled_time_utc': '2027-11-07T05:30:00.000Z'})
+        self.assertTrue(typed['noteShown'])
+        self.assertIn('happens twice', typed['note'])
+        pre = self.r['oncePrefilled']
+        self.assertEqual(pre['value'], '2027-11-07T01:30')
+        self.assertEqual(pre['hidden'], '2027-11-07T06:30:00.000Z')
+        self.assertEqual(pre['payload']['scheduled_time_utc'], '2027-11-07T06:30:00.000Z')
+        bare = self.r['oncePrefilledBare']
+        self.assertEqual(bare['value'], '2027-11-08T09:00')
+        self.assertEqual(bare['payload']['scheduled_time_utc'], '2027-11-08T14:00:00.000Z')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

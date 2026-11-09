@@ -4615,6 +4615,10 @@ def _finish_postprocess(app, recording_id: int, current_path: str, cfg: dict, *,
     # Deliberately not inside a try that swallows - write_sidecar() handles its own
     # failures, logs an event naming the reason, and never raises at a caller that is
     # one step from marking this recording COMPLETED.
+    # The recording's TheSportsDB event, brought up to date first so the sidecar can carry it.
+    # link_recording() reads only local tables and swallows its own failures (dev/changelog/1464).
+    from .sports_data import link_recording
+    link_recording(recording_id)
     from .metadata_sidecar import write_sidecar
     write_sidecar(recording_id, current_path, cfg)
 

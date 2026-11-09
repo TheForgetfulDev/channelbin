@@ -335,6 +335,9 @@ class RestoreAtomicityTests(ConfigSandbox):
         with open(self._backup, 'w') as f:
             yaml.dump({'flask': {'secret_key': 'from-backup'}, **_stamp()}, f)
         self.addCleanup(lambda: os.path.exists(self._backup) and os.remove(self._backup))
+        # A restore of the live file raises the process-wide restart flag
+        # (dev/changelog/1452); a test building no app must put it back itself.
+        self.addCleanup(cfgmod.set_restart_needed, False)
         # apply_backup() resolves the live path through config_backup._config_path().
         p = mock.patch.object(cbmod, '_config_path', return_value=self._cfg_path)
         p.start()

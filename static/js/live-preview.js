@@ -7,9 +7,13 @@
    server's idle reaper is the backstop for a tab that dies without either, so a stop here is
    prompt rather than load-bearing.
 
+   When the browser cannot decode the copy, the dialog says what the browser said and offers
+   a re-encode on the GPU, which starts a new session that re-encodes the video
+   (dev/changelog/1461). Nothing re-encodes unless the viewer asks.
+
    Called by the channel page's Preview and by the TV Guide's program chooser. The hls.js
    URL comes from this script tag's data-hls-js: it is loaded on the first Preview, not with
-   the page - 386 KB nobody pays for until they ask to watch something
+   the page - 620 KB nobody pays for until they ask to watch something
    (static/vendor/hls.js/NOTICE.md). */
 
 (() => {
@@ -18,13 +22,15 @@
   function openLivePreview({ channelId, channelName }) {
     const player = buildPlayerStage();
     const { video, setStatus, tryPlay } = player;
-    setStatus('Starting…');
 
     let session = null;     // the start response: status_url / playlist_url / stop_url
     let hls = null;
     let pollTimer = null;
     let closed = false;
     let recoveredOnce = false;
+    let failed = false;     // this session's decode failure has been reported
+    let attached = false;
+    let gen = 0;            // which begin() a response belongs to
 
     // pagehide cannot wait for a fetch and sendBeacon cannot set headers, so the token
     // travels as a form field, which the CSRF check accepts just the same.
@@ -55,7 +61,9 @@
       footer: [{ label: 'Stop', class: 'btn', onClick: (close) => close() }],
       onClose: () => {
         closed = true;
+        gen += 1;
         window.removeEventListener('pagehide', onPageHide);
+        player.clearOffer();
         detachPlayer();
         stopSession();
       },
@@ -71,32 +79,65 @@
       setStatus(why || 'Stopped.', s.reason === 'user' ? '' : 'error');
     };
 
+    // The browser could not decode what it was given. Its own words, then the re-encode -
+    // unless this already was the re-encode, which leaves nothing further to offer.
+    const undecodable = (hlsData) => {
+      if (failed) return;
+      failed = true;
+      const said = playbackFailureText(video, hlsData);
+      const reencoded = session && session.reencode;
+      // Nothing more will play from this session, so its provider connection is let go now.
+      detachPlayer();
+      stopSession();
+      setStatus(`This browser could not play ${reencoded ? 'the re-encoded video' : 'this stream'}: ${said}.`, 'error');
+      if (!reencoded) player.offerReencode(() => begin(true));
+    };
+
     video.addEventListener('playing', () => {
       if (closed || !session) return;
-      setStatus(session.transcode_audio
-        ? 'Playing. Audio is re-encoded to AAC so the browser can decode it; video is untouched.'
-        : 'Playing.', 'ok');
+      let text = 'Playing.';
+      if (session.reencode) {
+        text = 'Playing. ChannelBin re-encodes the video on the GPU, and the audio to AAC, so this browser can play it.';
+      } else if (session.transcode_audio) {
+        text = 'Playing. Audio is re-encoded to AAC so the browser can decode it; video is untouched.';
+      }
+      setStatus(text, 'ok');
     });
-
-    const onHlsError = (_evt, data) => {
-      if (!data || !data.fatal) return;
-      if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recoveredOnce) {
+    // The decoder refusing a packet puts the element in error at once, and hls.js may never
+    // say so: on channel 44107's segments in Chrome 155 the element errored at 0.5 s and hls.js
+    // raised nothing at all in 15 s (dev/changelog/1461). So the element's own error is acted
+    // on too: one recovery, as for hls.js's, then the failure is reported. The browser's own
+    // HLS (Safari) reports only here.
+    const recoverOrFail = (hlsData) => {
+      if (hls && !recoveredOnce) {
         recoveredOnce = true;
         hls.recoverMediaError();
         return;
       }
-      if (hls) { hls.destroy(); hls = null; }
+      undecodable(hlsData);
+    };
+    video.addEventListener('error', () => {
+      if (closed || !session || !attached || !video.error) return;
+      if (video.error.code === MediaError.MEDIA_ERR_NETWORK) return;   // the poll names a stop
+      recoverOrFail(null);
+    });
+
+    const onHlsError = (_evt, data) => {
+      if (!data || !data.fatal) return;
       if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-        setStatus(`This browser cannot decode this stream (${data.details}). HEVC video, or an audio codec the browser lacks, is the usual reason.`, 'error');
-      } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        recoverOrFail(data);
+        return;
+      }
+      if (hls) { hls.destroy(); hls = null; }
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
         // The status poll will replace this with the server's reason if the session ended.
         setStatus(`Lost the stream (${data.details}).`, 'error');
       } else {
-        setStatus(`Playback failed (${data.details}).`, 'error');
+        setStatus(`Playback failed: ${playbackFailureText(video, data)}.`, 'error');
       }
     };
 
-    const attach = () => {
+    const attach = (token) => {
       attachHls(video, session.playlist_url, {
         src: HLS_SRC,
         config: { liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8 },
@@ -104,56 +145,68 @@
         onError: onHlsError,
       })
         .then((h) => {
-          if (closed) { if (h) h.destroy(); return; }
+          if (closed || token !== gen) { if (h) h.destroy(); return; }
           hls = h;
         })
         .catch((e) => {
-          if (!closed) setStatus(e.message || 'Could not load the video player script.', 'error');
+          if (!closed && token === gen) setStatus(e.message || 'Could not load the video player script.', 'error');
         });
     };
 
     // hls.js gives a missing manifest very few retries, so the playlist is only handed to
     // it once the server says the first segment exists; the poll keeps running afterwards
     // so a stop decided on the server (preempted, idle, ended) reaches the dialog by name.
-    let attached = false;
-    const poll = () => {
-      if (closed || !session) return;
+    const poll = (token) => {
+      if (closed || !session || token !== gen) return;
       jsonFetch(session.status_url)
         .then((s) => {
-          if (closed || !session) return;
+          if (closed || !session || token !== gen) return;
           if (s.state === 'STOPPED') { ended(s); return; }
           if (s.state === 'READY' && !attached) {
             attached = true;
             setStatus('Connected - starting playback…');
-            attach();
+            attach(token);
           } else if (s.state === 'STARTING') {
             setStatus(`Connecting to the stream… (${Math.round(s.elapsed_seconds)}s)`);
           }
-          pollTimer = setTimeout(poll, attached ? 3000 : 1000);
+          pollTimer = setTimeout(() => poll(token), attached ? 3000 : 1000);
         })
         .catch((e) => {
-          if (closed) return;
+          if (closed || token !== gen) return;
           setStatus(e.message || 'Lost contact with the preview.', 'error');
         });
     };
 
-    jsonFetch(`/api/channels/${encodeURIComponent(channelId)}/preview`, { method: 'POST' })
-      .then((data) => {
-        if (closed) {
-          // Closed before the start round-trip came back: stop what was just started.
+    // Start a session - a stream copy, or the GPU re-encode the viewer asked for. A new one
+    // replaces the old on the server before it starts, so the old one is only let go here.
+    function begin(reencode) {
+      const token = ++gen;
+      detachPlayer();
+      session = null;
+      attached = false;
+      recoveredOnce = false;
+      failed = false;
+      setStatus(reencode ? 'Starting the re-encode…' : 'Starting…');
+      const opts = { method: 'POST' };
+      if (reencode) opts.body = JSON.stringify({ reencode: true });
+      jsonFetch(`/api/channels/${encodeURIComponent(channelId)}/preview`, opts)
+        .then((data) => {
+          if (closed || token !== gen) {
+            // Closed or replaced before the start round-trip came back: stop what was just started.
+            jsonFetch(data.stop_url, { method: 'POST' }).catch(() => {});
+            return;
+          }
           session = data;
-          stopSession();
-          return;
-        }
-        session = data;
-        setStatus('Connecting to the stream…');
-        poll();
-      })
-      .catch((e) => {
-        if (closed) return;
-        setStatus(e.message || 'Could not start the preview.', 'error');
-      });
+          setStatus(reencode ? 'Connecting to the stream to re-encode it…' : 'Connecting to the stream…');
+          poll(token);
+        })
+        .catch((e) => {
+          if (closed || token !== gen) return;
+          setStatus(e.message || 'Could not start the preview.', 'error');
+        });
+    }
 
+    begin(false);
     return modal;
   }
 

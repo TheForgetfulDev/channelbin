@@ -44,6 +44,9 @@ class _SavingRoutes(ConfigSandbox):
     def setUp(self):
         super().setUp()
         self._write_cfg(self.MINIMAL)
+        # What the file holds before any save: MINIMAL plus the sandbox's own temp dirs,
+        # which keep a runtime read out of the real /dvr and backup folder.
+        self.seeded = _leaves(self.MINIMAL) | _leaves(self._sandbox_paths)
         self.t = make_test_app(csrf=False)
         self.addCleanup(self.t.cleanup)
         self.client = self.t.app.test_client()
@@ -64,7 +67,7 @@ class FieldSaveTests(_SavingRoutes):
         self.assertEqual(resp.status_code, 200)
         stored = _leaves(self.file_cfg())
         self.assertEqual(
-            stored, _leaves(self.MINIMAL) | {'display.time_format'},
+            stored, self.seeded | {'display.time_format'},
             'the save wrote keys the user never set - config.yaml must hold only what was '
             'chosen, so a later change to a shipped default still reaches this install')
 
@@ -140,7 +143,7 @@ class SecretSaveTests(_SavingRoutes):
         self.assertEqual(resp.status_code, 200)
         stored = self.file_cfg()
         self.assertEqual(_leaves(stored),
-                         _leaves(self.MINIMAL) | {'auth.password_hash'})
+                         self.seeded | {'auth.password_hash'})
         self.assertTrue(stored['auth']['password_hash'])
 
     def test_a_masked_secret_round_trip_is_still_a_no_op(self):
@@ -161,7 +164,7 @@ class SecretSaveTests(_SavingRoutes):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(
             _leaves(self.file_cfg()),
-            _leaves(self.MINIMAL) | {'integrations.home_assistant.api_key_hash'})
+            self.seeded | {'integrations.home_assistant.api_key_hash'})
 
 
 class NotificationSaveTests(_SavingRoutes):
@@ -171,7 +174,7 @@ class NotificationSaveTests(_SavingRoutes):
                                 json={'enabled': True, 'url': 'pover://tok@user'})
         self.assertEqual(resp.status_code, 200)
         stored = self.file_cfg()
-        self.assertEqual(_leaves(stored), _leaves(self.MINIMAL) | {
+        self.assertEqual(_leaves(stored), self.seeded | {
             'notifications.services.pushover.enabled',
             'notifications.services.pushover.url'})
         self.assertNotIn('discord', stored['notifications']['services'],
@@ -201,7 +204,7 @@ class NotificationSaveTests(_SavingRoutes):
         resp = self.client.post('/api/notifications/rate-limit', json={'seconds': 90})
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(_leaves(self.file_cfg()),
-                         _leaves(self.MINIMAL) | {'notifications.push_rate_limit_seconds'})
+                         self.seeded | {'notifications.push_rate_limit_seconds'})
 
     def test_service_removal_stores_only_that_service(self):
         self.client.post('/api/notifications/services/pushover',
@@ -236,8 +239,10 @@ class SaveConfigDiffTests(ConfigSandbox):
     def test_dropping_a_key_reports_the_default_it_falls_back_to(self):
         """A key removed from config.yaml means "use the default", so the change is
         old value -> default, not old value -> nothing."""
+        # No sandbox dirs: the save below hands save_config() a file without them, and
+        # this test builds no app, so nothing reads a runtime path.
         self._write_cfg({'config_version': cfgmod.CURRENT_CONFIG_VERSION,
-                         'logging': {'level': 'DEBUG'}})
+                         'logging': {'level': 'DEBUG'}}, keep_sandbox_paths=False)
         changed = cfgmod.save_config(
             {'config_version': cfgmod.CURRENT_CONFIG_VERSION})
         self.assertEqual(changed,

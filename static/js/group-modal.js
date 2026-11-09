@@ -315,7 +315,7 @@ function openGroupModal(opts) {
                  data-channel-name="${escHtml(r.channel_name)}"${disabled ? ' disabled' : ''}></td>
           <td class="st-fmt">${fmtBadge(r)}</td>
           <td class="st-ch">
-            <span class="account-dot" style="background:${escHtml(r.account_color || 'var(--border)')}" title="${escHtml(r.account_name)}"></span>
+            <span class="color-dot" style="background:${escHtml(r.account_color || 'var(--border)')}" title="${escHtml(r.account_name)}"></span>
             <a href="/channels/${r.channel_id}" target="_blank" rel="noopener" class="channel-name-link">${escHtml(r.channel_name)}</a>${missing}
             <div class="st-meta">${meta}</div>
           </td>

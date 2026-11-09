@@ -474,20 +474,43 @@ def _seed_sports_leagues(n):
 
 
 def _seed_sports_league_page(n):
-    """One followed league with n upcoming games, n teams and n queue rows: a league's own page."""
-    from app.database import SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsTeam
+    """One followed league with n upcoming games, n teams, n queue rows, n tied categories, n guide
+    matches per game on n channels and n event channels naming each game: a league's own page with its
+    Where it's on column and Matching card (dev/changelog/1463, 1472)."""
+    from app.database import (SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsLeagueCategory,
+                              SportsMatch, SportsTeam)
     now = datetime.utcnow()
-    league = SportsLeague(tsdb_id=9000, name='Scaling league', sport='Pretend Ball', current_season='2099')
+    league = SportsLeague(tsdb_id=9000, name='Scaling league', sport='Pretend Ball', current_season='2099',
+                          match_terms='["Scaling league"]', trust_sample=n, trust_agreed=n)
     db.session.add(league)
     db.session.flush()
     db.session.add(SportsFollow(league_id=league.id, team_tsdb_id=0, rule_id=0))
+    acc = seed.make_account(name='Scaling sports')
+    channels = [seed.make_channel(acc, name=f'Sports {i}', category_name=f'Scaling league {i}') for i in range(n)]
+    slots = [seed.make_channel(acc, name=f'NEXT | Scaling league slot {i}', category_name='Slots') for i in range(n)]
+    events = []
     for i in range(n):
         db.session.add(SportsTeam(tsdb_id=1000 + i, full_name=f'Team {i}'))
         db.session.add(SportsFetch(target=f'round:9000:2099:{i}', kind='round', league_id=league.id,
                                    last_at=now, next_due_at=now + timedelta(hours=9), outcome='ok'))
-        db.session.add(SportsEvent(tsdb_id=500000 + i, league_id=league.id, name=f'Game {i}', season='2099', round=i,
-                                   home_team_id=1000 + i, away_team_id=1000, home_name=f'Team {i}', away_name='Team 0',
-                                   start_at=now + timedelta(hours=i + 1), local_date=(now + timedelta(hours=i + 1)).date()))
+        db.session.add(SportsLeagueCategory(league_id=league.id, category_name=f'Scaling league {i}'))
+        start = now + timedelta(hours=i + 1)
+        event = SportsEvent(tsdb_id=500000 + i, league_id=league.id, name=f'Game {i}', season='2099', round=i,
+                            home_team_id=1000 + i, away_team_id=1000, home_name=f'Team {i}', away_name='Team 0',
+                            start_at=start, local_date=start.date(), guide_start=start + timedelta(hours=12))
+        db.session.add(event)
+        events.append(event)
+    db.session.flush()
+    for event in events:
+        for ch in channels:
+            db.session.add(SportsMatch(event_id=event.id, channel_id=ch.id, kind='guide',
+                                       program_start_time=event.start_at, program_stop_time=event.start_at + timedelta(hours=3),
+                                       title_key='scaling league', program_title='Scaling league', strength='strong',
+                                       airing='first', reason='Matched.'))
+        for slot in slots:
+            db.session.add(SportsMatch(event_id=event.id, channel_id=slot.id, kind='channel_name',
+                                       program_start_time=event.start_at, title_key=slot.name.lower(), episode_key='',
+                                       program_title=slot.name, strength='strong', airing='unknown', reason='Read.'))
     db.session.commit()
 
 
@@ -1253,6 +1276,9 @@ NOT_ROW_SCALING = {
         'Serves one screenshot file from disk. Not a page and renders no rows.'),
     'recordings.live_thumbnail': (
         'Serves one JPEG for one recording. Not a page and renders no rows.'),
+    'recordings.recording_sports_image': (
+        'Serves one downloaded TheSportsDB image for one recording (dev/changelog/1465). Not a page '
+        'and renders no rows.'),
     'recordings.recording_file': (
         'Serves one recording\'s own file (dev/changelog/1312). Not a page and renders no rows.'),
     'recordings.recording_file_check': (

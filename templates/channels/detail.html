@@ -1009,7 +1009,7 @@
                 {% if r.user_key %}<button type="button" class="btn btn-sm" data-act="epg-key-clear" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}">Clear key</button>{% endif %}
               </div>{% endif %}</td>
             <td data-label="Listings">
-              {% if not r.covers %}<span class="text-faint">{{ 'none' if r.refreshed else 'no successful refresh yet' }}</span>
+              {% if not r.covers %}<span class="text-faint">{% if r.ran_out %}ran out {{ r.horizon_until | local_time }}, and this source has not refreshed since{% else %}{{ 'none' if r.refreshed else 'no successful refresh yet' }}{% endif %}</span>
               {% else %}{{ r.summary }}{% if r.sole_title is not none %}: <em>{{ r.sole_title or '(untitled)' }}</em>{% endif %}
               {% endif %}{% if r.covers and not r.refreshed %}<div class="text-faint small">already held; this source has no successful refresh yet</div>{% endif %}</td>
             <td data-label="Until">{% if r.covers and r.horizon_until %}{{ r.horizon_until | local_time }}{% else %}<span class="text-faint">-</span>{% endif %}</td>
@@ -1027,12 +1027,16 @@
   <div class="card" data-section="timeline" id="cd-timeline">
     <div class="card-head"><h2>Activity Timeline</h2></div>
     <div class="card-body">
-      {% if not timeline_entries %}
+      {% if not timeline_total %}
       <p class="card-note">No activity recorded for this channel yet.</p>
+      {% else %}
+      {{ m.history_chips(timeline_chips) }}
+      {% if not timeline_entries %}
+      <p class="card-note">Nothing here for that filter.</p>
       {% else %}
       <div class="test-history-controls">
         {# nav-ok: per-page select #}
-        <select class="form-control" style="width:auto" onchange="window.location.href = '{{ url_for('channels.channel_detail', channel_id=channel.id) }}?timeline_per_page=' + this.value">
+        <select class="form-control" style="width:auto" onchange="window.location.href = '{{ url_for('channels.channel_detail', channel_id=channel.id) }}?timeline_per_page=' + this.value + '{{ timeline_hist_qs }}'">
           {% for size in ['10', '25', '50', '100', 'all'] %}
           <option value="{{ size }}" {% if size == timeline_per_page %}selected{% endif %}>{{ 'All' if size == 'all' else size + ' per page' }}</option>
           {% endfor %}
@@ -1040,11 +1044,11 @@
         {% if timeline_pagination and timeline_pagination.pages > 1 %}
         <div class="test-history-pagination">
           {% if timeline_pagination.has_prev %}
-          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, timeline_per_page=timeline_per_page, timeline_page=timeline_pagination.prev_num) }}" class="btn btn-sm">{{ icon('back') }} Prev</a>
+          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, timeline_per_page=timeline_per_page, timeline_page=timeline_pagination.prev_num, hist=(timeline_hist if timeline_hist != 'all' else none)) }}" class="btn btn-sm">{{ icon('back') }} Prev</a>
           {% endif %}
           <span class="text-muted small">Page {{ timeline_pagination.page }} of {{ timeline_pagination.pages }}</span>
           {% if timeline_pagination.has_next %}
-          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, timeline_per_page=timeline_per_page, timeline_page=timeline_pagination.next_num) }}" class="btn btn-sm">Next {{ icon('forward') }}</a>
+          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, timeline_per_page=timeline_per_page, timeline_page=timeline_pagination.next_num, hist=(timeline_hist if timeline_hist != 'all' else none)) }}" class="btn btn-sm">Next {{ icon('forward') }}</a>
           {% endif %}
         </div>
         {% endif %}
@@ -1052,6 +1056,7 @@
 
       {% set entries = timeline_entries %}
       {% include 'channels/_timeline.html' with context %}
+      {% endif %}
       {% endif %}
     </div>
   </div>
@@ -1335,13 +1340,13 @@ const GUIDE_CONFIG = {
 </script>
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>
 <script src="{{ url_for('static', filename='js/recording-player.js') }}"
-        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.light.min.js') }}"></script>
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.min.js') }}"></script>
 <script src="{{ url_for('static', filename='js/program-chooser.js') }}"></script>
 {% endif %}
-{# Loaded on the first Preview, not with the page: 386 KB nobody pays for until they ask to
+{# Loaded on the first Preview, not with the page: 620 KB nobody pays for until they ask to
    watch something (static/vendor/hls.js/NOTICE.md). #}
 <script src="{{ url_for('static', filename='js/live-preview.js') }}"
-        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.light.min.js') }}"></script>
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.min.js') }}"></script>
 <script>
 window.CHANNEL_DETAIL = {
   channelId: {{ channel.id }},

@@ -397,15 +397,16 @@ async function standingInversionScenario() {
   const c = boot();
   await c.settle();
   const obs = {};
-  /* One option turned OFF before anything is read, so the lit half and the hiding half
-     cannot be the same SIZE. The channel grain's six defaults split 3/3, and a badge
-     counting the wrong half would read identically either way - the assertion this
-     scenario exists for could not tell them apart (dev/changelog/860). `showmembers` is
-     the one to move: it is turned OFF here, so it joins the hiding half rather than
-     leaving it, which is what keeps the disclosure entry read below the same one it has
-     always been. */
-  const seed = c.$('#standcard .st-tog[data-standing="showmembers"]');
-  if (seed) { c.click(seed); await c.settle(); }
+  /* Two options turned OFF before anything is read, so the lit half and the hiding half
+     cannot be the same SIZE (2 lit, 4 hiding). A badge counting the wrong half would read
+     identically on an even split - the assertion this scenario exists for could not tell
+     them apart (dev/changelog/860). `showmembers` and `showdup` are the ones to move: each
+     is on by default and joins the hiding half here, so the disclosure line read below
+     has a folded-into-groups entry and a duplicates entry to show. */
+  for (const key of ['showmembers', 'showdup']) {
+    const seed = c.$(`#standcard .st-tog[data-standing="${key}"]`);
+    if (seed) { c.click(seed); await c.settle(); }
+  }
 
   obs.disclosure_entries = c.$$('#cs-count .hid').map((el) => el.textContent.trim());
   obs.disclosure_keys = c.$$('#cs-count .hid').map((el) => el.dataset.standingOff);
@@ -1283,8 +1284,9 @@ async function mobileSheetsScenario() {
   c.click(c.$('.cs-sheet [data-fback]'));
   await c.wait(20);
   obs.after_back_dims = c.$$('.cs-sheet [data-fdim]').map((el) => el.dataset.fdim);
-  // A standing option, from the sheet's footer.
-  c.click(c.$('.cs-sheet [data-standing="showdup"]'));
+  // A standing option, from the sheet's footer. One that is off by default, so the toggle
+  // puts it into the URL.
+  c.click(c.$('.cs-sheet [data-standing="showhidden"]'));
   await c.settle();
   obs.standing_after_toggle = (c.params().standing || []);
   // The Filters sheet's entry point is the well's `+ Filter` since dev/changelog/811, and
@@ -1482,6 +1484,18 @@ async function nameNoticeScenario() {
     asked_again: asked(c).length,
     errors: c.errors,
   };
+  // The chip the button leaves behind reads as one phrase, not "Listings is None scheduled".
+  const chipOf = (cc, rm) => {
+    const x = cc.$(`#wellbody [data-rm="${rm}"]`);
+    const chip = x ? x.closest('.cs-chip') : null;
+    return chip ? {
+      text: chip.textContent.replace(/\s+/g, ' ').trim(),
+      tip: chip.getAttribute('data-tip') || '',
+      neg: chip.classList.contains('neg'),
+      parked: chip.classList.contains('parked'),
+    } : null;
+  };
+  obs.listings_chip = chipOf(c, 'listings');
   obs.after_click.same_search_as_counted = JSON.stringify(obs.destination)
     === JSON.stringify(Object.fromEntries(Object.keys(obs.destination).map(
       (k) => [k, c.params()[k]])));
@@ -1489,9 +1503,15 @@ async function nameNoticeScenario() {
   c.click(c.$('#grainslot-panel [data-grain="airings"]'));
   await c.settle();
   obs.back_on_programs = { notice: noticeOf(c), listings_sent: c.params()['f.listings'] || [] };
+  obs.listings_chip_parked = chipOf(c, 'listings:parked:channels');
   c.click(c.$('#grainslot-panel [data-grain="channels"]'));
   await c.settle();
   obs.channels_again_listings = c.params()['f.listings'];
+
+  const excluded = boot({ url: 'http://localhost:5000/channels?q=wembley&x.listings=none' });
+  await excluded.settle();
+  obs.listings_chip_excluded = chipOf(excluded, 'listings:ex');
+  obs.listings_chip_excluded_errors = excluded.errors;
 
   const none = boot({ url: `${AIR}&q=zzz-nothing`, listingsTotal: 3 });
   await none.settle();

@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
-from sqlalchemy import delete, func, insert, literal, select, union_all, update
+from sqlalchemy import and_, case, delete, func, insert, literal, select, union_all, update
 
 from . import db
 from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_KEY_CHANGED,
@@ -409,7 +409,7 @@ def write_directory(source_id: int, rows) -> None:
 # ── Moving a channel's listings between the two tables ───────────────────────
 
 _ENTRY_COLUMNS = ('channel_id', 'title', 'sub_title', 'description', 'start_time',
-                  'stop_time', 'category', 'rating', 'source_id')
+                  'stop_time', 'category', 'rating', 'is_live', 'is_new', 'source_id')
 
 
 def _chunks(ids):
@@ -1187,6 +1187,130 @@ def reresolve_channels(channel_ids, case_sensitive: bool, *,
     return {ch: new for ch, (_old, new) in changes.items()}
 
 
+class RanOut(NamedTuple):
+    """What retire_expired_listings() found for one source."""
+    channel_ids: list[int]          # channels first found with nothing left from the source
+    outcome: dict[int, int | None]  # reresolve_channels()' answer for the ones that moved
+    # Since the source's last good refresh, not only in this call: the channels its listings
+    # ran out for that have no guide from any source now, and how many it was guiding in
+    # all. A source whose channels run out a few per failed refresh is judged on the total.
+    dark_total: int
+    guided: int
+
+
+def _retired_rows(source_id: int):
+    """The source's directory rows whose listings ran out: no entries, and a horizon. A row
+    the file listed with no programs has no horizon, so the two are told apart."""
+    return db.session.query(EpgSourceChannel.xml_id).filter(
+        EpgSourceChannel.source_id == source_id, EpgSourceChannel.entry_count == 0,
+        EpgSourceChannel.horizon_until.isnot(None))
+
+
+RAN_OUT_ALL = 'all'     # every listing the source kept has passed
+RAN_OUT_SOME = 'some'   # some channels' kept listings have passed, others are still ahead
+#: What the Sources card says for each, as the page prints it.
+RAN_OUT_NOTES = {
+    RAN_OUT_ALL: 'Every listing it kept has passed. It has none until a refresh works.',
+    RAN_OUT_SOME: ('The listings it kept have passed for some channels. It has none for those '
+                   'until a refresh works.'),
+}
+
+
+def ran_out_states(source_ids) -> dict[int, str]:
+    """{source_id: RAN_OUT_*} for the sources whose kept listings have run out, in whole or
+    in part. A word and not a count: the directory counts the ids in the source's file,
+    which says nothing about how many of an account's channels read them. One query."""
+    source_ids = list(source_ids)
+    if not source_ids:
+        return {}
+    retired = case((and_(EpgSourceChannel.entry_count == 0,
+                         EpgSourceChannel.horizon_until.isnot(None)), 1), else_=0)
+    live = case((EpgSourceChannel.entry_count > 0, 1), else_=0)
+    return {sid: (RAN_OUT_SOME if n_live else RAN_OUT_ALL)
+            for sid, n_retired, n_live in db.session.query(
+                EpgSourceChannel.source_id, func.sum(retired), func.sum(live))
+            .filter(EpgSourceChannel.source_id.in_(source_ids))
+            .group_by(EpgSourceChannel.source_id) if n_retired}
+
+
+def retire_expired_listings(source_id: int, case_sensitive: bool,
+                            now: datetime | None = None) -> RanOut:
+    """A refresh that kept a source's previous listings calls this: every directory row
+    whose horizon has passed describes listings that no longer exist, so it stops counting
+    as coverage, and the channels that took their guide from it are re-resolved - onto a
+    source that still holds listings for them (a move from the alternates, never a fetch),
+    or onto none.
+
+    The directory is otherwise only rewritten by a successful import, so a source that
+    keeps failing went on "covering" channels it held nothing for: 291 on prod, 61 of them
+    with another source's listings unused in the alternates (dev/docs/BUGS.md 2026-11-05 @ 07:25 PM).
+    Retiring is a recorded fact rather than a test of the clock inside the resolver, so
+    every resolver reads the same answer and a healthy source whose file ends before its
+    next refresh is left alone. The next successful import rewrites the directory.
+
+    Every channel still on the source with a retired row is re-resolved on each call, not
+    only the rows retired by this one, so a run that died between the two commits is
+    finished by the next. `channel_ids` names a channel once: when its row is retired, or
+    when its winner moves. `Channel.epg_source_override_id` is never touched."""
+    now = now or datetime.utcnow()
+    due = db.session.query(EpgSourceChannel.id, EpgSourceChannel.xml_id).filter(
+        EpgSourceChannel.source_id == source_id, EpgSourceChannel.entry_count > 0,
+        EpgSourceChannel.horizon_until < now).all()
+    for chunk in _chunks([row_id for row_id, _xml in due]):
+        @retry_on_locked()
+        def _retire_and_commit(chunk=chunk):
+            db.session.execute(
+                update(EpgSourceChannel).where(EpgSourceChannel.id.in_(chunk))
+                .values(entry_count=0, distinct_titles=0, sole_title=None,
+                        upcoming_titles=None)
+                .execution_options(synchronize_session=False))
+            db.session.commit()
+        _retire_and_commit()
+
+    retired = {norm_key(x, case_sensitive) for (x,) in _retired_rows(source_id)}
+    if not retired:
+        return RanOut([], {}, 0, 0)
+    # Ids differing only in case fold to one key, and the key is covered while any of them
+    # still has listings (directory_coverage()).
+    retired -= {norm_key(x, case_sensitive) for (x,) in db.session.query(
+        EpgSourceChannel.xml_id).filter(EpgSourceChannel.source_id == source_id,
+                                        EpgSourceChannel.entry_count > 0)}
+    just_now = {norm_key(x, case_sensitive) for _id, x in due} & retired
+    on_source = db.session.query(Channel.id, Channel.epg_channel_id).filter(
+        Channel.epg_source_id == source_id, Channel.hidden.is_(False)).all()
+    keys = accepted_keys([source_id])
+
+    def retired_key(ch_id, epg_channel_id):
+        k = channel_key(epg_channel_id, keys.get((ch_id, source_id)))
+        k = norm_key(k, case_sensitive) if k else None
+        return k if k in retired else None
+
+    dark, new = [], set()
+    for ch_id, epg_channel_id in on_source:
+        k = retired_key(ch_id, epg_channel_id)
+        if k is not None:
+            dark.append(ch_id)
+            if k in just_now:
+                new.add(ch_id)
+    outcome = reresolve_channels(dark, case_sensitive) if dark else {}
+
+    # Everything this source has left dark since its last good refresh: the channels still
+    # pointing at it with nothing to show, and the ones a call like this one left with no
+    # source at all. Read back from the tables, so it needs no tally kept between calls.
+    waiting = sum(1 for c in dark if c not in outcome)
+    left_now = sum(1 for c in dark if c in outcome and outcome[c] is None)
+    readers = subscriber_ids(source_id)
+    no_source = 0
+    if readers:
+        no_source = sum(1 for ch_id, epg_channel_id in db.session.query(
+            Channel.id, Channel.epg_channel_id).filter(
+            Channel.account_id.in_(readers), Channel.epg_source_id.is_(None),
+            Channel.hidden.is_(False)) if retired_key(ch_id, epg_channel_id) is not None)
+    return RanOut([c for c in dark if c in new or c in outcome], outcome,
+                  dark_total=waiting + no_source,
+                  guided=len(on_source) + max(no_source - left_now, 0))
+
+
 class SourceRemoval(NamedTuple):
     """What taking a source away from channels did to their guide."""
     affected: int    # channels whose guide came from it
@@ -1643,8 +1767,10 @@ def refresh_busy_message(names, then: str = 'Try again once the refresh has fini
 def account_sources_view(account_id: int, schedule: dict | None = None) -> list[dict]:
     """The Sources card's rows (DESIGN-epg-sources.md §9.2): every source the account
     subscribes to, in priority order, then any source it owns and has stopped using (so
-    Use again has a row to sit on). Three queries whatever the count. A `url` source's
-    address is account-owned and secret in full, so it is masked whole.
+    Use again has a row to sit on). Four queries whatever the count. A `url` source's
+    address is account-owned and secret in full, so it is masked whole. `ran_out_note` is
+    the sentence for a source whose listings, kept through failed refreshes, have passed
+    in whole or in part (retire_expired_listings()), else None.
 
     `schedule` is scheduler.epg_source_schedule() - {source_id: {'next': ..., 'retry': ...}}
     read off the jobs that will really fire - or None on an app with no scheduler."""
@@ -1663,8 +1789,10 @@ def account_sources_view(account_id: int, schedule: dict | None = None) -> list[
              if s.owner_account_id == account_id]
     for fr in foreign_readers(owned, account_id):
         readers.setdefault(fr.source_id, []).append(fr)
+    listed = [(sub.source, sub.priority) for sub in subs] + [(s, None) for s in idle]
+    ran_out = ran_out_states(s.id for s, _priority in listed)
     rows = []
-    for s, priority in [(sub.source, sub.priority) for sub in subs] + [(s, None) for s in idle]:
+    for s, priority in listed:
         badge, label = STATUS_DISPLAY.get(s.last_status, STATUS_DISPLAY[None])
         when = schedule.get(s.id, {})
         rows.append({
@@ -1680,6 +1808,7 @@ def account_sources_view(account_id: int, schedule: dict | None = None) -> list[
             'status_badge': badge, 'status_label': label, 'last_error': s.last_error,
             'entry_count': s.entry_count or 0, 'channel_count': s.channel_count or 0,
             'active_here': active_here.get(s.id, 0),
+            'ran_out_note': RAN_OUT_NOTES.get(ran_out.get(s.id)),
             'readers': [{'id': fr.account_id, 'name': fr.account_name, 'guided': fr.guided}
                         for fr in readers.get(s.id, [])],
         })
@@ -1762,6 +1891,10 @@ def channel_guide_view(channel: Channel, case_sensitive: bool) -> dict:
             'summary': directory_row_summary(d.entry_count if d else 0,
                                              d.distinct_titles if d else 0),
             'horizon_until': getattr(d, 'horizon_until', None),
+            # The source's refreshes kept failing until what it held for this channel
+            # had all passed (retire_expired_listings()).
+            'ran_out': bool(d is not None and not d.entry_count
+                            and getattr(d, 'horizon_until', None)),
             'refreshed': sid not in no_directory,
             'active': sid == channel.epg_source_id,
             'override': sid == channel.epg_source_override_id,

@@ -31,6 +31,12 @@ rather than a broken link.
   considered, what was decided, and what actually shipped.
 - **dev/docs/ARCHITECTURE.md** - the database schema, the recording state machine, the event
   catalog, and the full config reference.
+- **dev/mockups/NN-\*.html** - the static mockup a page was built from. Pages here are designed
+  mockup-first, so a template, stylesheet or script that cites one is naming the arrangement that
+  was approved before the port; the shipped CSS is that port, and the comment describes it.
+- **dev/tools/\*.py** - development-side scripts that call shipped helpers (`tools/check_busy.py`
+  names the benchmarks that consult it before they run). A citation here says who else calls a
+  function, so a change to it knows its callers. None of those scripts is needed to run the app.
 
 ## Why they are not published
 

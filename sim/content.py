@@ -171,6 +171,10 @@ PROFILES = {p.name: p for p in (
     _p('test_tiny_black', '180p29.97 black H.264, stereo AAC - for tests', width=320,
        height=180, rate='30000/1001', frames=640, gop=64, video='h264', video_kbps=300,
        picture='black', audio_kbps=64),
+    # HEVC in MPEG-TS, the shape a browser's player must hand to the decoder rather than refuse
+    # (dev/changelog/1461); the UI suite's browser has no HEVC decoder, so it reports its own error.
+    _p('test_tiny_hevc', '180p29.97 HEVC, stereo AAC - for tests', width=320, height=180,
+       rate='30000/1001', frames=640, gop=64, video='hevc', video_kbps=300, audio_kbps=64),
     _p('test_tiny_lowrate', '180p29.97 H.264 at a sixth of test_tiny\'s rate - for tests',
        width=320, height=180, rate='30000/1001', frames=640, gop=64, video='h264',
        video_kbps=50, audio_kbps=32),

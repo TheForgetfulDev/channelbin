@@ -1,7 +1,8 @@
 /* The Sports Schedules pages (templates/sports.html, sports_league.html, mockup 50,
    dev/docs/DESIGN-sports-data.md 5 and 11).
 
-   Add a league, Change teams, Stop following and Delete league, then a fresh server render
+   Add a league, Change teams, Stop following and Delete league, the listings dialog's Wrong match,
+   and a league's names and categories (mockup 51), then a fresh server render
    (swapFromServer), so the templates stay the one renderer. A row and the league's action bar carry
    what the dialogs need as data attributes, which come back with that render. Clicks are delegated,
    since a swap rebuilds the nodes. The list sorts on its own column headers (DESIGN.md 10.3). */
@@ -204,8 +205,8 @@
   async function stop(d) {
     const ok = await confirmModal({
       title: `Stop following ${d.name}?`,
-      message: `ChannelBin stops calling TheSportsDB for ${d.name}.`,
-      consequence: `Its ${gamesWord(d.stored)} stay stored until ${d.keep_days} days after each one. The league stays in this list so you can follow it again.`,
+      message: `ChannelBin stops checking TheSportsDB for ${d.name}'s games.`,
+      consequence: `${d.stored ? `It keeps the ${gamesWord(d.stored)} it already has, and deletes each one ${d.keep_days} days after it's over. ` : ''}The league stays in this list so you can follow it again.`,
       confirmLabel: 'Stop following',
     });
     if (!ok) return;
@@ -233,6 +234,151 @@
     }).catch((err) => showToast(err.message, { type: 'error' }));
   }
 
+  /* ---- Listings on your guide, Wrong match (app/sports_match.py, mockup 51) ---------------- */
+  const leagueId = () => Number((document.getElementById('sp-actionbar') || {}).dataset.league);
+
+  function groupHtml(grp, gi, open) {
+    const wrongCount = grp.channels.filter((c) => c.wrong).length;
+    const label = grp.sub ? `${grp.title}: ${grp.sub}` : grp.title;
+    const count = `${grp.channels.length} ${grp.channels.length === 1 ? 'channel' : 'channels'}${wrongCount && !grp.all_wrong ? `, ${wrongCount} marked wrong` : ''}`;
+    const act = grp.all_wrong
+      ? `<span class="sp-rej">All marked wrong match</span><button class="btn btn-sm" data-wrong="0" data-group="${gi}">Undo</button>`
+      : `<button class="btn btn-sm btn-danger" data-wrong="1" data-group="${gi}">Wrong match</button>`;
+    const chans = open ? `<div class="sp-chans">${grp.channels.map((c) => {
+      const btn = grp.all_wrong ? ''
+        : c.wrong ? `<span class="sp-rej">Wrong match</span><button class="btn btn-sm" data-wrong="0" data-match="${c.id}">Undo</button>`
+          : `<button class="btn btn-sm" data-wrong="1" data-match="${c.id}">Wrong match</button>`;
+      return `<div class="sp-chan${c.wrong ? ' rejected' : ''}"><span class="sp-cname">${escHtml(c.name)}<span class="sp-cat">${escHtml(c.category)}</span></span><span class="sp-cact">${btn}</span></div>`;
+    }).join('')}</div>` : '';
+    return `<div class="sp-group${open ? ' open' : ''}${grp.all_wrong ? ' rejected' : ''}">
+      <div class="sp-ghead">
+        <button class="sp-gtoggle" data-toggle="${gi}" aria-expanded="${open}"><span class="sp-caret">${icon('expand')}</span><span class="t">${escHtml(label)}</span></button>
+        <span class="sp-gmeta">${escHtml(grp.when)} <span class="badge ${grp.airing_label === 'Live' ? 'b-done' : 'b-abort'}">${escHtml(grp.airing_label)}</span></span>
+      </div>
+      <div class="sp-gline"><p class="sp-why"><strong>${count}</strong>. ${escHtml(grp.reason)}</p><span class="sp-gact">${act}</span></div>
+      ${chans}</div>`;
+  }
+
+  /* Event channels (design 6.8): no real listing, only a name that names the event. The reason comes
+     without its "Read from the channel's name" clause, which the heading's note says once. */
+  function namesHtml(names, one) {
+    if (!names.length) return '';
+    const rows = names.map((n) => {
+      const act = n.wrong
+        ? `<span class="sp-rej">Wrong match</span><button class="btn btn-sm" data-wrong="0" data-match="${n.id}">Undo</button>`
+        : `<button class="btn btn-sm" data-wrong="1" data-match="${n.id}">Wrong match</button>`;
+      const badge = n.badge ? ` <span class="badge ${n.badge[0]}">${escHtml(n.badge[1])}</span>` : '';
+      return `<div class="sp-chan sp-ename${n.wrong ? ' rejected' : ''}"><span class="sp-cname">${escHtml(n.name)}${badge}<span class="sp-cat">${escHtml(n.category)}</span><span class="sp-why">${escHtml(n.why)}</span></span><span class="sp-cact">${act}</span></div>`;
+    }).join('');
+    return `<h3 class="sp-h3">Event channels <span class="cnt">${names.length}</span></h3>
+      <p class="sp-intro">These channels have no real listings in your guide: none at all, or only their own name repeated. Each one's name says it carries this ${one}, and the name is all ChannelBin has to go on. Providers rename these channels as the day goes on, so the names are read again after every sync, and a channel whose name moves on to another ${one} drops off this list.</p>
+      <div class="sp-enames">${rows}</div>`;
+  }
+
+  function openListings(eventId, name, namesOnly) {
+    let data = null;
+    let changed = false;
+    const opened = new Set();
+    const modal = buildModal({
+      title: namesOnly ? `${name}: event channels naming it` : `${name}: where it is in your guide`,
+      panelClass: 'sp-dialog',
+      body: '<div class="sp-dialog-body"><p class="sp-intro">Loading&hellip;</p></div>',
+      footer: [{ label: 'Close', class: 'btn' }],
+      onClose: () => { if (changed) refresh(); },
+    });
+    const body = modal.querySelector('.sp-dialog-body');
+    const draw = () => {
+      const foot = `<p class="sp-foot">Is it wrong on TheSportsDB itself, like its time or teams? <a href="${escHtml(data.tsdb_url)}" target="_blank" rel="noopener">Edit it on TheSportsDB ${icon('forward')}</a></p>`;
+      if (!data.groups.length) {
+        body.innerHTML = data.names.length
+          ? `${namesHtml(data.names, data.one)}
+            <p class="sp-intro sp-faint">If a name is wrong for this ${data.one}, press its <strong>Wrong match</strong>. Nothing is recorded, cancelled or deleted, and Undo puts it back. ChannelBin reads what the name says. It cannot see what the channel actually shows.</p>${foot}`
+          : `<p class="sp-intro">Nothing in your guide matches it now.</p>${foot}`;
+        return;
+      }
+      body.innerHTML = `<p class="sp-intro">These are the <strong>${data.listings} ${data.listings === 1 ? 'listing' : 'listings'}</strong> on <strong>${data.channels} ${data.channels === 1 ? 'channel' : 'channels'}</strong> in your guide that ChannelBin believes are this one, grouped by how the listing is worded. Open a group to see its channels.</p>
+        <p class="sp-intro">If ChannelBin got a group wrong, press its <strong>Wrong match</strong>. Those listings then stop counting: this count drops, ChannelBin works out the live airing and the guide's time without them, and anything that later uses this match, such as a recording's details or an auto-record rule, leaves them out. Nothing is recorded, cancelled or deleted, and Undo puts it back. Inside a group, each channel has its own Wrong match for the rare channel whose listing is wrong when the rest are right.</p>
+        <p class="sp-intro sp-faint">ChannelBin reads what the listing says. It cannot see what the channel actually shows.</p>
+        ${data.groups.map((g, gi) => groupHtml(g, gi, opened.has(gi))).join('')}
+        ${namesHtml(data.names, data.one)}${foot}`;
+    };
+    const load = () => jsonFetch(`/api/sports/events/${eventId}/listings`).then((d) => { data = d; draw(); })
+      .catch((err) => { body.innerHTML = `<p class="sp-intro">${escHtml(err.message)}</p>`; });
+    body.addEventListener('click', (e) => {
+      const toggle = e.target.closest('[data-toggle]');
+      if (toggle) {
+        const gi = Number(toggle.dataset.toggle);
+        if (opened.has(gi)) opened.delete(gi); else opened.add(gi);
+        draw();
+        return;
+      }
+      const btn = e.target.closest('[data-wrong]');
+      if (!btn) return;
+      const ids = btn.dataset.group !== undefined
+        ? data.groups[Number(btn.dataset.group)].channels.map((c) => c.id)
+        : [Number(btn.dataset.match)];
+      const wrong = btn.dataset.wrong === '1';
+      btn.disabled = true;
+      jsonFetch(`/api/sports/events/${eventId}/wrong`, { method: 'POST', body: JSON.stringify({ match_ids: ids, wrong }) })
+        .then(() => { changed = true; return load(); })
+        .catch((err) => { btn.disabled = false; showToast(err.message, { type: 'error' }); });
+    });
+    load();
+  }
+
+  /* ---- Names for this league, and its categories ------------------------------------------- */
+  const termsNow = () => JSON.parse((document.getElementById('sp-matching') || {}).dataset.terms || '[]');
+
+  function saveTerms(terms) {
+    return jsonFetch(`/api/sports/leagues/${leagueId()}/terms`, { method: 'PUT', body: JSON.stringify({ terms }) })
+      .then(() => { showToast('Saved. ChannelBin checks your guide again in a minute.'); return refresh(); })
+      .catch((err) => showToast(err.message, { type: 'error' }));
+  }
+
+  function saveCategories(change) {
+    return jsonFetch(`/api/sports/leagues/${leagueId()}/categories`, { method: 'PUT', body: JSON.stringify(change) })
+      .then(refresh)
+      .catch((err) => { showToast(err.message, { type: 'error' }); return refresh(); });
+  }
+
+  function openTie() {
+    const modal = buildModal({
+      title: 'Add a category',
+      body: '<div class="sp-dialog-body"><p class="sp-intro">Loading&hellip;</p></div>',
+      footer: [{ label: 'Cancel', class: 'btn' }, {
+        label: 'Add', class: 'btn btn-primary',
+        onClick: (close) => {
+          const names = Array.from(modal.querySelectorAll('.sp-offer input:checked')).map((i) => i.value);
+          if (!names.length) { showToast('Tick at least one category.', { type: 'error' }); return false; }
+          close();
+          saveCategories({ add: names });
+          return false;
+        },
+      }],
+    });
+    const body = modal.querySelector('.sp-dialog-body');
+    jsonFetch(`/api/sports/leagues/${leagueId()}/categories/offer`).then((d) => {
+      const offer = d.categories.filter((c) => !c.tied);
+      body.innerHTML = `<p class="sp-intro">Categories on your accounts whose name has one of this league's names in it. A listing on a channel in a category you add counts as this league even when its title does not name it. A game still has to name both teams.</p>
+        ${offer.length ? `<div class="sp-offer">${offer.map((c) => `<label class="sp-offer-row"><input type="checkbox" value="${escHtml(c.name)}"> <span>${escHtml(c.name)}</span><span class="sp-cat">${c.channels} ${c.channels === 1 ? 'channel' : 'channels'}</span></label>`).join('')}</div>`
+    : '<p class="sp-intro">None of your categories has one of these names in it. Add a name above first if your provider spells the league differently.</p>'}`;
+    }).catch((err) => { body.innerHTML = `<p class="sp-intro">${escHtml(err.message)}</p>`; });
+  }
+
+  document.addEventListener('submit', (e) => {
+    const form = e.target.closest('form[data-act="add-term"]');
+    if (!form) return;
+    e.preventDefault();
+    const value = form.querySelector('[name="term"]').value.trim();
+    if (!value) return;
+    saveTerms([...termsNow(), value]);
+  });
+
+  document.addEventListener('change', (e) => {
+    const sw = e.target.closest('input[data-act="replay"]');
+    if (sw) saveCategories({ replay: { [sw.dataset.name]: sw.checked } });
+  });
+
   /* ---- Wiring ---------------------------------------------------------------------------- */
   const sectionLayout = PAGE ? initSectionLayout({
     config: { sections: PAGE.sections, sectionPref: PAGE.sectionPref },
@@ -257,6 +403,17 @@
     closeMenus();
     const name = act.dataset.act;
     if (name === 'sections') { if (sectionLayout) sectionLayout.open(); return; }
+    if (name === 'listings') { e.preventDefault(); openListings(Number(act.dataset.event), act.dataset.name, act.dataset.namesOnly === '1'); return; }
+    if (name === 'remove-term') {
+      const left = termsNow().filter((t) => t !== act.dataset.term);
+      if (!left.length) { showToast('A league needs at least one name, or no listing could ever match it.', { type: 'error' }); return; }
+      saveTerms(left);
+      return;
+    }
+    if (name === 'accept-term') { saveTerms([...termsNow(), act.dataset.term]); return; }
+    if (name === 'tie') { openTie(); return; }
+    if (name === 'untie') { saveCategories({ remove: [act.dataset.name] }); return; }
+    if (name === 'add-term' || name === 'replay') return;
     const d = dialogOf(act);
     if (!d) return;
     if (name === 'teams') openTeams(d);

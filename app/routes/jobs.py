@@ -83,6 +83,9 @@ RECURRING_META = {
     'sports_worker': ('Sports Schedules', '/sports',
                       'Keeps the schedules of the leagues you follow up to date, one call at a '
                       'time. Only here while something is followed.'),
+    # The one-shot a sync, a guide import or a schedule update queues (app/scheduler.py::queue_sports_match).
+    'sports_match': ('Sports Schedules match', '/sports',
+                     'Finds the games you follow in the new listings and channel names.'),
     'account_sync_queue': ('Account Sync Queue', '/readiness',
                            'Syncs the accounts you asked for, one at a time.'),
     # The one-shot a guide import (or a refused run) queues: one evaluation of every
@@ -856,7 +859,7 @@ def _build_job_list():
             continue
 
         display_name, edit_url, what = RECURRING_META.get(job.id, (job.id, None, None))
-        if job.id in ('auto_rules_evaluate', 'account_sync_queue'):
+        if job.id in ('auto_rules_evaluate', 'account_sync_queue', 'sports_match'):
             if job.id == 'account_sync_queue':
                 left = len((job.kwargs or {}).get('pending') or [])
                 reason = f'{counted(left, "account")} left to sync, one at a time'

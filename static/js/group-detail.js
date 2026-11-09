@@ -2424,7 +2424,8 @@
         host: schedHost, templateId: 'gd-schedule-fields', prefix: 'gdsched',      });
       const s = G.schedule || { mode: 'manual' };
       gdSched.prefill({
-        oneoff_value: s.oneoff_value, recur_day: s.recur_day, recur_time: s.recur_time,
+        oneoff_value: s.oneoff_value, oneoff_utc: s.oneoff_utc,
+        recur_day: s.recur_day, recur_time: s.recur_time,
         use_window: s.use_window,
       });
       gdSched.setMode(s.mode);
@@ -3251,6 +3252,9 @@
   }, 1000);
 
   // ── Wiring ────────────────────────────────────────────────────────────────
+
+  // The Activity timeline's filter chips (app/history_filter.py): links swapped in place.
+  bindHistoryChips('#gd-activity');
 
   document.addEventListener('click', (e) => {
     const shot = e.target.closest('[data-shot]');

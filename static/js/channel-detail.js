@@ -360,6 +360,11 @@
       });
   }
 
+  // ── The Activity Timeline's filter chips (app/history_filter.py). The card is also one
+  //    of LIVE_REGIONS below, swapped from location.href, which the chip click updates - so
+  //    the filter survives the live refresh and the card keeps one updater.
+  bindHistoryChips('#cd-timeline');
+
   // ── Live refresh (dev/changelog/1158) ─────────────────────────────────────
   // Driven by base.html's /api/nav-status poll, which hands over
   // channel_tester.health_check_signature(). When it differs from the one #cd-statusbar

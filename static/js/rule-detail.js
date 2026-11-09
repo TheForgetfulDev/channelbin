@@ -9,9 +9,9 @@
    * The Settings chips: util.js renderSettingChips() over #rule-setbar's data-items, which
      arrives with the swap. Their arrangement follows the 960px breakpoint, so crossing it
      redraws them too.
-   * Nothing else - History's filter chips and "Show more" are links to this page with
-     ?hist= and ?shown=, so they work with a plain or a new-tab click; a plain click swaps
-     only the History card and puts the URL in the address bar, so a reload keeps it.
+   * Nothing else - History's filter chips and "Show more" are the shared history filter
+     (util.js::bindHistoryChips over app/history_filter.py): links to this page with
+     ?hist= and ?shown=, swapped in place on a plain click.
 
    The section layout is util.js initSectionLayout(): a generated stylesheet orders and
    hides the [data-section] cards, so a swap never undoes it. */
@@ -45,16 +45,6 @@
     drawSettings();
   }
 
-  async function history(url) {
-    try {
-      await swapFromServer(['#rule-history'], url);
-    } catch (e) {
-      followHref(null, url);
-      return;
-    }
-    window.history.replaceState(null, '', url);
-  }
-
   const sectionLayout = initSectionLayout({
     config: { sections: CFG.sections, sectionPref: CFG.sectionPref },
     saveUrl: `/api/user-prefs/${CFG.sectionsPrefKey}`,
@@ -62,14 +52,9 @@
     note: 'The title, status bar and warning banners always show. The same layout applies to every rule.',
   });
 
+  bindHistoryChips('#rule-history');
+
   document.addEventListener('click', (e) => {
-    const link = e.target.closest('[data-hist], [data-hist-more]');
-    if (link) {
-      if (wantsNewTab(e)) return;
-      e.preventDefault();
-      history(link.href);
-      return;
-    }
     const act = e.target.closest('[data-act]');
     if (!act || act.disabled) return;
     closeMenus();

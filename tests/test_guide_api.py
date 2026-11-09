@@ -90,6 +90,60 @@ class GuideEpgApiTests(unittest.TestCase):
         self.assertEqual(by_title['Second']['recording_id'], rec2.id,
                          'each program must match the recording overlapping ITS window')
 
+    def _failed(self, entry, **kw):
+        kw.setdefault('channel_id', self.ch.id)
+        return seed.make_recording(status='FAILED', name='failed', url='http://example.test/live/1',
+                                   start_time=entry.start_time, stop_time=entry.stop_time, **kw)
+
+    def _program(self, title):
+        row = self._row_for(self._get_window(), self.ch.id)
+        return row, {p['title']: p for p in row['programs']}[title]
+
+    def test_a_failed_recording_marks_its_program_and_leaves_it_recordable(self):
+        """dev/changelog/1457: the route left FAILED out, so the guide showed nothing where
+        a recording had failed. It is a fact of its own and never `has_recording`, which is
+        what takes Record off the program."""
+        a = self._epg(0, title='Lost')
+        self._epg(1, title='Untouched')
+        rec = self._failed(a)
+        db.session.commit()
+        row, lost = self._program('Lost')
+        self.assertEqual(lost['failed_recording_id'], rec.id)
+        self.assertFalse(lost['has_recording'])
+        self.assertIsNone(lost['recording_id'])
+        self.assertIsNone(lost['recording_status'])
+        self.assertEqual(row['recordings'], [], 'a failed recording draws no band')
+        self.assertIsNone(self._program('Untouched')[1]['failed_recording_id'])
+
+    def test_a_cancelled_recording_leaves_no_mark(self):
+        a = self._epg(0, title='Cancelled')
+        seed.make_recording(status='ABORTED', name='gone', channel_id=self.ch.id,
+                            url='http://example.test/live/1',
+                            start_time=a.start_time, stop_time=a.stop_time)
+        db.session.commit()
+        _row, prog = self._program('Cancelled')
+        self.assertIsNone(prog['failed_recording_id'])
+        self.assertFalse(prog['has_recording'])
+
+    def test_a_live_recording_of_the_same_program_wins_the_cell(self):
+        a = self._epg(0, title='Retried')
+        self._failed(a)
+        again = seed.make_recording(status='SCHEDULED', name='again', channel_id=self.ch.id,
+                                    url='http://example.test/live/1',
+                                    start_time=a.start_time, stop_time=a.stop_time)
+        db.session.commit()
+        _row, prog = self._program('Retried')
+        self.assertTrue(prog['has_recording'])
+        self.assertEqual(prog['recording_id'], again.id)
+        self.assertIsNone(prog['failed_recording_id'])
+
+    def test_two_failures_name_the_latest(self):
+        a = self._epg(0, title='Twice')
+        self._failed(a)
+        second = self._failed(a)
+        db.session.commit()
+        self.assertEqual(self._program('Twice')[1]['failed_recording_id'], second.id)
+
     def test_m3u8_recording_url_matches_channel(self):
         """BUGS.md 2026-07-16 02:42 PM - a .m3u8 recording URL must still match."""
         a = self._epg(0, title='OnAir')

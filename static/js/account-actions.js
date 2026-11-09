@@ -256,7 +256,9 @@ function confirmBlockAccount(opts = {}) {
       '<option value="until">Until a time...</option></select>' }) +
     '<div id="block-until-row" style="display:none">' +
     fieldRow({ label: 'Until', control:
-      '<input type="datetime-local" id="block-until" class="form-control">' }) +
+      '<input type="datetime-local" id="block-until" class="form-control">' +
+      '<input type="hidden" id="block-until-utc">' +
+      '<div class="text-muted small" id="block-until-note" style="display:none; margin-top:4px;"></div>' }) +
     '</div>' + slots +
     '<p class="text-muted small" style="margin-top:8px">No recording, failover, health check ' +
     'or preview uses the account until then. A channel group records from members on other ' +
@@ -266,6 +268,10 @@ function confirmBlockAccount(opts = {}) {
     `${maxHours} hours.</p>`;
   const forSel = body.querySelector('#block-for');
   const untilRow = body.querySelector('#block-until-row');
+  // The until field keeps the instant it stands for and says which pass of a repeated hour
+  // it means (util.js::wallTimeField); the instant is posted beside the text as until_utc.
+  const untilWall = wallTimeField(body.querySelector('#block-until'), {
+    hidden: body.querySelector('#block-until-utc'), note: body.querySelector('#block-until-note') });
   forSel.addEventListener('change', () => {
     untilRow.style.display = forSel.value === 'until' ? '' : 'none';
   });
@@ -280,7 +286,10 @@ function confirmBlockAccount(opts = {}) {
         class: 'btn btn-primary',
         onClick: (close) => {
           const payload = {};
-          if (forSel.value === 'until') payload.until = body.querySelector('#block-until').value;
+          if (forSel.value === 'until') {
+            payload.until = body.querySelector('#block-until').value;
+            payload.until_utc = untilWall.utc();
+          }
           else payload.minutes = Number(forSel.value);
           const slotSel = body.querySelector('#block-slots');
           if (slotSel && slotSel.value) payload.slots = Number(slotSel.value);

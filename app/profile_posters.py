@@ -186,7 +186,13 @@ def store_poster(cfg: dict, profile_id: int, data: bytes, info: ImageInfo) -> st
     folder = posters_dir(cfg)
     os.makedirs(folder, exist_ok=True)
     filename = f'profile-{profile_id}-{secrets.token_hex(6)}{EXTENSIONS[info.kind]}'
-    final = os.path.join(folder, filename)
+    write_image_file(os.path.join(folder, filename), data)
+    return filename
+
+
+def write_image_file(final: str, data: bytes):
+    """Write `data` to `final` through a temp name in the same folder and os.replace(), so a
+    half-written file is never at `final`. Raises OSError; the temp file is gone either way."""
     tmp = final + '.tmp'
     try:
         with open(tmp, 'wb') as fh:
@@ -200,7 +206,6 @@ def store_poster(cfg: dict, profile_id: int, data: bytes, info: ImageInfo) -> st
         except OSError:
             pass  # best-effort cleanup of the temp file; the original error is what matters
         raise
-    return filename
 
 
 def discard_poster_file(cfg: dict, filename: Optional[str]):

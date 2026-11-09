@@ -219,6 +219,35 @@ await record('scheduled', async () => {
   return { errors: c.errors, tiles, afterEdit: { panelOpen: c.panelOpen(), recordModal: c.recordModal() } };
 });
 
+// A program a recording failed on: still recordable, with the failed recording's page on
+// offer and a chip in the head line (dev/changelog/1457).
+await record('failed', async () => {
+  const c = boot();
+  const start = iso(10);
+  const stop = iso(70);
+  c.server.epg = { channels: [row([prog({ start_time: start, stop_time: stop,
+                                          failed_recording_id: 91 })])] };
+  c.window.fetchAndRender();
+  await c.settle();
+  const cell = c.document.querySelector('.guide-program');
+  const badge = cell && cell.querySelector('.rec-badge');
+  const drawn = cell ? {
+    cellClass: cell.className,
+    badgeText: badge ? badge.textContent.trim() : null,
+    badgeClass: badge ? badge.className : null,
+    badgeIcon: badge && badge.querySelector('[data-icon]') ? badge.querySelector('[data-icon]').dataset.icon : null,
+    badgeTip: badge ? badge.getAttribute('data-tip') : null,
+  } : null;
+  c.open(prog({ start_time: start, stop_time: stop, failed_recording_id: 91 }), row([]));
+  await c.settle();
+  const tiles = c.tiles();
+  const state = c.document.querySelector('#side-panel .chooser-state .rec-badge');
+  c.click('Schedule recording');
+  await c.settle();
+  return { errors: c.errors, drawn, tiles, headChip: state ? state.textContent.trim() : null,
+           afterRecord: { panelOpen: c.panelOpen(), recordModal: c.recordModal() } };
+});
+
 await record('capturing', async () => {
   const c = boot();
   const p = prog({ start_time: iso(-20), stop_time: iso(40), has_recording: true,

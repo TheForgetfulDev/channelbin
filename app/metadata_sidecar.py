@@ -5,8 +5,10 @@ everything those servers can tell a user about it has to be guessed from the fil
 module writes the answer down instead: a Kodi/XBMC-format `.nfo` beside the final file,
 plus a poster image, both named after the video so no folder restructuring is needed. The
 poster is the image pinned to the recording's profile when it has one
-(app/profile_posters.py), otherwise the frame captured from inside the program itself
-(recorder.persist_poster_frame), otherwise the final-frame thumbnail.
+(app/profile_posters.py), otherwise TheSportsDB's poster or thumb for the recording's event
+(app/sports_images.py), otherwise the frame captured from inside the program itself
+(recorder.persist_poster_frame), otherwise the final-frame thumbnail. TheSportsDB's landscape
+thumb is also written as the background, `-fanart`, whatever the poster is.
 
 The format is the Kodi one because it is the portable one. Jellyfin, Emby and Kodi have
 read it for years, and Plex reads it natively as of PMS 1.43.1 through its own "Plex NFO
@@ -40,9 +42,11 @@ import os
 import shutil
 import xml.etree.ElementTree as ET
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from . import db
 from .database import (
-    Recording, add_recording_event,
+    Recording, RecordingSports, add_recording_event,
     METADATA_SIDECAR_WRITTEN, METADATA_SIDECAR_FAILED,
 )
 from .db_utils import retry_on_locked
@@ -59,11 +63,14 @@ log = logging.getLogger(__name__)
 NFO_SUFFIX = '.nfo'
 POSTER_SUFFIX = '-poster.jpg'
 POSTER_SUFFIXES = (POSTER_SUFFIX, '-poster.png')
+#: The background. `-fanart` is the one name Plex's local assets, Kodi and Jellyfin all read as a
+#: movie's background art (dev/changelog/1465); it keeps its image's own format like the poster.
+FANART_SUFFIXES = ('-fanart.jpg', '-fanart.png')
 
 
 def sidecar_paths(video_path: str) -> list:
     """The files this module could write beside `video_path`, whether or not they exist:
-    the .nfo first, then every name a poster can take.
+    the .nfo first, then every name a poster and a background can take.
 
     The one place those names are spelled, so the writer and
     recorder.recording_disk_paths() (which deletes them) cannot disagree about what a
@@ -72,7 +79,7 @@ def sidecar_paths(video_path: str) -> list:
     push a legitimately free stem to a `_2` suffix.
     """
     stem = os.path.splitext(video_path)[0]
-    return [stem + NFO_SUFFIX] + [stem + suffix for suffix in POSTER_SUFFIXES]
+    return [stem + NFO_SUFFIX] + [stem + suffix for suffix in POSTER_SUFFIXES + FANART_SUFFIXES]
 
 
 def sidecar_source(cfg: dict, profile, recording=None):
@@ -175,15 +182,32 @@ def _text(parent, tag, value):
     return node
 
 
-def _render_movie(rec, tz, poster_name):
-    """The `<movie>` document for one recording."""
+def _render_movie(rec, tz, poster_name, sports=None, fanart_name=None):
+    """The `<movie>` document for one recording. `sports` is its RecordingSports link, already
+    known not to be removed, or None."""
+    from .sports_data import link_facts
     root = ET.Element('movie')
     _text(root, 'title', _display_title(rec))
-    _text(root, 'plot', rec.metadata_description)
+    if sports is not None:
+        # The movie shape has no field for a season, a round or a venue, so they reach a library
+        # three ways: the league and season as a set (a collection in Kodi and Jellyfin), the
+        # league as a tag, and one sentence under the synopsis, which every server shows. The
+        # title stays the guide's, or the one typed: naming a file from the event is a separate
+        # option (DESIGN-sports-data.md 11).
+        uid = _text(root, 'uniqueid', sports.tsdb_event_id)
+        uid.set('type', 'thesportsdb')
+    plot = (rec.metadata_description or '').strip()
+    if sports is not None:
+        plot = '\n\n'.join(x for x in (plot, link_facts(sports)) if x)
+    _text(root, 'plot', plot)
     # No <tagline>. The sub-title is the obvious candidate for it and is already inside
     # <title>, so emitting both made a real recording read "NASCAR Cup Series - Enjoy
     # Illinois 300" with "Enjoy Illinois 300" printed again directly underneath it.
     _text(root, 'genre', rec.metadata_category)
+    if sports is not None:
+        collection = ET.SubElement(root, 'set')
+        _text(collection, 'name', ' '.join(x for x in (sports.league_name, sports.season) if x))
+        _text(root, 'tag', sports.league_name)
     # <mpaa> is where every reader of this format looks for a content rating, whatever the
     # provider's own scheme happens to be.
     _text(root, 'mpaa', rec.metadata_rating)
@@ -199,6 +223,8 @@ def _render_movie(rec, tz, poster_name):
         thumb = _text(root, 'thumb', poster_name)
         if thumb is not None:
             thumb.set('aspect', 'poster')
+    if fanart_name:
+        _text(ET.SubElement(root, 'fanart'), 'thumb', fanart_name)
     return root
 
 
@@ -211,15 +237,16 @@ _RENDERERS = {
 DEFAULT_KIND = 'movie'
 
 
-def render_nfo(rec, tz, poster_name=None, kind: str = DEFAULT_KIND) -> str:
+def render_nfo(rec, tz, poster_name=None, kind: str = DEFAULT_KIND, sports=None, fanart_name=None) -> str:
     """The sidecar's full XML text for one recording.
 
     `poster_name` is the poster's BASENAME, not a path: the reference has to resolve
     relative to the folder the video sits in, and an absolute path written into the file
     stops resolving the moment the library is mounted somewhere else (a container, another
-    machine, a rename of the share).
+    machine, a rename of the share). `sports` is the recording's TheSportsDB link from
+    `active_sports_link()`, or None.
     """
-    root = _RENDERERS[kind](rec, tz, poster_name)
+    root = _RENDERERS[kind](rec, tz, poster_name, sports, fanart_name)
     ET.indent(root, '  ')
     return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
             + ET.tostring(root, encoding='unicode') + '\n')
@@ -229,20 +256,25 @@ def render_nfo(rec, tz, poster_name=None, kind: str = DEFAULT_KIND) -> str:
 POSTER_FROM_PROFILE = 'profile'
 POSTER_FROM_FRAME = 'frame'
 POSTER_FROM_THUMBNAIL = 'thumbnail'
+POSTER_FROM_SPORTS = 'thesportsdb'
+POSTER_FROM_SPORTS_THUMB = 'thesportsdb_thumb'
 
 #: How each source reads in the event's sentence.
 POSTER_ORIGINS = {
     POSTER_FROM_PROFILE: 'the image pinned to its profile',
     POSTER_FROM_FRAME: 'a frame from inside the program',
     POSTER_FROM_THUMBNAIL: 'the final frame of the recording',
+    POSTER_FROM_SPORTS: "TheSportsDB's poster for its event",
+    POSTER_FROM_SPORTS_THUMB: "TheSportsDB's background for its event, which has no poster",
 }
 
 
-def _drop_stale_posters(stem: str, keep: str):
+def _drop_stale_posters(stem: str, keep: str, suffixes=POSTER_SUFFIXES):
     """Remove any other poster name beside the video, so the folder never holds a
     `-poster.jpg` from an earlier write next to the `-poster.png` the .nfo now names. A
-    server that picks artwork by filename would otherwise choose between them by luck."""
-    for suffix in POSTER_SUFFIXES:
+    server that picks artwork by filename would otherwise choose between them by luck.
+    `keep` None removes them all."""
+    for suffix in suffixes:
         stale = stem + suffix
         if stale == keep or not os.path.exists(stale):
             continue
@@ -252,12 +284,36 @@ def _drop_stale_posters(stem: str, keep: str):
             log.warning('Could not remove the previous poster %s: %s', stale, exc)
 
 
-def _copy_poster(recording_id, cfg, video_path, profile):
+def active_sports_link(recording_id: int):
+    """The recording's TheSportsDB link, or None when it has none or a person removed it. A
+    snapshot taken in the app's own database, so a sidecar never waits on TheSportsDB."""
+    link = db.session.get(RecordingSports, recording_id)
+    return link if link is not None and link.removed_at is None else None
+
+
+def _sports_notes(art: dict) -> list:
+    """Why each of TheSportsDB's images is not used, for the event: an image a recording expected
+    and did not get is worth a sentence, since the frame it falls back to is a poor cover."""
+    from .sports_images import LABELS, OFF, READY
+    if any(state == OFF for state, _, _ in art.values()):
+        return ["Downloading TheSportsDB's posters and backgrounds is off in Settings, so neither was used"]
+    notes = []
+    for role, (state, _, reason) in art.items():
+        if state != READY:
+            why = f' ({reason.rstrip(".")})' if reason else ''
+            notes.append(f"TheSportsDB's {LABELS[role].lower()} for its event had not been downloaded{why}")
+    return notes
+
+
+def _copy_poster(recording_id, cfg, video_path, profile, sports=None, art=None):
     """Put a poster beside the video. Returns `(path written or None, source, note)`.
 
-    Three sources, best first. The image pinned to the recording's profile wins outright
+    Four sources, best first. The image pinned to the recording's profile wins outright
     when there is one, in its own format (dev/changelog/1059) - it is the only one the user
-    chose. Below it is the poster frame taken from inside the program itself
+    chose. Below it is TheSportsDB's poster for the recording's event, or its landscape thumb
+    when the event has none (`art`, from sports_images.artwork(), dev/changelog/1465): designed
+    artwork beats a frame that landed on whatever graphic was on screen. Below that is the poster
+    frame taken from inside the program itself
     (recorder.persist_poster_frame, dev/changelog/1060). Last is the final-frame thumbnail,
     which is a reasonable "what did this end on" image and a poor cover - a ball game ends
     on a postgame graphic - and is kept as the floor because every recording made before
@@ -289,6 +345,21 @@ def _copy_poster(recording_id, cfg, video_path, profile):
                 f'({pinned or profile.poster_file}), so it could not be used')
         log.warning('Recording %d: %s', recording_id, note)
 
+    from .sports_images import POSTER, READY
+    state, path, _ = (art or {}).get(POSTER, (None, None, None))
+    if state == READY:
+        dest = stem + '-poster' + os.path.splitext(path)[1]
+        try:
+            shutil.copyfile(path, dest)
+        except OSError as exc:
+            # The downloaded copy, not the recording, is what failed: fall back to the frames.
+            sports_note = f"TheSportsDB's image could not be copied ({exc.strerror or exc})"
+            log.warning('Recording %d: %s', recording_id, sports_note)
+            note = '. '.join(x for x in (note, sports_note) if x)
+        else:
+            _drop_stale_posters(stem, dest)
+            return dest, (POSTER_FROM_SPORTS if sports.poster_url else POSTER_FROM_SPORTS_THUMB), note
+
     captured = [(poster_frame_path(recording_id, cfg), POSTER_FROM_FRAME),
                 (os.path.join(image_dir(cfg, THUMBNAILS), f'{recording_id}.jpg'),
                  POSTER_FROM_THUMBNAIL)]
@@ -300,6 +371,27 @@ def _copy_poster(recording_id, cfg, video_path, profile):
         _drop_stale_posters(stem, dest)
         return dest, source, note
     return None, None, note
+
+
+def _copy_fanart(recording_id, video_path, art):
+    """Put TheSportsDB's landscape thumb beside the video as its background, or remove one an
+    earlier write left when there is none now. Returns `(path written or None, note)`: a background
+    that cannot be copied is left out and said, never a reason to lose the whole file."""
+    from .sports_images import BACKGROUND, READY
+    stem = os.path.splitext(video_path)[0]
+    state, path, _ = (art or {}).get(BACKGROUND, (None, None, None))
+    if state == READY:
+        dest = stem + '-fanart' + os.path.splitext(path)[1]
+        try:
+            shutil.copyfile(path, dest)
+        except OSError as exc:
+            note = f"TheSportsDB's background could not be copied ({exc.strerror or exc}), so it was left out"
+            log.warning('Recording %d: %s', recording_id, note)
+            return None, note
+        _drop_stale_posters(stem, dest, FANART_SUFFIXES)
+        return dest, None
+    _drop_stale_posters(stem, None, FANART_SUFFIXES)
+    return None, None
 
 
 def write_sidecar(recording_id: int, video_path: str, cfg: dict, profile=None):
@@ -333,12 +425,25 @@ def write_sidecar(recording_id: int, video_path: str, cfg: dict, profile=None):
     # is how a sidecar ends up describing half of what it started from.
     tz = get_display_tz()
     title = _display_title(rec)
+    sports = active_sports_link(recording_id)
+    from .sports_images import artwork
+    art_note = fanart_note = None
+    try:
+        art = artwork(cfg, sports)
+    except SQLAlchemyError as exc:
+        # Its images are a nicety: a database that stayed locked costs them, not the file.
+        db.session.rollback()
+        art, art_note = {}, "TheSportsDB's images could not be looked up, so none was used"
+        log.warning('Recording %d: %s: %s', recording_id, art_note, exc)
 
     try:
         poster_path, poster_source, poster_note = _copy_poster(
-            recording_id, cfg, video_path, profile)
+            recording_id, cfg, video_path, profile, sports, art)
+        fanart_path, fanart_note = _copy_fanart(recording_id, video_path, art)
         xml = render_nfo(rec, tz,
-                         poster_name=os.path.basename(poster_path) if poster_path else None)
+                         poster_name=os.path.basename(poster_path) if poster_path else None,
+                         sports=sports,
+                         fanart_name=os.path.basename(fanart_path) if fanart_path else None)
         # Written last, so a poster copy that died partway never leaves an .nfo pointing at
         # a truncated image.
         with open(nfo_path, 'w', encoding='utf-8') as fh:
@@ -361,19 +466,27 @@ def write_sidecar(recording_id: int, video_path: str, cfg: dict, profile=None):
         return False
 
     detail = f'Wrote {os.path.basename(nfo_path)} describing "{title}"'
+    if sports is not None:
+        detail += f', with the {sports.league_name} event details from TheSportsDB'
     if poster_path:
         origin = POSTER_ORIGINS.get(poster_source, 'an image from the recording')
         detail += f', with {os.path.basename(poster_path)} as its poster ({origin})'
     else:
         detail += '. No poster was available to copy, so the file carries no artwork'
-    if poster_note:
-        detail += '. ' + poster_note
+    if fanart_path:
+        detail += f", and {os.path.basename(fanart_path)} as its background (TheSportsDB's for its event)"
+    # A pinned image is the poster the user chose, so TheSportsDB's missing one is not news.
+    from .sports_images import POSTER
+    unused = {k: v for k, v in art.items() if not (k == POSTER and poster_source == POSTER_FROM_PROFILE)}
+    for note in [n for n in (poster_note, fanart_note, art_note) if n] + _sports_notes(unused):
+        detail += '. ' + note
 
     @retry_on_locked()
     def _log_written_and_commit():
         add_recording_event(recording_id, METADATA_SIDECAR_WRITTEN, detail=detail,
                             extra={'poster': bool(poster_path),
-                                   'poster_source': poster_source})
+                                   'poster_source': poster_source,
+                                   'fanart': bool(fanart_path)})
         db.session.commit()
 
     _log_written_and_commit()

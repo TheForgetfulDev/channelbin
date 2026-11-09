@@ -12,7 +12,9 @@ Two halves with opposite rules about the disk:
   answer, because a sleeping disk can take ten seconds or more and a wait nobody explains
   reads as a hang.
 
-Video is never re-encoded for playback (DESIGN-playback.md, the measured cost of a re-encode).
+Video is a stream copy. When the browser cannot decode the copy, the player offers a re-encode on
+the GPU, which goes through the preview pipeline whichever route Play took (app/preview.py,
+dev/changelog/1461); there is never a CPU encode (DESIGN-playback.md, the measured cost of one).
 """
 import errno
 import logging
@@ -77,7 +79,8 @@ class Offer:
     and the segments captured so far play through the same pipeline, following the one being
     written. At most one. When `native` is False, `reason` says in the user's
     terms why the browser's own player cannot take the file. `caveat` is set when a browser
-    may still refuse it (HEVC video, or audio a browser lacks on the native route).
+    may still refuse it (HEVC video, or audio a browser lacks on the native route); the player
+    then offers a GPU re-encode, decided on the click rather than here.
     """
     play: bool = False
     download: bool = False

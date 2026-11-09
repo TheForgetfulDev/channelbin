@@ -247,15 +247,23 @@ _FAKE_CAPTURE = (
     'content = 0.0\n'
     'tick = 0\n'
     'while True:\n'
-    '    content += step * rate\n'
+    # A feed fast only by its replays runs at real time between reconnects; each reconnect
+    # then moves the position by the replay in one jump, after the reconnect notice and
+    # before the next position line - where ffmpeg puts it. Spreading the replay over the
+    # ticks instead, with the notice every fifth, read as 2.0x "own" speed whenever a loaded
+    # box stretched the tick and a 1 s window held 8 ticks and one notice (dev/docs/BUGS.md
+    # 2026-11-09). `rate` is still what the detector reads over any whole number of cycles.
+    '    content += step * (1.0 if replay else rate)\n'
     '    tick += 1\n'
     '    h, rem = divmod(content, 3600)\n'
     '    m, s = divmod(rem, 60)\n'
     '    sys.stderr.write("frame=1 time=%02d:%02d:%05.2f speed=%.2fx    \\r" % (h, m, s, rate))\n'
     '    if replay and tick % 5 == 0:\n'
+    '        jump = 5 * step * (rate - 1)\n'
     '        sys.stderr.write("[http @ 0x1] Will reconnect at 1 in 0 second(s), '
     'error=Input/output error.\\n[vist#0:0/h264 @ 0x2] timestamp discontinuity (stream id=256): '
-    '%d, new offset= 1\\n" % -int(5 * step * (rate - 1) * 1000000))\n'
+    '%d, new offset= 1\\n" % -int(jump * 1000000))\n'
+    '        content += jump\n'
     '    sys.stderr.flush()\n'
     '    time.sleep(step)\n'
 )

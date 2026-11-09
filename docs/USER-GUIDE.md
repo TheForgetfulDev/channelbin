@@ -80,6 +80,10 @@ In the TV Guide and on the Dashboard, a completed recording is one of:
 
 ![Three rows of the TV Guide marked Recorded, Stopped early and Partial.](screenshots/guide-recording-marks.png)
 
+A program whose recording **failed** reads **Failed** in red in the TV Guide. Nothing is holding
+that program, so you can record it again from the same click, and the program's actions also
+open the failed recording to show what happened. A recording you cancelled leaves no mark.
+
 ### The event log
 
 The **Event log** lists everything that happened to the recording, in order, each in plain words
@@ -320,7 +324,8 @@ from here.
 - **Storage**, **External tools** and **Search index**: disk space, the ffmpeg and ffprobe
   versions, and the state of the search index.
 - **Backup & Restore**: back up your settings now, or pick an earlier backup, see what it would
-  change, and apply it. A full backup (database included) is covered in the
+  change, and apply it. Applying one always asks for a restart, so every restored setting
+  takes effect. A full backup (database included) is covered in the
   [README](../README.md#backup-and-restore).
 - **Support bundle**: one zip with what someone helping you would ask for. URLs and secrets are
   removed and account, channel and group names are replaced, but look through it before you

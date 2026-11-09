@@ -305,9 +305,8 @@ class PasswordChangeRevocationTests(_ConfigSandbox):
         # Written to the sandboxed config.yaml, not extra_overrides: the password endpoint
         # re-reads config via load_config()/refresh_auth() at run time, which does not see
         # a test app's overrides (CLAUDE.md testing section).
-        with open(self._cfg_path, 'w') as f:
-            yaml.dump({'auth': {'enabled': True, 'password_hash': generate_password_hash(PASSWORD),
-                                'session_timeout_minutes': 0, 'cookie_secure': False}}, f)
+        self._write_cfg({'auth': {'enabled': True, 'password_hash': generate_password_hash(PASSWORD),
+                                  'session_timeout_minutes': 0, 'cookie_secure': False}})
         cfgmod._yaml_cache = None
         self.t = make_test_app()
         self.addCleanup(self.t.cleanup)
@@ -482,8 +481,7 @@ class RecoveryPathTests(_ConfigSandbox):
     """
 
     def _app_with(self, auth_block):
-        with open(self._cfg_path, 'w') as f:
-            yaml.dump({'auth': auth_block}, f)
+        self._write_cfg({'auth': auth_block})
         cfgmod._yaml_cache = None
         self.t = make_test_app()
         self.addCleanup(self.t.cleanup)
@@ -721,8 +719,7 @@ class MaskingTests(_ConfigSandbox):
         # of gate state, and leaving it off keeps these pages reachable with no session.
         raw = {'auth': {'enabled': False, 'password_hash': self.pw_hash,
                         'session_timeout_minutes': 0, 'cookie_secure': False}}
-        with open(self._cfg_path, 'w') as f:
-            yaml.dump(raw, f)
+        self._write_cfg(raw)
         cfgmod._yaml_cache = None
         self.t = make_test_app()
         self.client = self.t.app.test_client()

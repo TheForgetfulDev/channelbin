@@ -24,14 +24,15 @@
    Returns { setMode, mode, prefill, value, payload, onChange }:
      setMode('manual'|'once'|'recur') - which row shows; 'manual' hides the whole block
      mode()      - the current mode
-     prefill({oneoff_value, recur_day, recur_time, use_window}) - every key optional; an
+     prefill({oneoff_value, oneoff_utc, recur_day, recur_time, use_window}) - every key
+                 optional; oneoff_utc is the ISO instant oneoff_value stands for; an
                  omitted use_window leaves the macro's rendered "Run at" default alone
                  (see the macro's own note), an explicit true/false moves it
      value()     - {oneoff, recurDay, recurTime, useWindow} - live values, unvalidated
      payload()   - {recurring:true, recur_day, recur_time, use_window:false}
                    | {recurring:true, recur_day, use_window:true} (maintenance window - no
                      recur_time; app/check_window.py's dispatcher owns starting it)
-                   | {recurring:false, scheduled_time}
+                   | {recurring:false, scheduled_time, scheduled_time_utc}
                    | {error: '<message>'} when a required input is empty, so the caller
                    decides how to surface it. null in 'manual' mode. The window branch only
                    exists when the macro was rendered with a window_label - otherwise the
@@ -51,6 +52,10 @@ function mountScheduleFields(opts) {
   const oneoffRow = q('oneoff-row');
   const recurRow = q('recurring-row');
   const dt = q('dt');
+  // The one-off field keeps the instant it stands for (util.js::wallTimeField): a wall
+  // time a DST change repeats cannot say which pass it means, so the instant is posted
+  // beside the text as scheduled_time_utc and a note under the field says which it is.
+  const dtWall = wallTimeField(dt, { hidden: q('dt-utc'), note: q('dt-note'), onPick: () => fire() });
   const day = q('recur-day');
   const time = q('recur-time');
   // Only present when the macro was rendered with a window_label (see _macros.html) -
@@ -98,7 +103,10 @@ function mountScheduleFields(opts) {
     mode: () => mode,
     prefill(s) {
       if (!s) return;
-      if (s.oneoff_value) dt.value = s.oneoff_value;
+      // A stored moment comes with its instant, which the field then keeps; bare text
+      // (a cloned schedule's) reads as its first pass, like typing it would.
+      if (s.oneoff_utc) dtWall.set(new Date(s.oneoff_utc));
+      else if (s.oneoff_value) dt.value = s.oneoff_value;
       if (s.recur_day !== undefined && s.recur_day !== null) day.value = String(s.recur_day);
       if (s.recur_time) time.value = s.recur_time;
       // Absent is not false. A caller that states no use_window has no opinion, so the
@@ -128,7 +136,7 @@ function mountScheduleFields(opts) {
         return { recurring: true, recur_day: parseInt(day.value, 10), recur_time: time.value, use_window: false };
       }
       if (!dt.value) return { error: 'Pick a date and time for the one-off run.' };
-      return { recurring: false, scheduled_time: dt.value };
+      return { recurring: false, scheduled_time: dt.value, scheduled_time_utc: dtWall.utc() };
     },
     onChange(fn) { listeners.push(fn); },
   };

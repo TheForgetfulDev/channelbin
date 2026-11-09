@@ -19,6 +19,7 @@ fixture, a deliberately-missing config path) - and none of the 20 were a genuine
 on the real file.
 """
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -28,7 +29,8 @@ import yaml
 
 from app import config as cfgmod
 import tests.support.app as testapp_mod
-from tests.support.app import make_test_app, write_sandbox_config
+from tests.support.app import make_test_app, sandbox_runtime_paths, write_sandbox_config
+from tests.support.config_sandbox import ConfigSandbox
 
 
 class RealConfigNeverLeaksIntoASandboxedAppTests(unittest.TestCase):
@@ -89,9 +91,12 @@ class CooperatesWithAnOuterSandboxTests(unittest.TestCase):
     def setUp(self):
         fd, self._outer_path = tempfile.mkstemp(suffix='.yaml')
         os.close(fd)
+        self._outer_dir = tempfile.mkdtemp(prefix='dvr_outer_sandbox_')
+        self.addCleanup(shutil.rmtree, self._outer_dir, ignore_errors=True)
         with open(self._outer_path, 'w') as f:
             yaml.dump({'integrations': {'home_assistant': {
-                'enabled': True, 'api_key_hash': 'outer-sandbox-marker-xyz'}}}, f)
+                'enabled': True, 'api_key_hash': 'outer-sandbox-marker-xyz'}},
+                **sandbox_runtime_paths(self._outer_dir)}, f)
         self._orig_cfg_path = cfgmod._CONFIG_PATH
         cfgmod._CONFIG_PATH = self._outer_path
         cfgmod._yaml_cache = None
@@ -213,8 +218,11 @@ class SandboxFailuresAreNamedTests(unittest.TestCase):
         fd, outer = tempfile.mkstemp(suffix='.yaml')
         os.close(fd)
         self.addCleanup(lambda: os.path.exists(outer) and os.remove(outer))
+        outer_dir = tempfile.mkdtemp(prefix='dvr_outer_sandbox_')
+        self.addCleanup(shutil.rmtree, outer_dir, ignore_errors=True)
         with open(outer, 'w') as f:
-            yaml.dump({'config_version': cfgmod.CURRENT_CONFIG_VERSION}, f)
+            yaml.dump({'config_version': cfgmod.CURRENT_CONFIG_VERSION,
+                       **sandbox_runtime_paths(outer_dir)}, f)
         cfgmod._CONFIG_PATH = outer
         cfgmod._yaml_cache = None
 
@@ -305,6 +313,81 @@ class RuntimePathGuardTests(unittest.TestCase):
         self.assertIn('recording.dvr_output_dir', str(caught.exception))
         self.assertEqual(cfgmod._CONFIG_PATH, orig_path,
                          'a refused build must hand _CONFIG_PATH back')
+
+
+class OuterSandboxRuntimePathTests(ConfigSandbox):
+    """dev/docs/BUGS.md 2026-11-05 @ 06:29:33 PM: TestApp defers to an outer sandbox
+    (ConfigSandbox, a hand-patched _CONFIG_PATH), and that file named no output or backup
+    dir - so under it a runtime load_config() resolved the real /dvr and the real
+    instance/config-backups, and the build-time guard never ran. ConfigSandbox now carries
+    temp dirs of its own, and TestApp checks an outer sandbox too."""
+
+    def _assert_in_sandbox(self, label, path):
+        self.assertTrue(os.path.realpath(path).startswith(
+            os.path.realpath(self._sandbox_dir) + os.sep), f'{label} = {path}')
+
+    def test_runtime_reads_resolve_into_the_sandbox_dir(self):
+        from app.config_backup import get_backup_dir
+        rec = cfgmod.load_config()['recording']
+        for key in ('dvr_output_dir', 'capture_log_dir', 'images_dir'):
+            self._assert_in_sandbox(key, rec[key])
+        self._assert_in_sandbox('config_backup.backup_dir', get_backup_dir())
+
+    def test_write_cfg_keeps_the_dirs_and_a_dir_the_test_names_wins(self):
+        named = os.path.join(self._sandbox_dir, 'named-output')
+        self._write_cfg({'recording': {'dvr_output_dir': named, 'retention_days': 3}})
+        rec = cfgmod.load_config()['recording']
+        self.assertEqual(rec['dvr_output_dir'], named)
+        self.assertEqual(rec['retention_days'], 3)
+        self._assert_in_sandbox('images_dir', rec['images_dir'])
+
+    def test_a_bare_do_backup_writes_into_the_sandbox_dir(self):
+        from app.config_backup import do_backup, get_backup_dir
+        self._assert_in_sandbox('config_backup.backup_dir', get_backup_dir())
+        self._assert_in_sandbox('do_backup()', do_backup())
+
+    def test_an_app_over_the_opt_out_refuses_to_build(self):
+        """keep_sandbox_paths=False is for a test about the defaults; an app built on it
+        would send runtime writes to the real dirs, so the build refuses."""
+        self._write_cfg({'config_version': cfgmod.CURRENT_CONFIG_VERSION},
+                        keep_sandbox_paths=False)
+        with self.assertRaises(AssertionError) as caught:
+            make_test_app()
+        self.assertIn('config_backup.backup_dir', str(caught.exception))
+        self.assertEqual(cfgmod._CONFIG_PATH, self._cfg_path,
+                         'the outer sandbox stays where its test put it')
+
+
+class OuterHandPatchedSandboxGuardTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-05 @ 06:29:33 PM: the hand-patched form of an outer
+    sandbox, whose file names no dirs, is refused at build time by name."""
+
+    def setUp(self):
+        fd, self._outer = tempfile.mkstemp(suffix='.yaml')
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(self._outer) and os.remove(self._outer))
+        write_sandbox_config(self._outer, {'config_version': cfgmod.CURRENT_CONFIG_VERSION})
+        self._orig = cfgmod._CONFIG_PATH
+        cfgmod._CONFIG_PATH = self._outer
+        cfgmod._yaml_cache = None
+        self.addCleanup(lambda: setattr(cfgmod, '_yaml_cache', None))
+        self.addCleanup(lambda: setattr(cfgmod, '_CONFIG_PATH', self._orig))
+
+    def test_an_outer_file_naming_no_dirs_refuses_to_build(self):
+        with self.assertRaises(AssertionError) as caught:
+            make_test_app()
+        for key in ('recording.dvr_output_dir', 'recording.capture_log_dir',
+                    'recording.images_dir', 'config_backup.backup_dir'):
+            self.assertIn(key, str(caught.exception))
+
+    def test_an_outer_file_naming_temp_dirs_builds(self):
+        outer_dir = tempfile.mkdtemp(prefix='dvr_outer_sandbox_')
+        self.addCleanup(shutil.rmtree, outer_dir, ignore_errors=True)
+        write_sandbox_config(self._outer, {'config_version': cfgmod.CURRENT_CONFIG_VERSION,
+                                           **sandbox_runtime_paths(outer_dir)})
+        cfgmod._yaml_cache = None
+        t = make_test_app()
+        t.cleanup()
 
 
 if __name__ == '__main__':

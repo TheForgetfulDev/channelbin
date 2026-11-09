@@ -140,9 +140,16 @@ def apply_backup(backup_path: str, cfg_path: str | None = None):
     writer of config.yaml: a restore that truncates the live file and copies into it can
     be interrupted mid-copy, and a save landing between the copy and the migration below
     would be silently discarded by it (dev/changelog/671). The lock is an RLock precisely
-    so migrate_config() can re-take it here."""
+    so migrate_config() can re-take it here.
+
+    Restoring the live file always raises the restart banner, whichever keys changed: a
+    restore replaces every setting while the app keeps running, and only some of them are
+    applied live, so the rest would sit on the old value with nothing saying so - the sync
+    interval, auth, the toolchain and the search caches among them (dev/changelog/1452).
+    The banner rather than a restart of its own, because a restart is refused while a
+    recording or other work is running."""
     from .config import (load_config, record_config_changes, migrate_config,
-                         config_write_lock, _replace_config_file_from)
+                         config_write_lock, _replace_config_file_from, set_restart_needed)
 
     live_cfg_path = _config_path()
     if cfg_path is None:
@@ -151,6 +158,13 @@ def apply_backup(backup_path: str, cfg_path: str | None = None):
         old = load_config()
         _replace_config_file_from(backup_path, cfg_path)
         if cfg_path == live_cfg_path:
+            # From here the live file is the backup's, even if what follows raises (a
+            # backup that will not parse fails in migrate_config()), so the banner goes up
+            # before anything else can fail.
+            log.info('Restart required: config.yaml was restored from %s, and settings '
+                     'that are not applied live keep their old values until the service '
+                     'restarts', os.path.basename(backup_path))
+            set_restart_needed(True)
             # A backup from an older config_version restores stale key names - re-run the
             # startup config migrations so the restored file self-heals immediately.
             migrate_config()

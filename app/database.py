@@ -97,6 +97,12 @@ RECORDING_URL_RERESOLVED            = 'RECORDING_URL_RERESOLVED'
 # never rolls, so this event is always paired with a resolver error in the stderr tail.
 RECORDING_HOST_ROLLED               = 'RECORDING_HOST_ROLLED'
 RECORDING_LOGIN_REFUSED             = 'RECORDING_LOGIN_REFUSED'
+# Recordings on two or more accounts of one provider stalled within a few minutes of each
+# other, so the stall this recording just logged is most likely the provider's, not the
+# channel's or the account's (app/provider_stalls.py, dev/changelog/1476). Written on every
+# recording in the window once the second account joins it; the PROVIDER_STALLS_CORRELATED
+# alert is raised once per provider per window.
+PROVIDER_STALLS_CORRELATED          = 'PROVIDER_STALLS_CORRELATED'
 # Logged on the NEW recording when it was created via "Find Another Airing" replace mode
 # (the SCHEDULED recording it replaced is deleted in the same request).
 RECORDING_REPLACED_OTHER            = 'RECORDING_REPLACED_OTHER'
@@ -160,6 +166,12 @@ METADATA_SIDECAR_WRITTEN            = 'METADATA_SIDECAR_WRITTEN'
 # The recording is complete and untouched either way: a file that only describes the
 # artifact may never be allowed to damage it.
 METADATA_SIDECAR_FAILED             = 'METADATA_SIDECAR_FAILED'
+# The recording was matched to a TheSportsDB event through its guide listing, or moved to a
+# different one, or a person put back a match they had removed (app/sports_data.py,
+# dev/changelog/1464). Names the event and why it matched.
+RECORDING_SPORTS_LINKED             = 'RECORDING_SPORTS_LINKED'
+# A person said the recording is not the event it was matched to.
+RECORDING_SPORTS_REMOVED            = 'RECORDING_SPORTS_REMOVED'
 # Timeline damage found in the concatenated .ts (gaps/missing frames that break player
 # seeking) - logged when post_process.reencode_mode='damaged' decides to re-encode.
 SEEK_DAMAGE_DETECTED   = 'SEEK_DAMAGE_DETECTED'
@@ -481,6 +493,7 @@ EVENT_LABELS = {
     RECORDING_URL_RERESOLVED: 'Stream address updated',
     RECORDING_HOST_ROLLED: 'Moved to the account\'s next server',
     RECORDING_LOGIN_REFUSED: 'Login refused',
+    PROVIDER_STALLS_CORRELATED: 'Other accounts on the provider stalled too',
     RECORDING_REPLACED_OTHER: 'Replaced another recording',
     RECORDING_RULE_SCHEDULED: 'Scheduled by an auto-record rule',
     RECORDING_START_NOT_ARMED: 'Will not start on its own',
@@ -493,6 +506,8 @@ EVENT_LABELS = {
     RECORDING_METADATA_EDITED: 'Description edited',
     METADATA_SIDECAR_WRITTEN: 'Media server files written',
     METADATA_SIDECAR_FAILED: 'Could not write the media server files',
+    RECORDING_SPORTS_LINKED: 'Matched to a TheSportsDB event',
+    RECORDING_SPORTS_REMOVED: 'TheSportsDB match removed',
     SEEK_DAMAGE_DETECTED: 'Gaps found in the file',
     MIXED_FRAME_RATE_DETECTED: 'Frame rate changed',
     FORMAT_NORMALIZE_NEEDED: 'Format needs evening out',
@@ -1568,6 +1583,11 @@ def detach_recording_references(recording_id: int):
     ).delete(synchronize_session=False)
     # A block set on a recording takes its window from the row, so it means nothing without it.
     AccountBlock.query.filter_by(recording_id=recording_id).delete(synchronize_session=False)
+    # Its downloaded images go with it when no other recording names them; the files are in
+    # recorder.recording_image_paths(), read before this row went.
+    if RecordingSports.query.filter_by(recording_id=recording_id).delete(synchronize_session=False):
+        from .sports_images import forget_unreferenced
+        forget_unreferenced()
 
 
 def group_event_channel_links(events) -> dict:
@@ -2796,6 +2816,12 @@ class EPGEntry(db.Model):
     stop_time   = db.Column(db.DateTime, nullable=False, index=True)
     category    = db.Column(db.String(255))
     rating      = db.Column(db.String(64))
+    # The XMLTV <live/> and <new/> elements, as the source's file marked this showing. NULL
+    # on a row imported before the columns existed (dev/changelog/1454); an import always
+    # writes one or the other. Separate from the raised "Live"/"New" marks some providers
+    # put in the title text, which the tags find.
+    is_live     = db.Column(db.Boolean)
+    is_new      = db.Column(db.Boolean)
     # VIRTUAL generated column, not app-written - SQLite computes it from start_time/stop_time
     # on every read, so it can never disagree with them and the EPG sync path never touches it.
     # Backs the EPG Deep Search program-length filter (migration 36, dev/changelog/594).
@@ -2951,6 +2977,8 @@ class EpgAlternateEntry(db.Model):
     stop_time   = db.Column(db.DateTime, nullable=False)
     category    = db.Column(db.String(255))
     rating      = db.Column(db.String(64))
+    is_live     = db.Column(db.Boolean)    # as EPGEntry: a move carries them across
+    is_new      = db.Column(db.Boolean)
 
     __table_args__ = (
         db.Index('ix_epg_alt_source_channel', 'source_id', 'channel_id'),
@@ -3117,8 +3145,29 @@ class SportsLeague(db.Model):
     sport          = db.Column(db.String(64))
     current_season = db.Column(db.String(32))
     # The words in guide text that mean this league, a JSON list (5.1). Seeded when it is added.
-    match_terms    = db.Column(db.Text, nullable=False, default='[]')
+    match_terms    = db.Column(db.Text, nullable=False, default='[]', server_default=db.text("'[]'"))
     created_at     = db.Column(db.DateTime, default=datetime.utcnow)
+    # Whether its start times can be believed (7): of the last `trust_sample` events the guide
+    # identified, `trust_agreed` started within 5 minutes of TheSportsDB's time. Both NULL until
+    # the matcher has measured anything; app/sports_match.py::league_trusted() is the one reader.
+    trust_sample      = db.Column(db.Integer)
+    trust_agreed      = db.Column(db.Integer)
+    trust_measured_at = db.Column(db.DateTime)
+
+
+class SportsLeagueCategory(db.Model):
+    """A provider category a person tied to a league (5.2). Stored by name, not per account, the way
+    the search treats a category; one category may be tied to several leagues. Kept while a
+    provider has removed it, since the same name often comes back."""
+    __tablename__ = 'sports_league_categories'
+    __table_args__ = (db.UniqueConstraint('league_id', 'category_name',
+                                          name='uq_sports_league_category'),)
+    id            = db.Column(db.Integer, primary_key=True)
+    league_id     = db.Column(db.Integer, db.ForeignKey('sports_leagues.id'), nullable=False)
+    category_name = db.Column(db.String(255), nullable=False)
+    # Everything in it is a replay, such as `US| NHL REPLAY`.
+    is_replay     = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
+    created_at    = db.Column(db.DateTime, default=datetime.utcnow)
 
 
 class SportsFollow(db.Model):
@@ -3130,8 +3179,8 @@ class SportsFollow(db.Model):
                                           name='uq_sports_follow'),)
     id           = db.Column(db.Integer, primary_key=True)
     league_id    = db.Column(db.Integer, db.ForeignKey('sports_leagues.id'), nullable=False)
-    team_tsdb_id = db.Column(db.Integer, nullable=False, default=0)
-    rule_id      = db.Column(db.Integer, nullable=False, default=0)
+    team_tsdb_id = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    rule_id      = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
     created_at   = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -3142,7 +3191,7 @@ class SportsTeam(db.Model):
     id             = db.Column(db.Integer, primary_key=True)
     tsdb_id        = db.Column(db.Integer, nullable=False, unique=True)
     full_name      = db.Column(db.String(255), nullable=False)
-    names          = db.Column(db.Text, nullable=False, default='[]')
+    names          = db.Column(db.Text, nullable=False, default='[]', server_default=db.text("'[]'"))
     city           = db.Column(db.String(255))
     last_looked_up = db.Column(db.DateTime)
 
@@ -3164,7 +3213,7 @@ class SportsFetch(db.Model):
     row_count      = db.Column(db.Integer)
     prev_row_count = db.Column(db.Integer)
     # Rows the last answer carried that failed validation at import, named on the league's page.
-    dropped_count  = db.Column(db.Integer, nullable=False, default=0)
+    dropped_count  = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
     # When this row started failing; NULL when its last answer was good. It is what lets a page say
     # "since Nov 3" instead of only "just now".
     failing_since  = db.Column(db.DateTime)
@@ -3177,11 +3226,14 @@ class SportsState(db.Model):
     next_call_at         = db.Column(db.DateTime)
     last_call_at         = db.Column(db.DateTime)
     # Seconds between calls while backing off a 429; 0 when not backing off.
-    backoff_seconds      = db.Column(db.Integer, nullable=False, default=0)
-    clean_calls          = db.Column(db.Integer, nullable=False, default=0)
+    backoff_seconds      = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    clean_calls          = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
     # This install's own time of day for its daily round, so installs do not all call at once.
-    daily_offset_seconds = db.Column(db.Integer, nullable=False, default=0)
+    daily_offset_seconds = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
     last_pruned_at       = db.Column(db.DateTime)
+    # The matcher's last run, and a sentence on what it did or what it is waiting for (6.6).
+    last_match_at        = db.Column(db.DateTime)
+    match_note           = db.Column(db.Text)
 
 
 class SportsEvent(db.Model):
@@ -3197,8 +3249,8 @@ class SportsEvent(db.Model):
     round            = db.Column(db.Integer)
     name             = db.Column(db.String(255), nullable=False)
     # 0 on both is a field event such as a race: no teams at all (6.1).
-    home_team_id     = db.Column(db.Integer, nullable=False, default=0)
-    away_team_id     = db.Column(db.Integer, nullable=False, default=0)
+    home_team_id     = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    away_team_id     = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
     home_name        = db.Column(db.String(255))
     away_name        = db.Column(db.String(255))
     venue            = db.Column(db.String(255))
@@ -3206,7 +3258,7 @@ class SportsEvent(db.Model):
     start_at         = db.Column(db.DateTime)
     local_date       = db.Column(db.Date)
     status           = db.Column(db.String(16))
-    postponed        = db.Column(db.Boolean, nullable=False, default=False)
+    postponed        = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
     poster_url       = db.Column(db.Text)
     thumb_url        = db.Column(db.Text)
     first_seen       = db.Column(db.DateTime, default=datetime.utcnow)
@@ -3215,6 +3267,118 @@ class SportsEvent(db.Model):
     missing_since    = db.Column(db.DateTime)
     previous_start   = db.Column(db.DateTime)
     start_changed_at = db.Column(db.DateTime)
+    # What the guide says the start is (7): for a matchup the start most of its channels list, for
+    # a field event its earliest race row. NULL until the matcher has found the event in the guide.
+    # Shown beside start_at when the two disagree, and never written into it.
+    guide_start      = db.Column(db.DateTime)
+    guide_channels   = db.Column(db.Integer)
+
+
+# A match's strength, kind and airing (DESIGN-sports-data.md 6, 9).
+SPORTS_MATCH_STRONG = 'strong'
+SPORTS_MATCH_WEAK = 'weak'
+SPORTS_MATCH_KIND_GUIDE = 'guide'
+SPORTS_MATCH_KIND_CHANNEL_NAME = 'channel_name'
+SPORTS_AIRING_FIRST = 'first'
+SPORTS_AIRING_REPLAY = 'replay'
+# Doubt. Never skipped by anything (6.5).
+SPORTS_AIRING_UNKNOWN = 'unknown'
+
+
+class SportsMatch(db.Model):
+    """One guide row, or one channel's name, that the provider's text says is this event
+    (app/sports_match.py, DESIGN-sports-data.md 9). What the text claims, not what the stream carries.
+
+    Never anchored on an EPGEntry id, since an import deletes and rewrites listings: a guide match is
+    the event, the channel, the program's start and its title_key; a channel-name match is the event
+    and the channel, since a name changes on every sync. Both are partial unique indexes (migration
+    115). A row the matcher stops finding is marked gone, not deleted; a person's rejection stays
+    until the event is pruned. Deleted with its channel on every path that deletes one."""
+    __tablename__ = 'sports_matches'
+    __table_args__ = (
+        db.Index('uq_sports_matches_guide', 'event_id', 'channel_id', 'program_start_time', 'title_key',
+                 unique=True, sqlite_where=db.text("kind = 'guide'")),
+        db.Index('uq_sports_matches_channel', 'event_id', 'channel_id',
+                 unique=True, sqlite_where=db.text("kind = 'channel_name'")),
+        db.Index('ix_sports_matches_channel', 'channel_id'),
+    )
+    id                 = db.Column(db.Integer, primary_key=True)
+    event_id           = db.Column(db.Integer, db.ForeignKey('sports_events.id'), nullable=False)
+    channel_id         = db.Column(db.Integer, nullable=False)
+    kind               = db.Column(db.String(16), nullable=False)
+    program_start_time = db.Column(db.DateTime)
+    program_stop_time  = db.Column(db.DateTime)
+    title_key          = db.Column(db.String(512))
+    episode_key        = db.Column(db.String(512), nullable=False, default='', server_default=db.text("''"))
+    program_title      = db.Column(db.String(512))
+    program_sub_title  = db.Column(db.String(512))
+    strength           = db.Column(db.String(8), nullable=False)
+    airing             = db.Column(db.String(8), nullable=False)
+    # Why, as a sentence a person reads.
+    reason             = db.Column(db.Text, nullable=False)
+    first_seen         = db.Column(db.DateTime, default=datetime.utcnow)
+    last_seen          = db.Column(db.DateTime, default=datetime.utcnow)
+    gone_since         = db.Column(db.DateTime)
+    rejected_at        = db.Column(db.DateTime)
+
+
+class RecordingSports(db.Model):
+    """The TheSportsDB event a recording is, as a snapshot (DESIGN-sports-data.md 9). Written only
+    by app/sports_data.py::link_recording(). A snapshot rather than a reference because events are
+    pruned days after they air and the .nfo is written when a capture ends: neither may depend on
+    TheSportsDB, or on its rows still being here.
+
+    Keyed on TheSportsDB's own event id, never sports_events.id: that table has no AUTOINCREMENT,
+    so a pruned event's id can be handed to the next one and a link by it would silently re-point
+    (the dev/changelog/929 class). Deleted with its recording in detach_recording_references()."""
+    __tablename__ = 'recording_sports'
+    recording_id  = db.Column(db.Integer, primary_key=True, autoincrement=False)
+    tsdb_event_id = db.Column(db.Integer, nullable=False)
+    league_name   = db.Column(db.String(255), nullable=False)
+    event_name    = db.Column(db.String(255), nullable=False)
+    # Both empty on a field event such as a race (6.1).
+    home_name     = db.Column(db.String(255))
+    away_name     = db.Column(db.String(255))
+    season        = db.Column(db.String(32))
+    round         = db.Column(db.Integer)
+    venue         = db.Column(db.String(255))
+    city          = db.Column(db.String(255))
+    # TheSportsDB's start, as given: a fourth time beside the recording's scheduled, live and
+    # program times, and never written into any of them (9).
+    event_start   = db.Column(db.DateTime)
+    local_date    = db.Column(db.Date)
+    strength      = db.Column(db.String(8), nullable=False)
+    airing        = db.Column(db.String(8), nullable=False)
+    reason        = db.Column(db.Text, nullable=False)
+    linked_at     = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at    = db.Column(db.DateTime, default=datetime.utcnow)
+    # A person said this is not the event. The row stays so no later pass links it again; only
+    # the person's undo clears it.
+    removed_at    = db.Column(db.DateTime)
+    # Where TheSportsDB's portrait poster and landscape thumb are, as the event gave them. The
+    # downloaded file and why it is not there yet are on SportsImage, keyed by the address, since
+    # every recording of one event shares the one file (dev/changelog/1465).
+    poster_url    = db.Column(db.Text)
+    thumb_url     = db.Column(db.Text)
+
+
+class SportsImage(db.Model):
+    """One image downloaded from TheSportsDB for the recordings that point at it, by address
+    (app/sports_images.py, dev/changelog/1465). Written only by that module's worker step, and
+    deleted once no recording_sports row names its address."""
+    __tablename__ = 'sports_images'
+    id          = db.Column(db.Integer, primary_key=True)
+    url         = db.Column(db.Text, nullable=False, unique=True)
+    # The stored name, chosen by the app; NULL until a download succeeds.
+    file_name   = db.Column(db.String(64))
+    fetched_at  = db.Column(db.DateTime)
+    tried_at    = db.Column(db.DateTime)
+    tries       = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    # When to try again. NULL with no file means it is never tried again: the address was refused
+    # before any call.
+    next_try_at = db.Column(db.DateTime)
+    # Why the last try did not give a file, as a sentence. NULL once one is stored.
+    reason      = db.Column(db.Text)
 
 
 class AutoRule(db.Model):

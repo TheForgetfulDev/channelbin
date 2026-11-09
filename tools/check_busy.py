@@ -75,8 +75,8 @@ def busy_rows(db_path):
     A recording whose post-processing is parked waiting on another recording is NOT here -
     see parked_rows() below.
 
-    Callers other than main(): dev/tools/search_bench.py, which refuses to benchmark
-    while work is in flight (dev/changelog/362).
+    Callers other than main(): dev/tools/search_bench.py and dev/tools/search_timing_check.py,
+    which refuse to benchmark while work is in flight (dev/changelog/362, 696).
     """
     rows, note = _recording_rows(db_path)
     return [(rid, status, name) for rid, status, name, waiting, _on, _pct in rows

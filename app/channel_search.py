@@ -69,8 +69,8 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
-from sqlalchemy import (Integer, String, and_, case, cast, func, literal_column, not_, or_, select,
-                        union)
+from sqlalchemy import (Integer, String, and_, case, cast, func, literal, literal_column, not_, or_,
+                        select, type_coerce, union)
 from sqlalchemy.orm import aliased
 
 from . import db, health_bands
@@ -363,6 +363,14 @@ DIMENSIONS = (
                    'length of its own, only a showing does.\n\n'
                    'You do not have to set both: set only "at least" for "longer '
                    'than X", or only "at most" for "shorter than X".'),
+    Dimension('mark', 'Guide mark', multi=True, grain=GRAIN_AIRINGS,
+              help='What the guide file itself says about a showing: Live, or New for a '
+                   'first showing. Not every provider sends these, so a count of zero can '
+                   'mean the guide does not say rather than that nothing is live.\n\n'
+                   'A listing keeps the marks it was imported with, and one imported before '
+                   'ChannelBin read them has none until its guide next refreshes.\n\n'
+                   'Separate from the live and new tags, which look for the small raised '
+                   'marks some providers put in the title itself.'),
     Dimension('tag', 'Tag', multi=True,
               help="A label of yours, not the provider's, so it survives a sync. A tag is "
                    "a set of literal patterns, not a column: a channel carries the tag when "
@@ -488,7 +496,13 @@ OTHER_VALUES = (OTHER_REMOVED, OTHER_NEW, OTHER_IN_GUIDE, OTHER_GUIDE_OWN_ROW,
                 OTHER_GUIDE_VIA_GROUP, OTHER_DUP_URL, OTHER_PROVIDER, OTHER_MONITORED,
                 OTHER_SOURCE_OVERRIDE)
 LISTINGS_NONE = 'none'
-LISTINGS_LABELS = {LISTINGS_NONE: 'None scheduled'}
+#: A `listings` filter reads as one phrase, picked and excluded, never as "Listings is <value>":
+#: the chip, its tooltip and a described search all say it this way (dev/changelog/1450).
+LISTINGS_PHRASES = {LISTINGS_NONE: {
+    'label': 'No scheduled listings', 'label_ex': 'Has scheduled listings',
+    'tip': 'Channels with nothing in the guide that has not ended yet.',
+    'tip_ex': 'Channels with something in the guide that has not ended yet.',
+}}
 #: The rail's wording for those four, from the approved mockup. Here rather than in the
 #: template because the values are a registry and their labels are part of it - a page that
 #: spelled them itself would be a second vocabulary to keep in step.
@@ -675,6 +689,22 @@ DOW_LABELS = {
     'fri': 'Friday', 'sat': 'Saturday', 'sun': 'Sunday',
 }
 
+#: `mark` - what the guide file itself says about a showing, from the XMLTV <live/> and <new/>
+#: elements (`EPGEntry.is_live` / `is_new`, dev/changelog/1454). Not the raised "Live" and
+#: "New" marks some providers put in the title text; those are the tags' business.
+MARK_LIVE = 'live'
+MARK_NEW = 'new'
+MARK_VALUES = (MARK_LIVE, MARK_NEW)
+MARK_LABELS = {MARK_LIVE: 'Live', MARK_NEW: 'New'}
+
+
+def mark_labels(entry) -> list:
+    """The guide marks one showing carries, in words - what every surface that describes a
+    showing prints, so the filter's vocabulary has one spelling."""
+    return [MARK_LABELS[value] for value, on in ((MARK_LIVE, entry.is_live),
+                                                 (MARK_NEW, entry.is_new)) if on]
+
+
 #: `tod:<HH:MM>..<HH:MM>`, 24-hour local wall clock, both ends included - the same reading as
 #: `custom:` and `dur:` beside it in the rail. Either end may be empty: `tod:18:00..` is "at or
 #: after 6 PM", `tod:..09:00` is "at or before 9 AM". An end EARLIER than the start runs past
@@ -772,7 +802,10 @@ STANDING_OPTIONS = (
     # offered to you" amounts to in practice (dev/changelog/775).
     StandingOption('showhidden', 'Show hidden channels', False,
                    noun='hidden', hides_when_on=False),
-    StandingOption('showdup', 'Show duplicates', False, cluster=True,
+    # On by default since dev/changelog/1458: a duplicate hidden by default is a channel the
+    # page answers "no such channel" for, to the person looking for it. Hiding them is one
+    # untick away, and the count line says how many that took out.
+    StandingOption('showdup', 'Show duplicates', True, cluster=True,
                    noun='duplicates', hides_when_on=False),
     StandingOption('shownotnorm', 'Show "not normalized" URLs', False,
                    noun='not normalized', hides_when_on=False),
@@ -1215,6 +1248,8 @@ def describe_value(key: str, value: str, *, account_names=None, channel_names=No
         return value
     if key == 'dow':
         return DOW_LABELS.get(value, value)
+    if key == 'mark':
+        return MARK_LABELS.get(value, value)
     if key == 'tod':
         ends = parse_time_of_day(value)
         if ends is None:
@@ -1248,7 +1283,7 @@ def describe_value(key: str, value: str, *, account_names=None, channel_names=No
         name = (channel_names or {}).get(int(value)) if value.isdigit() else None
         return name or f'#{value}'
     if key == 'listings':
-        return LISTINGS_LABELS.get(value, value)
+        return LISTINGS_PHRASES[value]['label'] if value in LISTINGS_PHRASES else value
     return value
 
 
@@ -1286,6 +1321,13 @@ def describe_state(state, *, account_names=None, channel_names=None, gone=None, 
             continue
         for values, neg in ((f.values, False), (f.ex, True)):
             if not values:
+                continue
+            if dim.key == 'listings' and all(v in LISTINGS_PHRASES for v in values):
+                # A whole phrase either way round, so there is no "not" to add.
+                said = 'label_ex' if neg else 'label'
+                texts = [(v, LISTINGS_PHRASES[v][said]) for v in values]
+                line(dim.label, texts, key=dim.key)
+                summary.append(' or '.join(lower_first(t) for _v, t in texts))
                 continue
             texts = [(v, describe_value(dim.key, v, **names)) for v in values]
             line(dim.label, texts, neg=neg, key=dim.key)
@@ -2244,6 +2286,17 @@ def _dow_predicate(values, ctx: 'SearchContext'):
     return _local_weekday(ctx).in_(sorted(set(days)))
 
 
+def _mark_predicate(value: str):
+    """"Did the guide file mark this SHOWING live, or new". An unknown mark is a 400, like an
+    unknown day: the vocabulary is closed, so anything else is a broken link."""
+    if value == MARK_LIVE:
+        return EPGEntry.is_live.is_(True)
+    if value == MARK_NEW:
+        return EPGEntry.is_new.is_(True)
+    raise SearchStateError(f'unknown Guide mark value {value!r} - one of '
+                           f'{", ".join(MARK_VALUES)}')
+
+
 def _tod_predicate(value: str, ctx: 'SearchContext'):
     """"Does this SHOWING start inside this clock-time range" - both ends included.
 
@@ -2275,7 +2328,7 @@ def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str 
                      narrow: bool = False, hides_past: bool = True):
     """"Does a channel carry this value of this dimension" - one entry per dimension.
 
-    Every dimension here except `when`, `dow`, `tod`, `duration` and `tag` is about the
+    Every dimension here except `when`, `dow`, `tod`, `duration`, `mark` and `tag` is about the
     CHANNEL, on both grains alike. That is the §1 caveat of DESIGN-channel-search.md, and it
     is why the airing query can reuse those predicates verbatim: it joins Channel, so a
     Channel expression composes into it directly. `tag` is the other exception - see
@@ -2290,6 +2343,8 @@ def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str 
         return _tod_predicate(value, ctx)
     if dim_key == 'duration':
         return _duration_predicate(value)
+    if dim_key == 'mark':
+        return _mark_predicate(value)
     if dim_key == 'tag':
         tag = ctx.tags_by_name.get(value)
         # Tags read both indexes, so they need both to be trustworthy.
@@ -2451,7 +2506,7 @@ def _provider_keyed(ctx: 'SearchContext'):
 
 
 def _no_scheduled_listing():
-    """This channel has no listing that has not ended: "no EPG data" and "None scheduled"."""
+    """This channel has no listing that has not ended: "no EPG data" and "No scheduled listings"."""
     return not_(select(EPGEntry.id).where(
         EPGEntry.channel_id == Channel.id,
         EPGEntry.stop_time >= datetime.utcnow()).correlate(Channel).exists())
@@ -2616,7 +2671,7 @@ def _later_showings(row_preds=()):
             .having(func.min(ranked.c.rn) > 1))
 
 
-def _group_ranked_entries(row_preds=()):
+def _group_ranked_entries(row_preds=(), extra=()):
     """One row per (entry, group it is in), carrying that group's rank `rn`.
 
     Split out from `_group_collapse_losers` so the equivalence test can run a reference
@@ -2624,13 +2679,18 @@ def _group_ranked_entries(row_preds=()):
     duplication that goes stale the first time the ranking rule changes. The ranking rule
     itself, and why each part of it is the way it is, is documented on `_group_collapse_losers`
     below.
+
+    `extra` is labeled columns carried beside each row, for a caller that needs the
+    partition or the row's own answers as well as its rank (`_add_back_collapsed`).
     """
+    partition = [ChannelGroupMember.group_id, EPGEntry.title,
+                 EPGEntry.start_time, EPGEntry.stop_time]
     return (
         select(EPGEntry.id.label('id'),
                ChannelGroupMember.group_id.label('group_id'),
+               *extra,
                func.row_number().over(
-                   partition_by=[ChannelGroupMember.group_id, EPGEntry.title,
-                                 EPGEntry.start_time, EPGEntry.stop_time],
+                   partition_by=partition,
                    order_by=[
                        db.case((ChannelGroupMember.recording_enabled.is_(True), 0), else_=1),
                        func.min(100, func.max(
@@ -3487,8 +3547,8 @@ _STANDING_SIDE = {
     'showuntested': _SIDE_CHANNEL, 'showmembers': _SIDE_CHANNEL,
     'showpast': _SIDE_EPG, 'firstonly': _SIDE_EPG, 'grpdedup': _SIDE_EPG,
 }
-#: The channel-side standing options cheap enough to defer past the tally - the two that
-#: hide by default and reject a fixed handful of rows (~1,600 duplicate losers, and whatever
+#: The channel-side standing options cheap enough to defer past the tally - the ones that
+#: reject a fixed handful of rows when they hide (~1,600 duplicate losers, and whatever
 #: normalization left alone) rather than narrowing the set. `shownoepg` and `showuntested`
 #: are channel-side too but genuinely selective, and deferring one of those costs more than
 #: the split saves: measured on the production database, `noepg`+`untested` together are
@@ -3507,6 +3567,7 @@ _DIMENSION_SIDE = {
     'acct': _SIDE_CHANNEL, 'health': _SIDE_CHANNEL, 'cat': _SIDE_CHANNEL,
     'other': _SIDE_CHANNEL, 'group': _SIDE_CHANNEL, 'chan': _SIDE_CHANNEL,
     'when': _SIDE_EPG, 'duration': _SIDE_EPG, 'dow': _SIDE_EPG, 'tod': _SIDE_EPG,
+    'mark': _SIDE_EPG,
 }
 
 
@@ -4047,6 +4108,14 @@ def _standing_breakdown_compute(state: SearchState, ctx: SearchContext, narrowin
     counted twice makes the numbers not add up to the total, which is worse than a slightly
     arbitrary attribution.
 
+    **An option that is not `reported` goes first**, ahead of registry order. That is
+    `showpast`, and an ended airing is one no other option gives back while ended airings stay
+    hidden. After it in the CASE, every ended airing on a duplicate channel was counted as a
+    duplicate: on the production database "13,924 duplicates" beside 6,163 that ticking the box
+    brought back, and "28 not normalized" beside none. Put first, both equal what ticking gives
+    back, and nothing is lost by it, since that bucket's number is never shown
+    (dev/changelog/1449).
+
     Counted over rows that pass the text and the filters, so "412 duplicates hidden" means
     412 rows this search would give back by turning the option off - not 412 rows somewhere
     in the database. A number the user cannot act on is worse than no number. An option that
@@ -4078,8 +4147,9 @@ def _standing_breakdown_compute(state: SearchState, ctx: SearchContext, narrowin
         row = query.filter(*narrowing).one()
         return {}, (row[0] or 0), (row[1] or 0) if airings else None
 
+    ordered = [s for s in active if not s.reported] + [s for s in active if s.reported]
     bucket = db.case(*[(_reject_for_rows(s, state, ctx, narrowing, scope), s.key)
-                       for s in active],
+                       for s in ordered],
                      else_='')
     query = db.session.query(bucket.label('bucket'), func.count(counted),
                              *([channels] if airings else []))
@@ -4275,13 +4345,14 @@ def compute_facets(state: SearchState, ctx: SearchContext,
         if d.key not in out:
             out[d.key] = _facet_counts(d, state, ctx, text_preds)
     _add_back_unfolded(out, wanted, state, ctx, text_preds, filtered)
+    _add_back_collapsed(out, wanted, state, ctx, text_preds, filtered)
     # Registry order, not the order they were computed in - the rail renders this as given.
     return {d.key: out[d.key] for d in wanted}
 
 
 #: The airing-grain dimensions that describe the SHOWING rather than its channel. `tag` is one
 #: of them on this grain: there a showing answers for itself (see `_tag_predicate`).
-_SHOWING_DIMENSIONS = frozenset({'when', 'dow', 'tod', 'duration', 'tag'})
+_SHOWING_DIMENSIONS = frozenset({'when', 'dow', 'tod', 'duration', 'mark', 'tag'})
 
 
 def _firstonly_skews(dim: Dimension, state: SearchState) -> bool:
@@ -4305,8 +4376,8 @@ def _firstonly_skews(dim: Dimension, state: SearchState) -> bool:
 #: Why `_firstonly_skews()` left a facet uncounted, in a sentence the page shows as it is.
 FIRSTONLY_UNCOUNTED_REASON = (
     "Not counted while One row per channel is on. It keeps only each channel's earliest "
-    'matching showing, so a count for one day, time, length, When window or tag would not '
-    'match the list you get by picking it.')
+    'matching showing, so a count for one day, time, length, When window, guide mark or tag '
+    'would not match the list you get by picking it.')
 
 
 def uncounted_facets(state: SearchState) -> dict:
@@ -4322,7 +4393,7 @@ def uncounted_facets(state: SearchState) -> dict:
 #: can therefore share a single pass. `group` needs a join from the membership table's small
 #: end and `tag` needs the FTS indexes, so neither can join that pass. `dow` is the one
 #: grouping key read off the SHOWING rather than the channel.
-_SCAN_DIMENSIONS = ('acct', 'cat', 'health', 'other', 'when', 'dow')
+_SCAN_DIMENSIONS = ('acct', 'cat', 'health', 'other', 'when', 'dow', 'mark')
 
 
 def _combined_facet_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext,
@@ -4386,12 +4457,21 @@ def _combined_facet_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext
                        lambda v: _value_predicate('other', v, ctx)))
     if 'when' in dim_keys:
         riders.append(('when', WHEN_STATIC_VALUES, lambda v: _when_predicate(v, ctx)))
+    # Two more FILTER counts on a scan that already reads the row for `when`: 1.24s -> 1.34s
+    # for the tally on a copy of the production database (dev/changelog/1454). Never on the
+    # channel grain, where `mark` is grain-scoped out of `wanted`.
+    if 'mark' in dim_keys:
+        riders.append(('mark', MARK_VALUES, _mark_predicate))
 
     # A rider whose predicate reads `epg_entries` has to be counted in the tally, before the
     # rows are collapsed to one per channel; a channel-side one is a property of the channel
-    # and is summed after. `when` is the only epg-side rider today.
-    epg_riders = [r for r in riders if r[0] == 'when']
-    channel_riders = [r for r in riders if r[0] != 'when']
+    # and is summed after.
+    epg_riders = [r for r in riders if r[0] in ('when', 'mark')]
+    channel_riders = [r for r in riders if r[0] not in ('when', 'mark')]
+    # One label per epg-side count, numbered across the riders so two riders' columns
+    # cannot share a name.
+    epg_counts = [(f'w{n}', predicate(v)) for n, (predicate, v) in enumerate(
+        (predicate, v) for _key, values, predicate in epg_riders for v in values)]
 
     if airings and split is not None:
         channel_preds, epg_preds = split
@@ -4404,9 +4484,7 @@ def _combined_facet_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext
         tally = (db.session.query(
             *tally_keys,
             func.count(EPGEntry.id).label('n'),
-            *[func.count(EPGEntry.id).filter(predicate(v)).label(f'w{i}')
-              for _key, values, predicate in epg_riders
-              for i, v in enumerate(values)])
+            *[func.count(EPGEntry.id).filter(test).label(name) for name, test in epg_counts])
             .filter(*epg_preds)
             .group_by(EPGEntry.channel_id, *[k.name for k in tally_keys[1:]])
             .subquery())
@@ -4420,9 +4498,7 @@ def _combined_facet_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext
         for _key, values, predicate in channel_riders:
             aggregates += [func.sum(case((predicate(v), tally.c.n), else_=0))
                            for v in values]
-        aggregates += [func.sum(getattr(tally.c, f'w{i}'))
-                       for _key, values, _predicate in epg_riders
-                       for i in range(len(values))]
+        aggregates += [func.sum(getattr(tally.c, name)) for name, _test in epg_counts]
         query = (db.session.query(*group_exprs, *aggregates)
                  .select_from(tally)
                  .join(Channel, Channel.id == tally.c.cid)
@@ -4555,6 +4631,12 @@ def _facet_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
         row = over(*[func.count(counted).filter(_duration_predicate(v))
                      for v in values]).filter(*preds).one()
         return dict(zip(values, [n or 0 for n in row]))
+
+    if dim.key == 'mark':
+        # Reached when Guide mark is itself filtered, and from the duplicate add-back.
+        row = over(*[func.count(counted).filter(_mark_predicate(v))
+                     for v in MARK_VALUES]).filter(*preds).one()
+        return dict(zip(MARK_VALUES, [n or 0 for n in row]))
 
     if dim.key == 'dow':
         # Only reached when Day of week is itself filtered, so its own filter has to come off
@@ -4763,6 +4845,10 @@ def _unfolded_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
                                                          ctx.cfg, hides_past, ctx))
                 for tag in ctx.tags}
 
+    if dim.key == 'mark':
+        # Two copies of one stream can read different guides, and a mark is the guide's.
+        return {value: count_stays_for(_mark_predicate(value)) for value in MARK_VALUES}
+
     if dim.key in _SHOWING_DIMENSIONS:
         return _facet_counts(dim, state, ctx, text_preds, preds=[*base, not_(kept)],
                              channels_first=True)
@@ -4821,3 +4907,164 @@ def _add_back_unfolded(out: dict, wanted: list, state: SearchState, ctx: SearchC
                                             skip=d.key)[d.key])
         else:
             merge(d.key, _unfolded_counts(d, state, ctx, text_preds))
+
+
+#: The dimensions "Collapse channel groups" can count differently from their own filter: the ones
+#: whose value can differ between two members of one group showing the same program. The showing
+#: dimensions cannot - the collapse's partition is the program's title and times, so every row in
+#: it has the same When, Day of week, Time of day and length. `tag` can: on this grain it reads the
+#: showing's subtitle and description too, and two members' copies of one program can differ there.
+#: `mark` can for the same reason: it is each member's own guide that marks its copy.
+_COLLAPSE_SKEWED_DIMENSIONS = ('acct', 'cat', 'health', 'other', 'group', 'mark', 'tag')
+
+
+def _add_back_collapsed(out: dict, wanted: list, state: SearchState, ctx: SearchContext,
+                        text_preds: list, filtered: set) -> None:
+    """Add to the facet counts the showings "Collapse channel groups" hides that picking the value
+    would show.
+
+    The collapse keeps a group's best member over the rows in the search, and a facet is counted
+    with its own filter off. Picking a value re-ranks inside that value, so a member that lost to
+    a member on another account wins once that account is out. On the production database the
+    uncorrected rail read 261,832 for an account whose filter returned 264,449, and 0 for a health
+    band whose filter returned 127 (dev/changelog/1448).
+
+    The same window the collapse runs, read once into Python over the grouped showings alone
+    (25,585 rows on that database): narrowing a partition to one value keeps its order, so the
+    best member carrying the value is the first such row in the window's own ranking - this
+    never re-states the ranking rule. Showings on a channel in no group cannot lose and are never
+    read.
+
+    One gap is left on purpose. A foldable duplicate whose kept copy is out of the results is on
+    the page, and the collapse can hide it behind a better member that picking a value removes.
+    The shared base leaves out every foldable duplicate, the duplicate add-back counts only those
+    the collapse keeps, and this pass leaves them out too, because whether the kept copy is in the
+    results once a value is picked is a per-value question of its own. On the production database
+    no sampled value was off for it (dev/changelog/1448).
+    """
+    if (state.grain != GRAIN_AIRINGS or not standing_applied(state.standing, 'grpdedup')
+            or not ctx.group_member_channel_ids):
+        return
+    keys = [d.key for d in wanted if d.key in _COLLAPSE_SKEWED_DIMENSIONS and d.key in out]
+    together = tuple(k for k in keys if k not in filtered)
+    passes = ([(together, '')] if together else []) + [((k,), k) for k in keys if k in filtered]
+    for dim_keys, skip in passes:
+        for key, counts in _collapsed_scan(dim_keys, state, ctx, text_preds, skip).items():
+            for value, count in counts.items():
+                out[key][value] = out[key].get(value, 0) + count
+
+
+def _collapsed_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext, text_preds: list,
+                    skip: str = '') -> dict:
+    """{dimension key: {value: showings the collapse hides that it keeps once the value is
+    picked}}, with `skip`'s own filter off - see `_add_back_collapsed`.
+
+    A channel's answers are read once per channel rather than carried on every showing: the
+    Other flags as columns of the window cost 390ms on the production database against a few
+    ms over the grouped channels. A tag and a guide mark read the showing, so they ride the
+    window.
+    """
+    narrowing = list(text_preds) + dimension_predicates(state, ctx, skip=skip)
+    scope = _cluster_scope(state, ctx, narrowing)
+
+    showing_columns = []
+    if 'tag' in dim_keys:
+        narrow = airing_narrowing_decision(state, ctx)[0]
+        hides_past = standing_applied(state.standing, 'showpast')
+        indexed = ctx.readiness_for(_TAG_FIELDS)[0]
+        showing_columns = [
+            (('tag', tag.name),
+             case((_tag_predicate(tag, indexed, state.grain, narrow, ctx.cfg, hides_past, ctx),
+                   1), else_=0).label(f'tag{i}'))
+            for i, tag in enumerate(ctx.tags)]
+    if 'mark' in dim_keys:
+        # The same shape as a tag: a yes/no read off the showing, riding the window.
+        showing_columns += [
+            (('mark', value), case((_mark_predicate(value), 1), else_=0).label(f'mark{i}'))
+            for i, value in enumerate(MARK_VALUES)]
+    # What else takes a showing off the page once the value is picked. The other standing options
+    # are already in `scope`; these two rank or fold over it.
+    gates = []
+    if standing_applied(state.standing, 'firstonly'):
+        gates.append(_standing_reject('firstonly', ctx, scope))
+    if standing_applied(state.standing, 'showdup'):
+        gates.append(_standing_reject('showdup', ctx, state=state))
+    gated = (case((or_(*gates), 1), else_=0) if gates else literal(0)).label('gated')
+    # The partition's times are only compared, never read, so they come back as the stored text
+    # rather than being turned into two datetimes per grouped showing.
+    ranked = _group_ranked_entries(scope, extra=[
+        EPGEntry.title.label('p_title'), type_coerce(EPGEntry.start_time, String).label('p_start'),
+        type_coerce(EPGEntry.stop_time, String).label('p_stop'), Channel.id.label('cid'), gated,
+        *[column for _pair, column in showing_columns]])
+    # Positions, not names: this loop is over every grouped showing in the search.
+    partitions, best, cid_of, tags_of, gated_entries = {}, {}, {}, {}, set()
+    for entry, group_id, title, start, stop, cid, is_gated, *tags, rn in (
+            db.session.execute(select(ranked))):
+        partitions.setdefault((group_id, title, start, stop), []).append((rn, entry))
+        if entry in cid_of:
+            best[entry] = min(best[entry], rn)
+            continue
+        best[entry] = rn
+        cid_of[entry] = cid
+        if tags:
+            tags_of[entry] = frozenset(pair for (pair, _column), hit
+                                       in zip(showing_columns, tags) if hit)
+        if is_gated:
+            gated_entries.add(entry)
+    # The collapse hides it, and nothing else would.
+    hidden = {entry for entry, rn in best.items() if rn > 1} - gated_entries
+    out = {key: {} for key in dim_keys}
+
+    # Asked even when nothing is hidden, so a page's statement count does not move with its
+    # data (tests/test_scaling_pages.py).
+    by_channel = {}
+    cids = set(cid_of.values())
+    channel_columns = []
+    if 'acct' in dim_keys:
+        channel_columns.append(('acct', None, Channel.account_id))
+    if 'cat' in dim_keys:
+        channel_columns.append(('cat', None, Channel.category_name))
+    if 'health' in dim_keys:
+        channel_columns.append(('health', None, health_band_expr(ctx.cfg)))
+    if 'other' in dim_keys:
+        channel_columns += [('other', value, case((_value_predicate('other', value, ctx), 1),
+                                                  else_=0))
+                            for value in OTHER_VALUES]
+    if channel_columns:
+        for cid, *got in (db.session.query(Channel.id, *[c for _k, _v, c in channel_columns])
+                          .filter(Channel.id.in_(cids))):
+            values = by_channel.setdefault(cid, set())
+            for (key, value, _column), answer in zip(channel_columns, got):
+                if value is None and answer is not None and answer != '':
+                    values.add((key, str(answer)))
+                elif value is not None and answer:
+                    values.add((key, value))
+    if 'group' in dim_keys:
+        for cid, name in (db.session.query(ChannelGroupMember.channel_id, ChannelGroup.name)
+                          .join(ChannelGroup, ChannelGroup.id == ChannelGroupMember.group_id)
+                          .filter(ChannelGroupMember.channel_id.in_(cids))):
+            by_channel.setdefault(cid, set()).add(('group', name))
+
+    if not hidden:
+        return out
+
+    def carried(entry):
+        return by_channel.get(cid_of[entry], frozenset()) | tags_of.get(entry, frozenset())
+
+    answers = {}
+    kept = set()
+    for members in partitions.values():
+        if len(members) < 2 or not any(entry in hidden for _rn, entry in members):
+            continue
+        members.sort()
+        first = set()
+        for _rn, entry in members:
+            if entry not in answers:
+                answers[entry] = carried(entry)
+            for pair in answers[entry] - first:
+                first.add(pair)
+                if entry in hidden:
+                    kept.add((entry, pair))
+    for _entry, (key, value) in kept:
+        out[key][value] = out[key].get(value, 0) + 1
+    return out

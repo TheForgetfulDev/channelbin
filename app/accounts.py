@@ -25,7 +25,7 @@ from io import BytesIO
 from typing import NamedTuple
 
 import requests
-from sqlalchemy import func, select, update
+from sqlalchemy import delete as sa_delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from .config import load_config, config_default
@@ -50,6 +50,7 @@ from .epg_sources import (
     apply_winners, case_sensitive_matching, channel_key, demote,
     directory_coverage, drop_alternates,
     ensure_provider_source, file_id_for, held_coverage, holding_rows, norm_key, promote,
+    retire_expired_listings,
     provider_xmltv_url, refresh_source_counts, resolve_row, sources_refreshed_by_sync,
     subscriber_ids, subscriptions_for, sources_without_directory, write_directory,
 )
@@ -1105,11 +1106,14 @@ def stop_sync_and_wait(account_id: int, reason: str, timeout: float) -> bool:
     and SQLite foreign keys are off, so it would go on inserting channels for an account
     that no longer exists.
 
-    A False is not a failure to escalate past. A sync now honors its stop event inside the
-    channel-upsert and EPG-import loops as well as between phases (dev/changelog/720), so
-    most cancels land in well under `timeout` - but a checkpoint can still be a batch commit
-    or a provider fetch away, and the caller is holding a delete that must not race a live
-    writer. Refusing and letting the caller retry stays the answer, not a longer wait.
+    A False is not a failure to escalate past. A sync honors its stop event inside the
+    channel-upsert and EPG-import loops as well as between phases (dev/changelog/720), and
+    measured on a simulated 60,000-channel account a cancel inside either loop lands in
+    under 0.2 s (dev/changelog/1478). What a cancel cannot interrupt is a provider download
+    and the work on what it returned before the next loop begins - 8 to 50 s on that
+    account, longer on a slow provider - and the caller is holding a delete that must not
+    race a live writer. Refusing and letting the caller retry stays the answer, not a wait
+    long enough to cover a download.
     """
     with _sync_locks_mutex:
         thread = _sync_threads.get(account_id)
@@ -1531,6 +1535,13 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
                 degraded.append(f'EPG source "{source.name}": {reason}')
         epg_degradation_reason = ' '.join(degraded) or None
         epg_log_notes = ' '.join(degraded + skipped + coverage_notes) or None
+        # Event channels are matched by their names, which change here and not at a guide import,
+        # and a sync can import no guide at all (design 6.8). Queued after the import's own request
+        # on purpose: the job's fixed id makes the two one run.
+        from .sports_match import run_needed
+        if run_needed():
+            from .scheduler import queue_sports_match
+            queue_sports_match(reason=f'account #{account_id} synced its channels')
 
         # "Removed this sync" = the immediate per-sync diff (channels the previous sync
         # touched that this one didn't) - not _raise_channel_lifecycle_alerts's delayed
@@ -3056,7 +3067,9 @@ def _refresh_source(source: EpgSource, timeout: int, epg_days: int, cfg: dict | 
     if reason:
         log.warning('XMLTV fetch failed for EPG source %d (%s): %s - listings kept',
                     source_id, source_name, reason)
-        _report_source_outcome(source_id, reason, None)
+        note = _report_source_outcome(source_id, reason, None, cfg=cfg)
+        if note and notes is not None:
+            notes.append(note)
         return 0, reason
     # The download is one blocking call, so this is the first moment a cancel issued during
     # it can land - and it lands before the import deletes anything.
@@ -3360,6 +3373,11 @@ def import_source(source: EpgSource, xml_bytes: bytes, epg_days: int,
     if result.lost_channel_ids is not None:
         from .auto_rules import queue_evaluation
         queue_evaluation(f'EPG source #{source_id} imported')
+        # And TheSportsDB's events are matched to it again, when anything is followed (design 6.6).
+        from .sports_match import run_needed
+        if run_needed():
+            from .scheduler import queue_sports_match
+            queue_sports_match(reason=f'EPG source #{source_id} imported')
     return result.synced, result.reason
 
 
@@ -3624,6 +3642,9 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
             sub_title = (sub_title_el.text or '').strip() if sub_title_el is not None else None
             category = (cat_el.text or '').strip() if cat_el is not None else None
             rating = (rating_el.text or '').strip() if rating_el is not None else None
+            # Empty elements: being there is the whole statement.
+            is_live = elem.find('live') is not None
+            is_new = elem.find('new') is not None
 
             for channel_id in channel_ids:
                 winner = winners.get(channel_id)
@@ -3632,7 +3653,8 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
                 row = {'channel_id': channel_id, 'source_id': source_id, 'title': title,
                        'description': description, 'sub_title': sub_title,
                        'start_time': start_dt, 'stop_time': stop_dt,
-                       'category': category, 'rating': rating}
+                       'category': category, 'rating': rating,
+                       'is_live': is_live, 'is_new': is_new}
                 if winner == source_id:
                     active_batch.append(row)
                     synced += 1
@@ -3713,9 +3735,10 @@ def _report_source_outcome(source_id: int, reason: str | None,
     """Write one refresh's outcome onto the source and raise or clear its alerts
     (DESIGN-epg-sources.md §9.1). The three refresh types are evaluated on every refresh, so
     whichever one is not this refresh's reason is auto-resolved if it was standing from an
-    earlier one. The coverage alert is evaluated only when the import got as far as
-    resolving winners (`lost_channel_ids` is not None): a refused or failed refresh changed
-    no channel's guide, so it can neither raise nor clear it.
+    earlier one. A loss inside an import is evaluated only when the import got as far as
+    resolving winners (`lost_channel_ids` is not None). A refused or failed refresh kept the
+    previous listings instead, and `_report_ran_out()` answers for the ones that have since
+    passed.
 
     Returns the sentence naming the channels left with no guide, or None when there were
     none. Every loss gets the sentence; only a loss of at least
@@ -3764,11 +3787,10 @@ def _report_source_outcome(source_id: int, reason: str | None,
         body=reason if truncated else '')
 
     if lost_channel_ids is None:
-        return None
+        # The previous listings were kept, and kept listings run out.
+        return _report_ran_out(source_id, name, cfg)
     n_lost = len(lost_channel_ids)
-    alert_pct = (cfg or {}).get('sync', {}).get(
-        'epg_coverage_lost_alert_percent', config_default('sync.epg_coverage_lost_alert_percent'))
-    alerting = bool(n_lost) and (alert_pct <= 0 or n_lost * 100 >= alert_pct * guided_before)
+    alert_pct, alerting = _coverage_loss_alerts(n_lost, guided_before, cfg)
     note = None
     if n_lost:
         share = f'{n_lost * 100 / guided_before:.1f}%' if guided_before else 'all'
@@ -3791,6 +3813,65 @@ def _report_source_outcome(source_id: int, reason: str | None,
     return note
 
 
+def _coverage_loss_alerts(n_lost: int, guided_before: int, cfg: dict | None) -> tuple[int, bool]:
+    """(sync.epg_coverage_lost_alert_percent, whether a loss of `n_lost` of `guided_before`
+    channels raises EPG_SOURCE_COVERAGE_LOST). One rule for both of its paths."""
+    alert_pct = (cfg or {}).get('sync', {}).get(
+        'epg_coverage_lost_alert_percent', config_default('sync.epg_coverage_lost_alert_percent'))
+    return alert_pct, bool(n_lost) and (alert_pct <= 0
+                                        or n_lost * 100 >= alert_pct * guided_before)
+
+
+def _report_ran_out(source_id: int, name: str, cfg: dict | None) -> str | None:
+    """After a refresh that kept a source's previous listings: retire what has run out
+    (epg_sources.retire_expired_listings()) and say what became of the channels that took
+    their guide from it. Returns the sentence, or None when nothing ran out.
+
+    A failed refresh used to say only that the listings were kept. Once they had all
+    passed, the channels on the source showed an empty guide with no alert, and a source
+    still holding listings for them was never tried (dev/docs/BUGS.md 2026-11-05 @ 07:25 PM). The
+    alert follows the same threshold as a loss inside an import, judged on every channel
+    the source has left with no guide since its last good refresh and not on this call's
+    alone: a file whose channels run out a few per failed refresh would otherwise stay
+    under it all the way to empty. A channel that moved to another source is in the
+    sentence and on its own page, and raises nothing."""
+    if cfg is None:
+        cfg = load_config()
+    ran_out = retire_expired_listings(source_id, case_sensitive_matching(cfg))
+    if not ran_out.channel_ids:
+        return None
+    moved = [cid for cid in ran_out.channel_ids if ran_out.outcome.get(cid)]
+    lost = [cid for cid in ran_out.channel_ids if not ran_out.outcome.get(cid)]
+    what = []
+    if moved:
+        what.append(f'{len(moved):,} now take their guide from another source')
+    if lost:
+        what.append(f'{len(lost):,} have no guide from any source now: {_named_sample(lost)}')
+    note = (f'EPG source "{name}" has not refreshed, and the listings it kept have all '
+            f'passed for {len(ran_out.channel_ids):,} channel(s) that took their guide from '
+            f'it. {"; ".join(what)}.')
+    if lost:
+        note += (f' In all {ran_out.dark_total:,} of the {ran_out.guided:,} channel(s) it was '
+                 'the guide for have none now.')
+    _pct, over = _coverage_loss_alerts(ran_out.dark_total, ran_out.guided, cfg)
+    alerting = bool(lost) and over
+    log.log(logging.WARNING if alerting else logging.INFO, '%s', note)
+    if alerting:
+        from .alerts import create_alert
+        create_alert(
+            'EPG_SOURCE_COVERAGE_LOST',
+            title=f'EPG source "{name}": its kept listings ran out for {len(lost):,} channel(s)',
+            body=(f'{note} The source keeps the listings from its last good refresh while a '
+                  'refresh fails, and those have now passed. The channels with no guide get '
+                  'one back when this source refreshes, or when another source the account '
+                  'reads lists them.'),
+            source=f'epg-source:{source_id}:coverage')
+    if moved:
+        from .auto_rules import queue_evaluation
+        queue_evaluation(f'EPG source #{source_id} ran out of listings')
+    return note
+
+
 #: How many channel names EPG_SOURCE_COVERAGE_LOST spells out before "and N more".
 _LOST_CHANNELS_NAMED = 10
 
@@ -3810,6 +3891,37 @@ _EPG_STATUS_BY_ALERT = {
 }
 
 
+#: Ended listings the daily cleanup deletes per transaction. One transaction for the lot held
+#: the write lock for 56-74 s on prod every night, long enough to outlast retry_on_locked's
+#: five 10 s waits; prod's write probe logged "database is locked" inside that window on 19
+#: nights (dev/docs/BUGS.md 2026-11-05 @ 08:14 PM). Measured on a copy of that database, cold, on
+#: the slower dev box, 823,000 rows: 67.8 s held in one transaction; 10,000 per chunk held
+#: 5.99 s at worst and took 130 s in all; 2,500 held 1.97 s at worst and took 157 s.
+EPG_CLEANUP_CHUNK_ROWS = 2_500
+
+
+def _delete_ended_listings(model, cutoff: datetime) -> int:
+    """Delete `model`'s rows that ended before `cutoff`, EPG_CLEANUP_CHUNK_ROWS per
+    transaction, so no other writer waits behind the whole delete. Returns how many went.
+    Re-runnable: each chunk is whatever still matches."""
+    total = 0
+    while True:
+        @retry_on_locked()
+        def _delete_chunk_and_commit():
+            ended = (select(model.id).where(model.stop_time < cutoff)
+                     .limit(EPG_CLEANUP_CHUNK_ROWS))
+            n = db.session.execute(
+                sa_delete(model).where(model.id.in_(ended))
+                .execution_options(synchronize_session=False)).rowcount
+            db.session.commit()
+            return n
+
+        n = _delete_chunk_and_commit()
+        total += n
+        if n < EPG_CLEANUP_CHUNK_ROWS:
+            return total
+
+
 def cleanup_old_epg_entries(app):
     """Delete EPG entries, active and alternate, older than sync.epg_keep_days (0 = keep
     forever), then rebuild the program index in full."""
@@ -3818,37 +3930,41 @@ def cleanup_old_epg_entries(app):
         keep_days = cfg.get('sync', {}).get('epg_keep_days', 1)
         if keep_days > 0:
             cutoff = datetime.utcnow() - timedelta(days=keep_days)
+            deleted = _delete_ended_listings(EPGEntry, cutoff)
+            # Same cutoff for the alternates (DESIGN-epg-sources.md §4), so the comparison
+            # view never shows a source's past that the guide itself has already dropped.
+            deleted_alt = _delete_ended_listings(EpgAlternateEntry, cutoff)
 
             @retry_on_locked()
-            def _delete_and_commit():
-                n = EPGEntry.query.filter(EPGEntry.stop_time < cutoff).delete(
-                    synchronize_session=False)
-                # Same cutoff for the alternates (DESIGN-epg-sources.md §4), so the comparison
-                # view never shows a source's past that the guide itself has already dropped.
-                n_alt = EpgAlternateEntry.query.filter(
-                    EpgAlternateEntry.stop_time < cutoff).delete(synchronize_session=False)
-                if n or n_alt:
-                    # The delete is global, so any stored count may now be stale. Recompute in
-                    # the same transaction (COUNT sees the pending delete) so the stored value
-                    # doesn't drift until the next full sync. Only a handful of accounts and
-                    # sources, once daily - not a per-row hot loop.
+            def _recount_and_commit():
+                # The delete is global, so any stored count may now be stale. A recompute,
+                # so a run that died before reaching it is put right by the next day's.
+                # Counted before anything is assigned and with autoflush off, so the write
+                # lock is taken at the commit and not held across the counting.
+                per_account = dict(
+                    db.session.query(Channel.account_id, func.count(EPGEntry.id))
+                    .join(EPGEntry, EPGEntry.channel_id == Channel.id)
+                    .group_by(Channel.account_id))
+                with db.session.no_autoflush:
                     for account in Account.query.all():
-                        account.epg_entry_count = EPGEntry.query.join(Channel).filter(
-                            Channel.account_id == account.id
-                        ).count()
+                        account.epg_entry_count = per_account.get(account.id, 0)
                     for (source_id,) in db.session.query(EpgSource.id).all():
                         refresh_source_counts(source_id)
                 db.session.commit()
-                return n
 
-            deleted = _delete_and_commit()
+            if deleted or deleted_alt:
+                _recount_and_commit()
             if deleted:
                 log.info('EPG cleanup: deleted %d entries older than %d day(s)', deleted,
                          keep_days)
-        # Every day, whatever was deleted and whatever epg_keep_days says: this is the one full
-        # rebuild a healthy install gets, because a sync only writes what changed. It is what
-        # compacts the segments those syncs leave behind and what repairs any drift a row count
-        # cannot see (dev/changelog/1416). Only the program index - channels are untouched here,
-        # and a channel rebuild is several seconds of held write lock for nothing.
+        # Every day, whatever was deleted and whatever epg_keep_days says: the listings that
+        # ended leave the program index as a difference, the way a sync's changes do, and then
+        # FTS5's incremental merge compacts the segments those passes leave behind
+        # (dev/changelog/1416, 1460). Not a full rebuild: emptying the whole index is the one
+        # step no documented FTS5 command does in bounded pieces. An index that is not known
+        # whole still gets the full rebuild, which only_changes falls back to by itself. Only
+        # the program index - a channel rebuild is several seconds of held write lock for
+        # nothing.
         from .search_index import rebuild_search_indexes, SEARCH_INDEX_PROGRAMS
-        rebuild_search_indexes('EPG cleanup', names=(SEARCH_INDEX_PROGRAMS,))
+        rebuild_search_indexes('EPG cleanup', names=(SEARCH_INDEX_PROGRAMS,),
+                               only_changes=True, compact=True)

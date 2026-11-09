@@ -256,6 +256,28 @@ class NameNoticeTests(_PageJs, unittest.TestCase):
         self.assertTrue(after['same_search_as_counted'])
         self.assertFalse(after['notice'])
 
+    def test_the_chip_it_leaves_reads_as_one_phrase(self):
+        """It read "Listings is None scheduled" (dev/changelog/1450)."""
+        chip = self.obs['listings_chip']
+        self.assertEqual(chip['text'], 'No scheduled listings')
+        self.assertEqual(chip['tip'], 'Channels with nothing in the guide that has not ended yet.')
+        self.assertFalse(chip['neg'])
+
+    def test_the_excluded_chip_reads_the_other_way_round_and_is_not_tinted(self):
+        """A red "Has scheduled listings" would read as the opposite of what it does."""
+        self.assertEqual(self.obs['listings_chip_excluded_errors'], [])
+        chip = self.obs['listings_chip_excluded']
+        self.assertEqual(chip['text'], 'Has scheduled listings')
+        self.assertEqual(chip['tip'],
+                         'Channels with something in the guide that has not ended yet.')
+        self.assertFalse(chip['neg'])
+
+    def test_the_parked_chip_on_programs_reads_as_the_phrase_too(self):
+        chip = self.obs['listings_chip_parked']
+        self.assertEqual(chip['text'], 'No scheduled listings')
+        self.assertTrue(chip['parked'])
+        self.assertIn('which is not the tab you are on', chip['tip'])
+
     def test_the_filter_stays_behind_on_programs_and_comes_back_with_channels(self):
         back = self.obs['back_on_programs']
         self.assertEqual(back['listings_sent'], [])
@@ -501,7 +523,8 @@ class SuggestionZeroResultTests(_PageJs, unittest.TestCase):
 
     def test_a_value_with_a_real_nonzero_count_is_still_suggested(self):
         self.assertIn('Alpha', self.obs['sugg_html_nonzero_count'])
-        self.assertIn('>4<', self.obs['sugg_html_nonzero_count'])
+        # All six of Alpha's channels: duplicates show by default (dev/changelog/1458).
+        self.assertIn('>6<', self.obs['sugg_html_nonzero_count'])
 
 
 class TableTests(_PageJs, unittest.TestCase):
@@ -1130,7 +1153,7 @@ class MobileSheetTests(_PageJs, unittest.TestCase):
         """They live in the URL and nowhere else (DESIGN-channel-search.md 5), so a
         toggle that only moved a local flag would give the address bar and the screen
         two different result sets."""
-        self.assertIn('showdup', self.obs['standing_after_toggle'])
+        self.assertIn('showhidden', self.obs['standing_after_toggle'])
 
     def test_the_three_state_survives_into_the_sheet(self):
         """Excluding a value is what the one-tap suggestion row down here deliberately
@@ -1685,7 +1708,7 @@ class DayTimeDimensionTests(_PageJs, unittest.TestCase):
         not counted, because each count would disagree with its own list. A column of bare
         `--` would be a number withheld for no stated reason (dev/docs/BUGS.md 2026-10-13
         03:38 PM)."""
-        self.assertEqual(self.obs['served_uncounted'], ['dow', 'duration', 'tag', 'tod', 'when'])
+        self.assertEqual(self.obs['served_uncounted'], ['dow', 'duration', 'mark', 'tag', 'tod', 'when'])
         self.assertEqual(len(self.obs['uncounted_notes']), 1, self.obs['uncounted_notes'])
         note = self.obs['uncounted_notes'][0]
         self.assertIn('Day of week', note)
