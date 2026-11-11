@@ -1570,6 +1570,9 @@ class WhenDimensionTests(_PageJs, unittest.TestCase):
         self.assertTrue(self.obs['caret_box_still_focused'])
         self.assertEqual(self.obs['caret_box_value'], '12')
         self.assertEqual(self.obs['when_after_two_digits'], ['next:12:hours'])
+        # Polled, never read after a flat sleep: Node runs a whole list of same-length
+        # timers before a shorter timer set earlier (dev/docs/BUGS.md 2026-11-10).
+        self.assertNotIn(self.obs.get('caret_redraw_waited_ms'), (None, -1))
         self.assertTrue(self.obs['caret_box_redrawn_after_blur'])
 
     def test_a_filter_the_other_grain_cannot_express_is_parked_not_dropped(self):
@@ -1683,6 +1686,7 @@ class DayTimeDimensionTests(_PageJs, unittest.TestCase):
         self.assertEqual(self.obs['pill_pop_first_chip'], ['dur:120..'])
         self.assertTrue(self.obs['pill_pop_kept_focus'])
         self.assertEqual(self.obs['pill_pop_two_digits'], ['dur:1440..'])
+        self.assertNotIn(self.obs.get('pill_move_waited_ms'), (None, -1))
         self.assertTrue(self.obs['pill_after_chips'])
         self.assertEqual(self.obs['pill_pop_errors'], [])
 

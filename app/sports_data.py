@@ -16,13 +16,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 
 import requests
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from . import db
 from .config import load_config
 from .database import (
-    REC_ENDED_STATUSES, RECORDING_SPORTS_LINKED, RECORDING_SPORTS_REMOVED, SPORTS_MATCH_KIND_GUIDE,
+    REC_ENDED_STATUSES, RECORDING_SPORTS_LINKED, RECORDING_SPORTS_REMOVED, SPORTS_MATCH_KIND_CHANNEL_NAME, SPORTS_MATCH_KIND_GUIDE,
     SPORTS_MATCH_STRONG, SPORTS_MATCH_WEAK, ChannelGroupMember, Recording, RecordingEvent, RecordingSports,
     add_recording_event,
     SPORTS_FETCH_EMPTY, SPORTS_FETCH_OK, SPORTS_FETCH_RATE_LIMITED, SPORTS_FETCH_REFUSED,
@@ -52,7 +52,7 @@ EMPTY_RECHECK_DAYS = 3
 REFUSED_RETRY_HOURS = 6
 MATCH_AFTER_REFRESH_SECONDS = 180
 
-#: The Add a league picks, in the order the dialog shows them: alphabetical. Names and numbers only,
+#: The Add league or team picks, in the order the dialog shows them: alphabetical. Names and numbers only,
 #: ChannelBin ships no event data (design 8), and following one is always the user's own click.
 SHIPPED_LEAGUES = (
     {'tsdb_id': 4328, 'name': 'English Premier League', 'sport': 'Soccer'},
@@ -712,37 +712,79 @@ def lookup_league(tsdb_id: int) -> dict:
         raise _failed_lookup(answer)
     if not answer.rows or not _int(answer.rows[0].get('idLeague')):
         raise LeagueNotFound(f'TheSportsDB has no league with the number {tsdb_id}.')
-    return _league_payload(answer.rows[0])
+    league = _league_payload(answer.rows[0])
+    if league['name'].startswith('_'):
+        raise LeagueNotFound(f'League {tsdb_id} is {league["name"]}, where TheSportsDB files teams that no longer '
+                             'play, so there are no games to follow.')
+    return league
 
 
-def search_teams(text: str) -> list:
-    """Find a team and its league with one call: the way in for most team sports (design 5). The
-    answer is itself the check of that league, since the one-call pace would refuse a second call
+def _team_payload(raw: dict):
+    """A team and its league from one `searchteams` or `lookupteam` row, or None without both ids.
+    The row is itself the check of that league, since the one-call pace would refuse a second call
     straight after it. The worker's first league call fills in the season and the alternate names."""
+    team_id, league_id = _int(raw.get('idTeam')), _int(raw.get('idLeague'))
+    if not (team_id and league_id):
+        return None
+    return {'team_id': team_id, 'team': _text(raw.get('strTeam')) or str(team_id),
+            'league': {'tsdb_id': league_id, 'name': _text(raw.get('strLeague')) or str(league_id),
+                       'sport': _text(raw.get('strSport')), 'season': None,
+                       'terms': [t for t in [_text(raw.get('strLeague'))] if t]}}
+
+
+def is_defunct(team: dict) -> bool:
+    """TheSportsDB files a team that no longer plays under a holding league whose name starts with
+    an underscore, such as `_Defunct American Football Teams` (4809) or `_Defunct Ice Hockey Teams`
+    (4810). No live league seen on the free key starts with one (dev/changelog/1497).
+    `lookup_league()` refuses such a league by number for the same reason."""
+    return team['league']['name'].startswith('_')
+
+
+def search_teams(text: str) -> tuple:
+    """Find a team and its league with one call: the way in for most team sports (design 5).
+    Returns (teams, defunct). A defunct team is never offered, and is handed back so the answer can
+    say it was found and why it was left out. The free key gives one row, its best match for the
+    name, never a list (measured 2026-11-10)."""
     answer = _person_call('searchteams', {'t': text}, 'teams')
     if answer.outcome != SPORTS_FETCH_OK:
         raise _failed_lookup(answer)
-    out = []
+    teams, defunct = [], []
     for raw in answer.rows:
-        team_id, league_id = _int(raw.get('idTeam')), _int(raw.get('idLeague'))
-        if team_id and league_id:
-            out.append({'team_id': team_id, 'team': _text(raw.get('strTeam')) or str(team_id),
-                        'league': {'tsdb_id': league_id, 'name': _text(raw.get('strLeague')) or str(league_id),
-                                   'sport': _text(raw.get('strSport')), 'season': None,
-                                   'terms': [t for t in [_text(raw.get('strLeague'))] if t]}})
-    return out
+        team = _team_payload(raw)
+        if team is not None:
+            (defunct if is_defunct(team) else teams).append(team)
+    return teams, defunct
+
+
+def lookup_team(tsdb_id: int) -> dict:
+    """Check a team link with one `lookupteam` call. The answer has the team's league, so following
+    it needs no `lookupleague` after it. A row for some other team is not this one."""
+    answer = _person_call('lookupteam', {'id': tsdb_id}, 'teams')
+    if answer.outcome != SPORTS_FETCH_OK:
+        raise _failed_lookup(answer)
+    team = _team_payload(answer.rows[0]) if answer.rows else None
+    if team is None or team['team_id'] != tsdb_id:
+        raise LeagueNotFound(f'TheSportsDB has no team with the number {tsdb_id}.')
+    if is_defunct(team):
+        raise LeagueNotFound(f'That link is to {team["team"]}, a defunct team, so there are no games to follow.')
+    return team
 
 
 _LEAGUE_LINK_RE = re.compile(r'thesportsdb\.com/league/(\d+)', re.I)
+_TEAM_LINK_RE = re.compile(r'thesportsdb\.com/team/(\d+)', re.I)
 
 
 def parse_entry(text: str) -> tuple:
-    """What was typed into Add a league: ('league', id), ('team', text), or ('badlink', text). The
-    number is read from a link, and the page itself is never fetched, since the terms bar scraping."""
+    """What was typed into Add league or team: ('league', id), ('teamlink', id), ('team', text), or
+    ('badlink', text). The number is read from a link, and the page itself is never fetched, since
+    the terms bar scraping."""
     text = (text or '').strip()
     m = _LEAGUE_LINK_RE.search(text)
     if m:
         return 'league', int(m.group(1))
+    m = _TEAM_LINK_RE.search(text)
+    if m:
+        return 'teamlink', int(m.group(1))
     if re.match(r'https?://', text, re.I) or 'thesportsdb.com' in text.lower():
         return 'badlink', text
     if text.isdigit():
@@ -821,13 +863,68 @@ def stop_following(league_id: int) -> bool:
     return True
 
 
+def _drop_queue_if_unfollowed(league_ids):
+    """Delete the queue rows of each league nothing follows any more, which stops its calls (design 3).
+    Inside the caller's commit unit, after its follow rows were changed and flushed."""
+    for league_id in league_ids:
+        if SportsFollow.query.filter_by(league_id=league_id).first() is None:
+            SportsFetch.query.filter_by(league_id=league_id).delete(synchronize_session=False)
+
+
+def set_rule_follow(rule_id: int, league_id, team_tsdb_id, now: datetime) -> bool:
+    """The follow an auto-record rule owns: the league it names, or one team in it, and nothing when
+    it names none (design 3, 10, dev/changelog/1490). Mutates without committing: the rule's own save
+    or delete is the commit unit, so the rule and its follow can never disagree. A league newly
+    followed has its queue rows registered in the same commit. Returns True when that happened, so the
+    caller starts the worker once the commit is done."""
+    before = {f.league_id for f in SportsFollow.query.filter_by(rule_id=rule_id).all()}
+    SportsFollow.query.filter_by(rule_id=rule_id).delete(synchronize_session=False)
+    added = False
+    if league_id:
+        league = db.session.get(SportsLeague, league_id)
+        if league is not None:
+            db.session.add(SportsFollow(league_id=league_id, team_tsdb_id=int(team_tsdb_id or 0),
+                                        rule_id=rule_id, created_at=now))
+            if SportsFetch.query.filter_by(league_id=league_id).first() is None:
+                _enqueue_league(league, now)
+                added = True
+    db.session.flush()
+    _drop_queue_if_unfollowed(before - {league_id})
+    return added
+
+
+class LeagueInUse(Exception):
+    """A league an auto-record rule names cannot be removed: the rule would silently stop being about
+    anything. The message names the rules."""
+
+
+def rules_naming(league_id: int) -> list:
+    """[(rule id, rule name)] of the auto-record rules that name this league, by name."""
+    from .database import AutoRule
+    return [(i, n) for i, n in db.session.query(AutoRule.id, AutoRule.name).filter(
+        AutoRule.sports_league_id == league_id).order_by(AutoRule.name, AutoRule.id).all()]
+
+
 @retry_on_locked()
 def delete_league(league_id: int) -> bool:
     """Remove the league and everything only it holds: follows, queue rows, events, and any team no
-    other league has events for. A recording's own snapshot is never touched (design 3)."""
-    league = db.session.get(SportsLeague, league_id)
-    if league is None:
+    other league has events for. A recording's own snapshot is never touched (design 3). Refused with
+    LeagueInUse while an auto-record rule names the league. The write lock is taken first, by a no-op
+    UPDATE of the league's row, so a rule saved while this decides is seen: a plain read runs outside
+    the write's transaction under pysqlite and would miss it."""
+    if not db.session.execute(update(SportsLeague).where(SportsLeague.id == league_id)
+                              .values(id=SportsLeague.id)
+                              .execution_options(synchronize_session=False)).rowcount:
+        db.session.rollback()
         return False
+    league = db.session.get(SportsLeague, league_id)
+    naming = rules_naming(league_id)
+    if naming:
+        db.session.rollback()
+        names = ', '.join(f'"{n}"' for _i, n in naming)
+        raise LeagueInUse(f'{"An auto-record rule names" if len(naming) == 1 else "Auto-record rules name"} '
+                          f'this league: {names}. Change {"it" if len(naming) == 1 else "them"} to name '
+                          'something else first.')
     SportsFollow.query.filter_by(league_id=league_id).delete(synchronize_session=False)
     SportsFetch.query.filter_by(league_id=league_id).delete(synchronize_session=False)
     SportsLeagueCategory.query.filter_by(league_id=league_id).delete(synchronize_session=False)
@@ -902,6 +999,32 @@ def recording_matches(rec, rejected: bool = False) -> list:
     return q.all()
 
 
+#: How near a channel-name match's game must start to a recording's program start to be the game
+#: that recording is: an event slot is renamed for the next game days later (design 6.8).
+NAME_LINK_WINDOW = timedelta(hours=3)
+
+
+def recording_name_matches(rec) -> list:
+    """For a recording with no guide listing - one an auto-record rule made from an event channel
+    (dev/changelog/1491), or one a person made on it - the strong channel-name matches on its
+    channels whose game starts near its program start. Not rejected."""
+    if rec.program_start_time is None:
+        return []
+    ids = recording_channel_ids(rec)
+    if not ids:
+        return []
+    rows = db.session.query(SportsMatch, SportsEvent.start_at).join(
+        SportsEvent, SportsEvent.id == SportsMatch.event_id).filter(
+        SportsMatch.kind == SPORTS_MATCH_KIND_CHANNEL_NAME, SportsMatch.channel_id.in_(ids),
+        SportsMatch.strength == SPORTS_MATCH_STRONG, SportsMatch.rejected_at.is_(None)).all()
+    out = []
+    for m, event_start in rows:
+        start = m.program_start_time or event_start
+        if start is not None and abs(start - rec.program_start_time) <= NAME_LINK_WINDOW:
+            out.append(m)
+    return out
+
+
 def pick_match(matches: list, wanted_title: str) -> tuple:
     """(match, ambiguous). Still listed beats gone, strong beats weak, and a match on the
     recording's own title wins a tie. Two events tied at the best still-listed strength is not a
@@ -960,6 +1083,8 @@ def _link_recording(recording_id: int) -> str:
     if existing is not None and existing.removed_at is not None:
         return LINK_REMOVED
     matches = recording_matches(rec, rejected=True)
+    if not matches:
+        matches = recording_name_matches(rec)
     live = [m for m in matches if m.rejected_at is None]
     match, ambiguous = pick_match(live, title_key(rec.program_title))
     if match is None and existing is not None:
@@ -1122,13 +1247,8 @@ def link_facts(link) -> str:
 
 
 # ---------------------------------------------------------------------------
-# A matched recording's file name (design 11, dev/changelog/1466)
+# TheSportsDB's fields in a recording's name (design 11, dev/changelog/1498)
 # ---------------------------------------------------------------------------
-
-def file_names_on(cfg: dict) -> bool:
-    """sports_data.file_names: name a matched recording's file from TheSportsDB. Off by default."""
-    return bool((cfg.get('sports_data') or {}).get('file_names', False))
-
 
 def link_has_time(link) -> bool:
     """Whether a link's start is a real time. A field event at exactly 00:00 has none: that is
@@ -1137,46 +1257,69 @@ def link_has_time(link) -> bool:
     return start is not None and (bool(link.home_name and link.away_name) or (start.hour, start.minute) != (0, 0))
 
 
-def file_name(link, tz) -> str | None:
-    """`League YYYY-MM-DD Event`, the shape of TheSportsDB's own strFilename and what Plex's sports
-    agents read, built from the link's fields. Never strFilename itself, whose date was wrong on 4 of
-    6 Truck rows. The league is TheSportsDB's name for it, since that is what an agent looks it up by,
-    even where a guide uses another (`NASCAR Xfinity Series`, not `NASCAR O'Reilly Auto Parts
-    Series`). The date is the event's day in the display timezone, or TheSportsDB's own date when it
-    gives no real time. None when the link has no date at all."""
+def event_day(link, tz):
+    """The event's day: in the display timezone when TheSportsDB gives a real time, else its own
+    date. Never from strTimeLocal or strFilename, whose date was wrong on 4 of 6 Truck rows. None
+    when the link has no date at all."""
     if link_has_time(link):
-        day = to_local(link.event_start, tz).date()
-    else:
-        day = link.local_date
-    if day is None:
-        return None
-    return f'{link.league_name} {day.isoformat()} {link.event_name}'
+        return to_local(link.event_start, tz).date()
+    return link.local_date
 
 
-def recording_file_name(rec, cfg: dict, tz) -> tuple:
-    """(name, note): what the join names a recording's file, and the sentence its event carries
-    about that, or None to say nothing. With sports_data.file_names off, or no link, the recording's
-    own name and nothing said. A link a person removed keeps the recording's own name and says so.
+def template_values(link, tz) -> dict:
+    """{field: text} for the filename template's {sports:field} placeholders
+    (accounts.SPORTS_TEMPLATE_FIELDS). The league is TheSportsDB's name for it, since that is what
+    a media server's sports agent looks it up by, even where a guide uses another. A round outside
+    1 to 99 is one of TheSportsDB's codes for a preseason or playoff round, as in link_facts()."""
+    day = event_day(link, tz)
+    return {
+        'league': link.league_name or '',
+        'event': link.event_name or '',
+        'home': link.home_name or '',
+        'away': link.away_name or '',
+        'season': link.season or '',
+        'round': str(link.round) if link.round and 0 < link.round < 100 else '',
+        'venue': link.venue or '',
+        'city': link.city or '',
+        'date': day.isoformat() if day else '',
+        'start_time': to_local(link.event_start, tz).strftime('%H%M') if link_has_time(link) else '',
+    }
+
+
+def recording_file_name(rec, tz) -> tuple:
+    """(name, note): what the join names a recording, and the sentence its event carries about
+    that, or None to say nothing.
+
+    Only a recording whose name came from a filename template with {sports:...} fields carries
+    Recording.sports_name_template; any other keeps its own name and nothing is said. One that
+    does gets those fields filled from its TheSportsDB event, or left empty when it has none or a
+    person removed it, and the note says which. Its name is checked against the template's
+    empty rendering first, so a name changed since it was scheduled is never rewritten, whichever
+    path changed it.
 
     Read-only, and it never raises: the join is one step from a recording's only file, and a
     name is never worth losing that."""
+    from .accounts import fill_sports_fields, sports_name_matches
     own = rec.name
-    if not file_names_on(cfg):
+    pending = rec.sports_name_template
+    if not pending:
         return own, None
+    if not sports_name_matches(own, pending, rec.program_title or ''):
+        return own, ('its name was changed after it was scheduled, so its TheSportsDB fields were '
+                     'not filled in')
     try:
         link = db.session.get(RecordingSports, rec.id)
     except SQLAlchemyError:
         db.session.rollback()
-        log.warning('Recording %d: could not read its TheSportsDB event, so its file keeps its own name',
-                    rec.id, exc_info=True)
-        return own, 'its TheSportsDB event could not be read, so the file keeps the recording\'s own name'
+        log.warning('Recording %d: could not read its TheSportsDB event, so its TheSportsDB fields '
+                    'stay empty', rec.id, exc_info=True)
+        return own, 'its TheSportsDB event could not be read, so its TheSportsDB fields are empty'
     if link is None:
-        return own, None
+        return own, 'no TheSportsDB event was matched, so its TheSportsDB fields are empty'
     if link.removed_at is not None:
-        return own, (f'not named from TheSportsDB\'s {link.league_name} event, since its match was '
-                     f'removed')
-    name = file_name(link, tz)
-    if not name:
-        return own, None
+        return own, (f'its match to TheSportsDB\'s {link.league_name} event was removed, so its '
+                     f'TheSportsDB fields are empty')
+    name = fill_sports_fields(pending, template_values(link, tz)) or own
     weak = '' if link.strength == SPORTS_MATCH_STRONG else ', a weak match'
-    return name, f'named from TheSportsDB\'s {link.league_name} event "{event_title(link)}"{weak}'
+    return name, (f'TheSportsDB fields filled from its {link.league_name} event '
+                  f'"{event_title(link)}"{weak}')

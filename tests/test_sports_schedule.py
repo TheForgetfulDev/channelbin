@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support.fake_sportsdb import (  # noqa: E402
-    FIELD_LEAGUE_ID, LEAGUE_ID, FakeSportsDB, game, race, team_row,
+    FIELD_LEAGUE_ID, LEAGUE_ID, FakeSportsDB, game, league_row, race, team_row,
 )
 
 from app import db  # noqa: E402
@@ -89,8 +89,17 @@ class NothingFollowedTests(SportsCase):
     def test_the_page_says_no_calls_are_being_made(self):
         text = self.client.get('/sports').get_data(as_text=True)
         self.assertIn('No leagues followed', text)
-        self.assertIn('making no calls', text)
+        self.assertIn('where each event is in your guide', text)
         self.assertEqual(self.fake.calls, [])
+
+    def test_the_about_text_says_the_schedule_is_matched_to_the_guide(self):
+        """The About panel said the schedule was "not matched to your guide listings yet" long
+        after matching shipped (dev/changelog/1500)."""
+        text = self.client.get('/sports').get_data(as_text=True)
+        about = text[text.index('class="page-about"'):text.index('id="sports-body"')]
+        self.assertNotIn('not matched', about)
+        self.assertIn('checks each event against your', about)
+        self.assertIn('{sports:league}', about)
 
 
 class AnswerShapeTests(SportsCase):
@@ -576,14 +585,86 @@ class AddingALeagueTests(SportsCase):
         self.assertEqual(sports_data.parse_entry('https://www.thesportsdb.com/league/4391-NFL'), ('league', 4391))
         self.assertEqual(sports_data.parse_entry(' 4387 '), ('league', 4387))
         self.assertEqual(sports_data.parse_entry('Boston Bruins'), ('team', 'Boston Bruins'))
-        self.assertEqual(sports_data.parse_entry('https://www.thesportsdb.com/team/1-X')[0], 'badlink')
+        self.assertEqual(sports_data.parse_entry('https://www.thesportsdb.com/team/134936-philadelphia-eagles'),
+                         ('teamlink', 134936))
+        self.assertEqual(sports_data.parse_entry('https://www.thesportsdb.com/player/1-X')[0], 'badlink')
         self.assertEqual(sports_data.parse_entry('https://example.test/x')[0], 'badlink')
 
-    def test_a_link_to_something_else_says_so_with_no_call(self):
-        r = self.post(text='https://www.thesportsdb.com/team/1-X')
+    def test_a_link_to_something_else_names_both_shapes_with_no_call(self):
+        r = self.post(text='https://www.thesportsdb.com/player/1-X')
         self.assertEqual(r.status_code, 400)
-        self.assertIn('not a league', r.get_json()['error'])
+        error = r.get_json()['error']
+        self.assertIn('not a league or a team', error)
+        self.assertIn('thesportsdb.com/league/', error)
+        self.assertIn('thesportsdb.com/team/', error)
         self.assertEqual(self.fake.calls, [])
+
+    def test_a_team_link_finds_the_team_and_its_league_in_one_call(self):
+        """dev/changelog/1497: a pasted team link does what typing the team's name and picking it does."""
+        self.fake.teams[11] = team_row(11, 'Pretendville Reds', 'Reds')
+        body = self.post(text='https://www.thesportsdb.com/team/11-pretendville-reds').get_json()
+        self.assertEqual(body['team']['team_id'], 11)
+        self.assertEqual(body['league']['tsdb_id'], LEAGUE_ID)
+        self.assertFalse(body.get('best_match'))
+        self.assertEqual([c[0] for c in self.fake.calls], ['lookupteam'])
+        # Following it needs no second call: the team row was the check of its league.
+        r = self.client.post('/api/sports/leagues', json={'tsdb_id': LEAGUE_ID, 'team_id': 11})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual([c[0] for c in self.fake.calls], ['lookupteam'])
+        self.assertEqual(SportsLeague.query.count(), 1)
+
+    def test_a_team_link_to_no_such_team_says_so(self):
+        r = self.post(text='https://www.thesportsdb.com/team/424242-nobody')
+        self.assertEqual(r.status_code, 404)
+        self.assertIn('no team with the number 424242', r.get_json()['error'])
+
+    def test_a_team_link_answered_with_some_other_team_is_not_that_team(self):
+        self.fake.answer_overrides = {'lookupteam': {'teams': [team_row(12, 'Reds Reserves')]}}
+        r = self.post(text='https://www.thesportsdb.com/team/11-pretendville-reds')
+        self.assertEqual(r.status_code, 404)
+        self.assertIn('no team with the number 11', r.get_json()['error'])
+
+    def test_a_team_link_to_a_defunct_team_says_so(self):
+        self.fake.teams[13] = team_row(13, 'Pretendville Soul', league=4809, league_name='_Defunct Pretend Ball Teams')
+        r = self.post(text='https://www.thesportsdb.com/team/13-pretendville-soul')
+        self.assertEqual(r.status_code, 404)
+        self.assertIn('Pretendville Soul, a defunct team', r.get_json()['error'])
+
+    def test_a_name_whose_best_match_is_defunct_says_what_was_found_and_why(self):
+        """dev/changelog/1497: `philadelphia` gave Philadelphia Soul, in `_Defunct American Football Teams`."""
+        self.fake.team_search['pretendville'] = [
+            team_row(13, 'Pretendville Soul', league=4809, league_name='_Defunct Pretend Ball Teams')]
+        r = self.post(text='Pretendville')
+        self.assertEqual(r.status_code, 404)
+        error = r.get_json()['error']
+        self.assertIn('best match for "Pretendville" is Pretendville Soul, a defunct team', error)
+        self.assertIn('Type more of the name', error)
+
+    def test_a_defunct_team_is_never_offered_beside_live_ones_and_is_named(self):
+        self.fake.team_search['reds'] = [team_row(11, 'Pretendville Reds'),
+                                         team_row(13, 'Old Reds', league=4809, league_name='_Defunct Pretend Ball Teams')]
+        body = self.post(text='Reds').get_json()
+        self.assertEqual(body['team']['team_id'], 11)
+        self.assertEqual(body['skipped'], ['Old Reds'])
+
+    def test_a_defunct_teams_holding_league_cannot_be_followed_by_number(self):
+        self.fake.leagues[4809] = league_row(4809, '_Defunct Pretend Ball Teams')
+        r = self.post(text='4809')
+        self.assertEqual(r.status_code, 404)
+        self.assertIn('_Defunct Pretend Ball Teams, where TheSportsDB files teams that no longer play', r.get_json()['error'])
+
+    def test_several_defunct_matches_are_all_named(self):
+        self.fake.team_search['reds'] = [
+            team_row(13, 'Old Reds', league=4809, league_name='_Defunct Pretend Ball Teams'),
+            team_row(14, 'Older Reds', league=4809, league_name='_Defunct Pretend Ball Teams')]
+        error = self.post(text='Reds').get_json()['error']
+        self.assertIn('found only defunct teams for "Reds" (Old Reds and Older Reds), so they are left out', error)
+
+    def test_only_a_name_search_is_marked_a_best_match(self):
+        self.fake.team_search['pretendville reds'] = [team_row(11, 'Pretendville Reds', 'Reds')]
+        self.assertTrue(self.post(text='Pretendville Reds').get_json()['best_match'])
+        self.clear_pace()
+        self.assertNotIn('best_match', self.post(tsdb_id=LEAGUE_ID).get_json())
 
     def test_a_number_finds_its_league_and_saves_nothing(self):
         body = self.post(text=str(LEAGUE_ID)).get_json()

@@ -1066,10 +1066,11 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
             # the plain `{safe_name}.ts` can already be occupied by an earlier same-named
             # recording - directly, or via the converted sibling it left behind
             # (dev/changelog/643).
-            # A matched game may be named from TheSportsDB instead (dev/changelog/1466). Decided
-            # here, when the file is first written, so a match that arrived after the recording
-            # was scheduled still counts, and a finished file is never renamed.
-            file_stem, name_note = recording_file_name(rec, cfg, get_display_tz())
+            # A name whose template has {sports:...} fields gets them filled from the recording's
+            # TheSportsDB event here, when the file is first written, so a match that arrived
+            # after the recording was scheduled still counts, and a finished file is never
+            # renamed (dev/changelog/1498).
+            file_stem, name_note = recording_file_name(rec, get_display_tz())
             safe_name = _safe_name(file_stem)
             output_path = reserve_concat_output_path(
                 dvr_dir, safe_name, output_extension_family(cfg))
@@ -1201,8 +1202,17 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
 
                 @retry_on_locked()
                 def _mark_concat_done_and_commit():
-                    rec.output_path = output_path
-                    rec.final_file_size = final_size
+                    r = db.session.get(Recording, recording_id)
+                    r.output_path = output_path
+                    r.final_file_size = final_size
+                    # The recording takes the name its file got, so the app and the file agree,
+                    # and its TheSportsDB fields are settled: nothing fills them in again.
+                    renamed_to = ''
+                    if r.sports_name_template is not None:
+                        if file_stem != r.name:
+                            renamed_to = f' - the recording is now named "{file_stem}", was "{r.name}"'
+                            r.name = file_stem
+                        r.sports_name_template = None
                     # A file that landed under a different name than the recording is called
                     # has to be explainable afterwards, so the rename is named here rather
                     # than left for the user to notice in the output path.
@@ -1219,6 +1229,7 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                     add_recording_event(recording_id, CONCATENATION_DONE,
                                         detail=f'Concat complete: {output_path} ({_fmt_bytes(final_size)})'
                                                + (f' - {name_note}' if name_note else '')
+                                               + renamed_to
                                                + (f' - renamed, {renamed_from} was already taken'
                                                   if renamed_from else '')
                                                + (' - starting post-processing' if doing_postprocess else ''))

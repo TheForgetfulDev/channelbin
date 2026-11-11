@@ -495,6 +495,10 @@ channel_testing:
   # through weeks of hard failures, which is what the streak catches.
   failing_band: poor                     # this band and every band below it = failing; 'none' = only hard test failures count
   failing_streak_threshold: 3            # this many consecutive failed tests = failing; 0 = disabled
+  # A format strategy (Highest bitrate, Balanced) ranks each channel's bitrate as the median
+  # of its own healthy, same-format health checks inside this many days, not its single
+  # latest check - one check can swing 43% on the same feed a day apart. 0 = latest check only.
+  bitrate_window_days: 14
   recording_score:
     fail_floor: 5
     near_empty_bitrate_ratio: 0.20
@@ -528,7 +532,6 @@ sports_data:                             # the schedules on the Sports Schedules
   horizon_days: 21                       # how far ahead a schedule is kept
   history_keep_days: 30                  # how long a past game is kept
   download_images: true                  # a matched recording's poster and background, for media servers
-  file_names: false                      # name a matched recording's file League YYYY-MM-DD Event
 
 auto_scheduling:                         # auto-record rules
   default_max_upcoming: 10               # per-rule cap on scheduled recordings when a rule sets none; 0 = uncapped

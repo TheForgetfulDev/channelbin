@@ -838,11 +838,8 @@
          'A past game is deleted this long after it happened.',
          sportscfg.get('history_keep_days', 30), tier='advanced') }}
       {{ field_bool('sports_data.download_images', 'Download posters and backgrounds',
-         'For a recording matched to a TheSportsDB event, download the event\'s poster and background once and use them in the files written beside the recording for Plex, Jellyfin and Kodi. An image pinned to the recording\'s profile still comes first. Off, nothing is downloaded, none already downloaded is used, and the poster is a frame from the program.',
+         'For a recording matched to a TheSportsDB event, download the event\'s poster and background once and use them in the files written beside the recording for Plex, Jellyfin and Kodi. An image pinned to the recording\'s profile still comes first, unless the profile is set to use TheSportsDB\'s poster when the game has one. Off, nothing is downloaded, none already downloaded is used, and the poster is a frame from the program.',
          sportscfg.get('download_images', true), tier='advanced') }}
-      {{ field_bool('sports_data.file_names', 'Name matched games from TheSportsDB',
-         'Name the file of a recording matched to a TheSportsDB event from the event: its league, its date and its name, such as "NASCAR Cup Series 2026-11-01 Xfinity 500", the way Plex\'s sports agents read it. This takes the place of the filename template, and of a name typed for the recording, for those recordings only. It is decided when the recording is saved, so a match found after it was scheduled still counts, and a file already saved is never renamed. A recording with no match, or whose match you removed, keeps its own name, and its page says so before it is saved.',
-         sportscfg.get('file_names', false), tier='advanced') }}
       </div>
     {% endcall %}
 

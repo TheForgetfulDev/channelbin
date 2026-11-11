@@ -585,6 +585,19 @@ class NameTests(_RetrackCase):
         self.assertEqual(r.name, 'My race')
         self.assertEqual(r.program_start_time, new_air)
 
+    def test_a_rules_name_keeps_its_thesportsdb_fields_for_the_join_through_a_move(self):
+        """The rule made the name, so its {sports:...} fields are the template's to fill at the
+        join, before and after the rename (dev/changelog/1498)."""
+        with _template('{sports:league} ' + self.TEMPLATE):
+            rid, rec = self.scheduled()
+            self.assertEqual(rec.sports_name_template, f'{{sports:league}} {self._clock(self.t0)} Cup Race')
+            new_air = self.t0 + timedelta(hours=2)
+            self.move(self.entry, new_air)
+            self.evaluate(rid)
+        r = self.rec(rec.id)
+        self.assertEqual(r.name, f'{self._clock(new_air)} Cup Race')
+        self.assertEqual(r.sports_name_template, f'{{sports:league}} {self._clock(new_air)} Cup Race')
+
     def test_a_row_that_never_recorded_a_name_never_renames(self):
         """A row written before rule_matches.rec_name existed carries NULL: nothing says the
         name is still the rule's, so it is left alone."""

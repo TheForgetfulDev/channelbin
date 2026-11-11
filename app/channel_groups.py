@@ -8,9 +8,12 @@ created from it resolve to the highest-scored member at record start
 """
 import collections
 import json
+import logging
 import math
 import re
 import statistics
+
+from .fmt_utils import iso_or_none
 
 # Ranking-only neutral score for members that have never been observed. Display
 # code deliberately shows "untested" instead (e.g. routes/channels.py channel
@@ -22,6 +25,11 @@ UNSCORED_NEUTRAL = 50
 # own default (app/config.py _DEFAULTS). Callers that already have cfg loaded pass the
 # live configured value explicitly; this is the fallback for the few that don't.
 DEFAULT_FAILING_STREAK_THRESHOLD = 3
+# How far back a channel's own health checks feed its bitrate for a format ranking
+# (`channel_testing.bitrate_window_days`). One check is a noisy snapshot - the same feed
+# measured 5659 kbps one night and 3234 the next - and members on different test
+# schedules were compared one snapshot each, taken weeks apart (dev/changelog/1487).
+DEFAULT_BITRATE_WINDOW_DAYS = 14
 
 # Suggest-candidates ranking order, shared with app/routes/channel_groups.py::suggest -
 # lower is better/stronger. A candidate matched by both epg_id and name outranks an
@@ -347,16 +355,61 @@ def healthy_channels(channels, latest_by_channel) -> list:
             if _test_status_label(latest_by_channel.get(ch.id)) in HEALTHY_TEST_LABELS]
 
 
-def format_buckets(channels, latest_by_channel, rank_ids=None) -> list:
+def _channel_measurement(channel_id, test, window_by_channel):
+    """One channel's bitrate and bits-per-pixel for a format ranking, with the times of
+    the health checks they came from: `(bitrate_kbps, bpp, [test_started_at...], n)`.
+
+    The median of the channel's own healthy checks inside the recency window that measured
+    the SAME format as its latest check, its latest check alone when it has none - nothing
+    is ever dropped to None for being old. One check is a noisy snapshot (a 43% swing on
+    one feed a day apart), and the window is what stops a bucket measured on a bad night
+    losing to one measured on a good night three weeks earlier (dev/changelog/1487).
+
+    Same format only, because bitrate scales with the picture: a channel now at 720p30
+    whose window holds last week's 1080p60 readings would carry a 720p bucket's median up
+    on 1080p numbers, which is the non-comparable figure the window exists to remove.
+    Healthy only (PASS or WARN), because a FAILED check stores the bitrate of whatever it
+    captured before the verdict - a provider's offline clip, a stalled capture."""
+    from .routes.channel_tests import _test_status_label
+    key = format_key(test)
+    window = [t for t in (window_by_channel or {}).get(channel_id) or []
+              if format_key(t) == key and _test_status_label(t) in HEALTHY_TEST_LABELS]
+    rates = [t.bitrate_kbps for t in window if t.bitrate_kbps is not None]
+    if rates:
+        bpps = [t.bits_per_pixel_frame for t in window if t.bits_per_pixel_frame is not None]
+        times = [t.test_started_at for t in window
+                 if getattr(t, 'test_started_at', None) is not None]
+        return (statistics.median(rates),
+                statistics.median(bpps) if bpps else test.bits_per_pixel_frame,
+                times, len(rates))
+    started = getattr(test, 'test_started_at', None)
+    return (test.bitrate_kbps, test.bits_per_pixel_frame,
+            [started] if started is not None else [],
+            1 if test.bitrate_kbps is not None else 0)
+
+
+def format_buckets(channels, latest_by_channel, rank_ids=None, window_by_channel=None) -> list:
     """Healthy channels grouped by video format (format_key) - one bucket per distinct
     (resolution, fps). A channel with an unknown format is dropped; a bucket needs a
     known format to be selectable. Each bucket:
       {'key', 'label', 'resolution', 'fps', 'pixels', 'channel_ids', 'count',
        'pass_count', 'warn_count', 'median_bitrate_kbps', 'median_bpp',
-       'rank_count', 'rank_median_bitrate_kbps', 'rank_median_bpp'}
+       'rank_count', 'rank_median_bitrate_kbps', 'rank_median_bpp',
+       'rank_measurement_count', 'rank_measured_from', 'rank_measured_to',
+       'rank_measured_span_days'}
     'pixels' = width * height parsed off the resolution string (so each strategy's sort
     key doesn't re-parse it). Medians are statistics.median over non-None values, None
     when the bucket has none - never silently substitute a number. Pure/DB-free.
+
+    **The format is the latest check's; the bitrate is the window's.** `latest_by_channel`
+    decides which bucket a channel sits in and whether it is healthy - what the feed
+    measures NOW. `window_by_channel` (channel_id -> that channel's checks inside
+    `channel_testing.bitrate_window_days`, any job) feeds each channel's bitrate and
+    bits-per-pixel as a median over its own recent checks, through _channel_measurement();
+    None ranks every channel on its latest check alone, as before the window existed. The
+    `rank_measured_*` fields say what the ranking rested on - how many checks, and how far
+    apart the oldest and newest were - so a lock that moved on measurements weeks apart
+    says so rather than reading as a change in the feeds (dev/changelog/1487).
 
     **The bucket answers two different questions and keeps them apart.** `count`,
     `channel_ids` and `median_*` describe every channel handed in: that is the MEMBERSHIP
@@ -382,7 +435,8 @@ def format_buckets(channels, latest_by_channel, rank_ids=None) -> list:
         key = format_key(test)
         if key is None:
             continue
-        by_key.setdefault(key, []).append((ch, test, label))
+        bitrate, bpp, times, n = _channel_measurement(ch.id, test, window_by_channel)
+        by_key.setdefault(key, []).append((ch, label, bitrate, bpp, times, n))
 
     def _median(values):
         return statistics.median(values) if values else None
@@ -391,27 +445,30 @@ def format_buckets(channels, latest_by_channel, rank_ids=None) -> list:
     for key, rows in by_key.items():
         res, fps = key
         ranked = rows if rank_ids is None else [r for r in rows if r[0].id in rank_ids]
+        rank_times = [t for row in ranked for t in row[4]]
+        measured_from = min(rank_times) if rank_times else None
+        measured_to = max(rank_times) if rank_times else None
         buckets.append({
             'key': key,
             'label': format_label(key),
             'resolution': res,
             'fps': fps,
             'pixels': resolution_pixels(res),
-            'channel_ids': [ch.id for ch, _t, _l in rows],
+            'channel_ids': [row[0].id for row in rows],
             'count': len(rows),
-            'pass_count': sum(1 for _ch, _t, lbl in rows if lbl == 'PASS'),
-            'warn_count': sum(1 for _ch, _t, lbl in rows if lbl != 'PASS'),
-            'median_bitrate_kbps': _median(
-                [t.bitrate_kbps for _ch, t, _l in rows if t.bitrate_kbps is not None]),
-            'median_bpp': _median(
-                [t.bits_per_pixel_frame for _ch, t, _l in rows
-                 if t.bits_per_pixel_frame is not None]),
+            'pass_count': sum(1 for row in rows if row[1] == 'PASS'),
+            'warn_count': sum(1 for row in rows if row[1] != 'PASS'),
+            'median_bitrate_kbps': _median([row[2] for row in rows if row[2] is not None]),
+            'median_bpp': _median([row[3] for row in rows if row[3] is not None]),
             'rank_count': len(ranked),
             'rank_median_bitrate_kbps': _median(
-                [t.bitrate_kbps for _ch, t, _l in ranked if t.bitrate_kbps is not None]),
-            'rank_median_bpp': _median(
-                [t.bits_per_pixel_frame for _ch, t, _l in ranked
-                 if t.bits_per_pixel_frame is not None]),
+                [row[2] for row in ranked if row[2] is not None]),
+            'rank_median_bpp': _median([row[3] for row in ranked if row[3] is not None]),
+            'rank_measurement_count': sum(row[5] for row in ranked),
+            'rank_measured_from': iso_or_none(measured_from),
+            'rank_measured_to': iso_or_none(measured_to),
+            'rank_measured_span_days': (round((measured_to - measured_from).total_seconds()
+                                              / 86400) if rank_times else None),
         })
     return buckets
 
@@ -523,18 +580,46 @@ def _format_strategy_entry(strategy, buckets):
         rationale = (f'{channels_txt} at {bitrate_txt}, the highest bitrate among formats '
                      f'holding at least {int(BALANCED_COVERAGE_FLOOR * 100)}% as many '
                      f'recordable channels as the largest')
+    # The two strategies that rank on bitrate say what the bitrate rested on. A bucket
+    # measured on one bad night and a bucket measured on a good night three weeks earlier
+    # are not comparable, and a lock that moved on that difference reads as the feeds
+    # changing unless the sentence names the spread (dev/changelog/1487).
+    from .database import GROUP_FORMAT_HIGHEST_BITRATE, GROUP_FORMAT_BALANCED
+    if strategy in (GROUP_FORMAT_HIGHEST_BITRATE, GROUP_FORMAT_BALANCED) and bitrate is not None:
+        rationale += '; ' + _measurement_clause(winner)
     return {'key': winner['key'], 'label': winner['label'], 'resolution': winner['resolution'],
             'fps': winner['fps'], 'channel_ids': winner['channel_ids'],
             'count': winner['count'], 'rank_count': winner['rank_count'],
             'pass_count': winner['pass_count'], 'warn_count': winner['warn_count'],
+            'measurement_count': winner['rank_measurement_count'],
+            'measured_from': winner['rank_measured_from'],
+            'measured_to': winner['rank_measured_to'],
+            'measured_span_days': winner['rank_measured_span_days'],
             'rationale': rationale}
 
 
-def plan_format_selection(channels, latest_by_channel, rank_ids=None) -> dict:
+def _measurement_clause(bucket) -> str:
+    """The age spread of what a bitrate ranking rested on - "the bitrate is the median of
+    61 health checks spanning 21 days" - relative rather than dated so it needs no timezone
+    and reads the same in an event written months ago."""
+    n = bucket['rank_measurement_count']
+    checks = f'{n} health check{"" if n == 1 else "s"}'
+    span = bucket['rank_measured_span_days']
+    if span is None:
+        return f'the bitrate is the median of {checks}'
+    if span < 1:
+        return f'the bitrate is the median of {checks}, all within one day'
+    return (f'the bitrate is the median of {checks} spanning {span} '
+            f'day{"" if span == 1 else "s"}')
+
+
+def plan_format_selection(channels, latest_by_channel, rank_ids=None,
+                          window_by_channel=None) -> dict:
     """The auto-select-format engine: for each of FORMAT_STRATEGIES, which format wins
     and why. Returns {'buckets', 'eligible_count', 'excluded_count', 'total',
     'rank_total', 'strategies': {strategy: entry, ...}}. Pure/DB-free - the caller
-    supplies the test map (channel_id -> latest ChannelTest). See format_buckets for what
+    supplies the test map (channel_id -> latest ChannelTest) and the recency window's
+    tests (`window_by_channel`, see format_buckets). See format_buckets for what
     counts as healthy, how buckets are built and what `rank_ids` narrows, and
     _format_sort_key for the deterministic tie-break per strategy.
 
@@ -543,7 +628,8 @@ def plan_format_selection(channels, latest_by_channel, rank_ids=None) -> dict:
     and a surface that shows one as if it were the other is describing a group the user
     does not have."""
     total = len(channels)
-    buckets = format_buckets(channels, latest_by_channel, rank_ids=rank_ids)
+    buckets = format_buckets(channels, latest_by_channel, rank_ids=rank_ids,
+                             window_by_channel=window_by_channel)
     eligible_count = sum(b['count'] for b in buckets)
     return {
         'buckets': buckets,
@@ -2195,10 +2281,17 @@ def apply_lock_and_log(group, strategy, entry):
             'from': list(old_key) if old_key else None,
             'to': list(new_key) if new_key else None,
             'matched': entry['count'],
+            # What the bitrate rested on: how many health checks, oldest and newest
+            # (naive UTC isoformat), so a move on stale-versus-fresh data can be told
+            # apart from a feed that changed (dev/changelog/1487).
+            'measurements': entry.get('measurement_count'),
+            'measured_from': entry.get('measured_from'),
+            'measured_to': entry.get('measured_to'),
         })))
 
 
-def strategy_lock_plan(group, members, latest_by_channel, rank_ids=None) -> dict:
+def strategy_lock_plan(group, members, latest_by_channel, rank_ids=None,
+                       window_by_channel=None) -> dict:
     """What `group`'s standing format strategy would do to its lock right now - layer 1
     of the three-layer story (DESIGN-channel-groups-model.md 4.4, 5).
 
@@ -2220,12 +2313,31 @@ def strategy_lock_plan(group, members, latest_by_channel, rank_ids=None) -> dict
     strategy = group.format_strategy
     if strategy not in FORMAT_STRATEGIES:
         return {'strategy': strategy, 'manages_lock': False, 'entry': None}
-    buckets = format_buckets(members, latest_by_channel, rank_ids=rank_ids)
+    buckets = format_buckets(members, latest_by_channel, rank_ids=rank_ids,
+                             window_by_channel=window_by_channel)
     return {'strategy': strategy, 'manages_lock': True,
             'entry': _format_strategy_entry(strategy, buckets)}
 
 
-def apply_format_strategy(group, streak_threshold=None):
+def bitrate_window_days(cfg=None) -> int:
+    """`channel_testing.bitrate_window_days`, from `cfg` or one load_config() call. A loop
+    over groups resolves it once and hands it down (no hidden I/O in per-row loops). A
+    value that is not a whole number falls back to the default and says so, rather than
+    500ing the group page over one bad config line."""
+    if cfg is None:
+        from .config import load_config
+        cfg = load_config()
+    raw = cfg.get('channel_testing', {}).get('bitrate_window_days', DEFAULT_BITRATE_WINDOW_DAYS)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning(
+            'channel_testing.bitrate_window_days is %r, not a number of days; using %d',
+            raw, DEFAULT_BITRATE_WINDOW_DAYS)
+        return DEFAULT_BITRATE_WINDOW_DAYS
+
+
+def apply_format_strategy(group, streak_threshold=None, window_days=None):
     """Re-evaluate `group`'s standing format strategy and move its format lock to match -
     the standing half of DECIDED 9, which is what makes "today's recording might be 720p @
     30fps, and tomorrow's might be 1080p @ 60fps, not because I changed anything" true
@@ -2233,7 +2345,9 @@ def apply_format_strategy(group, streak_threshold=None):
 
     Called after a health check run over the group's members and when the user changes the
     setting. Returns the strategy_lock_plan() dict with an added 'moved' bool, or None for
-    a missing/system group.
+    a missing/system group. `window_days` is `channel_testing.bitrate_window_days`; a
+    caller looping over groups passes it (and `streak_threshold`) so the config is read
+    once, and a single-group caller leaves both None.
 
     **Silent when nothing moved.** An event is written only when the lock actually
     changes, or on the transition INTO the no-winner state - a nightly re-evaluation that
@@ -2248,14 +2362,21 @@ def apply_format_strategy(group, streak_threshold=None):
     from .database import (ChannelGroup, ChannelGroupEvent, GROUP_FORMAT_MANUAL,
                            GROUP_FORMAT_STRATEGY_APPLIED, GROUP_FORMAT_STRATEGY_BLOCKED)
     from .db_utils import retry_on_locked
-    from .routes.channel_tests import _latest_tests_by_channel
+    from .routes.channel_tests import _latest_tests_by_channel, _recent_tests_by_channel
 
     group_id = group.id
     memberships = list(group.memberships)
     members = member_channels(memberships)
-    latest_by_channel = _latest_tests_by_channel([m.channel_id for m in memberships])
+    member_ids = [m.channel_id for m in memberships]
+    latest_by_channel = _latest_tests_by_channel(member_ids)
+    window_by_channel = None
+    if group.format_strategy in FORMAT_STRATEGIES:
+        if window_days is None:
+            window_days = bitrate_window_days()
+        window_by_channel = _recent_tests_by_channel(member_ids, window_days)
     plan = strategy_lock_plan(group, members, latest_by_channel,
-                              rank_ids=lock_ranking_ids(memberships))
+                              rank_ids=lock_ranking_ids(memberships),
+                              window_by_channel=window_by_channel)
     plan['moved'] = False
     if not plan['manages_lock']:
         # A pin found under a strategy that owns none is cleared here, which is the

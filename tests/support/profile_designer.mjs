@@ -23,6 +23,7 @@ const BOOT = {
   tags: [{ name: 'live', color: '#f00', patterns: ['LIVE'] },
          { name: 'hd', color: '#0f0', patterns: ['HD'] }],
   variables: [{ name: '{title}', desc: 'Title' }], tag_variables: [], extension: 'mp4',
+  sports_fields: [{ name: 'league', desc: 'League' }, { name: 'event', desc: 'Event' }],
 };
 
 function boot() {
@@ -46,8 +47,10 @@ function boot() {
         if (url.pathname === '/api/filename-designer') payload = BOOT;
         if (url.pathname === '/api/template-preview') {
           payload = { success: true, name: url.searchParams.get('template'),
-                      disk: url.searchParams.get('template'), changed: false, unknown: [],
-                      also: [], subject: { title: 'Sample', channel: 'Chan' } };
+                      disk: url.searchParams.get('template'), changed: false,
+                      unknown: url.searchParams.get('template').match(/\{(?:sports:)?bogus\}/g) || [],
+                      also: [], subject: { title: 'Sample', channel: 'Chan' },
+                      sports: url.searchParams.get('template').includes('{sports:') ? 'sample' : null };
         }
         if (url.pathname === '/api/channels/search') payload = { success: true, rows: [], total: 0 };
         if (url.pathname.startsWith('/api/profiles')) {
@@ -224,6 +227,44 @@ await record('settings_host', async () => {
   esc(w);
   return { errors, opened, back, afterSave, saved: !!w.SAVED, closedByEscape: view(w),
            posts: sent.map((s) => s.path) };
+});
+
+/* ── The {sports:...} combo inserts the picked field, and the preview says where its
+      values come from (dev/changelog/1498) ─────────────────────────────────────────── */
+await record('sports_combo', async () => {
+  const { w, errors } = boot();
+  w.openFilenameDesigner({});
+  await settle(w);
+  const options = [...w.document.querySelectorAll('#fd-sportspick option')].map((o) => o.value);
+  const noteBefore = $(w, '#fd-sports').textContent.trim();
+  const tpl = $(w, '#fd-tpl');
+  tpl.value = '{title} - ';
+  tpl.selectionStart = tpl.selectionEnd = tpl.value.length;
+  $(w, '#fd-sportspick').value = 'event';
+  $(w, '#fd-sportsadd').click();
+  await new Promise((r) => w.setTimeout(r, 400));
+  await settle(w);
+  return { errors, options, noteBefore, template: $(w, '#fd-tpl').value,
+           noteAfter: $(w, '#fd-sports').textContent.trim() };
+});
+
+/* ── An unknown {sports:x} is left out of the name and an unknown {x} stays as typed, so the
+      warning says which (dev/changelog/1498). ─────────────────────────────────────────── */
+await record('unknown_fields', async () => {
+  const { w, errors } = boot();
+  w.openFilenameDesigner({});
+  await settle(w);
+  const tpl = $(w, '#fd-tpl');
+  const warnFor = async (text) => {
+    tpl.value = text;
+    tpl.dispatchEvent(new w.Event('input', { bubbles: true }));
+    await new Promise((r) => w.setTimeout(r, 400));
+    await settle(w);
+    return $(w, '#fd-warn').textContent.trim();
+  };
+  return { errors, sports: await warnFor('{sports:bogus} {title}'),
+           plain: await warnFor('{bogus} {title}'),
+           both: await warnFor('{bogus} {sports:bogus}') };
 });
 
 process.stdout.write(JSON.stringify(out));

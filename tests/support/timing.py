@@ -895,6 +895,7 @@ def _run_capture(args):
     log_dir = _prepare_log_dir()
     passed = 0
     for n in range(1, args.repeat + 1):
+        started_utc = datetime.now(timezone.utc).isoformat(timespec='seconds')
         cpu_before = _cpu_snapshot()
         suite = unittest.TestLoader().loadTestsFromNames(modules)
         log_fh = _open_log(log_dir, f'capture-pass{n}.log')
@@ -915,6 +916,7 @@ def _run_capture(args):
         failed_ids = _failed_ids(result)
         record = {
             'ts_utc': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'started_utc': started_utc,
             'git_commit': commit, 'git_dirty': dirty, 'tier': tier, 'jobs': 1,
             'host': platform.node(), 'python': platform.python_version(),
             'total_wall': round(wall, 2), 'test_count': result.testsRun,
@@ -1002,6 +1004,7 @@ def main(argv=None):
     # Brackets discovery and shard planning as well as the run itself. Both of those are our
     # own CPU, which cancels out of the busy-minus-own subtraction, so the figure stays a
     # measure of OTHER work - it is only the denominator (total_wall) that is a shade short.
+    started_utc = datetime.now(timezone.utc).isoformat(timespec='seconds')
     cpu_before = _cpu_snapshot()
 
     if jobs == 1:
@@ -1049,6 +1052,10 @@ def main(argv=None):
     commit, dirty = _git_info()
     record = {
         'ts_utc': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        # When the run began, before discovery. The close-out compares a changed file's
+        # mtime against this, not ts_utc: a file edited while the suite ran is older than
+        # the run's end and was still never tested (dev/changelog/1486).
+        'started_utc': started_utc,
         'git_commit': commit,
         'git_dirty': dirty,
         'tier': tier,

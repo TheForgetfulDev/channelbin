@@ -71,7 +71,7 @@
       openAutoRuleModal({
         rule: dialog(), focus: act.dataset.focus, apiBase: CFG.apiBase,
         profiles: CFG.profiles, defaultCap: CFG.defaultCap, phrases: CFG.phrases,
-        onSaved: refresh,
+        sportsLeagues: CFG.sportsLeagues, sportsUrl: CFG.sportsUrl, onSaved: refresh,
       });
     }
   });

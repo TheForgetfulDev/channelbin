@@ -245,7 +245,7 @@ class EventChannelTests(LeaguePageCase):
         db.session.commit()
         text = self.page(league.id)
         self.assertIn('On 1 event channel', text)
-        self.assertIn('Read from its name. Not in your guide yet: it reaches', text)
+        self.assertIn('Read from its name. Not in your guide yet. Your guide reaches', text)
 
     def test_a_game_with_listings_also_counts_its_event_channels(self):
         league, (soon_ev, _), ch, soon = seed_league()

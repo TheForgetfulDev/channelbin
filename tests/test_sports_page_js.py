@@ -80,6 +80,35 @@ class SportsListScriptTests(unittest.TestCase):
         self.assertRegex(self.obs['opened'][0], r'^/sports/\d+$')
         self.assertEqual(self.obs['kebab_opened_page'], 0)
 
+    def test_the_page_refreshes_itself_on_a_timer(self):
+        """dev/changelog/1495: the list and a league's page were drawn once and never again, so a
+        schedule filling while the page was open showed the same calls left and the same games
+        until a reload."""
+        self.assertTrue(self.obs['live_interval'])
+        self.assertEqual(self.obs['live_idle']['gets'], 1)
+        self.assertEqual(self.obs['live_idle']['mark'], 'idle')
+
+    def test_a_refresh_keeps_the_chosen_sort(self):
+        self.assertEqual(self.obs['live_sorted'][0], 'zebra league')
+        self.assertEqual(self.obs['live_idle']['order'], self.obs['live_sorted'])
+
+    def test_a_hidden_tab_waits_and_catches_up_when_shown(self):
+        self.assertEqual(self.obs['live_hidden_gets'], 0)
+        self.assertEqual(self.obs['live_shown_mark'], 'shown')
+
+    def test_no_refresh_while_the_page_is_in_use(self):
+        self.assertTrue(self.obs['kebab_menu_open'])
+        self.assertEqual(self.obs['live_menu_gets'], 0, 'an open menu')
+        self.assertEqual(self.obs['live_typing_gets'], 0, 'a text field holding something')
+        self.assertEqual(self.obs['live_selection_gets'], 0, 'text selected')
+
+    def test_a_failed_refresh_leaves_the_page_alone(self):
+        self.assertEqual(self.obs['live_fail_gets'], 1)
+        self.assertEqual(self.obs['live_fail'], {'navigations': 0, 'rows': 3})
+
+    def test_an_action_refresh_lands_after_a_timed_one_already_in_flight(self):
+        self.assertEqual(self.obs['live_race'], {'mark': 'action', 'deletes': 1})
+
     def test_thesportsdb_is_a_link_in_a_new_tab_in_the_dialog(self):
         self.assertEqual(self.obs['hint_link']['text'], 'TheSportsDB')
         self.assertEqual(self.obs['hint_link']['target'], '_blank')
@@ -99,6 +128,48 @@ class SportsListScriptTests(unittest.TestCase):
     def test_a_team_search_offers_that_team_and_follows_it(self):
         self.assertTrue(self.obs['only_team_checked'])
         self.assertEqual(self.obs['follow_body'], [{'tsdb_id': 9001, 'team_id': 11}])
+
+    def test_the_dialog_is_named_for_leagues_and_teams(self):
+        """dev/changelog/1497."""
+        self.assertEqual(self.obs['add_title'], 'Add league or team')
+        self.assertEqual(self.obs['add_button'], 'Add league or team')
+
+    def test_search_is_the_footer_primary_and_nothing_in_the_body(self):
+        """dev/changelog/1497: the search sat in the body, where it looked like a link out to TheSportsDB."""
+        self.assertEqual(self.obs['entry_foot'], ['Cancel', 'Search'])
+        self.assertEqual(self.obs['body_buttons'], 0)
+        self.assertTrue(self.obs['search_disabled_empty'])
+        self.assertTrue(self.obs['search_disabled_shipped_name'])
+        self.assertFalse(self.obs['search_disabled_typed'])
+        self.assertNotIn('One call', self.obs['dialog_text'])
+
+    def test_enter_searches(self):
+        self.assertIsNotNone(self.obs['not_found_link'])
+
+    def test_back_returns_to_the_entry_with_the_text_kept(self):
+        """dev/changelog/1497: after a search there was no way back to try another name."""
+        self.assertEqual(self.obs['confirm_foot'], ['Back', 'Cancel', 'Follow'])
+        self.assertEqual(self.obs['back_value'], 'reds')
+        self.assertEqual(self.obs['back_foot'], ['Cancel', 'Search'])
+        self.assertTrue(self.obs['back_search_enabled'])
+
+    def test_several_rows_ask_which_one_with_back_and_name_the_left_out(self):
+        """dev/changelog/1497: only a paid key or a changed API returns more than one row."""
+        self.assertEqual(len(self.obs['choices']), 2)
+        self.assertEqual(self.obs['choices_foot'], ['Back', 'Cancel'])
+        self.assertIn('Left out, as defunct: Old Reds.', self.obs['choices_text'])
+        self.assertIn('Only Reds Reserves', self.obs['choice_confirm_team'])
+        self.assertFalse(self.obs['best_match_after_choice'])
+
+    def test_escape_on_a_later_step_goes_back_with_the_text_kept(self):
+        self.assertTrue(self.obs['escape_dialog_open'])
+        self.assertEqual(self.obs['escape_value'], 'two')
+
+    def test_only_a_name_search_says_it_is_the_best_match(self):
+        """dev/changelog/1497: the free key gives one row for a name, which read as the only team."""
+        self.assertTrue(self.obs['best_match_after_search'])
+        self.assertFalse(self.obs['best_match_after_pick'])
+        self.assertNotIn('costs the same calls', self.obs['confirm_text'])
 
 
 if __name__ == '__main__':

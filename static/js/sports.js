@@ -1,11 +1,12 @@
 /* The Sports Schedules pages (templates/sports.html, sports_league.html, mockup 50,
    dev/docs/DESIGN-sports-data.md 5 and 11).
 
-   Add a league, Change teams, Stop following and Delete league, the listings dialog's Wrong match,
+   Add league or team, Change teams, Stop following and Delete league, the listings dialog's Wrong match,
    and a league's names and categories (mockup 51), then a fresh server render
    (swapFromServer), so the templates stay the one renderer. A row and the league's action bar carry
    what the dialogs need as data attributes, which come back with that render. Clicks are delegated,
-   since a swap rebuilds the nodes. The list sorts on its own column headers (DESIGN.md 10.3). */
+   since a swap rebuilds the nodes. The list sorts on its own column headers (DESIGN.md 10.3).
+   The same swap also runs on a timer, so the page keeps up while it is open (see liveTick). */
 (() => {
   const BOOT = readBootJson('sports-boot', { shipped: [], site: '' });
   const PAGE = window.SPORTS_LEAGUE || null;
@@ -13,12 +14,21 @@
   const siteLink = (text = 'TheSportsDB', path = '') =>
     `<a href="${escHtml(BOOT.site + path)}" target="_blank" rel="noopener">${escHtml(text)}</a>`;
 
-  const refresh = () => {
-    const regions = PAGE
-      ? ['.gd-head', '.gd-statezone', '#sp-sections']
-      : ['.page-head', '#sports-body'];
-    return swapFromServer(regions).then(applySort).catch(() => window.location.reload());
+  const REGIONS = PAGE
+    ? ['.gd-head', '.gd-statezone', '#sp-sections']
+    : ['.page-head', '#sports-body'];
+
+  // Swaps run one after another. A timed swap fetched before an action's must never land after
+  // it and put back what the action just changed.
+  let swapQueue = Promise.resolve();
+  let swapsPending = 0;
+  const swap = () => {
+    swapsPending += 1;
+    const run = swapQueue.then(() => swapFromServer(REGIONS)).then(applySort);
+    swapQueue = run.catch(() => {}).finally(() => { swapsPending -= 1; });
+    return run;
   };
+  const refresh = () => swap().catch(() => window.location.reload());
 
   const dialogOf = (el) => {
     const holder = el.closest('[data-dialog]') || document.getElementById('sp-actionbar');
@@ -53,59 +63,136 @@
     applySort();
   }
 
-  /* ---- Add a league ---------------------------------------------------------------------- */
+  /* ---- Add league or team ------------------------------------------------------------------
+     Three steps on one modal: the entry (Cancel, Search), the "which one" list (Back, Cancel) and
+     the confirm (Back, Cancel, Follow). Back returns to the entry with the typed text kept. Each
+     step rebuilds the body, so its listeners go on the elements it draws, never on the body. */
+  const isShippedName = (text) => BOOT.shipped.some((l) => l.name.toLowerCase() === text.trim().toLowerCase());
+
   function listHtml(needle) {
     const q = needle.trim().toLowerCase();
     const rows = BOOT.shipped.filter((l) => !q || l.name.toLowerCase().includes(q) || l.sport.toLowerCase().includes(q));
     const picks = rows.map((l) => `<button type="button" class="sp-pick" data-pick="${l.tsdb_id}"${l.followed ? ' disabled' : ''}>
         <span>${escHtml(l.name)}</span><span class="meta">${l.followed ? 'Following' : escHtml(l.sport)}</span></button>`).join('');
-    const lookup = q && !rows.length
-      ? `<button type="button" class="btn btn-sm sp-lookup" data-lookup="1">Look up on TheSportsDB</button>
-         <span class="form-hint">Finds a team and its league, or checks a league's number or link. One call.</span>`
-      : '';
-    const hint = q ? '' : `<span class="form-hint sp-lookup">Not listed? Type a team name, a league's number, or paste a link to its page on ${siteLink()}.</span>`;
-    return `<div class="sp-pick-list">${picks}</div>${lookup}${hint}`;
+    const hint = !q
+      ? `<span class="form-hint sp-lookup">Not listed? Type a team name, a league's number, or paste a link to a league's or team's page on ${siteLink()}.</span>`
+      : rows.length ? ''
+        : '<span class="form-hint sp-lookup">Search finds a team and its league, or checks a league\'s number or a link to a league\'s or team\'s page.</span>';
+    return `<div class="sp-pick-list">${picks}</div>${hint}`;
   }
+
+  // Only a paid key or a changed API returns more than one row, so only then can some be defunct and the rest not.
+  const skippedHtml = (answer) => ((answer.skipped || []).length
+    ? `<div class="sp-msg">Left out, as defunct: ${escHtml(answer.skipped.join(', '))}.</div>` : '');
 
   function openAdd() {
     const body = document.createElement('div');
-    body.innerHTML = `<div class="form-group sp-entry-group">
-        <label for="sp-entry">League, team or link</label>
-        <input id="sp-entry" class="form-control" type="text" autocomplete="off" placeholder="NFL, Boston Bruins, or a link">
-      </div>
-      <div id="sp-results">${listHtml('')}</div><div id="sp-msg"></div>`;
-    const modal = buildModal({ title: 'Add a league', body, footer: [{ label: 'Cancel' }] });
-    const input = body.querySelector('#sp-entry');
-    const results = body.querySelector('#sp-results');
-    const msg = body.querySelector('#sp-msg');
+    const modal = buildModal({ title: 'Add league or team', body, footer: [{ label: 'Cancel' }] });
+    const foot = modal.querySelector('.modal-foot');
+    let typed = '';
+    let busy = false;
+    let onEntry = true;
+    let posting = false;
+    // Escape on a later step goes back to the entry, as on the other stepped panels (dev/changelog/1161).
+    modal.escapeHandler = () => {
+      if (posting) return;
+      if (onEntry) modal.closeModal(); else showEntry();
+    };
+
+    // duplicated from static/js/util.js buildModal's footer buttons - those are built once, and this
+    // dialog swaps its footer per step on the one modal.
+    const button = (label, cls, onClick, iconName = null) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = cls;
+      b.innerHTML = `${iconName ? icon(iconName) : ''}${escHtml(label)}`;
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    const setFoot = (...buttons) => { foot.innerHTML = ''; foot.append(...buttons); };
+    const cancelBtn = () => button('Cancel', 'btn', () => modal.closeModal());
+    const backBtn = () => button('Back', 'btn', () => showEntry(), 'back');
     const setMsg = (text, cls = 'bad') => {
+      const msg = body.querySelector('#sp-msg');
+      if (!msg) return;
       msg.innerHTML = text ? `<div class="sp-msg ${cls}">${escHtml(text).replace('its page on TheSportsDB', `its page on ${siteLink()}`)}</div>` : '';
     };
 
-    function showConfirm(league, team) {
+    function showEntry() {
+      onEntry = true;
+      body.innerHTML = `<div class="form-group sp-entry-group">
+          <label for="sp-entry">League, team or link</label>
+          <input id="sp-entry" class="form-control" type="text" autocomplete="off" placeholder="NFL, Boston Bruins, or a link">
+        </div>
+        <div id="sp-results"></div><div id="sp-msg"></div>`;
+      const input = body.querySelector('#sp-entry');
+      const results = body.querySelector('#sp-results');
+      input.value = typed;
+      const search = button('Search', 'btn btn-primary', () => {
+        search.disabled = true;
+        lookup({ text: input.value }).finally(sync);
+      });
+      function sync() {
+        search.disabled = busy || !input.value.trim() || isShippedName(input.value);
+      }
+      input.addEventListener('input', () => {
+        typed = input.value;
+        setMsg('');
+        results.innerHTML = listHtml(typed);
+        sync();
+      });
+      input.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        if (!search.disabled) search.click();
+      });
+      results.addEventListener('click', (e) => {
+        const pick = e.target.closest('[data-pick]');
+        if (pick && !pick.disabled) lookup({ tsdb_id: Number(pick.dataset.pick) });
+      });
+      results.innerHTML = listHtml(typed);
+      setFoot(cancelBtn(), search);
+      sync();
+      setTimeout(() => input.focus(), 0);
+    }
+
+    function showChoices(answer) {
+      onEntry = false;
+      body.innerHTML = `<div class="sp-msg">Which one do you mean?</div>
+        <div class="sp-pick-list">${answer.choices.map((c, i) => `<button type="button" class="sp-pick" data-choice="${i}"><span>${escHtml(c.team)}</span><span class="meta">${escHtml(c.league.name)}</span></button>`).join('')}</div>
+        ${skippedHtml(answer)}`;
+      body.querySelector('.sp-pick-list').addEventListener('click', (e) => {
+        const b = e.target.closest('[data-choice]');
+        if (!b) return;
+        const c = answer.choices[Number(b.dataset.choice)];
+        showConfirm(c.league, c, {});
+      });
+      setFoot(backBtn(), cancelBtn());
+    }
+
+    function showConfirm(league, team, answer) {
       const leaguePage = `league/${league.tsdb_id}`;
       body.innerHTML = `<div class="sp-confirm-name">${escHtml(league.name)}</div>
         <div class="sp-confirm-sub">${[league.sport, league.season ? `${league.season} season` : null].filter(Boolean).map(escHtml).join(', ')}${league.sport || league.season ? ', ' : ''}${siteLink(`TheSportsDB league ${league.tsdb_id}`, leaguePage)}</div>
         ${team ? `<div class="form-group sp-follow-group">
           <label class="sp-radio"><input type="radio" name="sp-follow" value="team" checked> Only ${escHtml(team.team)}</label>
           <label class="sp-radio"><input type="radio" name="sp-follow" value="all"> All games in the league</label>
-          <span class="form-hint">Following one team costs the same calls as its whole league. More teams can be picked once its schedule is here.</span>
+          <span class="form-hint">ChannelBin gets the whole league's schedule either way, so more teams can be picked once it is here.</span>
         </div>` : ''}
+        ${answer.best_match ? '<div class="sp-msg" id="sp-best">TheSportsDB gives only its best match for a name. If this is not the team you meant, go back and type more of it, such as the city and nickname.</div>' : ''}
+        ${skippedHtml(answer)}
         <div class="sp-msg">Getting a new schedule can take up to an hour, because the calls are spread out. After that it costs a few calls a day.</div>
         <div id="sp-msg-2"></div>`;
-      const foot = modal.querySelector('.modal-foot');
-      foot.innerHTML = '';
-      const cancel = document.createElement('button');
-      cancel.className = 'btn';
-      cancel.textContent = 'Cancel';
-      cancel.addEventListener('click', () => modal.closeModal());
-      const go = document.createElement('button');
-      go.className = 'btn btn-primary';
-      go.textContent = 'Follow';
-      go.addEventListener('click', async () => {
+      onEntry = false;
+      const back = backBtn();
+      const msg2 = body.querySelector('#sp-msg-2');
+      // While a follow is posting, Back (and Escape) must not swap the step out from under its answer.
+      const go = button('Follow', 'btn btn-primary', async () => {
         const choice = body.querySelector('input[name="sp-follow"]:checked');
         const teamId = team && choice && choice.value === 'team' ? team.team_id : null;
         go.disabled = true;
+        back.disabled = true;
+        posting = true;
         try {
           await jsonFetch('/api/sports/leagues', {
             method: 'POST', body: JSON.stringify({ tsdb_id: league.tsdb_id, team_id: teamId }),
@@ -115,13 +202,19 @@
           window.location.reload();
         } catch (err) {
           go.disabled = false;
-          body.querySelector('#sp-msg-2').innerHTML = `<div class="sp-msg bad">${escHtml(err.message)}</div>`;
+          back.disabled = false;
+          msg2.innerHTML = `<div class="sp-msg bad">${escHtml(err.message)}</div>`;
+        } finally {
+          posting = false;
         }
       });
-      foot.append(cancel, go);
+      setFoot(back, cancelBtn(), go);
     }
 
+    // One lookup at a time: a second straight after the first would only be told to wait.
     async function lookup(payload) {
+      if (busy) return;
+      busy = true;
       setMsg('');
       let answer;
       try {
@@ -129,33 +222,14 @@
       } catch (err) {
         setMsg(err.message, err.status === 409 ? 'warn' : 'bad');
         return;
+      } finally {
+        busy = false;
       }
-      if (answer.league) { showConfirm(answer.league, answer.team || null); return; }
-      results.innerHTML = `<div class="sp-msg">Which one do you mean?</div><div class="sp-pick-list">${answer.choices.map((c, i) => `<button type="button" class="sp-pick" data-choice="${i}"><span>${escHtml(c.team)}</span><span class="meta">${escHtml(c.league.name)}</span></button>`).join('')}</div>`;
-      results.onclick = (e) => {
-        const b = e.target.closest('[data-choice]');
-        if (!b) return;
-        const c = answer.choices[Number(b.dataset.choice)];
-        showConfirm(c.league, c);
-      };
+      if (answer.league) showConfirm(answer.league, answer.team || null, answer);
+      else showChoices(answer);
     }
 
-    input.addEventListener('input', () => {
-      setMsg('');
-      results.onclick = null;
-      results.innerHTML = listHtml(input.value);
-    });
-    input.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter') return;
-      e.preventDefault();
-      if (results.querySelector('[data-lookup]')) lookup({ text: input.value });
-    });
-    body.addEventListener('click', (e) => {
-      const pick = e.target.closest('[data-pick]');
-      if (pick && !pick.disabled) { lookup({ tsdb_id: Number(pick.dataset.pick) }); return; }
-      if (e.target.closest('[data-lookup]')) lookup({ text: input.value });
-    });
-    setTimeout(() => input.focus(), 0);
+    showEntry();
   }
 
   /* ---- Change teams ---------------------------------------------------------------------- */
@@ -221,6 +295,15 @@
   }
 
   async function del(d) {
+    // A league an auto-record rule names cannot be removed (app/sports_data.py::delete_league), so
+    // the page says so before anything is pressed rather than after (dev/changelog/1491).
+    if (d.rules && d.rules.length) {
+      const names = d.rules.map((n) => `"${n}"`).join(', ');
+      showToast(`${d.name} cannot be deleted: ${d.rules.length === 1 ? 'the auto-record rule' : 'the auto-record rules'} `
+        + `${names} ${d.rules.length === 1 ? 'names' : 'name'} it. Change ${d.rules.length === 1 ? 'it' : 'them'} `
+        + 'to name something else first.', { type: 'error', durationMs: 10000 });
+      return;
+    }
     const ok = await confirmModal({
       title: `Delete ${d.name}?`,
       message: `This deletes ${d.name} from ChannelBin, with its stored games and its team names.`,
@@ -421,6 +504,34 @@
     else if (name === 'refollow') refollow(d);
     else if (name === 'delete') del(d);
   });
+
+  /* ---- Keeping the page current ------------------------------------------------------------
+     The worker calls TheSportsDB about once a minute while a schedule fills, and the guide match
+     follows each refresh, so the status badge, the calls left, the games and Schedule updates
+     all move while the page is open. Every LIVE_MS the regions an action swaps are swapped
+     again from the server, so the templates stay the one renderer. A turn is skipped while the
+     page is in use - a dialog or menu open, a text field holding something, text selected -
+     because the swap would replace what the person is working on; the next turn catches up. A
+     failed fetch (a restart, a dropped connection) skips a turn, where an action's reloads. */
+  const LIVE_MS = 30 * 1000;
+  const TEXT_FIELDS = 'input:not([type]), input[type="text"], input[type="search"], textarea';
+
+  const inUse = () => REGIONS.some((sel) => {
+    const region = document.querySelector(sel);
+    if (!region) return false;
+    const field = document.activeElement;
+    if (field && region.contains(field) && field.matches(TEXT_FIELDS)) return true;
+    if (Array.from(region.querySelectorAll(TEXT_FIELDS)).some((f) => f.value !== f.defaultValue)) return true;
+    return hasSelectionIn(region);
+  });
+
+  const liveTick = () => {
+    if (document.hidden || swapsPending || overlayOpen() || inUse()) return;
+    swap().catch((err) => console.warn('Sports page refresh failed; the next turn retries.', err));
+  };
+  setInterval(liveTick, LIVE_MS);
+  // A hidden tab skips its turns, so it catches up the moment it is looked at again.
+  document.addEventListener('visibilitychange', liveTick);
 
   applySort();
 })();

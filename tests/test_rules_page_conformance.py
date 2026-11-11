@@ -329,8 +329,8 @@ class ListPageTests(_Base):
 
 class VerdictPhraseTests(unittest.TestCase):
 
-    def test_the_phrase_table_names_all_six_verdicts_in_order(self):
-        """database.py: every branch over action_taken names all six. Its wording is driven
+    def test_the_phrase_table_names_all_seven_verdicts_in_order(self):
+        """database.py: every branch over action_taken names all seven. Its wording is driven
         through the toasts in tests/test_auto_rule_modal_js.py."""
         self.assertEqual([a for a, _one, _many in VERDICT_PHRASES], list(RULE_MATCH_ACTIONS))
         self.assertEqual([p['action'] for p in verdict_phrases() if p['pick']],

@@ -153,6 +153,39 @@ class TemplatePreviewApiTests(unittest.TestCase):
 
     # ── The examples menu rides along on the same computation ────────────────────
 
+    # ── TheSportsDB fields (dev/changelog/1498) ───────────────────────────────────
+
+    def test_the_sample_shows_sample_sports_values_and_says_so(self):
+        _, d = self._get(template='{sports:league} {sports:event} - {title}')
+        self.assertTrue(d['name'].startswith('NFL Philadelphia Eagles vs Dallas Cowboys - '), d['name'])
+        self.assertEqual(d['sports'], 'sample')
+        self.assertEqual(d['unknown'], [])
+
+    def test_a_real_airing_shows_the_sports_fields_empty_and_says_so(self):
+        entry = self._airing('Premier League', 'NBC Sports',
+                             datetime.utcnow() + timedelta(hours=3))
+        _, d = self._get(template='{sports:league} - {title}', src='epg', epg_id=entry.id)
+        self.assertEqual(d['disk'], 'Premier_League')
+        self.assertEqual(d['sports'], 'empty')
+
+    def test_a_template_naming_no_program_previews_a_real_airing_by_its_title(self):
+        """`{sports:home} vs {sports:away}` would leave a recording no game is matched to named
+        `vs`; it is named by its title instead, and the preview shows that (dev/changelog/1498)."""
+        entry = self._airing('Premier League', 'NBC Sports',
+                             datetime.utcnow() + timedelta(hours=3))
+        _, d = self._get(template='{sports:home} vs {sports:away}', src='epg', epg_id=entry.id,
+                         also=['{sports:league} {sports:date} {sports:event}'])
+        self.assertEqual((d['disk'], d['sports']), ('Premier_League', 'title'))
+        self.assertEqual(d['also'][0]['disk'], 'Premier_League')
+
+    def test_no_sports_field_means_no_sports_note(self):
+        _, d = self._get(template='{title}')
+        self.assertIsNone(d['sports'])
+
+    def test_a_misspelled_sports_field_is_unknown(self):
+        _, d = self._get(template='{title} {sports:leauge}')
+        self.assertEqual(d['unknown'], ['{sports:leauge}'])
+
     def test_also_renders_extra_templates_against_the_same_program(self):
         """`Start from an example` shows what each example would produce. Rendering those
         anywhere else would be a second renderer that can disagree with the live preview
@@ -211,6 +244,7 @@ class FilenameDesignerBootApiTests(unittest.TestCase):
         for key in ('template', 'remove', 'replace', 'tags', 'variables', 'extension'):
             self.assertIn(key, d)
         self.assertTrue(d['variables'], 'the variable registry must not come back empty')
+        self.assertEqual([f['name'] for f in d['sports_fields']][:2], ['league', 'event'])
         for gone in ('timezone', 'hour12'):
             self.assertNotIn(gone, d, 'display settings belong to util.js, not this payload')
 

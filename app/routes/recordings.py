@@ -175,6 +175,10 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
         if profile_id is not _UNSET:
             r.profile_id = profile_id
         old_start, old_stop = r.start_time, r.stop_time
+        if name != r.name:
+            # A name a person changed is theirs: the join must not fill TheSportsDB fields
+            # into it (dev/changelog/1498).
+            r.sports_name_template = None
         r.name = name
         r.url = url
         r.start_time = start_utc
@@ -1139,6 +1143,31 @@ def _dur_size_cells(rec, now, live_seg_bytes=0):
             'size_num': size_num, 'size_unit': size_unit, 'rate': rate, 'rate_tip': rate_tip}
 
 
+def _score_sentence(rec) -> str:
+    """What `Recording.health_quality_score` is, in one sentence, for the Health badge's
+    tooltip. The number is read three ways by health_score.py, and the sentence has to
+    say which this one was (dev/changelog/1489): a recording that did not succeed is given
+    the fixed fail floor, not a measurement; a group recording that failed over stores the
+    share of the channel it ended on, not the whole recording; everything else is the
+    whole recording's own score."""
+    score = rec.health_quality_score
+    try:
+        breakdown = json.loads(rec.health_quality_breakdown or '{}')
+    except (ValueError, TypeError):
+        breakdown = {}
+    if not isinstance(breakdown, dict):
+        breakdown = {}
+    tail = "the number it fed into the channel's health score."
+    if breakdown.get('fail_floor_applied'):
+        return (f'This recording scored {score}/100 - the fixed floor a recording that did '
+                f'not succeed is given, {tail}')
+    if isinstance(breakdown.get('member_share'), dict):
+        return (f'The channel this recording ended on scored {score}/100 for its own stretch '
+                f'of it, on time with nothing being written, restarts and reconnects - {tail}')
+    return (f'This recording scored {score}/100 on time with nothing being written, '
+            f'restarts and reconnects - {tail}')
+
+
 def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
                thumb_enabled=True):
     """file_formats is channel_groups.file_format_stretches() over the recording's format
@@ -1252,6 +1281,14 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
         health = {'cls': 'ok', 'icon': 'ok', 'label': '', 'text': 'no stalls',
                   'tip': (f'{len(rec.segments)} segment{"s" if len(rec.segments) != 1 else ""} '
                           f'· 0 stalls{clean}.{missing}{reconnect_tail}{spanned}{format_tail}')}
+    # The recording's own 0-100 score (health_score.py::score_recording_metrics_quality),
+    # the number it fed into the channel's health score. It was stored on every scored
+    # recording and shown nowhere but the channel page's table; here it sits beside the
+    # facts it is made of, with one sentence saying what it measures, so it is a number
+    # the user can explain (dev/changelog/1489).
+    health['score'] = rec.health_quality_score
+    if rec.health_quality_score is not None and health.get('tip'):
+        health['tip'] += ' ' + _score_sentence(rec)
 
     video, audio, tech_source = _tech_parts(rec)
     tech_line = ' · '.join(p for p in (video, audio) if p) or None
@@ -2692,12 +2729,31 @@ def delete_recording(recording_id):
     return redirect(url_for('recordings.index'))
 
 
+def _submitted_sports_template(form, name, entry):
+    """The record dialog's `name_template` - the suggested name with its {sports:...} fields
+    still in it - when the submitted name is exactly that suggestion with the fields empty (or
+    the program's title, for a template made only of such fields), else None. Any change a person
+    made to the name fails the comparison, which is how a typed name is recorded as typed and
+    never filled in at the join (dev/changelog/1498). Checked here rather than trusted from the
+    dialog."""
+    from ..accounts import has_sports_fields, sports_name_matches
+    template = (form.get('name_template') or '').strip()
+    if not template or len(template) > 2048 or not has_sports_fields(template):
+        return None
+    title = (entry.title or '') if entry is not None else ''
+    return template if sports_name_matches(name, template, title) else None
+
+
 def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_id,
-                                 group_id, profile_id, entry=None, blocks=None, link=None):
+                                 group_id, profile_id, entry=None, blocks=None, link=None,
+                                 sports_name_template=None):
     """Create one SCHEDULED recording and arm its start - the one create path, shared by
     the record modal (new_recording_json), the bulk schedule (bulk_schedule_json) and
     auto-record rules (app/auto_rules.py), so none of them can drift in what a new
     recording carries (dev/changelog/1157).
+
+    `sports_name_template` is the name's template with its {sports:...} fields still to fill
+    (Recording.sports_name_template), or None when the name has none or was typed.
 
     `entry` is the EPGEntry being recorded, or None for a manual URL. `blocks` is the
     account-block picker's {account_id: slots}, or None to set none. A start already in
@@ -2760,6 +2816,7 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
             program_stop_time=program_stop_time,
             program_title=program_title,
             program_sub_title=program_sub_title,
+            sports_name_template=sports_name_template,
             metadata_description=metadata_description,
             metadata_category=metadata_category,
             metadata_rating=metadata_rating,
@@ -2897,7 +2954,8 @@ def new_recording_json():
     rec = _create_scheduled_recording(
         cfg, name=name, url=url, start_utc=start_utc, stop_utc=stop_utc,
         channel_id=channel_id, group_id=group_id, profile_id=profile_id,
-        entry=entry, blocks=wanted_blocks)
+        entry=entry, blocks=wanted_blocks,
+        sports_name_template=_submitted_sports_template(request.form, name, entry))
 
     if replace_recording_id is not None:
         unschedule_recording(replace_recording_id)
@@ -2994,10 +3052,10 @@ def _plan_bulk_schedule(items, profile_choice, cfg, skip_overlapped=True):
     coverage itself, and a partial overlap is a handoff, exactly as for a person's
     recordings. The person-facing bulk scheduler keeps the skip."""
     from types import SimpleNamespace
-    from ..accounts import default_profile_for, filename_naming_for
+    from ..accounts import default_profile_for
     from ..channel_search_rows import (
         REC_STATE_PAST, REC_STATE_RECORDING, REC_STATE_SCHEDULED,
-        _record_state, _recordings_for, _suggested_name)
+        _record_state, _recordings_for)
     from ..database import Tag
     from ..tz_utils import get_display_tz
 
@@ -3056,10 +3114,7 @@ def _plan_bulk_schedule(items, profile_choice, cfg, skip_overlapped=True):
 
         profile = (default_profile_for(ch, group) if profile_choice == 'default'
                    else profile_choice)
-        pre = (profile.pre_padding_minutes or 0) if profile is not None else 0
-        post = (profile.post_padding_minutes or 0) if profile is not None else 0
-        start = entry.start_time - timedelta(minutes=pre)
-        stop = entry.stop_time + timedelta(minutes=post)
+        start, stop = _padded(entry, profile)
 
         target_id = ch.id
         if group is not None:
@@ -3074,32 +3129,74 @@ def _plan_bulk_schedule(items, profile_choice, cfg, skip_overlapped=True):
             else:
                 target_id = resolved
         target = channels.get(target_id) or db.session.get(Channel, target_id)
-
-        # Named by the profile the showing is actually scheduled with, which is the chosen
-        # one when a profile was picked - not the channel's default (dev/docs/BUGS.md
-        # 2026-09-29 @ 08:56).
-        name = _suggested_name(ch, entry, filename_naming_for(cfg, profile), tags_by_name, tz)
-        warnings = _pending_recording_warnings(
-            target.id, group.id if group else None, start, stop, pending=pending)
-        plan.update(
-            name=name,
-            member_name=target.name if group is not None else None,
-            start_time=_iso_utc(start), stop_time=_iso_utc(stop),
-            started=start < now,
-            profile_name=profile.name if profile is not None else None,
-            warnings=warnings,
-            verdict=(BULK_HARD if 'connection_limit_warning' in warnings
-                     else BULK_WARN if warnings else BULK_OK),
-        )
-        plan['_create'] = dict(
-            name=name, url=normalize_url(target.stream_url, target.account, cfg),
-            start_utc=start, stop_utc=stop, channel_id=target.id,
-            group_id=group.id if group else None,
-            profile_id=profile.id if profile is not None else None, entry=entry)
-        pending.append({'channel_id': target.id, 'group_id': group.id if group else None,
-                        'account_id': target.account_id, 'start': start, 'stop': stop,
-                        'name': name, 'channel_name': group.name if group else target.name})
+        _fill_plan(plan, entry, ch, group, target, profile, cfg, tags_by_name, tz, pending, now)
     return plans
+
+
+def _padded(entry, profile):
+    pre = (profile.pre_padding_minutes or 0) if profile is not None else 0
+    post = (profile.post_padding_minutes or 0) if profile is not None else 0
+    return (entry.start_time - timedelta(minutes=pre), entry.stop_time + timedelta(minutes=post))
+
+
+def _fill_plan(plan, entry, ch, group, target, profile, cfg, tags_by_name, tz, pending, now):
+    """A showing's plan once its channel and profile are settled: its name, window, warnings and
+    the create arguments. The one tail of every plan, a listing's or an event channel's."""
+    from ..accounts import filename_naming_for
+    from ..channel_search_rows import _suggested_naming
+    start, stop = _padded(entry, profile)
+    # Named by the profile the showing is actually scheduled with, which is the chosen
+    # one when a profile was picked - not the channel's default (dev/docs/BUGS.md
+    # 2026-09-29 @ 08:56). Nobody types these names, so a template's {sports:...} fields are
+    # kept for the join as they are (dev/changelog/1498).
+    name, sports_template = _suggested_naming(ch, entry, filename_naming_for(cfg, profile),
+                                              tags_by_name, tz)
+    warnings = _pending_recording_warnings(
+        target.id, group.id if group else None, start, stop, pending=pending)
+    plan.update(
+        name=name,
+        member_name=target.name if group is not None else None,
+        start_time=_iso_utc(start), stop_time=_iso_utc(stop),
+        started=start < now,
+        profile_name=profile.name if profile is not None else None,
+        warnings=warnings,
+        verdict=(BULK_HARD if 'connection_limit_warning' in warnings
+                 else BULK_WARN if warnings else BULK_OK),
+    )
+    plan['_create'] = dict(
+        name=name, url=normalize_url(target.stream_url, target.account, cfg),
+        start_utc=start, stop_utc=stop, channel_id=target.id,
+        group_id=group.id if group else None,
+        profile_id=profile.id if profile is not None else None, entry=entry,
+        sports_name_template=sports_template)
+    pending.append({'channel_id': target.id, 'group_id': group.id if group else None,
+                    'account_id': target.account_id, 'start': start, 'stop': stop,
+                    'name': name, 'channel_name': group.name if group else target.name})
+
+
+def _plan_event_schedule(channel_id, title, start, stop, profile_choice, cfg):
+    """One plan, in _plan_bulk_schedule()'s shape, for a game an auto-record rule reads from an
+    event channel's name, which has no listing to plan from (DESIGN-sports-data.md 10,
+    dev/changelog/1491). The stand-in listing carries the game's title and the start the rule
+    stands behind, so the recording's program times say what it was scheduled for; the rest is
+    the same profile, padding, name and warnings any showing gets."""
+    from types import SimpleNamespace
+    from ..accounts import default_profile_for
+    from ..database import Tag
+    from ..tz_utils import get_display_tz
+    plan = {'epg_id': None, 'group_id': None, 'verdict': BULK_SKIP, 'reason': None, 'warnings': {}}
+    ch = db.session.get(Channel, channel_id)
+    if ch is None:
+        plan['reason'] = 'The event channel is no longer in your channels.'
+        return plan
+    entry = SimpleNamespace(channel_id=ch.id, start_time=start, stop_time=stop, title=title,
+                            sub_title=None, description=None, category=None, rating=None)
+    plan.update(title=title, sub_title='', channel_name=ch.name, program_start=_iso_utc(start),
+                program_stop=_iso_utc(stop))
+    profile = default_profile_for(ch, None) if profile_choice == 'default' else profile_choice
+    _fill_plan(plan, entry, ch, None, ch, profile, cfg, {t.name: t for t in Tag.query.all()},
+               get_display_tz(), [], datetime.utcnow())
+    return plan
 
 
 def _iso_utc(dt):

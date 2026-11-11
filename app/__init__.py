@@ -256,6 +256,7 @@ def create_app(config_overrides=None, start_scheduler=True):
         channel_hiding.apply_default_rules()
         duplicate_streams.install_listener()
         _ensure_system_health_job()
+        _retire_sports_file_names()
         if tags_table_is_new:
             _seed_default_tags()
         if fresh:
@@ -632,6 +633,39 @@ def _table_exists(table_name: str) -> bool:
         return row is not None
     finally:
         conn.close()
+
+
+SPORTS_FILE_NAMES_REMOVED = ('The setting "Name matched games from TheSportsDB" was removed. Use the '
+                             'filename designer to continue using filenames generated with '
+                             'TheSportsDB data.')
+
+
+def _retire_sports_file_names():
+    """Remove `sports_data.file_names` from config.yaml, and say so once if it was on.
+
+    v0.40.0 shipped the switch; the filename template's {sports:...} fields replaced it
+    (dev/changelog/1498). The app ignores an unknown key, so a user who had it on would find
+    matched games named the normal way again with nothing saying why. Removing the key is the
+    recorded fact that the alert was raised, so it is raised once; a restored old backup that
+    brings the key back raises it again, which is right. A leftover `false` is removed quietly.
+    Not a CONFIG_MIGRATIONS step because the alert needs the database, which migrate_config()
+    runs before. The alert is raised outside config_write_lock, which is never held while a
+    database lock is taken."""
+    from .config import config_write_lock, _load_config_file, _write_config_file
+    log = logging.getLogger(__name__)
+    with config_write_lock:
+        raw = _load_config_file(round_trip=True)
+        sd = raw.get('sports_data') if raw is not None else None
+        if not isinstance(sd, dict) or 'file_names' not in sd:
+            return
+        was_on = sd.pop('file_names') is True
+        _write_config_file(raw)
+    log.info('Removed sports_data.file_names from config.yaml (it was %s); the filename '
+             "template's TheSportsDB fields replace it", 'on' if was_on else 'off')
+    if was_on:
+        from .alerts import create_alert
+        create_alert('SETTING_REMOVED', title='"Name matched games from TheSportsDB" was removed',
+                     body=SPORTS_FILE_NAMES_REMOVED, source='startup')
 
 
 def _ensure_system_health_job():

@@ -24,6 +24,11 @@ relayed and no real name, host or URL is copied in.
 
 ## Worlds
 
+A backend with `any_stream_id: true` also plays a stream id its lineup never listed, as a plain
+live channel on the backend's content loop (which must then be a fixed profile). That is for a
+ChannelBin whose channels came from a copy of another install's database: every channel plays,
+and nothing about the playlists or guides changes.
+
 A world is a YAML file plus a seed: backends (the channels and their streams), panels (the
 services a user signs in to, several of which may sit in front of one backend), logins, and
 guide sites. The same world file, seed and `SIM_VERSION` produce the same bytes every time, so a

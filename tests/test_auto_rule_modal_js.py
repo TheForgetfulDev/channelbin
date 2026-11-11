@@ -279,3 +279,70 @@ class AutoRuleModalTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipIf(shutil.which('node') is None, 'node not installed')
+@unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
+class AboutRowTests(unittest.TestCase):
+    """The About row and Skip game replays (DESIGN-sports-data.md 10, dev/changelog/1490)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.obs = _observe()
+
+    def test_a_named_rule_opens_on_its_league_and_team_and_sends_them(self):
+        run = self.obs['sports_named']
+        self.assertEqual(run['errors'], [])
+        self.assertEqual((run['first']['league'], run['first']['team']), ('3', '101'))
+        self.assertEqual(run['first']['teams'],
+                         [['', 'All its games'], ['101', 'Harborview Gulls'], ['102', 'Ironvale Bears']])
+        self.assertEqual(run['first']['focused'], 'ar-league', 'the About chip lands on the league')
+        self.assertTrue(run['first']['channels_checked'])
+        body = run['sent'][0]['body']
+        self.assertEqual((body['sports_league_id'], body['sports_team_tsdb_id'], body['sports_skip_replays'],
+                          body['sports_event_channels']), (3, 101, True, True))
+
+    def test_a_new_league_starts_on_all_its_games(self):
+        run = self.obs['sports_moved']
+        self.assertEqual(run['after']['teams'], [['', 'All its games'], ['201', 'Saltmarsh Otters']])
+        body = run['sent'][0]['body']
+        self.assertEqual((body['sports_league_id'], body['sports_team_tsdb_id']), (4, None))
+
+    def test_naming_nothing_turns_the_team_and_the_option_off(self):
+        run = self.obs['sports_cleared']
+        self.assertTrue(run['after']['team_disabled'])
+        self.assertTrue(run['after']['replays_disabled'])
+        self.assertTrue(run['after']['channels_disabled'])
+        body = run['sent'][0]['body']
+        self.assertEqual((body['sports_league_id'], body['sports_team_tsdb_id'], body['sports_skip_replays'],
+                          body['sports_event_channels']), (None, None, False, False))
+
+    def test_a_team_with_no_stored_games_is_still_offered_and_kept(self):
+        run = self.obs['sports_pruned_team']
+        self.assertIn(['777', 'Pruned Pelicans'], run['first']['teams'])
+        self.assertEqual(run['sent'][0]['body']['sports_team_tsdb_id'], 777)
+
+    def test_with_no_league_on_sports_schedules_it_says_where_to_add_one(self):
+        run = self.obs['sports_no_leagues']
+        self.assertIn('No league is on Sports Schedules yet; add one there first.', run['first']['text'])
+        self.assertTrue(run['first']['team_disabled'])
+
+    def test_settings_that_leave_recordings_behind_ask_first_and_resend_the_answer(self):
+        """Turning off Record from event channels with an event recording scheduled (dev/changelog/1491)."""
+        run = self.obs['settings_question']
+        self.assertEqual(run['errors'], [])
+        self.assertEqual(run['question']['title'], 'Save rule')
+        self.assertEqual(run['question']['confirm'], 'Save')
+        self.assertIn('The new settings no longer record 1 recording "Gulls games" has scheduled', run['question']['text'])
+        first, second = run['sent']
+        self.assertFalse(first['body']['sports_event_channels'])
+        self.assertEqual(second['body']['unmatched'], {'action': 'cancel', 'ids': [41]})
+        self.assertFalse(second['body']['sports_event_channels'])
+        self.assertFalse(run['open'])
+        self.assertIn('1 scheduled recording cancelled.', run['toasts'][-1]['msg'])
+
+    def test_a_page_that_offers_no_league_list_sends_nothing_about_sports(self):
+        """The Programs search's create dialog: a rule there names nothing until it is edited."""
+        self.assertFalse(self.obs['sports_not_offered']['has_row'])
+        for name in ('clean', 'defaults'):
+            self.assertNotIn('sports_league_id', self.obs[name]['sent'][0]['body'])

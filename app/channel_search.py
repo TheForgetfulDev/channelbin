@@ -2324,6 +2324,87 @@ def _tod_predicate(value: str, ctx: 'SearchContext'):
     return not_(minute.between(hi + 1, lo - 1))
 
 
+#: The dimensions about a showing's start alone. They are the only ones that can also describe a
+#: game an event channel's name gives a time for, with no listing behind it (DESIGN-sports-data.md
+#: 10, dev/changelog/1491).
+START_DIMENSIONS = ('when', 'dow', 'tod')
+
+
+# duplicated from _when_predicate, _dow_predicate and _tod_predicate below - one start time with
+# no listing row cannot go through SQL; tests/test_auto_rules_sports.py holds the two equal.
+def start_passes(state: 'SearchState', start, ctx: 'SearchContext') -> bool:
+    """Would a showing starting at `start` (naive UTC) pass this search's When, Day of week and
+    Time of day filters? The Python reading of `_when_predicate`, `_dow_predicate` and
+    `_tod_predicate`, for one start time with no listing row; the other dimensions are not asked.
+    "On now" reads as begun, since there is no stop to overlap: it is only asked of a game that has
+    not ended. Values inside a filter OR, its exclusions are NOT any of them."""
+    for f in state.filters:
+        if f.key not in START_DIMENSIONS:
+            continue
+        if f.values and not any(_start_in(f.key, v, start, ctx) for v in f.values):
+            return False
+        if any(_start_in(f.key, v, start, ctx) for v in f.ex):
+            return False
+    return True
+
+
+# duplicated from the `acct` branch of _value_predicate - a channel with no listing row cannot go
+# through SQL; tests/test_auto_rules_sports.py holds the two equal.
+def account_passes(state: 'SearchState', account_id) -> bool:
+    """Would a channel on this account pass the search's Account filter (DESIGN-sports-data.md 10)?"""
+    for f in state.filters:
+        if f.key != 'acct':
+            continue
+        if f.values and str(account_id) not in {str(v) for v in f.values}:
+            return False
+        if str(account_id) in {str(v) for v in f.ex}:
+            return False
+    return True
+
+
+def _start_in(key: str, value: str, start, ctx: 'SearchContext') -> bool:
+    from .tz_utils import to_local
+    if key == 'when':
+        if value == WHEN_NOW:
+            # A start with no listing has no stop to overlap now with: it is on now once begun.
+            return start <= ctx.now
+        bounds = ctx.day_bounds.get(value)
+        if bounds is not None:
+            return bounds[0] <= start < bounds[1]
+        if value.startswith(WHEN_NEXT_PREFIX):
+            delta = parse_when_next(value)
+            return delta is not None and ctx.now <= start < ctx.now + delta
+        if value.startswith(WHEN_CUSTOM_PREFIX):
+            parsed = parse_when_custom(value, ctx.display_tz)
+            if parsed is None:
+                return False
+            lo, hi = parsed
+            return (lo is None or start >= lo) and (hi is None or start <= hi)
+        raise SearchStateError(f'unknown When value {value!r}')
+    local = to_local(start, ctx.display_tz)
+    if key == 'dow':
+        if value not in DOW_LABELS:
+            raise SearchStateError(f'unknown Day of week value {value!r} - one of '
+                                   f'{", ".join(DOW_VALUES)}')
+        return local.weekday() == DOW_VALUES.index(value)
+    if key == 'tod':
+        if not value.startswith(TOD_PREFIX):
+            raise SearchStateError(f'unknown Time of day value {value!r}')
+        parsed = parse_time_of_day(value)
+        if parsed is None:
+            return False
+        lo, hi = parsed
+        minute = local.hour * 60 + local.minute
+        if lo is None:
+            return minute <= hi
+        if hi is None:
+            return minute >= lo
+        if lo <= hi:
+            return lo <= minute <= hi
+        return not (hi + 1 <= minute <= lo - 1)
+    raise ValueError(f'{key!r} is not a start dimension')
+
+
 def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str = GRAIN_CHANNELS,
                      narrow: bool = False, hides_past: bool = True):
     """"Does a channel carry this value of this dimension" - one entry per dimension.

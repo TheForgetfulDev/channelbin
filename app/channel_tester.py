@@ -957,11 +957,13 @@ def _settle_group_formats(app, tested_channel_ids):
         from .config import load_config
         from .database import ChannelGroupMember
         from .channel_groups import (apply_format_strategy, evaluate_and_reconcile_group,
-                                     DEFAULT_FAILING_STREAK_THRESHOLD)
+                                     DEFAULT_FAILING_STREAK_THRESHOLD, bitrate_window_days)
         try:
             # Hoisted once for the whole loop (CLAUDE.md no-hidden-I/O-in-per-row-loops).
-            streak_threshold = load_config().get('channel_testing', {}).get(
+            cfg = load_config()
+            streak_threshold = cfg.get('channel_testing', {}).get(
                 'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
+            window_days = bitrate_window_days(cfg)
             groups = {m.group for m in ChannelGroupMember.query.filter(
                 ChannelGroupMember.channel_id.in_(list(tested_channel_ids))).all()
                 if m.group is not None}
@@ -970,7 +972,7 @@ def _settle_group_formats(app, tested_channel_ids):
             return
         for group in groups:
             try:
-                plan = apply_format_strategy(group, streak_threshold)
+                plan = apply_format_strategy(group, streak_threshold, window_days)
                 # apply_format_strategy() reconciles for itself when it moved or cleared
                 # the lock; every other case still needs the pass that logs which members
                 # now differ from the group's format.
@@ -2262,21 +2264,34 @@ def _capture_screenshot_with_recapture(filepath: str, output_path: str, ffmpeg_p
 
 
 def _check_screenshot_uniform(filepath: str, ffmpeg_path: str) -> Optional[str]:
-    """Return a warning string if the screenshot is a near-uniform color, else None.
+    """Return a warning string if the screenshot is black or a near-uniform color, else None.
 
-    Scales to 64×64 gray (4096 pixels) and computes standard deviation. A std_dev < 15
-    indicates a solid or near-solid frame regardless of its average brightness,
-    catching black, white, mid-grey, and solid-color test cards alike.
+    Two tests, because black and "solid color" fail differently (dev/changelog/1488):
 
-    An 8×8 grid was used previously, but at that resolution each output pixel
-    averages such a large source block (~160×90px on a 1280x720 frame) that a
-    frame dominated by one color but with real content - e.g. a sports field with
-    players, lines, and a scoreboard overlay - gets smoothed into a false "solid
-    color" reading. 64×64 preserves enough local detail to tell the two apart while
-    still flagging genuinely uniform frames (verified against historical screenshots:
-    true blank/solid frames stay under std_dev 11 at this resolution, real
-    field-dominant sports frames clear 16.9).
+    **Black is a full-size pixel count** - `screenshot.frame_bright_percent()`, the rule the
+    poster frame uses: under BLACK_FRAME_MAX_BRIGHT_PERCENT of the pixels brighter than
+    BLACK_FRAME_LUMA. A contrast figure on a downscale answers the wrong question here: over
+    1,362 real frames the 64x64 standard deviation called 3 frames with people in them black
+    (dim scenes, 6-10% of their pixels lit, spread too evenly to raise the contrast), while a
+    station logo alone on black raised it enough to read as a picture (dev/changelog/1433).
+
+    **White and solid color stay a contrast test.** Scales to 64x64 gray (4096 pixels) and
+    computes the standard deviation; under 15 is a solid or near-solid frame whatever its
+    brightness. An 8x8 grid was used before that, but at that resolution each output pixel
+    averages such a large source block (~160x90px on a 1280x720 frame) that a frame dominated
+    by one color but with real content - a sports field with players, lines and a scoreboard -
+    smoothed into a false "solid color" reading. 64x64 keeps enough local detail to tell the
+    two apart while still flagging genuinely uniform frames (true blank/solid frames stay
+    under std_dev 11 at this resolution, real field-dominant sports frames clear 16.9).
+
+    A dark frame the contrast test would once have called black, but whose full-size count
+    says is lit, is a dark picture and gets no warning. Only when the count could not be
+    measured does the contrast verdict stand in for it.
     """
+    from .screenshot import frame_bright_percent, is_black_frame
+    bright = frame_bright_percent(filepath, ffmpeg_path)
+    if is_black_frame(bright):
+        return 'Screenshot nearly all black - stream may not be showing content'
     try:
         cmd = [ffmpeg_path, '-i', filepath,
                '-vf', 'scale=64:64,format=gray',
@@ -2288,6 +2303,8 @@ def _check_screenshot_uniform(filepath: str, ffmpeg_path: str) -> Optional[str]:
             std = (sum((p - avg) ** 2 for p in pixels) / len(pixels)) ** 0.5
             if std < 15:
                 if avg < 20:
+                    if bright is not None:
+                        return None
                     desc = 'nearly all black'
                 elif avg > 235:
                     desc = 'nearly all white'

@@ -1869,8 +1869,12 @@ async function whenScenario() {
     obs.caret_box_still_focused = c.document.activeElement === before;
     obs.caret_box_value = before.value;
     obs.when_after_two_digits = c.params()['f.when'] || [];
+    // Polled, never a flat sleep. The catch-up redraw is on a 0 ms timer, and Node runs a
+    // whole list of same-length timers before a shorter one set earlier: with another
+    // pooled scenario mid-sleep and the loop 20 ms behind, a 20 ms sleep set after the
+    // blur returns before the redraw has run (dev/docs/BUGS.md 2026-11-10).
     before.blur();
-    await c.wait(20);
+    obs.caret_redraw_waited_ms = await c.waitUntil(() => relBox() !== before && !!relBox());
     obs.caret_box_redrawn_after_blur = relBox() !== before && !!relBox();
   }
 
@@ -2017,8 +2021,9 @@ async function dayTimeScenario() {
     p.type(pmin, '24');
     await p.settle();
     obs.pill_pop_two_digits = p.params()['f.duration'] || [];
+    // The pill's move to the tail slot is held back the same way and polled the same way.
     pmin.blur();
-    await p.wait(20);
+    obs.pill_move_waited_ms = await p.waitUntil(() => !!p.$('#addf-slot-tail #addfpw2'));
   }
   obs.pill_after_chips = !!p.$('#addf-slot-tail #addfpw2');
   obs.pill_pop_errors = p.errors;

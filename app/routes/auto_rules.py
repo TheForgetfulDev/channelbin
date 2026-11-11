@@ -12,8 +12,8 @@ from flask import Blueprint, abort, jsonify, render_template, request, url_for
 from .. import auto_rules, auto_rules_view, db
 from ..database import (
     AutoRule, RULE_MATCH_SCHEDULED, RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_EXISTING,
-    RULE_MATCH_SKIPPED_LIMIT, RULE_MATCH_SKIPPED_REPEAT, RULE_MATCH_USER_MODIFIED,
-    RecordingProfile,
+    RULE_MATCH_SKIPPED_LIMIT, RULE_MATCH_SKIPPED_REPEAT, RULE_MATCH_SKIPPED_REPLAY,
+    RULE_MATCH_USER_MODIFIED, RecordingProfile,
 )
 
 log = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ auto_rules_bp = Blueprint('auto_rules', __name__)
 #: How every surface names a ledger verdict (DESIGN-autoschedule.md §2), in RULE_MATCH_ACTIONS
 #: order: (action, one, many), `{n}` the count. One table: the evaluation toasts
 #: (static/js/auto-rule-modal.js) receive it through their page's config, so a verdict cannot
-#: be worded two ways. All six are named - tests/test_rules_page_conformance.py holds it to
+#: be worded two ways. All seven are named - tests/test_rules_page_conformance.py holds it to
 #: RULE_MATCH_ACTIONS.
 VERDICT_PHRASES = (
     (RULE_MATCH_SCHEDULED, '{n} scheduled', '{n} scheduled'),
@@ -33,6 +33,7 @@ VERDICT_PHRASES = (
     (RULE_MATCH_SKIPPED_LIMIT, '{n} over the limit', '{n} over the limit'),
     (RULE_MATCH_USER_MODIFIED, '{n} left alone after you edited it',
      '{n} left alone after you edited them'),
+    (RULE_MATCH_SKIPPED_REPLAY, '{n} game replay skipped', '{n} game replays skipped'),
 )
 
 
@@ -98,6 +99,7 @@ def _page_config():
     from ..config import load_config
     from .channels import airing_search_url
     from ..channel_search import RULE_CONTEXT_NEW
+    from ..auto_rules_sports import dialog_leagues
     return {
         'apiBase': '/api/auto-rules/',
         'rulesUrl': url_for('auto_rules.rules_page'),
@@ -106,6 +108,10 @@ def _page_config():
         'profiles': _profiles(),
         'defaultCap': auto_rules.default_cap(load_config()),
         'phrases': verdict_phrases(),
+        # The edit dialog's About row offers only leagues already on Sports Schedules
+        # (DESIGN-sports-data.md 10, dev/changelog/1490).
+        'sportsLeagues': dialog_leagues(),
+        'sportsUrl': url_for('sports.sports_page'),
     }
 
 
@@ -128,7 +134,7 @@ def rule_page(rule_id):
         abort(404)
     return render_template(
         'rule_detail.html', page_config=_page_config(),
-        sections=list(auto_rules_view.SECTIONS), section_names=auto_rules_view.SECTION_NAMES,
+        sections=ctx.pop('sections'), section_names=auto_rules_view.SECTION_NAMES,
         section_pref=read_section_pref(auto_rules_view.SECTIONS_PREF_KEY),
         sections_pref_key=auto_rules_view.SECTIONS_PREF_KEY, **ctx)
 
@@ -174,23 +180,31 @@ def update_rule_json(rule_id):
     except auto_rules.RuleError as exc:
         return jsonify({'error': str(exc)}), 400
     settle = None
-    if values.search_params != rule.search_params:
-        found = auto_rules.unmatched_by_search(rule_id, values.search_params)
-        if found.recordings:
-            answer = data.get('unmatched')
-            read = _unmatched_answer(answer) if answer is not None else None
-            if answer is not None and read is None:
-                return jsonify({'error': 'Say what becomes of the recordings the new search no '
-                                         'longer matches (unmatched: {action: cancel or keep, '
-                                         'ids}).'}), 400
-            if read is None or not found.ids <= read[1]:
-                n = len(found.recordings)
-                return jsonify({
-                    'error': (f'The new search no longer matches {n} recording'
-                              f'{"" if n == 1 else "s"} this rule has scheduled. Say whether '
-                              'to cancel them or keep them, then save again.'),
-                    **found.payload()}), 409
-            settle = (read[0], found.ids)
+    found = (auto_rules.unmatched_by_search(rule_id, values.search_params)
+             if values.search_params != rule.search_params else auto_rules.Unmatched([]))
+    # The event-channel picks a settings change leaves behind are asked about the same way
+    # (DESIGN-sports-data.md 10, dev/changelog/1491).
+    events = auto_rules.unmatched_events(rule, values)
+    if events.recordings:
+        known = found.ids
+        found.recordings = found.recordings + [r for r in events.recordings if r['id'] not in known]
+    if found.recordings:
+        answer = data.get('unmatched')
+        read = _unmatched_answer(answer) if answer is not None else None
+        if answer is not None and read is None:
+            return jsonify({'error': 'Say what becomes of the recordings the change no '
+                                     'longer records (unmatched: {action: cancel or keep, '
+                                     'ids}).'}), 400
+        if read is None or not found.ids <= read[1]:
+            n = len(found.recordings)
+            what = 'search' if values.search_params != rule.search_params else 'settings'
+            verb = 'matches' if what == 'search' else 'records'
+            return jsonify({
+                'error': (f'The new {what} no longer {verb} {n} recording'
+                          f'{"" if n == 1 else "s"} this rule has scheduled. Say whether '
+                          'to cancel them or keep them, then save again.'),
+                'what': what, **found.payload()}), 409
+        settle = (read[0], found.ids)
     result = auto_rules.update_rule(rule_id, values, unmatched=settle)
     if result is None:
         return jsonify({'error': 'Rule not found.'}), 404

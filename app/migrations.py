@@ -3574,6 +3574,56 @@ _SPORTS_DEFAULTS = (
 )
 
 
+def _m119_rule_sports(conn, cur):
+    """auto_rules: what a rule is about from Sports Schedules, and its two options
+    (DESIGN-sports-data.md 10, dev/changelog/1490).
+
+    No backfill: every existing rule names nothing, which is what NULL and 0 mean. Each column is
+    added only when missing, so re-runnable from the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(auto_rules)').fetchall()}
+    for column, decl in (('sports_league_id', 'INTEGER'),
+                         ('sports_team_tsdb_id', 'INTEGER'),
+                         ('sports_skip_replays', 'BOOLEAN NOT NULL DEFAULT 0'),
+                         ('sports_event_channels', 'BOOLEAN NOT NULL DEFAULT 0')):
+        if cols and column not in cols:
+            cur.execute(f'ALTER TABLE auto_rules ADD COLUMN {column} {decl}')
+    conn.commit()
+
+
+def _m121_sports_name_template(conn, cur):
+    """recordings.sports_name_template: a template-made name waiting for its TheSportsDB fields
+    (dev/changelog/1498). No backfill: before this no name had such a field. Re-runnable."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()}
+    if cols and 'sports_name_template' not in cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN sports_name_template TEXT')
+    conn.commit()
+
+
+def _m122_prefer_sports_poster(conn, cur):
+    """recording_profiles.prefer_sports_poster (dev/changelog/1505). No backfill: every existing
+    profile keeps its pinned poster first, which is what 0 means. Re-runnable."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recording_profiles)').fetchall()}
+    if cols and 'prefer_sports_poster' not in cols:
+        cur.execute('ALTER TABLE recording_profiles ADD COLUMN prefer_sports_poster '
+                    'BOOLEAN NOT NULL DEFAULT 0')
+    conn.commit()
+
+
+def _m120_rule_match_event(conn, cur):
+    """rule_matches: the anchor of a game recorded from an event channel (DESIGN-sports-data.md 10,
+    dev/changelog/1491), with its partial unique index. No backfill: no such row exists before this.
+    Re-runnable from the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(rule_matches)').fetchall()}
+    if cols and 'sports_event_tsdb_id' not in cols:
+        cur.execute('ALTER TABLE rule_matches ADD COLUMN sports_event_tsdb_id INTEGER')
+    if cols and 'sports_start_from' not in cols:
+        cur.execute('ALTER TABLE rule_matches ADD COLUMN sports_start_from VARCHAR(8)')
+    if cols:
+        cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_matches_event ON rule_matches '
+                    '(rule_id, sports_event_tsdb_id) WHERE sports_event_tsdb_id IS NOT NULL')
+    conn.commit()
+
+
 def _m118_sports_defaults(conn, cur):
     """Sports tables: every column migrations 112, 115 and 117 give a DEFAULT carries it on the
     table the database actually holds.
@@ -4204,6 +4254,15 @@ SCHEMA_MIGRATIONS = [
      'recording\'s event', _m117_sports_images),
     (118, 'sports tables: rebuild so every defaulted column carries the DEFAULT a fresh build '
      'has', _m118_sports_defaults),
+    (119, 'auto_rules: the league or team a rule is about, and its two TheSportsDB options',
+     _m119_rule_sports),
+    (120, 'rule_matches: sports_event_tsdb_id and sports_start_from, the game a rule recorded from '
+     'an event channel and where its start came from',
+     _m120_rule_match_event),
+    (121, 'recordings: sports_name_template, a template-made name waiting for its TheSportsDB '
+     'fields', _m121_sports_name_template),
+    (122, 'recording_profiles: prefer_sports_poster, TheSportsDB\'s poster ahead of the pinned one',
+     _m122_prefer_sports_poster),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

@@ -172,6 +172,11 @@ METADATA_SIDECAR_FAILED             = 'METADATA_SIDECAR_FAILED'
 RECORDING_SPORTS_LINKED             = 'RECORDING_SPORTS_LINKED'
 # A person said the recording is not the event it was matched to.
 RECORDING_SPORTS_REMOVED            = 'RECORDING_SPORTS_REMOVED'
+# An auto-record rule recorded this game from an event channel, and what it read then changed:
+# the channel no longer names the game, or the start it can stand behind moved. The recording
+# keeps its slot, since TheSportsDB never moves one (DESIGN-sports-data.md 10, dev/changelog/1491);
+# `extra['reason']` is `renamed` or `start`.
+RECORDING_RULE_GAME_CHANGED         = 'RECORDING_RULE_GAME_CHANGED'
 # Timeline damage found in the concatenated .ts (gaps/missing frames that break player
 # seeking) - logged when post_process.reencode_mode='damaged' decides to re-encode.
 SEEK_DAMAGE_DETECTED   = 'SEEK_DAMAGE_DETECTED'
@@ -508,6 +513,7 @@ EVENT_LABELS = {
     METADATA_SIDECAR_FAILED: 'Could not write the media server files',
     RECORDING_SPORTS_LINKED: 'Matched to a TheSportsDB event',
     RECORDING_SPORTS_REMOVED: 'TheSportsDB match removed',
+    RECORDING_RULE_GAME_CHANGED: 'Event channel changed, recording stayed',
     SEEK_DAMAGE_DETECTED: 'Gaps found in the file',
     MIXED_FRAME_RATE_DETECTED: 'Frame rate changed',
     FORMAT_NORMALIZE_NEEDED: 'Format needs evening out',
@@ -643,6 +649,12 @@ class RecordingProfile(db.Model):
     poster_file               = db.Column(db.String(255))
     poster_width              = db.Column(db.Integer)
     poster_height             = db.Column(db.Integer)
+    # True = TheSportsDB's portrait poster for a recording's event goes ahead of the pinned
+    # one, which is then the poster only for a recording with no event poster. Its landscape
+    # thumb never does (app/metadata_sidecar.py::_copy_poster, dev/changelog/1505). No global
+    # to inherit: a pinned poster exists only on a profile.
+    prefer_sports_poster      = db.Column(db.Boolean, nullable=False, default=False,
+                                          server_default=db.text('0'))
     created_at                = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at                = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -768,17 +780,21 @@ CANCEL_REASONS = (
 )
 
 # RuleMatch.action_taken vocabulary - what an auto-record rule decided about one showing
-# (DESIGN-autoschedule.md §2). Every branch over the column names all six.
+# (DESIGN-autoschedule.md §2). Every branch over the column names all seven.
 RULE_MATCH_SCHEDULED        = 'scheduled'
 RULE_MATCH_SKIPPED_EXISTING = 'skipped_existing'
 RULE_MATCH_SKIPPED_REPEAT   = 'skipped_repeat'
 RULE_MATCH_SKIPPED_CAP      = 'skipped_cap'
 RULE_MATCH_SKIPPED_LIMIT    = 'skipped_limit'
 RULE_MATCH_USER_MODIFIED    = 'user_modified'
+# A listing TheSportsDB's matches call a replay of a game whose first airing is already
+# recorded or scheduled, on a rule with Skip game replays on (dev/changelog/1490).
+RULE_MATCH_SKIPPED_REPLAY   = 'skipped_replay'
 
 RULE_MATCH_ACTIONS = (
     RULE_MATCH_SCHEDULED, RULE_MATCH_SKIPPED_EXISTING, RULE_MATCH_SKIPPED_REPEAT,
     RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_LIMIT, RULE_MATCH_USER_MODIFIED,
+    RULE_MATCH_SKIPPED_REPLAY,
 )
 # The skip verdicts, every one of which is judged again at the next evaluation: the
 # condition behind each can stop being true (a cancelled winner, a failed original, a freed
@@ -786,7 +802,7 @@ RULE_MATCH_ACTIONS = (
 # DESIGN-autoschedule.md §2 for the one `scheduled` exception.
 RULE_MATCH_SKIPS = (
     RULE_MATCH_SKIPPED_EXISTING, RULE_MATCH_SKIPPED_REPEAT,
-    RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_LIMIT,
+    RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_LIMIT, RULE_MATCH_SKIPPED_REPLAY,
 )
 
 # ChannelTest.status vocabulary. Shares string values with REC_STATUS_* above and with
@@ -986,6 +1002,13 @@ class Recording(db.Model):
     program_stop_time    = db.Column(db.DateTime)
     program_title        = db.Column(db.String(512))  # immutable EPG program title snapshot at creation (None for manual recordings)
     program_sub_title    = db.Column(db.String(512))  # immutable EPG program sub-title snapshot at creation (None for manual recordings)
+    # The name as its filename template rendered it with the {sports:...} fields still in it,
+    # waiting for the join to fill them from the recording's TheSportsDB event
+    # (sports_data.recording_file_name(), dev/changelog/1498). Set at create only when the name
+    # came from a template that has such a field: a name a person typed leaves it NULL, an edit
+    # that changes the name clears it, and the join clears it once the file is written. It is
+    # the recorded fact that the name is the template's, so a typed name is never rewritten.
+    sports_name_template = db.Column(db.Text)
 
     # ── Describing the recording to something outside this app ────────────────
     # The program's synopsis, genre and content rating, copied off its epg_entries row.
@@ -3426,6 +3449,20 @@ class AutoRule(db.Model):
     # opposite things - the Rules page calls one rule "Not running" and the other a rule
     # that is running with a problem (dev/changelog/1189).
     last_problems      = db.Column(db.Text)
+    # What the rule is about, from Sports Schedules (DESIGN-sports-data.md 10, dev/changelog/1490):
+    # a league, and optionally one team in it. Naming one makes a follow owned by the rule, written
+    # with it by app/sports_data.py::set_rule_follow(). Not part of search_params - the search is
+    # still the rule - and every change bumps `revision` like any other edit. sports_leagues.id,
+    # with no foreign key for the reason none is declared on this table: they are off, and
+    # delete_league() refuses while a rule names the league instead.
+    sports_league_id      = db.Column(db.Integer)
+    sports_team_tsdb_id   = db.Column(db.Integer)
+    # Leave out a listing matched as a replay of a game whose first airing the rule already has.
+    sports_skip_replays   = db.Column(db.Boolean, nullable=False, default=False,
+                                      server_default=db.text('0'))
+    # Record a game from an event channel when the guide has no listing of it.
+    sports_event_channels = db.Column(db.Boolean, nullable=False, default=False,
+                                      server_default=db.text('0'))
 
 
 class RuleMatch(db.Model):
@@ -3473,10 +3510,20 @@ class RuleMatch(db.Model):
     detail                = db.Column(db.Text)
     created_at            = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at            = db.Column(db.DateTime, default=datetime.utcnow)
+    # A game recorded from an event channel, with no listing to anchor on (DESIGN-sports-data.md
+    # 10, dev/changelog/1491): TheSportsDB's own event id, never sports_events.id, which a prune can
+    # hand to another game. A start or a channel name can change, and an anchor built on either would
+    # bring back a cancelled pick, so the row is found by the game. NULL on every listing's row.
+    sports_event_tsdb_id  = db.Column(db.Integer)
+    # Where that game's start came from (auto_rules_sports.START_FROM_*), stored because the page
+    # shows it and a sentence is not a fact to read back. NULL on every listing's row.
+    sports_start_from     = db.Column(db.String(8))
 
     __table_args__ = (
         db.UniqueConstraint('rule_id', 'title_key', 'episode_key', 'program_start_time',
                             name='uq_rule_matches_anchor'),
+        db.Index('uq_rule_matches_event', 'rule_id', 'sports_event_tsdb_id', unique=True,
+                 sqlite_where=db.text('sports_event_tsdb_id IS NOT NULL')),
     )
 
 

@@ -1993,6 +1993,7 @@ function applyProfileName() {
     if (seq !== _modalNameSeq || _modalNameEdited || _modalNameProg !== prog) return;
     if (!d || typeof d.name !== 'string') return;
     document.getElementById('modal-name').value = d.name;
+    document.getElementById('modal-name-template').value = d.name_template || '';
   }).catch((e) => showToast(`Could not rename the recording for that profile: ${e.message}`,
     { type: 'error' }));
 }
@@ -2056,6 +2057,7 @@ function openModal(prog, ch, opts = {}) {
   const stopSrc  = isEdit ? prog.recording_stop_time  : prog.stop_time;
 
   document.getElementById('modal-name').value       = prog.suggested_name || prog.title;
+  document.getElementById('modal-name-template').value = isEdit ? '' : (prog.suggested_name_template || '');
   document.getElementById('modal-url').value        = prog.stream_url;
   const urlDisplay = document.getElementById('modal-url-display');
   urlDisplay.value = maskCreds(prog.stream_url);

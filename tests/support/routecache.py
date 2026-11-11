@@ -15,11 +15,18 @@ TEST-ONLY. Production never imports this; app/ is untouched.
 
 Why this is safe for the pinned werkzeug (3.1.8), and what would break it
 ------------------------------------------------------------------------
-compile() sets exactly five attributes: _parts, _trace, _converters, _build and
-_build_unknown. After compile() returns, every use of them in werkzeug is read-only
+compile() sets five attributes - _parts, _trace, _converters, _build and _build_unknown -
+and adds each placeholder's name to a sixth, `arguments`, which __init__ started from the
+rule's defaults. All six are replayed. A rule left without its `arguments` still matches
+and still builds a URL it is given every value for, so nothing looks wrong until a value
+is missing: werkzeug then takes the rule for one that needs no values and the builder
+raises TypeError where a real app raises BuildError (dev/docs/BUGS.md 2026-11-10).
+
+After compile() returns, every use of the first five in werkzeug is read-only
 (routing/matcher.py iterates _parts and calls _converters[...].to_python; routing/map.py
 calls _converters[...].to_url) - nothing mutates them, so sharing them between Rule
-objects on different Maps cannot leak state. _build/_build_unknown are stored unbound and
+objects on different Maps cannot leak state. `arguments` is a set each Rule owns, so the
+names are added to the new rule's own set, never shared. _build/_build_unknown are stored unbound and
 re-bound per instance, so a cached builder never closes over the wrong rule. The one real
 aliasing is _converters: converter instances hold the Map they were built for, but
 BaseConverter only ever assigns self.map and never reads it, so the shared reference is
@@ -36,7 +43,8 @@ import sys
 from werkzeug.routing.map import Map
 from werkzeug.routing.rules import Rule
 
-_REQUIRED_ATTRS = ('_parts', '_trace', '_converters', '_build', '_build_unknown')
+_REQUIRED_ATTRS = ('_parts', '_trace', '_converters', '_build', '_build_unknown',
+                   'arguments')
 
 _cache = {}
 _real_compile = None
@@ -62,12 +70,14 @@ def _compile_memo(self):
     if hit is None:
         _real_compile(self)
         _cache[key] = (self._parts, self._trace, self._converters,
-                       self._build.__func__, self._build_unknown.__func__)
+                       self._build.__func__, self._build_unknown.__func__,
+                       frozenset(self._converters))
         return
-    parts, trace, converters, build, build_unknown = hit
+    parts, trace, converters, build, build_unknown, placeholders = hit
     self._parts = parts
     self._trace = trace
     self._converters = converters
+    self.arguments.update(placeholders)
     # Re-bind per instance: a cached builder must never stay bound to the rule that
     # first compiled it, or it would build URLs against another app's Map.
     self._build = build.__get__(self, None)
@@ -88,7 +98,7 @@ def install():
         return True
 
     # Contract check against the installed werkzeug, not against assumption: compile a
-    # real rule the real way and confirm the five attributes we replay still exist.
+    # real rule the real way and confirm the six attributes we replay still exist.
     try:
         probe_map = Map([Rule('/probe/<int:n>', endpoint='probe')])
         probe = next(iter(probe_map.iter_rules()))

@@ -137,6 +137,25 @@ class InheritableFieldTests(_Base):
             self.assertIs(RecordingProfile.query.one().pre_check_enabled, expected)
 
 
+class PreferSportsPosterTests(_Base):
+    """dev/changelog/1505: an on/off with no inherit, since a pinned poster exists only on a profile."""
+
+    def test_it_round_trips_and_blank_stores_off_not_null(self):
+        for sent, expected in ((True, True), (False, False), (None, False)):
+            RecordingProfile.query.delete()
+            db.session.commit()
+            resp = self.post(prefer_sports_poster=sent)
+            self.assertEqual(resp.status_code, 200)
+            self.assertIs(RecordingProfile.query.one().prefer_sports_poster, expected)
+            self.assertIs(resp.get_json()['profile']['prefer_sports_poster'], expected)
+
+    def test_an_edit_turns_it_off(self):
+        p = self.make_profile(prefer_sports_poster=True)
+        self.assertEqual(self.put(p.id, prefer_sports_poster=False).status_code, 200)
+        db.session.expire_all()
+        self.assertIs(db.session.get(RecordingProfile, p.id).prefer_sports_poster, False)
+
+
 class ValidationTests(_Base):
     def test_missing_name_is_rejected(self):
         self.assertEqual(self.post(name='').status_code, 400)

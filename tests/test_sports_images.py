@@ -341,6 +341,78 @@ class SidecarTests(_Case):
         self.assertEqual(json.loads(ev.extra_data)['poster_source'], POSTER_FROM_PROFILE)
         self.assertEqual(root.find('fanart/thumb').text, 'game-fanart.jpg')
 
+    def pinned_profile(self, prefer):
+        cfg = load_config()
+        profile = RecordingProfile(name='Football', prefer_sports_poster=prefer)
+        db.session.add(profile)
+        db.session.commit()
+        info = sniff_image(png_bytes(1000, 1500))
+        profile.poster_file = store_poster(cfg, profile.id, png_bytes(1000, 1500), info)
+        db.session.commit()
+        return profile
+
+    def test_a_profile_can_put_their_poster_ahead_of_its_pinned_one(self):
+        """dev/changelog/1505: prefer_sports_poster moves TheSportsDB's own poster above the pin,
+        and the event says the pinned one was passed over."""
+        profile = self.pinned_profile(prefer=True)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        root, ev = self.write(rec)
+        with open(os.path.join(self.dvr, 'game-poster.png'), 'rb') as fh:
+            self.assertEqual(fh.read(), POSTER)
+        self.assertEqual(json.loads(ev.extra_data)['poster_source'], POSTER_FROM_SPORTS)
+        self.assertIn('Profile "Football" puts TheSportsDB\'s poster ahead of its pinned one', ev.detail)
+        self.assertEqual(root.find('fanart/thumb').text, 'game-fanart.jpg')
+
+    def test_their_thumb_never_replaces_a_pinned_poster(self):
+        """dev/changelog/1505: an event with no poster keeps the pinned one, and the event says why."""
+        e = db.session.get(SportsEvent, self.event.id)
+        e.poster_url = None
+        db.session.commit()
+        profile = self.pinned_profile(prefer=True)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        root, ev = self.write(rec)
+        self.assertEqual(json.loads(ev.extra_data)['poster_source'], POSTER_FROM_PROFILE)
+        self.assertIn('TheSportsDB has no poster for this event, so the one pinned to profile "Football" '
+                      'was used', ev.detail)
+        self.assertEqual(root.find('fanart/thumb').text, 'game-fanart.jpg')
+
+    def test_a_preferred_poster_not_downloaded_keeps_the_pin_and_says_why(self):
+        """dev/changelog/1505: the reason TheSportsDB's poster was missing is said, not swallowed
+        as it is when the pin is simply wanted first."""
+        del self.fake.images['/images/media/event/poster/aaa.png']
+        profile = self.pinned_profile(prefer=True)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        _, ev = self.write(rec)
+        self.assertEqual(json.loads(ev.extra_data)['poster_source'], POSTER_FROM_PROFILE)
+        self.assertIn("TheSportsDB's poster for its event had not been downloaded (HTTP 404)", ev.detail)
+
+    def test_a_preferred_poster_that_cannot_be_copied_falls_back_to_the_pin(self):
+        profile = self.pinned_profile(prefer=True)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        real = shutil.copyfile
+
+        def copy(src, dst):
+            if SPORTS_IMAGES in src and dst.endswith('-poster.png'):
+                raise PermissionError(13, 'Permission denied')
+            return real(src, dst)
+        with patch('app.metadata_sidecar.shutil.copyfile', side_effect=copy):
+            _, ev = self.write(rec)
+        self.assertEqual(json.loads(ev.extra_data)['poster_source'], POSTER_FROM_PROFILE)
+        self.assertIn("TheSportsDB's image could not be copied (Permission denied)", ev.detail)
+
+    def test_with_it_off_the_pin_still_wins_and_nothing_is_said_about_their_poster(self):
+        profile = self.pinned_profile(prefer=False)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        _, ev = self.write(rec)
+        self.assertEqual(json.loads(ev.extra_data)['poster_source'], POSTER_FROM_PROFILE)
+        self.assertNotIn('ahead of', ev.detail)
+        self.assertNotIn('no poster for this event', ev.detail)
+
     def test_not_downloaded_yet_falls_back_and_says_why(self):
         del self.fake.images['/images/media/event/poster/aaa.png']
         rec = self.recording()
@@ -465,6 +537,58 @@ class PageTests(_Case):
         self.assertIn('Background from TheSportsDB.', html)
         self.assertIn('Poster not downloaded yet. HTTP 404. Tries again', html)
         self.assertEqual(self.t.client.get(f'/recordings/{rec.id}/sports-image/poster').status_code, 404)
+
+    def pinned(self, prefer):
+        profile = RecordingProfile(name='Football', prefer_sports_poster=prefer)
+        db.session.add(profile)
+        db.session.commit()
+        profile.poster_file = store_poster(load_config(), profile.id, png_bytes(1000, 1500),
+                                           sniff_image(png_bytes(1000, 1500)))
+        db.session.commit()
+        return profile
+
+    def test_the_row_names_which_poster_a_pinned_profile_uses(self):
+        """dev/changelog/1505: the Artwork row follows the profile's choice."""
+        off = self.pinned(prefer=False)
+        rec = self.recording(profile_id=off.id)
+        self.drain()
+        self.assertIn('The image pinned to profile &#34;Football&#34; is the poster.', self.page(rec.id))
+        off = db.session.get(RecordingProfile, off.id)
+        off.prefer_sports_poster = True
+        db.session.commit()
+        self.assertIn('Profile &#34;Football&#34; puts this poster ahead of its pinned one.', self.page(rec.id))
+
+    def test_a_preferred_poster_not_downloaded_is_not_claimed(self):
+        """dev/changelog/1505: the row says the pinned image is the poster while TheSportsDB's is not
+        downloaded, as the sidecar would write it, never that TheSportsDB's goes ahead."""
+        del self.fake.images['/images/media/event/poster/aaa.png']
+        profile = self.pinned(prefer=True)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        html = self.page(rec.id)
+        self.assertNotIn('ahead of its pinned one', html)
+        self.assertIn('The image pinned to profile &#34;Football&#34; is the poster until TheSportsDB&#39;s '
+                      'is downloaded.', html)
+
+    def test_a_pinned_poster_is_never_called_replaced_by_their_thumb(self):
+        """dev/docs/BUGS.md 2026-11-11: with an event that has no poster, the row said the thumb was
+        also the poster and, in the next sentence, that the pinned image was. Either way the switch is."""
+        e = db.session.get(SportsEvent, self.event.id)
+        e.poster_url = None
+        db.session.commit()
+        profile = self.pinned(prefer=False)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        html = self.page(rec.id)
+        self.assertNotIn('also used as the poster', html)
+        self.assertIn('Background from TheSportsDB.', html)
+        self.assertIn('The image pinned to profile &#34;Football&#34; is the poster.', html)
+        profile = db.session.get(RecordingProfile, profile.id)
+        profile.prefer_sports_poster = True
+        db.session.commit()
+        html = self.page(rec.id)
+        self.assertNotIn('also used as the poster', html)
+        self.assertIn('is the poster, since the event has none.', html)
 
     def test_an_event_with_no_artwork_says_so(self):
         e = db.session.get(SportsEvent, self.event.id)

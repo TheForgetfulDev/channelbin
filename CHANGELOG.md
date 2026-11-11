@@ -5,6 +5,59 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.41.0 - 2026-11-11
+
+Record a league or a team, and name sports recordings from TheSportsDB.
+
+**Added**
+
+- An auto-record rule can name a league, or one team in it, from Sports Schedules. It records
+  each game once, from the listing most channels carry, instead of every channel's differently
+  worded listing of the same game. The rule's page lists the games it expects, and one alert
+  says so when a game a few hours away has nothing to record it from.
+- Such a rule can skip a game's replays. A listing that starts well after the game's start time
+  on TheSportsDB, or sits in a category you marked as replays, is skipped while the game's first
+  airing is scheduled or recorded. A listing ChannelBin cannot place is never skipped.
+- Such a rule can turn on Record from event channels: when the guide has no listing of a game
+  at all, it records the game from an event channel whose name names it, with a start time it
+  can trust.
+- Add league or team on Sports Schedules takes a link to a team's page on TheSportsDB, and says
+  so when it leaves out a team that no longer plays.
+- The filename template takes ten TheSportsDB fields: `{sports:league}`, `{sports:event}`,
+  `{sports:home}`, `{sports:away}`, `{sports:season}`, `{sports:round}`, `{sports:venue}`,
+  `{sports:city}`, `{sports:date}` and `{sports:start_time}`. The designer offers them from a
+  `{sports:` dropdown, and they are filled in from the recording's matched game when its file is
+  written. A name you typed yourself is never changed.
+- A recording profile with a pinned poster can use TheSportsDB's poster for a matched game
+  instead, and keep the pinned image for everything else. It is off by default.
+- The score each recording gives its channel's health, 0 to 100, is now shown on the recording:
+  in the Health badge's tooltip on the Recordings list and on the recording's page.
+- Sports Schedules pages refresh themselves every 30 seconds while open.
+
+**Changed**
+
+- The "Name matched games from TheSportsDB" setting (`sports_data.file_names`) added in 0.40.0
+  is gone. The filename template's TheSportsDB fields replace it:
+  `{sports:league} {sports:date} {sports:event}` gives the same `League YYYY-MM-DD Event` names,
+  best set on a sports recording profile. An install that had the setting on gets an alert
+  saying so.
+- The format strategies rank each channel on the median of its health checks from the last 14
+  days instead of only its latest one, and say how many checks and days they ranked on.
+- The health check's "nearly all black" warning counts dark pixels on the full-size screenshot,
+  so dim scenes are no longer called black and a station logo alone on black is.
+- Sports Schedules' About this page says what the feature is for, and covers rules and the
+  filename fields.
+
+**Fixed**
+
+- A league's page on Sports Schedules loads in under a tenth of a second instead of over one.
+- Text in a wide card runs the full width of the card instead of wrapping a third of the way
+  across.
+- A group's Channels table no longer overflows its box when the page's font finishes loading
+  late.
+- A recording's Artwork row no longer calls TheSportsDB's thumb the poster when a pinned image
+  is used.
+
 ## 0.40.0 - 2026-11-09
 
 Sports games matched to your guide, Live and New marks, and a player that says what went wrong.

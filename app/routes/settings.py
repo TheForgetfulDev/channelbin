@@ -23,8 +23,10 @@ from ..database import (
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
     ACCOUNT_STATUS_SYNCING, OD_JOB_STATUS_RUNNING,
 )
-from ..accounts import (TEMPLATE_VARIABLES, _TAG_TOKEN_RE, render_filename_template,
-                        tag_template_variables)
+from ..accounts import (SPORTS_TEMPLATE_FIELDS, TEMPLATE_VARIABLES, _SPORTS_TOKEN_RE,
+                        _TAG_TOKEN_RE, _names_a_program, has_sports_fields,
+                        render_filename_template, tag_template_variables,
+                        unmatched_sports_name)
 from ..recorder import _safe_name, FINISHED_IMAGE_CHOICES
 from ..normalize import AUDIO_CHANNELS_CHOICES, MAX_HEIGHT_CHOICES, VIDEO_CODECS
 from ..postprocessor import VIDEO_ENCODERS
@@ -1121,6 +1123,17 @@ def api_search_index_rebuild():
 _SAMPLE_PROGRAM_TITLE = 'The Tonight Show 2160p (backup)'
 
 
+def _sample_sports(program, tz):
+    """Sample values for the {sports:...} fields, shown with the built-in sample program only.
+    The date and time are the sample program's own, so {sports:date} and {date} agree."""
+    from ..tz_utils import to_local
+    start = to_local(program['start_time'], tz)
+    return {'league': 'NFL', 'event': 'Philadelphia Eagles vs Dallas Cowboys',
+            'home': 'Philadelphia Eagles', 'away': 'Dallas Cowboys', 'season': '2026',
+            'round': '10', 'venue': 'Lincoln Financial Field', 'city': 'Philadelphia',
+            'date': start.strftime('%Y-%m-%d'), 'start_time': start.strftime('%H%M')}
+
+
 def _sample_program():
     """The built-in sample, with each configured tag's first pattern appended to the title.
 
@@ -1243,6 +1256,9 @@ def _unknown_tokens(template, tag_names):
     unknown = [t for t in re.findall(r'\{[a-z_]+\}', template) if t not in known]
     unknown += ['{tag:' + m.group(1) + '}' for m in _TAG_TOKEN_RE.finditer(template)
                 if m.group(1) not in tag_names]
+    sports_fields = {n for n, _ in SPORTS_TEMPLATE_FIELDS}
+    unknown += ['{sports:' + m.group(1) + '}' for m in _SPORTS_TOKEN_RE.finditer(template)
+                if m.group(1) not in sports_fields]
     # Deduplicated, order preserved: a template repeating one typo should say it once.
     return list(dict.fromkeys(unknown))
 
@@ -1269,6 +1285,8 @@ def filename_designer_boot_api():
         'tags': tags,
         'variables': [{'name': v, 'desc': d} for v, d in TEMPLATE_VARIABLES],
         'tag_variables': [{'name': v, 'desc': d} for v, d in tag_template_variables()],
+        # The {sports:...} combo's choices (dev/changelog/1498).
+        'sports_fields': [{'name': n, 'desc': d} for n, d in SPORTS_TEMPLATE_FIELDS],
         # The designer draws the extension after the filename, so it has to be the one the
         # file will actually carry. Capture always writes .ts; post-processing remuxes it
         # to post_process.format, and with post-processing off the .ts is what survives.
@@ -1305,7 +1323,20 @@ def template_preview_api():
         [(n, 'replace') for n in request.args.getlist('replace')]
     )
     tz = get_display_tz()
-    name = render_filename_template(template, program, tag_cleanup=tag_cleanup, tz=tz)
+    # The sample shows sample game values for the {sports:...} fields; a real or typed program
+    # shows them empty, which is what a recording no event is matched to gets. Either way the
+    # designer says they are filled in from TheSportsDB by the time the file is written.
+    sports = _sample_sports(program, tz) if subject['source'] == 'sample' else None
+
+    def _render(t):
+        rendered = render_filename_template(t, program, tag_cleanup=tag_cleanup, tz=tz,
+                                            sports=sports)
+        if sports is None and has_sports_fields(t):
+            # What a recording no game is matched to is called, by the same rule.
+            return unmatched_sports_name(t, rendered, program.get('title') or '')
+        return rendered
+
+    name = _render(template)
     disk = _safe_name(name)
     tag_names = {t.name for t in Tag.query.all()}
     # `also` renders extra templates against the SAME program and the SAME cleanup lists,
@@ -1313,9 +1344,8 @@ def template_preview_api():
     # each example would produce: computing those anywhere else would be a second renderer
     # that can disagree with the live preview about the very thing being compared. Bounded
     # at 8 so a hand-built request cannot turn one preview into an unbounded render loop.
-    alsos = [{'template': t, 'disk': _safe_name(
-        render_filename_template(t, program, tag_cleanup=tag_cleanup, tz=tz))}
-        for t in request.args.getlist('also')[:8] if t.strip()]
+    alsos = [{'template': t, 'disk': _safe_name(_render(t))}
+             for t in request.args.getlist('also')[:8] if t.strip()]
     return jsonify({
         'success': True,
         'name': name,
@@ -1327,6 +1357,10 @@ def template_preview_api():
         'changed': disk != name,
         'unknown': _unknown_tokens(template, tag_names),
         'subject': subject,
+        # 'sample', 'empty' or 'title' (an unmatched recording is named by its title) when the
+        # template has a {sports:...} field, else None: which sentence the designer shows.
+        'sports': (None if not has_sports_fields(template) else 'sample' if sports
+                   else 'empty' if _names_a_program(template) else 'title'),
     })
 
 

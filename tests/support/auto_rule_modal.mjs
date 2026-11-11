@@ -226,6 +226,98 @@ out.unmatched_refused = await unmatchedScenario(
   { unmatched: TWO, determined: true, reason: null },
   [{ reject: 'Rule not found.', status: 404, data: { error: 'Rule not found.' } }], null);
 
+/* Edit mode on a rule that names a team, with the league list a rule page serves
+   (auto_rules_sports.dialog_leagues(), dev/changelog/1490). `act(w)` changes the About row. */
+const LEAGUES = [
+  { id: 3, name: 'Pretend Football League', teams: [{ id: 101, name: 'Harborview Gulls' }, { id: 102, name: 'Ironvale Bears' }] },
+  { id: 4, name: 'Pretend Hockey League', teams: [{ id: 201, name: 'Saltmarsh Otters' }] },
+];
+async function sportsScenario(rule, act, leagues = LEAGUES) {
+  const { w, errors } = boot({ success: true, rule: { id: 9 }, evaluation: EV_OK });
+  w.openAutoRuleModal({
+    rule: Object.assign({ id: 9, name: 'Gulls games', profile_id: null, skip_repeats: true,
+                          limit_count: null, limit_window_hours: null, max_upcoming: null,
+                          search_lines: [['Search', 'gulls']], edit_search_url: '/channels' }, rule),
+    focus: 'sports', apiBase: '/api/auto-rules/', profiles: [], defaultCap: 10, phrases: FIX.phrases,
+    sportsLeagues: leagues, sportsUrl: '/sports',
+  });
+  const first = {
+    league: ($(w, '#ar-league') || {}).value,
+    teams: $$(w, '#ar-team option').map((o) => [o.value, o.textContent]),
+    team: ($(w, '#ar-team') || {}).value,
+    team_disabled: ($(w, '#ar-team') || {}).disabled,
+    replays_disabled: ($(w, '#ar-sports-replays') || {}).disabled,
+    channels_checked: ($(w, '#ar-sports-channels') || {}).checked,
+    focused: w.document.activeElement ? w.document.activeElement.id : null,
+    text: $(w, '.modal-body').textContent.replace(/\s+/g, ' ').trim(),
+  };
+  if (act) act(w);
+  const after = {
+    teams: $$(w, '#ar-team option').map((o) => [o.value, o.textContent]),
+    team_disabled: ($(w, '#ar-team') || {}).disabled,
+    replays_disabled: ($(w, '#ar-sports-replays') || {}).disabled,
+    channels_disabled: ($(w, '#ar-sports-channels') || {}).disabled,
+  };
+  $(w, '.modal-foot .btn-primary').click();
+  await settle(w);
+  await settle(w);
+  return { first, after, sent: w.SENT, errors };
+}
+out.sports_named = await sportsScenario(
+  { sports_league_id: 3, sports_team_tsdb_id: 101, sports_skip_replays: true, sports_event_channels: true }, null);
+out.sports_moved = await sportsScenario(
+  { sports_league_id: 3, sports_team_tsdb_id: 101, sports_skip_replays: true },
+  (w) => setValue(w, '#ar-league', '4'));
+out.sports_cleared = await sportsScenario(
+  { sports_league_id: 3, sports_team_tsdb_id: 101, sports_skip_replays: true },
+  (w) => setValue(w, '#ar-league', ''));
+out.sports_no_leagues = await sportsScenario({ sports_league_id: null }, null, []);
+// A team no stored game names any more (retention, off-season) is still offered and kept.
+out.sports_pruned_team = await sportsScenario(
+  { sports_league_id: 3, sports_team_tsdb_id: 777, sports_team_name: 'Pruned Pelicans', sports_skip_replays: false },
+  null);
+// New settings that leave an event-channel recording behind: the edit dialog's save answers 409,
+// the question opens worded for settings, and its answer goes back with the same settings.
+out.settings_question = await (async () => {
+  const { w, errors } = boot({});
+  w.SEQ = [
+    { reject: 'asked', status: 409, data: { unmatched: [{ id: 41, name: 'Gulls game', when: 'Sun Nov 15, 1:00 PM' }],
+                                           determined: true, reason: null, what: 'settings' } },
+    { success: true, rule: { id: 9 }, evaluation: EV_OK, cancelled: 1, kept: 0 },
+  ];
+  w.eval(`jsonFetch = function (url, opts) {
+    SENT.push({ url: url, method: opts.method, body: JSON.parse(opts.body) });
+    const a = SEQ.shift();
+    if (a.reject) { const e = new Error(a.reject); e.status = a.status; e.data = a.data; return Promise.reject(e); }
+    return Promise.resolve(a);
+  };`);
+  w.openAutoRuleModal({
+    rule: { id: 9, name: 'Gulls games', profile_id: null, skip_repeats: true, limit_count: null,
+            limit_window_hours: null, max_upcoming: null, search_lines: [], edit_search_url: '/channels',
+            sports_league_id: 3, sports_team_tsdb_id: null, sports_skip_replays: false, sports_event_channels: true },
+    apiBase: '/api/auto-rules/', profiles: [], defaultCap: 10, phrases: FIX.phrases,
+    sportsLeagues: LEAGUES, sportsUrl: '/sports',
+  });
+  $(w, '#ar-sports-channels').checked = false;
+  $(w, '.modal-foot .btn-primary').click();
+  await settle(w);
+  await settle(w);
+  const question = {
+    title: ($(w, '.modal-head h2') || {}).textContent,
+    text: ($(w, '.modal-body') || { textContent: '' }).textContent.replace(/\s+/g, ' ').trim(),
+    confirm: ($(w, '.modal-foot .btn-primary') || {}).textContent,
+  };
+  $(w, '.modal-foot .btn-primary').click();
+  await settle(w);
+  await settle(w);
+  return { question, sent: w.SENT, toasts: w.TOASTS, open: !!$(w, '.modal'), errors };
+})();
+out.sports_not_offered = await (async () => {
+  const { w, errors } = boot({});
+  open(w, []);
+  return { has_row: !!$(w, '#ar-league'), errors };
+})();
+
 // The pure helpers, over the real phrase table.
 const { w } = boot({});
 out.counts_text = FIX.counts.map((c) => w.autoRuleCountsText(c, FIX.phrases));

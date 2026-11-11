@@ -43,6 +43,16 @@ class CsrfSweepTests(unittest.TestCase):
                        .replace(f'<string:{arg}>', val)
         return path
 
+    def test_the_sweep_fills_in_every_placeholder(self):
+        """dev/docs/BUGS.md 2026-11-10: a path still holding `<int:channel_id>` matches no
+        route, so the request 404s before the CSRF check and proves nothing about it."""
+        rules = [rule for rule in self.t.app.url_map.iter_rules()
+                 if (rule.methods or set()) & _MUTATING]
+        with_values = [rule for rule in rules if '<' in rule.rule]
+        self.assertTrue(with_values, 'no mutating route takes a value - the check would be vacuous')
+        self.assertEqual([self._concrete_path(rule) for rule in rules
+                          if '<' in self._concrete_path(rule)], [])
+
     def test_every_mutating_route_rejects_missing_token(self):
         offenders = []
         for rule in self.t.app.url_map.iter_rules():
@@ -53,8 +63,9 @@ class CsrfSweepTests(unittest.TestCase):
             method = 'POST' if 'POST' in methods else sorted(methods)[0]
             resp = self.t.client.open(path, method=method)
             # Rejected without executing: CSRF returns 400 (api/json) or 302 (html
-            # redirect). It must never 200 (executed) or 500 (crashed).
-            if resp.status_code in (200, 500):
+            # redirect). It must never 200 (executed) or 500 (crashed), and a 404 means
+            # the request never reached a route to be rejected from.
+            if resp.status_code in (200, 404, 500):
                 offenders.append(f'{method} {path} -> {resp.status_code}')
         self.assertEqual(offenders, [], f'mutating routes not rejected without CSRF: {offenders}')
 

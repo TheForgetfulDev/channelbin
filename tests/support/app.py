@@ -54,6 +54,7 @@ from app import config as cfgmod  # noqa: E402
 from app.config import _deep_merge  # noqa: E402
 import yaml  # noqa: E402
 
+
 # Captured at import time, before any test file gets a chance to monkeypatch _CONFIG_PATH -
 # this is the one stable reference for "nobody has sandboxed config.yaml yet" that
 # TestApp.__init__ below compares against. See its own comment for why.

@@ -231,7 +231,8 @@ class ShellTests(_Ledger):
     def test_the_sections_are_in_the_approved_default_order(self):
         order = re.findall(r'<div class="card" data-section="(\w+)"', self.html)
         self.assertEqual(order, ['coming', 'search', 'checks', 'settings', 'history'])
-        self.assertEqual(list(auto_rules_view.SECTIONS), order)
+        # Expected games leads, on a rule that names a league only (dev/changelog/1490).
+        self.assertEqual(list(auto_rules_view.SECTIONS), ['games'] + order)
         start = self.html.index('window.RULE_CONFIG = Object.assign(') + len(
             'window.RULE_CONFIG = Object.assign(')
         cfg, _end = json.JSONDecoder().raw_decode(self.html[start:])
@@ -502,7 +503,10 @@ class CardTests(_Base):
         items = json.loads(_unescaped(re.search(r'id="rule-setbar" data-items="([^"]+)"', html).group(1)))
         self.assertEqual([(i['focus'], i['label'], i['value']) for i in items], [
             ('profile', 'Recording profile', "Each showing's default profile"),
+            ('sports', 'About', 'Nothing'),
             ('repeats', 'Skip repeats', 'Off'),
+            ('sports-replays', 'Skip game replays', 'Off'),
+            ('sports-channels', 'Event channels', 'Off'),
             ('limit', 'Limit', 'At most 1 within 72 hours'),
             ('cap', 'Cap', 'No cap')])
         for i in items:
@@ -643,11 +647,13 @@ class RulePageJsTests(unittest.TestCase):
         self.assertEqual(desk['setbar_class'], 'gd-setbar')
         self.assertEqual(desk['chips'], [
             ['Recording profile', "Each showing's default profile", 'profile'],
-            ['Skip repeats', 'On', 'repeats'], ['Limit', 'At most 1 within 72 hours', 'limit'],
+            ['About', 'Nothing', 'sports'], ['Skip repeats', 'On', 'repeats'],
+            ['Skip game replays', 'Off', 'sports-replays'], ['Event channels', 'Off', 'sports-channels'],
+            ['Limit', 'At most 1 within 72 hours', 'limit'],
             ['Cap', '10 scheduled at once (the default)', 'cap']])
         phone = self.obs['phone']
         self.assertEqual(phone['setbar_class'], '')
-        self.assertEqual(phone['rows'], 4)
+        self.assertEqual(phone['rows'], 7)
 
     def test_a_chip_opens_the_edit_dialog_on_its_own_field(self):
         for focus, field in (('profile', 'ar-profile'), ('repeats', 'ar-repeats'),

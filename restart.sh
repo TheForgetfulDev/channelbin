@@ -39,7 +39,15 @@ DVR_OUTPUT_DIR="$(cd "$SCRIPT_DIR" && python3 -c 'from app.config import load_co
 # interpreter and the script) and nothing else: the older "python.*run\.py" also matched
 # "python3 dev/sim/run.py" and killed a full-stack simulator run mid-scenario
 # (dev/changelog/1252).
-APP_PATTERN='python[0-9.]* run\.py$'
+#
+# On the dev box the app runs under dev/tools/devbox.py, which installs a staged build of
+# prod's data and starts run.py inside the guards that keep it off prod's provider accounts
+# and storage (dev/changelog/1499). A checkout without that file runs run.py itself.
+APP_PATTERN='python[0-9.]* (run\.py|dev/tools/devbox\.py serve)$'
+LAUNCH=(run.py)
+if [ -f "$SCRIPT_DIR/dev/tools/devbox.py" ]; then
+    LAUNCH=(dev/tools/devbox.py serve)
+fi
 if pgrep -f "$APP_PATTERN" > /dev/null 2>&1; then
     BUSY_ROWS="$(cd "$SCRIPT_DIR" && python3 tools/check_busy.py)" && BUSY=0 || BUSY=1
     BUSY_TEXT="$(echo "$BUSY_ROWS" | grep -v '^blocking-kinds:' || true)"
@@ -105,5 +113,5 @@ fi
 # Launch from the project directory so relative imports and config paths work
 echo "Starting ChannelBin..."
 cd "$SCRIPT_DIR"
-nohup python3 run.py >> "$LOG_FILE" 2>&1 &
+nohup python3 "${LAUNCH[@]}" >> "$LOG_FILE" 2>&1 &
 echo "Started (PID $!). Logs: $LOG_FILE"

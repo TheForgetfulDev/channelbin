@@ -3484,4 +3484,14 @@
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => { if (!isPhone()) renderList(); }, 120);
   });
+  // The fit is measured in whatever face is on screen at the time. Inter is
+  // `font-display: swap`, so a first draw made before it arrives is measured in the fallback,
+  // and the table then grows past its box when Inter lands - 43px at 1280px, with nothing
+  // re-deciding (dev/changelog/1503). Re-decide when a font finishes loading: a table that
+  // now overflows becomes cards, and cards drawn for room get their chance at the table.
+  if (document.fonts && document.fonts.addEventListener) {
+    document.fonts.addEventListener('loadingdone', () => {
+      if (!isPhone() && (cardsForRoom || tableOverflows())) renderList();
+    });
+  }
 })();

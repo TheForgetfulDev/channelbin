@@ -64,6 +64,10 @@
         <div class="form-group">
           <label>Recording Name <span class="required">*</span></label>
           <input type="text" name="name" id="modal-name" class="form-control" required>
+          {# The suggested name with its {sports:...} fields still in it. new_recording_json keeps
+             it only while the name is exactly that suggestion, so the join fills those fields in
+             for a suggested name and never for a typed one (dev/changelog/1498). #}
+          <input type="hidden" name="name_template" id="modal-name-template">
         </div>
         <div class="form-row">
           <div class="form-group">

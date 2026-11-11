@@ -18,7 +18,7 @@ from .database import (
 )
 from .config import load_config
 from .fmt_utils import counted
-from .sports_data import SHIPPED_LEAGUES, _settings, event_shape_is_matchup, file_name, file_names_on, link_has_time
+from .sports_data import SHIPPED_LEAGUES, _settings, event_shape_is_matchup, link_has_time
 from .tz_utils import ago, date_label, day_label, format_local, get_display_tz, is_24h, to_local
 
 STATUS_OK = 'ok'
@@ -257,6 +257,8 @@ def list_context() -> dict:
     fetches, follows, missing, teams = _load_all()
     upcoming = _group([e for e in _upcoming_query(now, settings, tz).all() if _still_ahead(e, now, tz)],
                       lambda e: e.league_id)
+    from .database import AutoRule
+    rule_names = dict(db.session.query(AutoRule.id, AutoRule.name).filter(AutoRule.sports_league_id.isnot(None)))
 
     rows = []
     for league in leagues:
@@ -281,7 +283,9 @@ def list_context() -> dict:
             'updated': ago(updated, now), 'updated_at': format_local(updated, 'day_datetime', none_value='', tz=tz, h24=h24),
             'updated_sort': int((now - updated).total_seconds()) if updated else 10 ** 9,
             'has_teams': any(event_shape_is_matchup(e) for e in events),
-            'dialog': _dialog(league, lfollows, teams, events, settings),
+            # The person's own follow, as on the league's page; a rule's is changed on the rule.
+            'dialog': _dialog(league, [f for f in lfollows if not f.rule_id], teams, events, settings,
+                              sorted(rule_names[f.rule_id] for f in lfollows if f.rule_id in rule_names)),
         })
     rows.sort(key=lambda r: (r['next_sort'], r['name']))
     followed = sum(1 for r in rows if r['followed'])
@@ -300,8 +304,10 @@ def _sort_key(event) -> str:
     return (event.start_at or datetime.combine(event.local_date, datetime.min.time())).strftime('%Y%m%d%H%M')
 
 
-def _dialog(league, follows, teams, events, settings) -> dict:
-    """What the row's dialogs act on, read from the row itself so it is never older than the page."""
+def _dialog(league, follows, teams, events, settings, rules=()) -> dict:
+    """What the row's dialogs act on, read from the row itself so it is never older than the page.
+    `rules` names the auto-record rules that name the league, so Delete league says it cannot before
+    it is pressed (dev/changelog/1491)."""
     names = {}
     for e in events:
         if e.home_team_id:
@@ -311,7 +317,7 @@ def _dialog(league, follows, teams, events, settings) -> dict:
     return {'id': league.id, 'name': league.name, 'stored': len(events), 'keep_days': settings['history_keep_days'],
             'chosen': sorted(f.team_tsdb_id for f in follows if f.team_tsdb_id),
             'whole': any(f.team_tsdb_id == 0 for f in follows),
-            'followed': bool(follows),
+            'followed': bool(follows), 'rules': list(rules),
             'teams': sorted(({'id': i, 'name': teams.get(i) or n} for i, n in names.items()),
                             key=lambda t: t['name'] or '')}
 
@@ -422,6 +428,10 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED):
     shown = all_events if (scope == SCOPE_ALL or not picked_teams) else mine
     updated = _last_updated(fetches)
     follow_text = _follow_text(league, follows, teams, many)
+    # A rule's follow is changed on the rule, so the buttons and the Following row are about the
+    # person's own; the rules that follow it have a row of their own (dev/changelog/1490).
+    person = [f for f in follows if not f.rule_id]
+    rule_follows = _rule_follows(follows, teams)
     if picked_teams:
         lead = f'Following {follow_text.replace(", ", " and ")}.'
     elif whole:
@@ -445,7 +455,7 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED):
         message = f'Last updated {ago(updated, now)}.' if updated else 'Not checking for games.'
     return {
         'league': league, 'status': status, 'badge': badge, 'label': label, 'tip': tip, 'lead': f'{lead} {", ".join(bits)}.' if bits else lead,
-        'added': format_local(league.created_at, 'date', tz=tz, h24=h24), 'message': message, 'followed': bool(follows),
+        'added': format_local(league.created_at, 'date', tz=tz, h24=h24), 'message': message, 'followed': bool(person),
         'notices': _notices(league, status, fetches, missing_events, one, many, stored, settings['history_keep_days'], now, tz),
         'no_games_note': _no_games_note(status, settings['horizon_days']),
         'games': _enrich_games([_game_row(e, now, tz, h24) for e in shown], shown, counts, names, checked_at,
@@ -457,14 +467,36 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED):
         'match_waiting': bool(state and (state.match_note or '').startswith(('Waiting', 'The last run'))),
         'matching': _matching_context(league),
         'picked_teams': picked_teams, 'scope': SCOPE_ALL if scope == SCOPE_ALL and picked_teams else SCOPE_FOLLOWED,
-        'mine_total': len(mine), 'all_total': len(all_events), 'follow_text': follow_text if follows else 'Nothing',
+        'mine_total': len(mine), 'all_total': len(all_events),
+        'follow_text': _follow_text(league, person, teams, many) if person else 'Nothing',
         'next_update': next_update, 'horizon_days': settings['horizon_days'],
         'updates': [_update_row(f, rounds, one, many, now, tz, h24) for f in update_rows],
-        'dialog': _dialog(league, follows, teams, all_events, settings),
+        # Change teams and Stop following act on the person's own follow only (sports_data.
+        # set_following); a rule's follow is changed on the rule (dev/changelog/1490).
+        'dialog': _dialog(league, person, teams, all_events, settings,
+                          sorted({r['name'] for r in rule_follows})),
+        'rule_follows': rule_follows,
         'can_change_teams': any(event_shape_is_matchup(e) for e in all_events),
         'section_names': {**SECTION_NAMES, 'upcoming': f'Upcoming {many}'},
         'league_url': f'https://www.thesportsdb.com/league/{league.tsdb_id}',
     }
+
+
+def _rule_follows(follows, teams) -> list:
+    """[{name, url, what}] for each auto-record rule that follows this league (design 3): a follow a
+    person cannot remove here, so the page says whose it is."""
+    from flask import url_for
+    from .database import AutoRule
+    ids = sorted({f.rule_id for f in follows if f.rule_id})
+    if not ids:
+        return []
+    names = dict(db.session.query(AutoRule.id, AutoRule.name).filter(AutoRule.id.in_(ids)))
+    out = []
+    for f in sorted((f for f in follows if f.rule_id in names), key=lambda f: names[f.rule_id].lower()):
+        what = teams.get(f.team_tsdb_id, f'Team #{f.team_tsdb_id}') if f.team_tsdb_id else 'All its games'
+        out.append({'name': names[f.rule_id], 'what': what,
+                    'url': url_for('auto_rules.rule_page', rule_id=f.rule_id)})
+    return out
 
 
 def _match_note(state, found: int, total: int, one: str, many: str, now, tz, h24) -> str:
@@ -542,7 +574,8 @@ def _guide_cell(event, c, n, checked_at, guide_end, now, tz) -> dict:
     start = event.start_at or datetime.combine(event.local_date, datetime.min.time())
     past_guide = guide_end is None or start > guide_end
     if kept:
-        where = (f'Not in your guide yet: it reaches {day_label(guide_end, now, tz)}.' if guide_end and past_guide
+        # Two facts, not one: "it reaches" read as when the game would show up (dev/changelog/1490).
+        where = (f'Not in your guide yet. Your guide reaches {day_label(guide_end, now, tz)}.' if guide_end and past_guide
                  else 'Not in your guide yet.' if past_guide else 'No listing in your guide names it.')
         read = 'Read from its name.' if kept == 1 else 'Read from their names.'
         return {'state': 'names', 'text': f'On {counted(kept, "event channel")}', 'sub': f'{read} {where}',
@@ -592,7 +625,7 @@ def _matching_context(league) -> dict:
 
 
 def add_dialog_config() -> dict:
-    """The shipped list, for Add a league. Which are followed already comes with the page."""
+    """The shipped list, for Add league or team. Which are followed already comes with the page."""
     followed = {tsdb for (tsdb,) in db.session.query(SportsLeague.tsdb_id).join(
         SportsFollow, SportsFollow.league_id == SportsLeague.id).distinct().all()}
     return {'shipped': [{'tsdb_id': s['tsdb_id'], 'name': s['name'], 'sport': s['sport'],
@@ -620,7 +653,8 @@ def recording_context(rec, now, tz, h24, cfg=None):
     """What the recording page's Program card says about TheSportsDB, or None to say nothing.
 
     A fixed handful of queries for one recording. A recording with no link says nothing unless a
-    followed league's text or category is on its listing, and then says why it was not matched."""
+    followed league's text or category is on its listing, and then says why it was not matched,
+    or its name is waiting for TheSportsDB fields, and then says when they fill in."""
     from .database import RecordingSports
     from .sports_data import event_title
     cfg = cfg if cfg is not None else load_config()
@@ -628,7 +662,7 @@ def recording_context(rec, now, tz, h24, cfg=None):
     if link is not None and link.removed_at is not None:
         return {'state': 'removed', 'event': event_title(link), 'league': link.league_name,
                 'removed_on': date_label(to_local(link.removed_at, tz).date(), now, tz),
-                'keeps_name': _file_not_named_yet(rec, cfg)}
+                'keeps_name': _name_waiting(rec)}
     if link is not None:
         season = ' '.join(x for x in (link.league_name, link.season) if x)
         if link.round and 0 < link.round < 100:
@@ -647,27 +681,30 @@ def recording_context(rec, now, tz, h24, cfg=None):
                 'reason': link.reason,
                 'tsdb_url': f'https://www.thesportsdb.com/event/{link.tsdb_event_id}',
                 'art': _artwork(rec, link, cfg, now, tz, h24),
-                'file_name': _future_file_name(rec, link, cfg, tz)}
+                'file_name': _future_file_name(rec, link, tz)}
     note = _unlinked_note(rec)
-    if note and _file_not_named_yet(rec, cfg):
-        note += ' Its file will keep its normal name.'
+    if _name_waiting(rec):
+        waiting = ('Its name has TheSportsDB fields, which fill in if the game is matched before its '
+                   'file is written.')
+        note = f'{note} {waiting}' if note else waiting
     return {'state': 'none', 'note': note} if note else None
 
 
-def _file_not_named_yet(rec, cfg) -> bool:
-    """Whether naming matched games from TheSportsDB is on and this recording's file is still to be
-    written, so what the join will call it is worth saying (dev/changelog/1466). Once written, the
-    page shows the file itself and its join event says how it was named."""
+def _name_waiting(rec) -> bool:
+    """Whether this recording's name came from a template with {sports:...} fields and its file is
+    still to be written, so what the join will fill in is worth saying (dev/changelog/1498). Once
+    written, the page shows the file itself and its join event says how it was named."""
     from .database import REC_ENDED_STATUSES
-    return file_names_on(cfg) and not rec.output_path and rec.status not in REC_ENDED_STATUSES
+    return bool(rec.sports_name_template) and not rec.output_path and rec.status not in REC_ENDED_STATUSES
 
 
-def _future_file_name(rec, link, cfg, tz):
+def _future_file_name(rec, link, tz):
     """The name the join will give a linked recording's file, as it will be on disk, or None."""
     from .recorder import _safe_name
-    if not _file_not_named_yet(rec, cfg):
+    from .sports_data import recording_file_name
+    if not _name_waiting(rec):
         return None
-    name = file_name(link, tz)
+    name, _ = recording_file_name(rec, tz)
     return _safe_name(name) if name else None
 
 
@@ -688,9 +725,12 @@ def _artwork(rec, link, cfg, now, tz, h24):
     names = {POSTER: 'poster', BACKGROUND: 'background'}
     ready = [r for r in roles if art[r][0] == READY]
     out = []
+    profile = rec.profile
+    pinned = profile is not None and bool(profile.poster_file)
     if ready:
         what = ' and '.join(names[r] for r in ready).capitalize()
-        out.append(f'{what} from TheSportsDB.' if link.poster_url else
+        # A pinned poster beats the thumb standing in for a missing one, whatever the profile prefers.
+        out.append(f'{what} from TheSportsDB.' if link.poster_url or pinned else
                    f'{what} from TheSportsDB, also used as the poster, since the event has none.')
     known = images_for(link)
     unused = False
@@ -714,9 +754,19 @@ def _artwork(rec, link, cfg, now, tz, h24):
             out.append(f'{name} not downloaded yet.{why}{when}')
     if unused:
         out.append('Not downloaded: this recording writes no metadata file, the one place they are used.')
-    profile = rec.profile
-    if profile is not None and profile.poster_file:
-        out.append(f'The image pinned to profile "{profile.name}" is the poster.')
+    if pinned:
+        if not profile.prefer_sports_poster:
+            out.append(f'The image pinned to profile "{profile.name}" is the poster.')
+        elif link.poster_url and art[POSTER][0] == READY:
+            out.append(f'Profile "{profile.name}" puts this poster ahead of its pinned one.')
+        elif link.poster_url and art[POSTER][0] in (MISSED, REFUSED):
+            out.append(f'The image pinned to profile "{profile.name}" is the poster, since TheSportsDB\'s '
+                       'was not downloaded.')
+        elif link.poster_url:
+            out.append(f'The image pinned to profile "{profile.name}" is the poster until TheSportsDB\'s '
+                       'is downloaded.')
+        else:
+            out.append(f'The image pinned to profile "{profile.name}" is the poster, since the event has none.')
     return {'text': ' '.join(out), 'cls': 'ok' if len(ready) == len(roles) else 'warn',
             'links': [{'role': r, 'label': names[r]} for r in ready]}
 

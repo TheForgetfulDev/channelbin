@@ -338,6 +338,36 @@ class SingleMobileBreakpointTests(unittest.TestCase):
             'means the breakpoint was renamed without this constant being updated.')
 
 
+class TextWidthCapTests(unittest.TestCase):
+    """Text runs the full width of its card. A `max-width` in `ch` caps a line at a
+    character count, which on a desktop card leaves a sentence wrapping a third of the way
+    across: rejected for Settings (dev/changelog/1002), for the About panels
+    (dev/changelog/1395), and app-wide (dev/changelog/1501). A cap that is really there for
+    layout says why with `text-width-ok: <reason>` in the rule."""
+
+    _CAP_RE = re.compile(r'max-width\s*:\s*[\d.]+ch\b')
+    _RULE_RE = re.compile(r'[^{}]*\{[^{}]*\}')
+    _STYLE_ATTR_RE = re.compile(r'style\s*=\s*(["\'])(.*?)\1')
+    _MARKER = 'text-width-ok:'
+
+    def _offenders(self):
+        out = []
+        for path, text in _css_sources():
+            for m in self._RULE_RE.finditer(text):
+                rule = m.group(0)
+                if self._CAP_RE.search(rule) and self._MARKER not in rule:
+                    out.append(f'{_rel(path)}: {rule.strip().splitlines()[-1][:80]}')
+        for path in list(_walk(TPL_DIR, '.html')) + list(_walk(JS_DIR, '.js')):
+            for line in _read(path).splitlines():
+                for m in self._STYLE_ATTR_RE.finditer(line):
+                    if self._CAP_RE.search(m.group(2)) and self._MARKER not in line:
+                        out.append(f'{_rel(path)}: {m.group(0)[:80]}')
+        return out
+
+    def test_no_text_is_capped_at_a_character_count(self):
+        self.assertEqual(self._offenders(), [])
+
+
 class CssBreakpointOverrideTests(unittest.TestCase):
     """A responsive `display` set inside a `@media` block must not be undone by a later
     top-level rule carrying the *same selector* (BUGS.md 2026-07-30 - the `/channels` page

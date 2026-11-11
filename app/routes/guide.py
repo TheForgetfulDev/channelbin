@@ -10,7 +10,7 @@ from ..database import (Account, Channel, ChannelEvent, ChannelGroup, EPGEntry, 
                         UserPref,
                         CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE,
                         REC_STATUS_ABORTED, REC_STATUS_FAILED)
-from ..accounts import (normalize_url, render_filename_template,
+from ..accounts import (normalize_url, render_filename_template, split_sports_name,
                         duplicates_within, lifecycle_states_for_channels,
                         repoint_candidates_for_channels, transfer_channel_state,
                         transfer_keeper_problem,
@@ -243,7 +243,7 @@ def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, 
     sub_title = (entry.sub_title or '') if entry else ''
     description = (entry.description or '') if entry else ''
     category = (entry.category or '') if entry else ''
-    suggested = render_filename_template(template, {
+    suggested, sports_template = split_sports_name(template, render_filename_template(template, {
         'start_time': start,
         'stop_time': stop,
         'title': title,
@@ -251,9 +251,10 @@ def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, 
         'description': description,
         'channel_name': name,
         'category': category,
-    }, tag_cleanup=tag_cleanup, tags_by_name=tags_by_name, tz=tz)
+    }, tag_cleanup=tag_cleanup, tags_by_name=tags_by_name, tz=tz, keep_sports=True),
+        (entry.title or '') if entry else '')
     has_rec = bool(rec)
-    return {
+    cell = {
         'id': entry.id if entry else None,
         'title': title,
         'sub_title': sub_title,
@@ -290,6 +291,11 @@ def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, 
         'is_dummy': entry is None,
         'matched_tags': _matched_tags(all_tags, entry.title, entry.sub_title, entry.description) if entry else [],
     }
+    if sports_template is not None:
+        # Only when the template has a {sports:...} field: the record dialog posts it back so
+        # the join can fill those fields in (dev/changelog/1498).
+        cell['suggested_name_template'] = sports_template
+    return cell
 
 
 @guide_bp.route('/api/guide/suggested-name', methods=['POST'])
@@ -318,7 +324,7 @@ def suggested_name_api():
     except ValueError:
         return jsonify({'error': 'start_time and stop_time must be ISO times.'}), 400
     template, tag_cleanup = filename_naming_for(load_config(), profile)
-    name = render_filename_template(template, {
+    name, sports_template = split_sports_name(template, render_filename_template(template, {
         'start_time': start,
         'stop_time': stop,
         'title': str(data.get('title') or ''),
@@ -326,8 +332,8 @@ def suggested_name_api():
         'description': str(data.get('description') or ''),
         'channel_name': str(data.get('channel_name') or ''),
         'category': str(data.get('category') or ''),
-    }, tag_cleanup=tag_cleanup)
-    return jsonify({'success': True, 'name': name})
+    }, tag_cleanup=tag_cleanup, keep_sports=True), str(data.get('title') or ''))
+    return jsonify({'success': True, 'name': name, 'name_template': sports_template})
 
 
 def _guide_row_entries(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD):

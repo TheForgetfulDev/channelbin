@@ -194,7 +194,7 @@ function pmPosterCardHtml(src, line, advice, removable) {
     '</div>';
 }
 
-function pmPosterSectionHtml(poster, spec) {
+function pmPosterSectionHtml(poster, spec, preferSports) {
   const current = poster
     ? `<div class="pm-poster">${pmPosterCardHtml(poster.url,
       `${poster.kind}, ${poster.width} x ${poster.height}`, poster.advice, true)}</div>`
@@ -211,7 +211,23 @@ function pmPosterSectionHtml(poster, spec) {
         '<input type="file" id="pm-poster-file" accept="image/jpeg,image/png">' +
         '<div id="pm-poster-preview" class="pm-poster" hidden></div>',
     }) +
+    // Saved with the profile's JSON body, not the poster's file route (pmPosterPayload).
+    fieldRow({
+      label: "Use TheSportsDB's poster when the game has one",
+      meta: "For a recording matched to a TheSportsDB event that has its own poster, use that " +
+        'poster instead of the pinned one. The pinned poster is still used for every other ' +
+        "recording. TheSportsDB's background images never replace it.",
+      control: '<label class="switch"><input type="checkbox" id="pm-prefer-sports-poster"' +
+        `${preferSports ? ' checked' : ''}><span class="knob"></span></label>`,
+    }) +
     '</fieldset>';
+}
+
+/* The poster section's one setting that travels in the JSON body. Every save sends it, like
+   every other field (pmPayload), so turning it off is a save like any other. */
+function pmPosterPayload(section) {
+  const box = section.querySelector('#pm-prefer-sports-poster');
+  return { prefer_sports_poster: !!(box && box.checked) };
 }
 
 /* Wires the section: a picked file is previewed with its size and the advice line, an
@@ -404,6 +420,7 @@ function pmSectionsHtml(sections, values, defaults, cleanup) {
      cleanup      - {remove, replace}: the tag cleanup that travels with a 'template' field.
                     Sent as filename_tags_remove / filename_tags_replace; omit for a type
                     with no template field
+     extraPayload() - optional; keys from `extra` merged into the request body
      afterSave(res) - optional; a promise for follow-up requests that need the saved
                     row's id (the poster upload). Its failure is reported but never leaves
                     the modal open over a profile that IS saved - a second Save on the
@@ -438,6 +455,7 @@ function openProfileModal(opts) {
       out.filename_tags_remove = cleanup.remove;
       out.filename_tags_replace = cleanup.replace;
     }
+    if (opts.extraPayload) Object.assign(out, opts.extraPayload());
     return out;
   };
 
@@ -559,10 +577,13 @@ function openRecordingProfileModal(opts) {
   const posterState = { file: null, remove: false };
   let extra = null;
   let afterSave;
+  let extraPayload;
   if (spec) {
     extra = document.createElement('div');
-    extra.innerHTML = pmPosterSectionHtml(p ? p.poster : null, spec);
+    extra.innerHTML = pmPosterSectionHtml(p ? p.poster : null, spec, !!(p && p.prefer_sports_poster));
     pmWirePosterSection(extra, spec, posterState);
+    const section = extra;
+    extraPayload = () => pmPosterPayload(section);
     afterSave = (res) => {
       const id = res.profile.id;
       if (posterState.file) {
@@ -578,6 +599,7 @@ function openRecordingProfileModal(opts) {
   }
   return openProfileModal({
     extra,
+    extraPayload,
     afterSave,
     cleanup: {
       remove: (p && p.filename_tags_remove) || [],

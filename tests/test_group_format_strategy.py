@@ -34,6 +34,7 @@ The rules with teeth, each of which is a separate way to get this wrong:
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -266,6 +267,72 @@ class ApplyFormatStrategyTests(_GroupCase):
         plan = apply_format_strategy(grp)
         self.assertFalse(plan['moved'])
         self.assertEqual(before, len(self._events(grp)))
+
+    def _bitrate_history(self, channel, readings):
+        """`readings` = [(days_ago, kbps), ...] passing tests on `channel`, oldest first,
+        so the most recent reading is the channel's latest test."""
+        for days_ago, kbps in sorted(readings, key=lambda r: -r[0]):
+            make_channel_test(channel, all_null=False, status='COMPLETED', connected=True,
+                              resolution=HD[0] if channel.name == 'HD' else SD[0],
+                              fps=float(HD[1] if channel.name == 'HD' else SD[1]),
+                              bitrate_kbps=kbps,
+                              test_started_at=datetime.utcnow() - timedelta(days=days_ago),
+                              test_ended_at=datetime.utcnow() - timedelta(days=days_ago))
+        db.session.commit()
+
+    def test_highest_bitrate_ranks_a_channel_on_the_median_of_its_recent_checks(self):
+        """dev/docs/BUGS.md 2026-11-09 02:09 PM (the bitrate window). HD's newest check caught a bad
+        night at 1000 kbps; its two checks earlier in the window read 9000. Ranked on the
+        latest check alone, SD at 4000 wins and the lock flips on one bad night; ranked
+        on HD's own 14-day median (9000) it does not."""
+        hd = make_channel(self.acct, name='HD')
+        sd = make_channel(self.acct, name='SD')
+        self._bitrate_history(hd, [(6, 9000), (3, 9000), (1, 1000)])
+        self._bitrate_history(sd, [(1, 4000)])
+        grp = make_group(name='FS1', members=[hd, sd], format_strategy='highest_bitrate')
+        db.session.commit()
+        plan = apply_format_strategy(grp)
+        self.assertTrue(plan['moved'])
+        self.assertEqual(HD, grp.locked_format_key)
+        event = self._events(grp, GROUP_FORMAT_STRATEGY_APPLIED)[-1]
+        self.assertIn('the median of 3 health checks spanning 5 days', event.detail)
+        import json
+        extra = json.loads(event.extra_data)
+        self.assertEqual(3, extra['measurements'])
+        self.assertIsNotNone(extra['measured_from'])
+
+    def test_a_failed_check_inside_the_window_does_not_feed_the_median(self):
+        """A FAILED check keeps the bitrate it measured before the verdict (a placeholder
+        clip, a stalled capture); only COMPLETED checks reach the window. HD's one failed
+        300 kbps reading must not drag its 9000 median under SD's 4000."""
+        hd = make_channel(self.acct, name='HD')
+        sd = make_channel(self.acct, name='SD')
+        self._bitrate_history(hd, [(6, 9000), (3, 9000)])
+        for days_ago in (5, 4, 2):
+            make_channel_test(hd, all_null=False, status='FAILED', connected=True,
+                              resolution=HD[0], fps=float(HD[1]), bitrate_kbps=300,
+                              test_started_at=datetime.utcnow() - timedelta(days=days_ago),
+                              test_ended_at=datetime.utcnow() - timedelta(days=days_ago))
+        self._bitrate_history(hd, [(1, 9000)])
+        self._bitrate_history(sd, [(1, 4000)])
+        grp = make_group(name='FS1', members=[hd, sd], format_strategy='highest_bitrate')
+        db.session.commit()
+        apply_format_strategy(grp)
+        self.assertEqual(HD, grp.locked_format_key)
+        event = self._events(grp, GROUP_FORMAT_STRATEGY_APPLIED)[-1]
+        self.assertIn('the median of 3 health checks', event.detail)
+
+    def test_a_check_older_than_the_window_does_not_feed_the_median(self):
+        """The same shape with HD's good readings 20 and 25 days old: outside the 14-day
+        window they are not the feed as it is now, so the latest check decides and SD wins."""
+        hd = make_channel(self.acct, name='HD')
+        sd = make_channel(self.acct, name='SD')
+        self._bitrate_history(hd, [(25, 9000), (20, 9000), (1, 1000)])
+        self._bitrate_history(sd, [(1, 4000)])
+        grp = make_group(name='FS1', members=[hd, sd], format_strategy='highest_bitrate')
+        db.session.commit()
+        apply_format_strategy(grp)
+        self.assertEqual(SD, grp.locked_format_key)
 
     def test_a_non_bucket_strategy_never_touches_the_lock(self):
         grp, chans = self._group(GROUP_FORMAT_HIGHEST_SCORE, [HD, SD, SD])
