@@ -1,6 +1,6 @@
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import (
     Blueprint, request, jsonify, redirect,
@@ -170,6 +170,34 @@ def _latest_tests_by_channel(channel_ids, for_job_id=ANY_JOB):
         ChannelTest.id.in_(db.session.query(sub.c.max_id))
     ).all()
     return {t.channel_id: t for t in tests}
+
+
+def _recent_tests_by_channel(channel_ids, days, now=None):
+    """channel_id -> [ChannelTest, ...] for every COMPLETED test of these channels that
+    started inside the last `days` days and measured a bitrate, whatever job ran it (a
+    recording's pre-check included, for the same reason ANY_JOB reads it above).
+
+    The format ranking's window (channel_groups.format_buckets): a channel's bitrate for a
+    ranking is the median over these, not its single latest check. COMPLETED only, which is
+    the PASS and WARN labels: a FAILED test stores the bitrate it measured before the
+    placeholder-clip, short-capture or quality verdict failed it, and that number is the
+    provider's offline clip or a stalled capture, not the feed. One query for the whole
+    list, grouped here - a channel has many tests, so this is a list per key and never a
+    {key: row} map (dev/changelog/1487)."""
+    if not channel_ids or days <= 0:
+        return {}
+    since = (now or datetime.utcnow()) - timedelta(days=days)
+    tests = (ChannelTest.query
+             .filter(ChannelTest.channel_id.in_(channel_ids),
+                     ChannelTest.status == TEST_STATUS_COMPLETED,
+                     ChannelTest.test_started_at >= since,
+                     ChannelTest.bitrate_kbps.isnot(None))
+             .order_by(ChannelTest.test_started_at)
+             .all())
+    out = {}
+    for t in tests:
+        out.setdefault(t.channel_id, []).append(t)
+    return out
 
 
 def _build_test_dict(t, test_duration_seconds=config_default('channel_testing.test_duration_seconds')):

@@ -69,12 +69,15 @@ ACCOUNT_LOGIN_REFUSED = 'ACCOUNT_LOGIN_REFUSED'
 #: (app/provider_stalls.py, dev/changelog/1476).
 PROVIDER_STALLS_CORRELATED = 'PROVIDER_STALLS_CORRELATED'
 
-# The three ways an auto-record rule cannot do its job (app/auto_rules.py,
+# The ways an auto-record rule cannot do its job (app/auto_rules.py,
 # DESIGN-autoschedule.md §6). A rule scheduling something is never an alert - its history and
 # the recording's own event show that (dev/changelog/923).
 AUTO_RULE_CAPPED = 'AUTO_RULE_CAPPED'
 AUTO_RULE_BROKEN = 'AUTO_RULE_BROKEN'
 AUTO_RULES_GUIDE_SHORT = 'AUTO_RULES_GUIDE_SHORT'
+#: A rule that names a league has a game starting within hours that nothing lists and no event
+#: channel names, so it will be missed (app/auto_rules.py, dev/changelog/1490).
+AUTO_RULE_GAME_UNLISTED = 'AUTO_RULE_GAME_UNLISTED'
 
 #: Types nothing raises any more, kept in ALERT_TYPES below purely so the rows already in
 #: the database still render with a label.
@@ -321,6 +324,9 @@ ALERT_TYPES = {
     # the label a human reads is the phase's own word (dev/changelog/961).
     'CONCATENATION_FAILED': {'label': 'Join Failed', 'severity': 'ERROR'},
     'CONFIG_FILE_MISSING': {'label': 'Config File Missing', 'severity': 'CRIT'},
+    # A setting a user had turned on no longer exists, so what it did has stopped. Raised once,
+    # when startup removes the key from config.yaml (dev/changelog/1498).
+    'SETTING_REMOVED': {'label': 'Setting Removed', 'severity': 'WARN'},
     'HEALTH_CHECK_COMPLETE': {'label': 'Health Check Completed', 'severity': 'INFO'},
     # A repeating health check whose row has no hour or minute, so it was not scheduled
     # and will never run on its own (dev/changelog/1110). Registering it anyway would fire
@@ -421,6 +427,13 @@ ALERT_TYPES = {
     # recomputed by every evaluation.
     AUTO_RULES_GUIDE_SHORT: {
         'label': 'Guide Too Short For Auto-record Rules', 'severity': 'WARN',
+        'self_clearing': True},
+    # A game an auto-record rule is about starts within six hours with no guide listing, no event
+    # channel naming it and nothing recording it. Days ahead that is normal and only shown on the
+    # rule's page; this close it is a recording that will not happen. Cleared by the next
+    # evaluation that finds something, or by a pause, edit or delete.
+    AUTO_RULE_GAME_UNLISTED: {
+        'label': 'Auto-record Rule Has A Game Nothing Lists', 'severity': 'WARN',
         'self_clearing': True},
 }
 

@@ -101,7 +101,58 @@ const _arCount = (n, one, many) => `${nf(n)} ${n === 1 ? one : many}`;
 const AUTO_RULE_FOCUS = {
   name: '#ar-name', profile: '#ar-profile', repeats: '#ar-repeats',
   limit: '#ar-limit-count', cap: '#ar-cap',
+  sports: '#ar-league', 'sports-replays': '#ar-sports-replays', 'sports-channels': '#ar-sports-channels',
 };
+
+/* The About row and Skip game replays (DESIGN-sports-data.md 10, dev/changelog/1490), or '' when
+   the page offers no league list. `leagues` is auto_rules_sports.dialog_leagues(): only leagues
+   already on Sports Schedules, with the teams their stored games name. */
+function autoRuleSportsRows(leagues, rule, sportsUrl) {
+  if (!Array.isArray(leagues)) return '';
+  const leagueId = rule ? rule.sports_league_id : null;
+  const teamId = rule ? rule.sports_team_tsdb_id : null;
+  const on = !!leagueId;
+  const league = leagues.find((l) => l.id === leagueId);
+  const link = sportsUrl ? `<a href="${escHtml(sportsUrl)}">Sports Schedules</a>` : 'Sports Schedules';
+  const none = leagues.length ? '' : ` No league is on ${link} yet; add one there first.`;
+  return fieldRow({
+    label: 'About', stack: true,
+    meta: `Optional: a league, or one team in it, from ${link}. The rule then shows the games it `
+      + 'expects, says when one is not in the guide yet, records each game once, and can skip game '
+      + 'replays. Naming one follows it on Sports Schedules for as long as the rule names it. It does '
+      + `not change what the search finds.${none}`,
+    control: '<div class="ar-about">'
+      + '<select id="ar-league" aria-label="League"><option value="">Nothing</option>'
+      + leagues.map((l) => `<option value="${l.id}"${l.id === leagueId ? ' selected' : ''}>${escHtml(l.name)}</option>`).join('')
+      + '</select>'
+      + `<select id="ar-team" aria-label="Team"${on ? '' : ' disabled'}>${autoRuleTeamOptions(league, teamId, rule && rule.sports_team_name)}</select>`
+      + '</div>',
+  }) + fieldRow({
+    label: 'Skip game replays',
+    meta: 'Leaves out a listing TheSportsDB matched as a replay while the game\'s first airing is '
+      + 'scheduled or recorded, by this rule or any other way. A listing whose airing is in doubt is '
+      + 'never left out, and if the first airing fails, its replay is recorded.',
+    control: `<label class="switch"><input type="checkbox" id="ar-sports-replays"${on && rule.sports_skip_replays ? ' checked' : ''}${on ? '' : ' disabled'}>`
+      + '<span class="knob"></span></label>',
+  }) + fieldRow({
+    label: 'Record from event channels',
+    meta: 'When the guide has no listing of one of its games at all, records it from a channel whose '
+      + 'name names it, such as "NFL | 06 - 1pm Browns at Saints". Only a strong match, and only when '
+      + 'the name or TheSportsDB gives a start ChannelBin can stand behind. The search\'s account, day '
+      + 'and time filters apply to these channels; its text, tag, group, category and length filters do not.',
+    control: `<label class="switch"><input type="checkbox" id="ar-sports-channels"${on && rule.sports_event_channels ? ' checked' : ''}${on ? '' : ' disabled'}>`
+      + '<span class="knob"></span></label>',
+  });
+}
+
+/* A team the rule names is offered even when no stored game names it any more (off-season,
+   retention), so saving another field never quietly widens the rule to the whole league. */
+function autoRuleTeamOptions(league, teamId, teamName) {
+  const teams = ((league && league.teams) || []).slice();
+  if (teamId && !teams.some((t) => t.id === teamId)) teams.push({ id: teamId, name: teamName || `Team #${teamId}` });
+  return '<option value="">All its games</option>'
+    + teams.map((t) => `<option value="${t.id}"${t.id === teamId ? ' selected' : ''}>${escHtml(t.name)}</option>`).join('');
+}
 
 /**
  * The rule dialog. Create, from a Programs search:
@@ -154,6 +205,7 @@ function openAutoRuleModal(opts) {
         'search loaded.</span>' +
         `<a class="btn btn-sm" href="${escHtml(rule.edit_search_url || '')}">Edit search ${icon('forward')}</a></div></div>`,
     }) : '') +
+    autoRuleSportsRows(opts.sportsLeagues, rule, opts.sportsUrl) +
     fieldRow({
       // Stacked: the 220px control column cut "Each showing's default profile" short.
       label: 'Recording profile', stack: true,
@@ -220,7 +272,25 @@ function openAutoRuleModal(opts) {
     limit_count: autoRuleNumber($('#ar-limit-count').value),
     limit_window_hours: autoRuleNumber($('#ar-limit-hours').value),
     max_upcoming: autoRuleNumber($('#ar-cap').value),
-  });
+  }, $('#ar-league') ? {
+    sports_league_id: $('#ar-league').value ? Number($('#ar-league').value) : null,
+    sports_team_tsdb_id: $('#ar-league').value && $('#ar-team').value ? Number($('#ar-team').value) : null,
+    sports_skip_replays: !!$('#ar-league').value && $('#ar-sports-replays').checked,
+    sports_event_channels: !!$('#ar-league').value && $('#ar-sports-channels').checked,
+  } : {});
+
+  // Naming nothing turns the team and the option off; a new league starts on all its games.
+  const leagueSel = $('#ar-league');
+  if (leagueSel) {
+    leagueSel.addEventListener('change', () => {
+      const id = leagueSel.value ? Number(leagueSel.value) : null;
+      const league = (opts.sportsLeagues || []).find((l) => l.id === id);
+      $('#ar-team').innerHTML = autoRuleTeamOptions(league, null);
+      $('#ar-team').disabled = !id;
+      $('#ar-sports-replays').disabled = !id;
+      $('#ar-sports-channels').disabled = !id;
+    });
+  }
 
   async function submit() {
     const payload = read();
@@ -233,22 +303,37 @@ function openAutoRuleModal(opts) {
     submitBtn.disabled = true;
     submitBtn.textContent = edit ? 'Saving…' : 'Creating…';
     let res;
+    const put = (unmatched) => jsonFetch(`${opts.apiBase}${rule.id}`, {
+      method: 'PUT', body: JSON.stringify(unmatched ? Object.assign({}, payload, { unmatched }) : payload),
+    });
     try {
       res = edit
-        ? await jsonFetch(`${opts.apiBase}${rule.id}`, { method: 'PUT', body: JSON.stringify(payload) })
+        ? await put(null)
         : await jsonFetch(opts.createUrl, { method: 'POST', body: JSON.stringify(payload) });
     } catch (e) {
-      fail(e.message || 'The rule could not be saved.');
       submitBtn.disabled = false;
       submitBtn.textContent = verb;
+      // New settings that stop the rule making some of its scheduled recordings - turning off
+      // event channels, naming another league - are saved only once the person says what
+      // becomes of them, as a changed search's are (dev/changelog/1491).
+      if (edit && e.status === 409 && e.data && e.data.unmatched) {
+        modal.closeModal();
+        openAutoRuleUnmatched({ ruleName: payload.name, data: e.data, save: put, onSaved: saved });
+        return;
+      }
+      fail(e.message || 'The rule could not be saved.');
       return;
     }
     modal.closeModal();
+    saved(res);
+  }
+
+  function saved(res) {
     if (edit && !res.evaluation) {
       // A paused rule is saved and not checked - which is what pausing means.
       showToast('Rule saved. It is paused, so nothing was checked.', { type: 'success' });
     } else if (edit) {
-      const out = autoRuleOutcome('Rule saved.', res.evaluation, opts.phrases);
+      const out = autoRuleOutcome(`Rule saved.${autoRuleUnmatchedText(res)}`, res.evaluation, opts.phrases);
       showToast(out.text, { type: out.type, durationMs: 10000 });
     } else if (opts.goToRule && res.url) {
       const out = autoRuleOutcome('Rule saved.', res.evaluation, opts.phrases);
@@ -258,7 +343,7 @@ function openAutoRuleModal(opts) {
     } else {
       const out = autoRuleOutcome('Rule saved.', res.evaluation, opts.phrases);
       const link = res.url
-        ? `<a href="${escHtml(res.url)}">${escHtml(payload.name)} ${icon('forward')}</a>`
+        ? `<a href="${escHtml(res.url)}">${escHtml($('#ar-name').value.trim())} ${icon('forward')}</a>`
         : `<a href="${escHtml(opts.rulesUrl || '/rules')}">Rules ${icon('forward')}</a>`;
       showToast(`${escHtml(out.text)} ${link}`, { type: out.type, html: true, durationMs: 12000 });
     }
@@ -355,6 +440,8 @@ function openAutoRuleUnmatched(opts) {
   const body = document.createElement('div');
   let current = opts.data || {};
 
+  // A changed search, or new settings - the event-channel option, the league or the team.
+  const settings = () => current.what === 'settings';
   const draw = (notice) => {
     const recs = current.unmatched || [];
     const n = recs.length;
@@ -367,8 +454,8 @@ function openAutoRuleUnmatched(opts) {
         ? `<p class="card-note">ChannelBin could not tell which of the ${_arCount(n, 'recording', 'recordings')} `
           + `"${escHtml(opts.ruleName)}" has scheduled the new search still matches, so all of them are listed. `
           + `${escHtml(current.reason || '')}</p>`
-        : `<p class="card-note">The new search no longer matches ${_arCount(n, 'recording', 'recordings')} `
-          + `"${escHtml(opts.ruleName)}" has scheduled:</p>`)
+        : `<p class="card-note">The new ${settings() ? 'settings no longer record' : 'search no longer matches'} `
+          + `${_arCount(n, 'recording', 'recordings')} "${escHtml(opts.ruleName)}" has scheduled:</p>`)
       + '<div class="statlist">'
       + recs.map((r) => `<div class="srow"><span class="sk">${escHtml(r.name)}</span>`
         + `<span class="sv">${escHtml(r.when || '')}</span></div>`).join('')
@@ -384,11 +471,11 @@ function openAutoRuleUnmatched(opts) {
   draw('');
 
   const modal = buildModal({
-    title: 'Save new search',
+    title: settings() ? 'Save rule' : 'Save new search',
     body,
     footer: [
       { label: 'Cancel', class: 'btn', onClick: (c) => c() },
-      { label: 'Save to rule', class: 'btn btn-primary', onClick: () => { submit(); return false; } },
+      { label: settings() ? 'Save' : 'Save to rule', class: 'btn btn-primary', onClick: () => { submit(); return false; } },
     ],
   });
   const confirmBtn = modal.querySelector('.modal-foot .btn-primary');
@@ -411,7 +498,7 @@ function openAutoRuleUnmatched(opts) {
         return;
       }
       const err = body.querySelector('#ru-err');
-      err.textContent = e.message || 'The search could not be saved to the rule.';
+      err.textContent = e.message || (settings() ? 'The rule could not be saved.' : 'The search could not be saved to the rule.');
       err.hidden = false;
       return;
     }

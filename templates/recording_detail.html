@@ -17,7 +17,7 @@
       <span id="status-badge" data-status="{{ rec.status }}">{{ status_badge(row.badge_class, row.badge_label, pulse=row.badge_pulse, lg=true) }}</span>
       {#- Words here, where the list has a column heading to lean on and this page has none:
           a bare green check beside the status read as nothing at all. -#}
-      {% if row.health.tip %}<span class="h-mini {{ row.health.cls }} tip-plain" data-tip="{{ row.health.tip }}">{% if row.health.icon %}{{ icon(row.health.icon) }} {% endif %}{{ row.health.text or row.health.label }}</span>
+      {% if row.health.tip %}<span class="h-mini {{ row.health.cls }} tip-plain" data-tip="{{ row.health.tip }}">{% if row.health.icon %}{{ icon(row.health.icon) }} {% endif %}{{ row.health.text or row.health.label }}{% if row.health.score is not none %} · {{ row.health.score }}/100{% endif %}</span>
       {% else %}<span class="h-mini na">-</span>{% endif %}
       {% if row.pill %}{{ channel_pill(row.pill.label, row.pill.url, logo_url=row.pill.logo_url, initials=row.pill.initials, acct_color=row.pill.acct_color) }}{% endif %}
       {% if row.member_pill %}{{ channel_pill(row.member_pill.label, row.member_pill.url, logo_url=row.member_pill.logo_url, initials=row.member_pill.initials, acct_color=row.member_pill.acct_color, tip=row.member_pill.tip) }}{% endif %}
@@ -1082,11 +1082,11 @@
                   sv_cls=('ok' if sports.strong else 'warn'), wide=true) }}
       {% if sports.file_name %}
       {{ stat_row('File name', sports.file_name, wide=true,
-                  tip='What the file will be called when the recording is saved: TheSportsDB\'s league, the event\'s date and its name, the way Plex\'s sports agents read it. Settings names matched games this way. Wrong match keeps the recording\'s own name instead, and a file already saved is never renamed.') }}
+                  tip='What the file will be called when the recording is saved, with TheSportsDB\'s fields in its filename template filled in from this event. The recording takes the same name then. Wrong match leaves those fields empty, and a file already saved is never renamed.') }}
       {% endif %}
       {#- Its poster and background from TheSportsDB (app/sports_view.py::_artwork, dev/changelog/1465).
           duplicated from _macros.html stat_row - the value carries View links, which stat_row escapes. -#}
-      <div class="srow wide"><span class="sk">Artwork</span><span class="sv {{ sports.art.cls }} tip-plain" data-tip="Downloaded once from TheSportsDB to this server, and written beside the recording as its poster and background for Plex, Jellyfin and Kodi when its metadata file is on. An image pinned to the recording's profile comes first.">{{ sports.art.text }}{% for l in sports.art.links %} <a href="{{ url_for('recordings.recording_sports_image', recording_id=rec.id, role=l.role) }}" target="_blank" rel="noopener">View {{ l.label }}</a>{% endfor %}</span></div>
+      <div class="srow wide"><span class="sk">Artwork</span><span class="sv {{ sports.art.cls }} tip-plain" data-tip="Downloaded once from TheSportsDB to this server, and written beside the recording as its poster and background for Plex, Jellyfin and Kodi when its metadata file is on. An image pinned to the recording's profile comes first, unless the profile is set to use TheSportsDB's poster when the game has one.">{{ sports.art.text }}{% for l in sports.art.links %} <a href="{{ url_for('recordings.recording_sports_image', recording_id=rec.id, role=l.role) }}" target="_blank" rel="noopener">View {{ l.label }}</a>{% endfor %}</span></div>
       {% endif %}
       {% if rec.metadata_category %}{{ stat_row('Genre', rec.metadata_category) }}{% endif %}
       {% if rec.metadata_rating %}{{ stat_row('Rating', rec.metadata_rating) }}{% endif %}
@@ -1115,7 +1115,7 @@
       <a href="{{ sports.tsdb_url }}" target="_blank" rel="noopener">Edit on TheSportsDB {{ icon('forward') }}</a>
       <button class="btn btn-sm" data-sports-remove data-event="{{ sports.event }}">Wrong match</button>
       {% elif sports.state == 'removed' %}
-      <span>You removed the match to the {{ sports.league }} event "{{ sports.event }}" ({{ sports.removed_on }}).{% if sports.keeps_name %} Its file will keep its normal name.{% endif %}</span>
+      <span>You removed the match to the {{ sports.league }} event "{{ sports.event }}" ({{ sports.removed_on }}).{% if sports.keeps_name %} TheSportsDB's fields in its name stay empty.{% endif %}</span>
       <button class="btn btn-sm" data-sports-restore>Undo</button>
       {% elif sports.state == 'none' %}
       <span>TheSportsDB: {{ sports.note }}</span>

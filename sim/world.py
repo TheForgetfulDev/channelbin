@@ -138,6 +138,10 @@ class BackendSpec:
     hls_idle_seconds: float = 60.0
     hls_variant: str | None = 'h264_720p2997_aac'
     over_limit: OverLimit = OverLimit()
+    # Serve a stream id the lineup does not list as a plain live channel on the backend's
+    # content loop, for a ChannelBin whose channels came from somewhere else (a copy of a real
+    # install's database, dev/changelog/1499). The lineup, playlists and guides are unchanged.
+    any_stream_id: bool = False
 
     def stream_host_names(self) -> list[str]:
         return [f'{self.name}-streams-{i + 1}' for i in range(self.stream_hosts)]
@@ -273,7 +277,8 @@ def _backend(d, i, cal) -> BackendSpec:
                          'hls_segment_seconds': BackendSpec.hls_segment_seconds,
                          'hls_window': BackendSpec.hls_window,
                          'hls_idle_seconds': BackendSpec.hls_idle_seconds,
-                         'hls_variant': 'h264_720p2997_aac', 'over_limit': None})
+                         'hls_variant': 'h264_720p2997_aac', 'over_limit': None,
+                         'any_stream_id': False})
     no_id = v['no_id_share']
     if no_id is None:
         no_id = cal.stream_url_shape.get('no_id', 0.0)
@@ -286,6 +291,12 @@ def _backend(d, i, cal) -> BackendSpec:
     variant = v['hls_variant']
     if variant is not None:
         _ts_profile(variant, f'{where}.hls_variant')
+    any_id = _flag(v['any_stream_id'], f'{where}.any_stream_id')
+    if any_id and content == CONTENT_CALIBRATED:
+        # A calibrated backend picks each channel's loop from its generated format, and a
+        # stand-in channel was never generated.
+        raise WorldError(f'{where}.any_stream_id needs a fixed content profile, not '
+                         f'{CONTENT_CALIBRATED}')
     return BackendSpec(
         name=_name(v['name'], f'{where}.name'),
         channels=_count(v['channels'], f'{where}.channels', 1),
@@ -300,7 +311,8 @@ def _backend(d, i, cal) -> BackendSpec:
         hls_window=_count(v['hls_window'], f'{where}.hls_window', 1),
         hls_idle_seconds=_seconds(v['hls_idle_seconds'], f'{where}.hls_idle_seconds', 1.0),
         hls_variant=variant,
-        over_limit=_over_limit(v['over_limit'], f'{where}.over_limit'))
+        over_limit=_over_limit(v['over_limit'], f'{where}.over_limit'),
+        any_stream_id=any_id)
 
 
 def _default_url_shape(cal) -> dict:

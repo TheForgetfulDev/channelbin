@@ -30,7 +30,8 @@ from .database import (
     Channel, ChannelGroup, EPGEntry, REC_STATUS_ABORTED, REC_STATUS_COMPLETED,
     REC_STATUS_FAILED, REC_STATUS_SCHEDULED, RULE_MATCH_SCHEDULED, RULE_MATCH_SKIPPED_CAP,
     RULE_MATCH_SKIPPED_EXISTING, RULE_MATCH_SKIPPED_LIMIT, RULE_MATCH_SKIPPED_REPEAT,
-    RULE_MATCH_USER_MODIFIED, Recording, RecordingProfile, RuleMatch,
+    RULE_MATCH_SKIPPED_REPLAY, RULE_MATCH_USER_MODIFIED, Recording, RecordingProfile, RuleMatch,
+    SPORTS_AIRING_UNKNOWN,
 )
 from .fmt_utils import counted
 
@@ -54,9 +55,15 @@ STATE_UI = {
 
 #: The cards of a rule's page, in their default order, and what Customize sections calls
 #: them. The status bar above them is not one: it is the rule's state and never moves.
-SECTIONS = ('coming', 'search', 'checks', 'settings', 'history')
-SECTION_NAMES = {'coming': 'Coming up', 'search': 'What it searches for', 'checks': 'Checks',
-                 'settings': 'Settings', 'history': 'History'}
+SECTIONS = ('games', 'coming', 'search', 'checks', 'settings', 'history')
+SECTION_NAMES = {'games': 'Expected games', 'coming': 'Coming up', 'search': 'What it searches for',
+                 'checks': 'Checks', 'settings': 'Settings', 'history': 'History'}
+
+
+def sections_for(rule) -> list:
+    """The page's cards: Expected games only on a rule that names a league (dev/changelog/1490),
+    first by default, since the games are what such a rule is for."""
+    return [s for s in SECTIONS if s != 'games' or rule.sports_league_id]
 #: The user-prefs row holding that order - one layout for every rule.
 SECTIONS_PREF_KEY = 'rule_detail_sections'
 
@@ -178,6 +185,8 @@ def ledger_entry(m, rec, names, *, now, tz, h24) -> dict:
         badge, bucket = ('b-warn', 'Cap reached' if past else 'Waiting: cap'), 'skip'
     elif action == RULE_MATCH_SKIPPED_LIMIT:
         badge, bucket = ('b-abort', 'Over the limit'), 'skip'
+    elif action == RULE_MATCH_SKIPPED_REPLAY:
+        badge, bucket = ('b-abort', 'Replay'), 'skip'
     elif action == RULE_MATCH_USER_MODIFIED:
         badge = ('b-warn', 'You edited it')
         fate = 'Your edited recording:' if rec is not None else 'Its recording was deleted.'
@@ -235,7 +244,8 @@ def _ledger_rows(rule_ids):
         RuleMatch.id, RuleMatch.rule_id, RuleMatch.channel_id, RuleMatch.group_id,
         RuleMatch.program_title, RuleMatch.program_sub_title, RuleMatch.program_start_time,
         RuleMatch.action_taken, RuleMatch.recording_id, RuleMatch.removed_status,
-        RuleMatch.removed_cancel_reason, RuleMatch.detail,
+        RuleMatch.removed_cancel_reason, RuleMatch.detail, RuleMatch.title_key,
+        RuleMatch.episode_key, RuleMatch.sports_event_tsdb_id, RuleMatch.sports_start_from,
     ).filter(RuleMatch.rule_id.in_(sorted(rule_ids))).all()
     rec_ids = sorted({r.recording_id for r in rows if r.recording_id is not None})
     recs = {r.id: r for r in db.session.query(
@@ -323,9 +333,14 @@ def search_urls(rule_id, search_params):
             f'{base}?{urlencode(replace(state, rule=str(rule_id)).to_params(explicit=True))}')
 
 
-def dialog_data(rule, described, edit_search_url) -> dict:
+def dialog_data(rule, described, edit_search_url, team_names=None) -> dict:
     """What the edit dialog (auto-rule-modal.js openAutoRuleModal, edit mode) starts from:
-    the rule's settings, its search as lines of text, and where Edit search goes."""
+    the rule's settings, its search as lines of text, and where Edit search goes. `team_names`
+    is auto_rules_sports.team_names() over every rule a page lists, read once; the rule's team is
+    named so the dialog keeps offering it after its stored games are gone."""
+    if team_names is None:
+        from .auto_rules_sports import team_names as read_names
+        team_names = read_names([rule.sports_team_tsdb_id])
     if described is None:
         lines = [['Search', 'Its search can no longer be read.']]
     else:
@@ -335,6 +350,11 @@ def dialog_data(rule, described, edit_search_url) -> dict:
     return {'id': rule.id, 'name': rule.name, 'profile_id': rule.profile_id,
             'skip_repeats': bool(rule.skip_repeats), 'limit_count': rule.limit_count,
             'limit_window_hours': rule.limit_window_hours, 'max_upcoming': rule.max_upcoming,
+            'sports_league_id': rule.sports_league_id,
+            'sports_team_tsdb_id': rule.sports_team_tsdb_id,
+            'sports_team_name': team_names.get(rule.sports_team_tsdb_id),
+            'sports_skip_replays': bool(rule.sports_skip_replays),
+            'sports_event_channels': bool(rule.sports_event_channels),
             'search_lines': lines, 'edit_search_url': edit_search_url}
 
 
@@ -433,6 +453,8 @@ def list_context(now=None) -> dict:
     scheduled = auto_rules.scheduled_counts(ids)
     waiting = _cap_waiting(ids, now)
     searches = _searches(rules, tz, h24)
+    from .auto_rules_sports import team_names
+    teams = team_names([r.sports_team_tsdb_id for r in rules])
     wait = first_check_wait() if any(r.enabled and r.last_evaluated_at is None for r in rules) \
         else None
 
@@ -491,7 +513,7 @@ def list_context(now=None) -> dict:
             'search_tip': _search_tip(described),
             'search_url': urls[0],
             'edit_search_url': urls[1],
-            'dialog': dialog_data(r, described, urls[1]),
+            'dialog': dialog_data(r, described, urls[1], teams),
             'next': next_cell,
             'problems': bool(r.last_problems) and state != STATE_BROKEN,
             'scheduled': n,
@@ -514,7 +536,7 @@ def _profile_name(rule):
         RecordingProfile.id == rule.profile_id).scalar()
 
 
-def _lead(rule, profile):
+def _lead(rule, profile, about=None):
     prof = f'the {profile} profile' if profile else "each showing's own default profile"
     out = f'Records each upcoming showing its search finds, once, with {prof}. '
     out += ('A showing that repeats something already recorded is skipped. ' if rule.skip_repeats
@@ -522,11 +544,19 @@ def _lead(rule, profile):
     if rule.limit_count and rule.limit_window_hours:
         out += (f'It takes at most {rule.limit_count:,} within any '
                 f'{counted(rule.limit_window_hours, "hour")}. ')
+    if about:
+        clauses = ['records each game once']
+        if rule.sports_skip_replays:
+            clauses.append('skips a replay while the game\'s first airing is scheduled or recorded')
+        if rule.sports_event_channels:
+            clauses.append('records a game from an event channel when the guide has no listing of it')
+        joined = clauses[0] if len(clauses) == 1 else ', '.join(clauses[:-1]) + ' and ' + clauses[-1]
+        out += f'It is about {about}, from Sports Schedules, and {joined}. '
     return out + ('Recordings it makes are ordinary recordings: they fail over, wait for a '
                   'connection and show up in Recordings like any other.')
 
 
-def settings_items(rule, profile, default_cap) -> list:
+def settings_items(rule, profile, default_cap, about=None) -> list:
     """The Settings card's chips (util.js settingChipsHtml), each opening the edit dialog on
     its own field."""
     cap = _cap_of(rule, default_cap)
@@ -534,15 +564,29 @@ def settings_items(rule, profile, default_cap) -> list:
         + (' (the default)' if rule.max_upcoming is None else '')
     limit = (f'At most {rule.limit_count:,} within {counted(rule.limit_window_hours, "hour")}'
              if rule.limit_count and rule.limit_window_hours else 'None')
+    profile_chip = {'focus': 'profile', 'label': 'Recording profile',
+                    'value': profile or "Each showing's default profile",
+                    'tip': "Its padding is what keeps a program that runs long. Each showing's default is "
+                           'the profile its own Record button would pick.'}
+    about_chip = {'focus': 'sports', 'label': 'About', 'value': about or 'Nothing',
+                  'tip': 'A league or team from Sports Schedules. Lets this rule show the games it '
+                         'expects, record each game once, and skip game replays.'}
+    repeats_chip = {'focus': 'repeats', 'label': 'Skip repeats', 'value': 'On' if rule.skip_repeats else 'Off',
+                    'tip': 'A showing whose title AND episode title both match an earlier airing that was '
+                           'already recorded is skipped. Showings without an episode title are never '
+                           'skipped as repeats.'}
+    replays_chip = {'focus': 'sports-replays', 'label': 'Skip game replays',
+                    'value': 'On' if about and rule.sports_skip_replays else 'Off',
+                    'tip': 'Leaves out a listing TheSportsDB matched as a replay while the game\'s first '
+                           'airing is scheduled or recorded, by this rule or any other way.'}
+    channels_chip = {'focus': 'sports-channels', 'label': 'Event channels',
+                     'value': 'When the guide has no listing' if about and rule.sports_event_channels else 'Off',
+                     'tip': 'Records a game from a channel whose name names it, when the guide has no '
+                            'listing of the game at all.'}
+    # The order mockup 52 drew: what the rule is about beside its profile, and the two game options
+    # beside repeats (dev/changelog/1490, 1491).
     return [
-        {'focus': 'profile', 'label': 'Recording profile',
-         'value': profile or "Each showing's default profile",
-         'tip': "Its padding is what keeps a program that runs long. Each showing's default is "
-                'the profile its own Record button would pick.'},
-        {'focus': 'repeats', 'label': 'Skip repeats', 'value': 'On' if rule.skip_repeats else 'Off',
-         'tip': 'A showing whose title AND episode title both match an earlier airing that was '
-                'already recorded is skipped. Showings without an episode title are never '
-                'skipped as repeats.'},
+        profile_chip, about_chip, repeats_chip, replays_chip, channels_chip,
         {'focus': 'limit', 'label': 'Limit', 'value': limit,
          'tip': 'At most X within Y hours, measured on start times. Optional; most series '
                 'need none.'},
@@ -567,6 +611,20 @@ def _action_message(state, scheduled, cap, cap_waiting, nxt):
     if state == STATE_NEW:
         return 'Waiting for its first check.'
     raise ValueError(f'unknown rule state {state!r}')
+
+
+def _game_notices(sports) -> list:
+    """The page's half of the AUTO_RULE_GAME_UNLISTED alert, from the same reader."""
+    if not sports or not sports['unrecordable']:
+        return []
+    games = '; '.join(f'{title}, {w["day"]} {w["time"]}' for title, w in sports['unrecordable'])
+    n = len(sports['unrecordable'])
+    return [('warn', 'A game this rule is about has nothing to record it from.' if n == 1 else
+             f'{n} games this rule is about have nothing to record them from.',
+             f'{games}. {sports["unrecordable_reason"]} so '
+             f'this rule cannot record {"it" if n == 1 else "them"}. If a channel you know of carries '
+             f'{"it" if n == 1 else "one"}, record that channel by hand. This clears itself when a '
+             'listing or an event channel appears, and the same warning is on the Alerts page.', '')]
 
 
 def _notices(state, rule, scheduled, cap, cap_waiting, wait, now, tz, h24, sync_on):
@@ -613,6 +671,212 @@ def _notices(state, rule, scheduled, cap, cap_waiting, wait, now, tz, h24, sync_
     return out
 
 
+# ---------------------------------------------------------------------------
+# A rule that names a league (DESIGN-sports-data.md 10, dev/changelog/1490, mockup 52)
+# ---------------------------------------------------------------------------
+
+#: Expected games shows a game until this long after its start.
+GAMES_SHOWN_PAST = timedelta(hours=2)
+
+
+def _game_line(game, airing, reason, league_name) -> dict:
+    from .auto_rules_sports import AIRING_WORDS
+    where = ', '.join(x for x in (game.venue, game.city) if x)
+    facts = ', '.join(x for x in (where, f'{league_name} {game.season}'.strip()) if x)
+    air = AIRING_WORDS.get(airing, '')
+    tip = f'{game.title}.\nFrom TheSportsDB: {facts}.' + (f'\n{reason}' if reason else '') \
+        + (f'\nAiring: {air}.' if air else '')
+    return {'title': game.title, 'airing': air, 'tip': tip}
+
+
+def _game_when(game, now, tz, h24) -> dict:
+    """When, as the league page writes it, and a moved game's old time with when it moved.
+    TheSportsDB never moves a recording (DESIGN-sports-data.md 10), and the tooltip says so."""
+    from .sports_view import event_when
+    from .tz_utils import day_label, format_local
+    shim = _EventShim(game)
+    day, clock = event_when(shim, now, tz, h24)
+    out = {'day': day, 'time': clock or 'Time not listed', 'was': '', 'was_tip': ''}
+    if game.matchup and game.previous_start is not None and game.start is not None:
+        was = format_local(game.previous_start, 'clock', tz=tz, h24=h24)
+        if day_label(game.previous_start, now, tz) != day:
+            was = f'{day_label(game.previous_start, now, tz)} {was}'
+        moved = (f' on {day_label(game.start_changed_at, now, tz)}, '
+                 f'{format_local(game.start_changed_at, "clock", tz=tz, h24=h24)}'
+                 if game.start_changed_at else '')
+        out['was'] = f'was {was}'
+        out['was_tip'] = (f'Moved.\nTheSportsDB moved this game{moved}, from {was} to {clock}.\n'
+                          'TheSportsDB never moves a recording; the guide does, when it changes.')
+    return out
+
+
+class _EventShim:
+    """A Game read the way sports_view's helpers read a SportsEvent."""
+
+    def __init__(self, game):
+        self.start_at = game.start
+        self.local_date = game.local_date
+        self.home_team_id = game.home_id
+        self.away_team_id = game.away_id
+
+
+def _recordable(rule, scope, games, cfg, recordable_pick):
+    """`game -> bool`: would this rule record the game from an event channel, asked exactly as the
+    engine asks it (auto_rules.recordable_pick over the rule's search). None when it does not record
+    from event channels. A search that no longer parses answers by the pick alone."""
+    if not scope.event_channels:
+        return None
+    from .auto_rules_sports import event_pick
+    from .channel_search import SearchContext, SearchStateError
+    try:
+        state = auto_rules.parse_search(rule.search_params)
+    except SearchStateError:
+        return lambda g: event_pick(games, g)[0] is not None
+    ctx = SearchContext.build(cfg)
+    return lambda g: recordable_pick(games, g, state, ctx) is not None
+
+
+def _rule_cell(game, rows, games, where, unrecordable, search_url, scope, rule_id, now,
+               recordable=None) -> dict:
+    """What this rule is doing about one game. `rows` are the rule's ledger entries for its
+    listings, each with the recording status it names. Every state is named."""
+    picks = [e for e in rows if e['action'] == RULE_MATCH_SCHEDULED and e['rec_live']]
+    if picks:
+        first = picks[0]
+        if first.get('event'):
+            badge = ('b-warn', 'Scheduled, unconfirmed') if first.get('unconfirmed') else first['badge']
+            how = ("at TheSportsDB's time: its name gives no time zone" if first.get('unconfirmed')
+                   else 'at the time its name gives')
+            return {'badge': badge, 'subs': [f'From the event channel "{first["where"]}", {how}.']}
+        subs = [f'"{first["title"]}" on {first["where"]}, {first["day"]}, {first["time"]}.']
+        if len(picks) > 1:
+            subs.append((f'And {counted(len(picks) - 1, "more recording")} of it, from listings '
+                         'the first does not cover.', 'warned'))
+        return {'badge': first['badge'], 'subs': subs}
+    held = [h for h in games.held.get(game.id, ()) if h.status in _held_statuses()]
+    if held:
+        h = held[0]
+        where = f' on {h.where}' if h.where else ''
+        if h.rule_id == rule_id:
+            from .fmt_utils import rec_status_display
+            _s, _e, cls, label, _pulse = rec_status_display(h.status)
+            return {'badge': (cls, label), 'subs': [f'"{h.title}"{where}.']}
+        return {'badge': ('b-abort', 'Has a recording'),
+                'subs': [f'"{h.title}"{where}, made outside this rule.']}
+    if rows:
+        lead = rows[0]
+        text = ''.join(t for t, _cls in lead['detail'])
+        return {'badge': lead['badge'], 'subs': [text] if text else []}
+    if game in unrecordable:
+        minutes = max(0, int((game.start - now).total_seconds() // 60))
+        soon = counted(minutes // 60, 'hour') if minutes >= 120 else counted(minutes, 'minute')
+        return {'badge': ('b-fail', 'Nothing to record'),
+                'subs': [f'Starts in {soon}. This rule cannot record it unless a listing or an event '
+                         'channel appears.']}
+    if where['state'] == 'found':
+        return {'badge': ('b-warn', 'Not recorded'),
+                'subs': [f'This rule\'s search finds none of its listings, {where["text"][0].lower()}'
+                         f'{where["text"][1:]}.', ('search', search_url)]}
+    if where['state'] == 'all_wrong':
+        return {'badge': ('b-abort', 'Waiting'),
+                'subs': ['Every listing of it was marked a wrong match on Sports Schedules.']}
+    if where['state'] == 'names' and scope.event_channels:
+        from .auto_rules_sports import event_pick
+        pick, why = event_pick(games, game)
+        if pick is None:
+            return {'badge': ('b-abort', 'Not scheduled'),
+                    'subs': [f'{why} If the guide lists it, this rule\'s search decides.']}
+        if recordable is not None and not recordable(game):
+            return {'badge': ('b-abort', 'Not scheduled'),
+                    'subs': ['Its event channel or its start is outside this rule\'s account, day or '
+                             'time filters.']}
+        return {'badge': ('b-abort', 'Waiting'), 'subs': ['Scheduled from its event channel at the next check.']}
+    if where['state'] == 'names' and not scope.event_channels:
+        return {'badge': ('b-abort', 'Waiting'),
+                'subs': ['Only an event channel names it so far, and this rule does not record from event '
+                         'channels. Once the guide lists it, this rule\'s search decides.']}
+    if where['state'] in ('later', 'unchecked', 'names', 'names_wrong'):
+        return {'badge': ('b-abort', 'Waiting'),
+                'subs': ['The guide does not list it yet. Once it does, this rule\'s search decides.']}
+    if where['state'] == 'missing':
+        return {'badge': ('b-abort', 'Waiting'),
+                'subs': ['Nothing in your guide lists it, so there is nothing to record yet.']}
+    raise ValueError(f'unknown where-it-is-on state {where["state"]!r}')
+
+
+def _held_statuses():
+    """What counts as holding a game: the engine's own spoken-for statuses, never a second list."""
+    return set(auto_rules._spoken_for())
+
+
+def _sports_context(rule, scope, pairs, search_url, cfg, now, tz, h24):
+    """The game line on each Coming up row, the Expected games card and the unrecordable-games
+    notice, for a rule that names a league. A fixed handful of queries."""
+    from . import sports_match
+    from .auto_rules_sports import START_FROM_TSDB, GameIndex
+    from .database import SportsEvent, SportsLeague, SportsState
+    from .sports_data import _settings as sports_settings
+    from .sports_view import _guide_cell
+    horizon = sports_settings(cfg)['horizon_days']
+    league = db.session.get(SportsLeague, scope.league_id)
+    league_name = league.name if league is not None else ''
+    games = GameIndex.load([scope.league_id], now, horizon)
+    by_tsdb = {g.tsdb_id: g for g in games.games.values()}
+    for m, e in pairs:
+        if m.sports_event_tsdb_id:
+            # A game recorded from an event channel is found by the game, not by a listing.
+            game, airing = by_tsdb.get(m.sports_event_tsdb_id), SPORTS_AIRING_UNKNOWN
+            e['sub'] = 'From an event channel'
+            e['event'] = True
+            e['unconfirmed'] = m.sports_start_from == START_FROM_TSDB
+        else:
+            game, airing = games.listing_game(m.title_key, m.episode_key, m.program_start_time, scope)
+        e['game'] = _game_line(game, airing, games.reasons.get(game.id), league_name) if game else None
+        e['game_id'] = game.id if game else None
+
+    shown = [g for g in games.in_scope(scope)
+             if (g.start or datetime.combine(g.local_date, datetime.min.time())) >= now - GAMES_SHOWN_PAST]
+    ids = [g.id for g in shown]
+    events = {e.id: e for e in SportsEvent.query.filter(SportsEvent.id.in_(ids))} if ids else {}
+    counts = sports_match.game_counts(ids)
+    names = sports_match.name_counts(ids)
+    state = db.session.get(SportsState, 1)
+    checked_at = state.last_match_at if state is not None else None
+    guide_end = db.session.query(func.max(EPGEntry.start_time)).scalar()
+    from .auto_rules import recordable_pick, unrecordable_games, unrecordable_reason
+    held_ok = _held_statuses()
+    recordable = _recordable(rule, scope, games, cfg, recordable_pick)
+    unrecordable = unrecordable_games(games, scope, now, lambda h: h.status in held_ok, recordable)
+    by_game = {}
+    for _m, e in sorted(pairs, key=lambda p: (p[1]['start'], p[1]['id'])):
+        if e.get('game_id'):
+            by_game.setdefault(e['game_id'], []).append(e)
+    rows = []
+    for g in shown:
+        where = _guide_cell(events[g.id], counts.get(g.id), names.get(g.id), checked_at, guide_end, now, tz)
+        rows.append({
+            'when': _game_when(g, now, tz, h24),
+            'title': g.title,
+            'venue': ', '.join(x for x in (g.venue, g.city) if x),
+            'postponed': g.postponed,
+            'where': where,
+            'rule': _rule_cell(g, by_game.get(g.id, []), games, where, unrecordable, search_url,
+                               scope, rule.id, now, recordable),
+        })
+    if league is not None and sports_match.league_trusted(league):
+        trust = (f'They matched your guide on {league.trust_agreed} of the last {league.trust_sample} '
+                 f'{league_name} games.')
+    else:
+        trust = (f'ChannelBin has not checked enough {league_name} games against your guide to rely '
+                 'on them yet.')
+    return {
+        'rows': rows, 'horizon': horizon, 'trust': trust, 'event_channels': scope.event_channels,
+        'league_url': url_for('sports.league_page', league_id=scope.league_id) if league else None,
+        'unrecordable': [(g.title, _game_when(g, now, tz, h24)) for g in unrecordable],
+        'unrecordable_reason': (unrecordable_reason(unrecordable, scope, games) if unrecordable else ''),
+    }
+
+
 def page_context(rule_id, *, hist='all', shown=HISTORY_PAGE, now=None):
     """Everything templates/rule_detail.html renders, or None for a rule that does not
     exist. `hist` and `shown` are History's filter and how many of its rows to show."""
@@ -634,8 +898,17 @@ def page_context(rule_id, *, hist='all', shown=HISTORY_PAGE, now=None):
     sync_on = db.session.query(Account.id).filter(Account.sync_enabled.is_(True)).first()
 
     rows, recs, names = _ledger_rows([rule_id])
-    entries = [ledger_entry(m, recs.get(m.recording_id), names, now=now, tz=tz, h24=h24)
-               for m in rows]
+    pairs = [(m, ledger_entry(m, recs.get(m.recording_id), names, now=now, tz=tz, h24=h24))
+             for m in rows]
+    live = _held_statuses()
+    for m, e in pairs:
+        rec = recs.get(m.recording_id)
+        e['rec_live'] = rec is not None and rec.status in live and not rec.gave_up_reason
+    entries = [e for _m, e in pairs]
+    from .auto_rules_sports import about_text, scope_of
+    scope = scope_of(rule)
+    about = about_text(rule) if scope else None
+    sports = _sports_context(rule, scope, pairs, urls[0], cfg, now, tz, h24) if scope else None
     coming = sorted((e for e in entries if e['start'] > now), key=lambda e: (e['start'], e['id']))
     aired = sorted((e for e in entries if e['start'] <= now),
                    key=lambda e: (e['start'], e['id']), reverse=True)
@@ -683,19 +956,22 @@ def page_context(rule_id, *, hist='all', shown=HISTORY_PAGE, now=None):
         'state': state,
         'badge': (cls, label),
         'badge_tip': _state_tip(state, rule, scheduled, cap, cap_waiting, wait, now),
-        'lead': _lead(rule, profile),
+        'lead': _lead(rule, profile, about),
         'added': format_local(rule.created_at, 'date', tz=tz, h24=h24),
         'changed': (format_local(rule.updated_at, 'date', tz=tz, h24=h24)
                     if rule.updated_at and rule.created_at
                     and rule.updated_at - rule.created_at > timedelta(seconds=1) else None),
-        'notices': _notices(state, rule, scheduled, cap, cap_waiting, wait, now, tz, h24,
-                            sync_on is not None),
+        'notices': _game_notices(sports) + _notices(state, rule, scheduled, cap, cap_waiting, wait,
+                                                    now, tz, h24, sync_on is not None),
         'action_message': _action_message(
             state, scheduled, cap, cap_waiting,
             f'{nxt["day"]}, {nxt["time"]}' if nxt else None),
         'search': described,
         'dialog': dialog_data(rule, described, urls[1]),
-        'settings': settings_items(rule, profile, default_cap),
+        'settings': settings_items(rule, profile, default_cap, about),
+        'about': about,
+        'sports': sports,
+        'sections': sections_for(rule),
         'checks': {
             'last': ago(rule.last_evaluated_at, now, none_value='Never'),
             'last_at': format_local(rule.last_evaluated_at, 'day_datetime', none_value='',

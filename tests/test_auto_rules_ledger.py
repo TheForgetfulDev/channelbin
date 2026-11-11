@@ -2,7 +2,7 @@
 what it decided (DESIGN-autoschedule.md §2, §3.4-§3.6, §4.3 step 4, §8, and the NASCAR,
 Repeats and Ledger bullets of §11; built in dev/changelog/1186).
 
-  - ActionTableTests (§2): the six verdicts, which of them an evaluation judges again, and
+  - ActionTableTests (§2): the seven verdicts, which of them an evaluation judges again, and
     that evaluation never deletes a ledger row.
   - NascarScenarioTests (§3.5, §11): the spec's drifting Cup start times. With skip repeats and
     no limit exactly the races are scheduled, once each, on the group - a doubleheader inside
@@ -225,16 +225,16 @@ class _LedgerCase(unittest.TestCase):
 
 class ActionTableTests(_LedgerCase):
 
-    def test_six_verdicts_and_the_four_skips_are_the_ones_re_judged(self):
-        """§2 names six values; `scheduled` and `user_modified` are not re-judged and the
-        four skips are."""
+    def test_seven_verdicts_and_the_five_skips_are_the_ones_re_judged(self):
+        """§2 names seven values; `scheduled` and `user_modified` are not re-judged and the
+        five skips are (skipped_replay since dev/changelog/1490)."""
         self.assertEqual(set(RULE_MATCH_ACTIONS), {
             'scheduled', 'skipped_existing', 'skipped_repeat', 'skipped_cap', 'skipped_limit',
-            'user_modified'})
-        self.assertEqual(len(RULE_MATCH_ACTIONS), 6)
+            'user_modified', 'skipped_replay'})
+        self.assertEqual(len(RULE_MATCH_ACTIONS), 7)
         self.assertEqual(set(RULE_MATCH_SKIPS), {
             RULE_MATCH_SKIPPED_EXISTING, RULE_MATCH_SKIPPED_REPEAT, RULE_MATCH_SKIPPED_CAP,
-            RULE_MATCH_SKIPPED_LIMIT})
+            RULE_MATCH_SKIPPED_LIMIT, 'skipped_replay'})
 
     def test_a_user_modified_row_ends_the_showing_at_its_anchor(self):
         """`user_modified` is never re-judged (§2): the showing at its anchor is neither

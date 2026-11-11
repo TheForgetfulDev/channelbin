@@ -864,6 +864,12 @@ _DEFAULTS = {
         # rank_members (last-resort failover ranking) and channel_failing_reason
         # (schedule-time + reactive warnings). 0 disables streak-based failing.
         'failing_streak_threshold': 3,
+        # A format strategy ranks a channel's bitrate as the median of its own healthy,
+        # same-format health checks inside this many days, not its single latest check: one
+        # check swings up to 43% on the same feed a day apart, and members on different test
+        # schedules were being compared one snapshot each, weeks apart (dev/changelog/1487).
+        # 0 = latest check only.
+        'bitrate_window_days': 14,
         'recording_score': {
             'fail_floor': 5,                          # quality score for a channel-attributable FAILED recording
             'near_empty_bitrate_ratio': 0.20,         # segment flagged near-empty/slate below this fraction of the recording's average bitrate
@@ -921,9 +927,6 @@ _DEFAULTS = {
         # files written beside it for media servers (app/sports_images.py, dev/changelog/1465).
         # Off, nothing is downloaded and none already downloaded is used.
         'download_images': True,
-        # Name a matched recording's file `League YYYY-MM-DD Event` from TheSportsDB when the
-        # join writes it, in place of the recording's own name (dev/changelog/1466).
-        'file_names': False,
     },
     'auto_scheduling': {
         # Per-rule cap on SCHEDULED recordings when the rule sets none of its own; a showing

@@ -40,6 +40,9 @@ const FD_EXAMPLES = [
   '{channel} - {date} {start_time} - {title}',
   '{date} - {title} ({channel})',
   '{date} - {title} {tag:live}',
+  // The shape Plex's sports agents read, offered as an example and never the default
+  // (dev/changelog/1498).
+  '{sports:league} {sports:date} {sports:event}',
 ];
 
 const FD_DEBOUNCE_MS = 250;
@@ -171,11 +174,37 @@ function safeNoteHtml() {
     + '<span class="sub">_</span> when the file is written.';
 }
 
+/* Shown only when the template has a {sports:...} field: those values are not the program's,
+   and the preview cannot know them yet for a real one, so it says where they come from. */
+function sportsNoteHtml() {
+  const kind = S.preview && S.preview.sports;
+  if (kind === 'sample') {
+    return 'TheSportsDB fields show sample game values here. They are filled in from TheSportsDB '
+      + 'when the recording is matched to a game, by the time the file is written.';
+  }
+  if (kind === 'empty') {
+    return 'TheSportsDB fields are empty here, as they are for a recording not matched to a game. '
+      + 'They are filled in from TheSportsDB when it is matched, by the time the file is written.';
+  }
+  if (kind === 'title') {
+    return 'This template has no program or channel field, so a recording not matched to a game is named '
+      + 'by its program\'s title, as here. A matched one is named from TheSportsDB by the time the '
+      + 'file is written.';
+  }
+  return '';
+}
+
 function warnText() {
   const unknown = (S.preview && S.preview.unknown) || [];
   if (!unknown.length) return '';
-  const verb = unknown.length === 1 ? 'is not a variable' : 'are not variables';
-  return `${unknown.join(', ')} ${verb} - it will appear literally in the filename.`;
+  // An unknown {tag:x} or {sports:x} renders empty; any other unknown {x} is left as typed.
+  const dropped = unknown.filter((t) => /^\{(tag|sports):/.test(t));
+  const literal = unknown.filter((t) => !dropped.includes(t));
+  const say = (list, what) => `${list.join(', ')} ${list.length === 1 ? 'is not a variable' : 'are not variables'}`
+    + ` - ${list.length === 1 ? 'it' : 'they'} ${what}.`;
+  return [literal.length ? say(literal, 'will appear literally in the filename') : '',
+          dropped.length ? say(dropped, 'will be left out of the filename') : '']
+    .filter(Boolean).join(' ');
 }
 
 /* The subject line: three sources, and each says what it IS rather than just showing a
@@ -250,6 +279,7 @@ function designerBodyHtml() {
   const p = S.preview || {};
   const vars = (FD_BOOT.variables || []);
   const tags = (FD_BOOT.tags || []);
+  const sportsFields = (FD_BOOT.sports_fields || []);
   return `<div class="fd">
 
     <div class="fd-sticky">
@@ -257,6 +287,7 @@ function designerBodyHtml() {
         <div class="rl">Resulting filename</div>
         <div class="fd-name" id="fd-name">${escHtml(p.disk || '')}<span class="ext">.${escHtml(FD_BOOT.extension || 'mp4')}</span></div>
         <div class="fd-safe" id="fd-safe">${safeNoteHtml()}</div>
+        <div class="fd-safe" id="fd-sports">${sportsNoteHtml()}</div>
       </div>
       <div class="fd-src" id="fd-src">${subjectHtml()}</div>
     </div>
@@ -296,6 +327,12 @@ function designerBodyHtml() {
           <span>}</span>
           <button type="button" class="tc-add" id="fd-tagadd">Insert</button>
         </span>` : ''}
+        ${sportsFields.length ? `<span class="tagcombo" data-tip="A fact about the game from TheSportsDB. It is filled in when the recording is matched to a TheSportsDB event, by the time the file is written, and renders as nothing for a recording that is not.">
+          <span>{sports:</span>
+          <select id="fd-sportspick" aria-label="TheSportsDB field to insert">${sportsFields.map((f) => `<option value="${escHtml(f.name)}" title="${escHtml(f.desc)}">${escHtml(f.name)}</option>`).join('')}</select>
+          <span>}</span>
+          <button type="button" class="tc-add" id="fd-sportsadd">Insert</button>
+        </span>` : ''}
       </div>
       <div class="fd-hint">Folders belong to a Recording Profile, not to the filename template -
         a <code>/</code> typed here is flattened to <code>_</code> when the file is written.</div>
@@ -323,6 +360,7 @@ function refreshPreviewOnly() {
   nameEl.innerHTML = escHtml(p.disk || '')
     + `<span class="ext">.${escHtml(FD_BOOT.extension || 'mp4')}</span>`;
   document.getElementById('fd-safe').innerHTML = safeNoteHtml();
+  document.getElementById('fd-sports').innerHTML = sportsNoteHtml();
   const warn = document.getElementById('fd-warn');
   const msg = p.empty ? 'A template cannot be empty.' : warnText();
   warn.textContent = msg;
@@ -521,7 +559,7 @@ function backToDesigner() {
   renderStep();
 }
 
-/* One insertion behavior for the variable chips and for the {tag:...} combo, rather than
+/* One insertion behavior for the variable chips and the {tag:...} and {sports:...} combos, rather than
    two that can drift. */
 function insertAtCursor(text) {
   const box = fdModal && fdModal.querySelector('#fd-tpl');
@@ -627,6 +665,11 @@ function wireDesigner(overlay) {
     if (t.closest('#fd-tagadd')) {
       const sel = overlay.querySelector('#fd-tagpick');
       if (sel && sel.value) insertAtCursor(`{tag:${sel.value}}`);
+      return;
+    }
+    if (t.closest('#fd-sportsadd')) {
+      const sel = overlay.querySelector('#fd-sportspick');
+      if (sel && sel.value) insertAtCursor(`{sports:${sel.value}}`);
       return;
     }
 

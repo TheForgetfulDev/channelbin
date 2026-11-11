@@ -238,6 +238,97 @@ class LivePageNumbersTests(_LivePage, unittest.TestCase):
         self.assertIn('failures in a row <span class="mono" id="live-failures">', html)
 
 
+class RecordingScoreShownTests(unittest.TestCase):
+    """dev/changelog/1489: a recording's own 0-100 score, the number it fed into the channel's
+    health score, is shown beside the Health badge on the list (in its tooltip, with one
+    sentence saying what it measures) and on the detail page's health pill. An unscored
+    recording shows no number rather than a made-up one."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        now = datetime.utcnow()
+        acct = seed.make_account()
+        self.ch = seed.make_channel(acct)
+        self.scored = self._finished('scored', now, health_quality_score=87)
+        self.unscored = self._finished('unscored', now)
+        db.session.commit()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _finished(self, name, now, **kw):
+        rec = seed.make_recording(status='COMPLETED', channel_id=self.ch.id, name=name,
+                                  start_time=now - timedelta(hours=2),
+                                  stop_time=now - timedelta(hours=1),
+                                  started_at=now - timedelta(hours=2), **kw)
+        seed.make_segment(rec, self.ch, now - timedelta(hours=2), now - timedelta(hours=1),
+                          segment_number=1)
+        return rec
+
+    def _get(self, path):
+        resp = self.t.app.test_client().get(path)
+        self.assertEqual(resp.status_code, 200)
+        return resp.get_data(as_text=True)
+
+    def test_the_list_tooltip_carries_the_score_and_what_it_measures(self):
+        html = self._get('/recordings')
+        self.assertIn('This recording scored 87/100 on time with nothing being written, '
+                      'restarts and reconnects', html)
+        self.assertEqual(1, html.count('This recording scored'))
+
+    def test_the_detail_pill_shows_the_score(self):
+        html = self._get(f'/recordings/{self.scored.id}')
+        head = html.split('id="detail-head-slot"', 1)[1].split('dh-actions', 1)[0]
+        self.assertIn('no stalls · 87/100', head)
+        self.assertIn('scored 87/100', head)
+
+    def test_a_failed_recordings_floor_is_named_as_a_floor_not_a_measurement(self):
+        """health_score.py gives a recording that did not succeed the fixed fail floor; the
+        sentence must say so rather than describe a measurement that never happened."""
+        now = datetime.utcnow()
+        rec = seed.make_recording(status='FAILED', channel_id=self.ch.id, name='failed',
+                                  start_time=now - timedelta(hours=2),
+                                  stop_time=now - timedelta(hours=1),
+                                  started_at=now - timedelta(hours=2),
+                                  health_quality_score=5,
+                                  health_quality_breakdown=json.dumps(
+                                      {'fail_floor_applied': True, 'fail_floor_value': 5}))
+        seed.make_segment(rec, self.ch, now - timedelta(hours=2), now - timedelta(hours=1),
+                          segment_number=1)
+        db.session.commit()
+        html = self._get(f'/recordings/{rec.id}')
+        head = html.split('id="detail-head-slot"', 1)[1].split('dh-actions', 1)[0]
+        self.assertIn('scored 5/100 - the fixed floor a recording that did not succeed is given',
+                      head)
+        self.assertNotIn('on time with nothing being written', head)
+
+    def test_a_failed_over_group_recordings_score_names_the_final_channel(self):
+        """For a group recording that failed over, the stored number is the share of the
+        channel it ended on (health_score._final_member_success_quality), so the sentence
+        says whose number it is."""
+        now = datetime.utcnow()
+        rec = seed.make_recording(status='COMPLETED', channel_id=self.ch.id, name='grouped',
+                                  start_time=now - timedelta(hours=2),
+                                  stop_time=now - timedelta(hours=1),
+                                  started_at=now - timedelta(hours=2),
+                                  health_quality_score=91,
+                                  health_quality_breakdown=json.dumps(
+                                      {'member_share': {'duration_seconds': 1800}}))
+        seed.make_segment(rec, self.ch, now - timedelta(hours=2), now - timedelta(hours=1),
+                          segment_number=1)
+        db.session.commit()
+        html = self._get(f'/recordings/{rec.id}')
+        head = html.split('id="detail-head-slot"', 1)[1].split('dh-actions', 1)[0]
+        self.assertIn('The channel this recording ended on scored 91/100 for its own stretch',
+                      head)
+
+    def test_an_unscored_recording_shows_no_number(self):
+        html = self._get(f'/recordings/{self.unscored.id}')
+        head = html.split('id="detail-head-slot"', 1)[1].split('dh-actions', 1)[0]
+        self.assertIn('no stalls', head)
+        self.assertNotIn('/100', head)
+
+
 class FinishedPageNumbersTests(unittest.TestCase):
     """A stalled recording's finished page: the counters name what they count."""
 

@@ -48,6 +48,7 @@
       openAutoRuleModal({
         rule: rule.dialog, apiBase: CFG.apiBase, profiles: CFG.profiles,
         defaultCap: CFG.defaultCap, phrases: CFG.phrases, onSaved: refresh,
+        sportsLeagues: CFG.sportsLeagues, sportsUrl: CFG.sportsUrl,
       });
     }
   });

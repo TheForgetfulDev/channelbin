@@ -25,7 +25,8 @@
       {% for e in rows %}
       <tr>
         <td data-label="{{ 'Aired' if past else 'When' }}" class="rl-when"><span class="day">{{ e.day }}</span>{{ e.time }}</td>
-        <td data-label="Program" class="rl-prog"><span class="t">{{ e.title }}</span>{% if e.sub %}<span class="s">{{ e.sub }}</span>{% endif %}</td>
+        <td data-label="Program" class="rl-prog"><span class="t">{{ e.title }}</span>{% if e.sub %}<span class="s">{{ e.sub }}</span>{% endif %}
+          {%- if e.game %}<span class="rl-game tip-plain" data-tip="{{ e.game.tip }}">{{ icon('nav-sports') }}<span>{{ e.game.title }}{% if e.game.airing %} <span class="air">{{ e.game.airing }}</span>{% endif %}</span></span>{% endif %}</td>
         <td data-label="Channel" class="rl-where">{{ e.where }}{% if e.via %}<span class="via">via {{ e.via }}</span>{% endif %}</td>
         <td data-label="{{ 'Outcome' if past else 'Decision' }}">{{ m.status_badge(e.badge[0], e.badge[1], pulse=e.pulse) }}</td>
         <td data-label="Why" class="rl-why">
@@ -104,6 +105,52 @@
 
 <div class="gd-sections" id="rule-sections">
 
+  {% if sports %}
+  {# A rule that names a league (dev/changelog/1490, mockup 52): TheSportsDB's games for it, and
+     what the rule is doing about each. Read from auto_rules_view._sports_context(). #}
+  <div class="card" data-section="games">
+    <div class="card-head">
+      <h2>Expected games{% if sports.rows %} <span class="cnt">{{ sports.rows | length }}</span>{% endif %}</h2>
+      {% if sports.league_url %}
+      <div class="card-head-actions">
+        <a class="btn btn-sm" href="{{ sports.league_url }}">{{ about }} on Sports Schedules <span class="arw">{{ icon('forward') }}</span></a>
+      </div>
+      {% endif %}
+    </div>
+    <div class="card-body">
+      {% if sports.rows %}
+      <p class="card-note">The games of {{ about }} in the next {{ sports.horizon }} days, from TheSportsDB, and
+        what this rule is doing about each. A game the guide does not list yet is normal days ahead. Times
+        are TheSportsDB's. {{ sports.trust }}</p>
+      <div class="table-scroll">
+        <table class="tbl tbl-cards rl-tbl">
+          <thead><tr><th>When</th><th>Game</th><th>Where it&rsquo;s on</th><th>This rule</th></tr></thead>
+          <tbody>
+            {% for g in sports.rows %}
+            <tr>
+              <td data-label="When" class="rl-when"><span class="day">{{ g.when.day }}</span>{{ g.when.time }}{% if g.when.was %}<span class="was tip-plain" data-tip="{{ g.when.was_tip }}">{{ g.when.was }}</span>{% endif %}</td>
+              <td data-label="Game" class="rl-prog"><span class="t">{{ g.title }}</span>{% if g.postponed %}<span class="s text-warning">Postponed</span>{% endif %}{% if g.venue %}<span class="s">{{ g.venue }}</span>{% endif %}</td>
+              <td data-label="Where it&rsquo;s on" class="rl-prog rl-cell"><span class="{{ 't' if g.where.open else 'sp-none' }}">{{ g.where.text }}</span>{% if g.where.sub %}<span class="s">{{ g.where.sub }}</span>{% endif %}{% if g.where.also %}<span class="s">{{ g.where.also }}</span>{% endif %}</td>
+              <td data-label="This rule" class="rl-prog rl-cell">{{ m.status_badge(g.rule.badge[0], g.rule.badge[1]) }}
+                {%- for sub in g.rule.subs %}
+                {%- if sub is string %}<span class="s">{{ sub }}</span>
+                {%- elif sub[0] == 'search' %}<span class="s"><a href="{{ sub[1] }}">Open search {{ icon('forward') }}</a></span>
+                {%- else %}<span class="s {{ sub[1] }}">{{ sub[0] }}</span>{% endif %}
+                {%- endfor %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="card-note">TheSportsDB lists no games of {{ about }} in the next {{ sports.horizon }} days, or its
+        schedule has not been fetched yet. Sports Schedules says which.</p>
+      {% endif %}
+      <p class="sp-credit">Game details from TheSportsDB.</p>
+    </div>
+  </div>
+  {% endif %}
+
   <div class="card" data-section="coming">
     <div class="card-head"><h2>Coming up{% if coming %} <span class="cnt">{{ coming | length }}</span>{% endif %}</h2></div>
     <div class="card-body">
@@ -119,7 +166,7 @@
       {% elif state == 'paused' %}
       <p class="card-note">Nothing - a paused rule judges nothing new.</p>
       {% else %}
-      <p class="card-note">Nothing it matches is in the guide yet{% if checks.reach not in ('Nothing listed', '-') %}, which reaches {{ checks.reach }}{% endif %}. The guide is checked every hour.</p>
+      <p class="card-note">Nothing it matches is in the guide yet.{% if checks.reach not in ('Nothing listed', '-') %} Your guide reaches {{ checks.reach }}.{% endif %} The guide is checked every hour.</p>
       {% endif %}
     </div>
   </div>
@@ -145,7 +192,10 @@
         <div class="srow"><span class="sk">Search</span><span class="sv"><span class="gone">Its search can no longer be read</span></span></div>
         {% endif %}
       </div>
-      <p class="card-note">The search is the rule: whatever it finds is what the rule records.</p>
+      <p class="card-note">The search is the rule: whatever it finds is what the rule records.{% if sports and sports.event_channels %}
+        A game the guide has no listing of is recorded from an event channel instead, which the search
+        cannot find: its account, day and time filters apply to those channels, and its text, tag, group,
+        category and length filters do not.{% endif %}</p>
     </div>
   </div>
 

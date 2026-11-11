@@ -8,6 +8,7 @@ Runs against a throwaway temp SQLite DB - never the live dvr.db.
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -132,9 +133,13 @@ class FormatPlanRouteTests(unittest.TestCase):
         job = make_test_job(name='Group check', channels=[hd, sd])
         db.session.commit()
         # The group's own check saw HD at a high bitrate; a later test from another job
-        # re-measured it much lower, which is what flips the winner.
+        # re-measured it much lower, which is what flips the winner. The high reading is
+        # far older than any plausible channel_testing.bitrate_window_days (the default is
+        # 14), so the ranking rests on the newest test alone rather than a median of the
+        # two (dev/changelog/1487).
         make_channel_test(hd, status='COMPLETED', resolution='1920x1080', fps=60,
-                          bitrate_kbps=9000, job_id=job.id)
+                          bitrate_kbps=9000, job_id=job.id,
+                          test_started_at=datetime.utcnow() - timedelta(days=400))
         make_channel_test(sd, status='COMPLETED', resolution='1280x720', fps=30,
                           bitrate_kbps=4000, job_id=job.id)
         make_channel_test(hd, status='COMPLETED', resolution='1920x1080', fps=60,

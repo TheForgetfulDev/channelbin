@@ -41,6 +41,8 @@ _FIELDS = (
     ProfileField('retention_days', 'Auto-delete after', INT),
     ProfileField('pre_check_enabled', 'Pre-recording health check', BOOL),
     ProfileField('metadata_sidecar_enabled', 'Metadata file for media servers', BOOL),
+    # On or off, never inherit: a pinned poster exists only on a profile (dev/changelog/1505).
+    ProfileField('prefer_sports_poster', "TheSportsDB's poster first", BOOL, blank_value=False),
 )
 
 
@@ -171,7 +173,8 @@ def _overrides(p):
     # Its size is what the row shows: whether the image matches what a media server
     # expects is the one thing about it a user would check here.
     if p.poster_file:
-        rows.append(Override('Poster', f'{p.poster_width} x {p.poster_height}'))
+        rows.append(Override('Poster', f'{p.poster_width} x {p.poster_height}'
+                             + (", TheSportsDB's first" if p.prefer_sports_poster else '')))
     return rows
 
 

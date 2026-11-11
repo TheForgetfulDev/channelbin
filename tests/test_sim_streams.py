@@ -291,6 +291,39 @@ class RadioTests(_Streams):
         self.assertGreater(loop.frames, 150)
 
 
+class AnyStreamIdTests(_Streams):
+    """A backend with any_stream_id serves ids its lineup never listed, which is how the dev
+    instance's copy of a real install's channels plays without a real provider (dev/changelog/1499)."""
+    backend = {'any_stream_id': True}
+
+    def test_an_unlisted_stream_id_plays_as_its_own_channel(self):
+        base = origin(self.url)
+        for sid in (99999999, 4242):
+            if sid in self.ids:
+                continue
+            status, data = read_for(f'{base}/live/reeduser/reedpass1/{sid}.ts', 0.3)
+            self.assertEqual(status, 200, sid)
+            self.assertTrue(sim_ts.check(whole_packets(data)).clean, sid)
+            self.free()
+            self.assertEqual(self.stream_rows()[-1].channel, f'cove:{sid}')
+
+    def test_credentials_are_still_checked(self):
+        base = origin(self.url)
+        self.assertEqual(requests.get(f'{base}/reeduser/wrongpass/99999999', timeout=5)
+                         .status_code, 401)
+
+    def test_the_playlist_still_lists_only_the_lineup(self):
+        self.assertNotIn(99999999, self.urls)
+        self.assertTrue(set(self.ids) <= set(self.urls))
+
+
+class AnyStreamIdWorldTests(unittest.TestCase):
+    def test_a_calibrated_backend_may_not_serve_any_stream_id(self):
+        from sim import WorldError
+        with self.assertRaises(WorldError):
+            stream_world(any_stream_id=True, content='calibrated')
+
+
 class RespelledUrlTests(_Streams):
     """Faults that re-spell a panel's stream URLs (dev/changelog/1218) still name a stream."""
     faults = (('cuid_url_mismatch', 'cove-tv', {}),)

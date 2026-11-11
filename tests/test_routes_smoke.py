@@ -43,8 +43,10 @@ _SKIP_ENDPOINTS = {
 # A 500 is the only hard failure. Everything else is a legitimate outcome of hitting a
 # route with a dummy/missing id or without its required query params. 503 is included
 # because recordings.live_thumbnail deliberately returns it for an IN_PROGRESS recording
-# whose thumbnail hasn't been captured yet (a designed "not ready", not a crash).
-_ALLOWED = {200, 302, 304, 400, 401, 403, 404, 503}
+# whose thumbnail hasn't been captured yet (a designed "not ready", not a crash). 409 is
+# what the recording file routes answer for a recording with no finished file to hand over
+# (app/playback.py::PlaybackRefused), which is every seeded recording.
+_ALLOWED = {200, 302, 304, 400, 401, 403, 404, 409, 503}
 
 _PLACEHOLDER = re.compile(r'<[^>]+>')
 
@@ -102,6 +104,21 @@ class RouteSmokeTests(unittest.TestCase):
                 valuemap = dict(zip(argnames, combo))
                 urls.append((_build_url(rule, valuemap), rule.endpoint))
         return urls
+
+    def test_the_sweep_fills_in_every_placeholder(self):
+        """dev/docs/BUGS.md 2026-11-10: the sweep asked for the literal text
+        `/recordings/<int:recording_id>` on every route that takes a value, got a 404 and
+        counted it as a pass. A route with an id in its path is only swept if a seeded id
+        went into the URL."""
+        rules = [rule for rule in self.t.app.url_map.iter_rules()
+                 if 'GET' in rule.methods and rule.endpoint not in _SKIP_ENDPOINTS]
+        with_values = {rule.endpoint for rule in rules if _PLACEHOLDER.search(rule.rule)}
+        self.assertTrue(with_values, 'no GET route takes a value - the check would be vacuous')
+        urls = self._get_urls()
+        self.assertEqual([url for url, _ in urls if _PLACEHOLDER.search(url)], [])
+        self.assertLessEqual(with_values, {endpoint for _, endpoint in urls})
+        # More than one URL per route somewhere: the recording routes run once per status.
+        self.assertGreater(len(urls), len(rules))
 
     def test_no_route_returns_500(self):
         failures = []

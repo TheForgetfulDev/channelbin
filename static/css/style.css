@@ -1072,6 +1072,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .page-about-body { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5;
   margin: 2px 0 8px; padding: 10px 14px; background: var(--bg1); border: 1px solid var(--border);
   border-radius: var(--radius); }
+.page-about-body p + p { margin-top: 8px; }
 .back { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-md); color: var(--text-muted); margin-bottom: 14px; }
 .back:hover { color: var(--accent-text); text-decoration: none; }
 
@@ -2426,6 +2427,8 @@ body.actbar-on #app-toast { bottom: 78px; }
    Wrapping is a no-op for the common 1-2 button footer - it only engages once content
    actually overflows a row. */
 .modal-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--border-soft); }
+/* text-width-ok: a flex item wraps on its max-content width, so an uncapped note takes the
+   whole footer row and pushes the buttons onto a second line (dev/changelog/1501). */
 .modal-foot-note { margin-right: auto; font-size: var(--fs-sm); color: var(--text-muted); max-width: 46ch; }
 /* util.js::confirmModal - the names a confirm is about (clashing channels). */
 .confirm-list { margin: 8px 0 12px 1.2rem; padding: 0; font-size: var(--fs-sm); }
@@ -2724,8 +2727,8 @@ body.actbar-on #app-toast { bottom: 78px; }
 .gd-kind { font-size: var(--fs-2xl); line-height: 1; color: var(--text-muted); }
 /* Deliberately NOT `.gd-sub` - that name is taken by the small second line inside a
    Channels-table cell further down this file, and the later rule wins at equal
-   specificity, so the page subtitle rendered at 10.5px faint with no line-length cap. */
-.gd-sub-lead { font-size: var(--fs-md); color: var(--text-muted); margin: 6px 0 0; max-width: 72ch; }
+   specificity, so the page subtitle rendered at 10.5px faint. */
+.gd-sub-lead { font-size: var(--fs-md); color: var(--text-muted); margin: 6px 0 0; }
 .gd-dates { font-size: var(--fs-sm); color: var(--text-faint); text-align: right; font-family: var(--font-mono); line-height: 1.7; white-space: nowrap; }
 
 /* ── Status / action bar ───────────────────────────────────────────── */
@@ -2797,13 +2800,13 @@ body.actbar-on #app-toast { bottom: 78px; }
 .gd-chip-val { font-weight: 600; }
 .gd-chip:hover, a.gd-chip:hover { text-decoration: none; }
 
-.card-note { font-size: var(--fs-md); color: var(--text-muted); margin: 0 0 2px; max-width: 78ch; }
+.card-note { font-size: var(--fs-md); color: var(--text-muted); margin: 0 0 2px; }
 /* The recording page's TheSportsDB line under the Program card's rows: the credit, the link and
    Wrong match on one wrapping line (dev/changelog/1464). */
 .card-note.sports-credit { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-top: 10px; }
 /* The recording page's "What happened" card (dev/changelog/1270): plain sentences, read
    top to bottom, so a list rather than a stat grid. */
-.story { margin: 6px 0 8px; padding-left: 1.2em; max-width: 78ch; font-size: var(--fs-md); line-height: 1.5; }
+.story { margin: 6px 0 8px; padding-left: 1.2em; font-size: var(--fs-md); line-height: 1.5; }
 .story li + li { margin-top: 4px; }
 
 /* ── Channels table ────────────────────────────────────────────────── */
@@ -2933,6 +2936,9 @@ th.gd-c-part { text-align: center; }
    width: 100%, which would otherwise stretch each box across the row. */
 .ar-limit { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: var(--fs-md); }
 .gd-field-ctl .ar-limit input[type=number] { width: 90px; }
+/* The rule dialog's About row: a league, then a team in it. */
+.ar-about { display: flex; gap: 8px; flex-wrap: wrap; }
+.ar-about select { flex: 1 1 180px; min-width: 0; }
 
 /* ── Settings modal: the real Settings page anatomy ────────────────── */
 .modal-panel.modal-wide { max-width: 680px; }
@@ -3343,7 +3349,7 @@ th.gd-c-part { text-align: center; }
   border-radius: var(--radius); padding: 14px 16px; margin-bottom: 1rem; box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .recovery-card .rc-head { display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--accent-text); font-size: var(--fs-base); margin-bottom: 5px; }
-.recovery-card .rc-body { font-size: var(--fs-md); color: var(--text-muted); max-width: 78ch; }
+.recovery-card .rc-body { font-size: var(--fs-md); color: var(--text-muted); }
 .recovery-card .rc-actions { margin-top: 11px; display: flex; gap: 0.5rem; flex-wrap: wrap; }
 
 /* ── Split cards (round 4) ───────────────────────────────
@@ -3507,7 +3513,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   opacity: .85;
 }
 .gs-b-title { font-size: var(--fs-2xl); font-weight: 700; line-height: 1.25; margin-top: 4px; }
-.gs-b-text { font-size: var(--fs-lg); line-height: 1.5; margin-top: 4px; opacity: .92; max-width: 70ch; }
+.gs-b-text { font-size: var(--fs-lg); line-height: 1.5; margin-top: 4px; opacity: .92; }
 .gs-b-also { font-size: var(--fs-md); font-weight: 700; line-height: 1.5; margin-top: 6px; }
 /* Equal fr tracks in one grid, however many steps there are: nothing to slide. */
 .gs-segs {
@@ -3558,14 +3564,14 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .gs-tag { font-size: var(--fs-xs); color: var(--text-faint); }
 .gs-state { font-size: var(--fs-md); color: var(--text-muted); margin-top: 3px; line-height: 1.45; }
 .gs-step.problem .gs-state { color: var(--bad-text); }
-.gs-body { font-size: var(--fs-md); color: var(--text); line-height: 1.55; margin-top: 8px; max-width: 72ch; }
+.gs-body { font-size: var(--fs-md); color: var(--text); line-height: 1.55; margin-top: 8px; }
 .gs-acts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 .gs-done-note { margin-top: 14px; }
 .gs-opt-head { margin: 22px 2px 0; }
 /* The search card and the hand-off to Readiness. The Maintenance numbers are the sidebar's
    own classes, inline, so the explanation shows the very badge it explains. */
 .gs-card { margin-top: 22px; }
-.gs-card p, .gs-card ul { font-size: var(--fs-md); line-height: 1.55; max-width: 72ch; }
+.gs-card p, .gs-card ul { font-size: var(--fs-md); line-height: 1.55; }
 .gs-card p { margin: 8px 0 0; }
 .gs-card p:first-child { margin-top: 0; }
 .gs-card ul { margin: 6px 0 0; padding-left: 18px; }
@@ -3576,7 +3582,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .gs-half p { margin: 6px 0 10px; }
 /* The account step's examples branch (dev/changelog/1281): the .gs-half panel inside the
    step, so it reads as the second way through the step rather than a step of its own. */
-.gs-try { background: var(--bg2); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 12px 14px; margin-top: 14px; max-width: 76ch; }
+.gs-try { background: var(--bg2); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 12px 14px; margin-top: 14px; }
 .gs-try-head { font-size: var(--fs-base); font-weight: 600; }
 .gs-try p, .gs-try ul { font-size: var(--fs-md); line-height: 1.55; margin: 6px 0 0; }
 .gs-try ul { padding-left: 18px; }
@@ -3594,7 +3600,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .gs-run-spin { width: 18px; height: 18px; }
 .gs-run-label { font-size: var(--fs-md); font-weight: 600; line-height: 24px; color: var(--text); }
 .gs-run-step.pending .gs-run-label, .gs-run-step.skipped .gs-run-label { font-weight: 500; color: var(--text-muted); }
-.gs-run-detail { font-size: var(--fs-md); line-height: 1.45; color: var(--text-muted); max-width: 72ch; }
+.gs-run-detail { font-size: var(--fs-md); line-height: 1.45; color: var(--text-muted); }
 .gs-run-step.problem .gs-run-detail { color: var(--warn-text); }
 .gs-run-step .btn { align-self: center; }
 .gs-run .gs-acts { margin-top: 14px; }
@@ -4206,7 +4212,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .acst { margin-top: 30px; }
 .acst-top { display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap; }
 .acst-top h2 { font-size: var(--fs-xl); font-weight: 700; margin: 0; }
-.acst-scope { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5; margin: 6px 0 0; max-width: 90ch; }
+.acst-scope { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5; margin: 6px 0 0; }
 .acst-body .acst-scope { margin: 0 0 8px; }
 .acst-notice { font-size: var(--fs-sm); margin: 4px 0 0; }
 .acst-cardscope { font-size: var(--fs-sm); color: var(--text-faint); }
@@ -4948,10 +4954,22 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .rl-filter .chip .n { color: var(--text-faint); margin-left: 4px; font-variant-numeric: tabular-nums; }
 .rl-filter .chip.active .n { color: inherit; opacity: .8; }
 .rl-more { display: flex; justify-content: center; padding: 10px 0 2px; }
+/* A rule that names a league (dev/changelog/1490, mockup 52): the game a listing is, under its
+   program, and Expected games' cells, which carry a badge or a status line over sentences. */
+.rl-game { display: flex; align-items: center; gap: 5px; margin-top: 3px; color: var(--accent-text); font-size: var(--fs-sm); }
+.rl-game .icon { width: 14px; height: 14px; flex: none; }
+.rl-game .air { color: var(--text-muted); }
+.rl-game .air::before { content: '\00b7'; margin: 0 5px 0 1px; color: var(--text-faint); }
+.rl-cell .s { display: block; color: var(--text-muted); font-size: var(--fs-sm); margin-top: 3px; }
+.rl-cell .s.warned { color: var(--warn); }
+.rl-cell .s a { color: var(--accent-text); }
+.rl-cell .badge { white-space: nowrap; }
+.rl-when .was { display: block; color: var(--warn); font-size: var(--fs-xs); margin-top: 2px; cursor: help; }
 @media (max-width: 960px) {
   .rl-when { white-space: normal; }
   .rl-where .via { max-width: none; }
   .rl-when .day { display: inline; margin-right: 6px; }
+  .rl-when .was { display: inline; margin-left: 6px; }
 }
 
 /* The rule dialog's read-only view of the search it records (static/js/auto-rule-modal.js),

@@ -74,6 +74,7 @@ class FakeSportsDB:
         self.images = {}
         self.calls = []
         self.fault = None
+        self.answer_overrides = {}  # endpoint -> the whole JSON answer, whatever was asked
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -127,6 +128,8 @@ class FakeSportsDB:
         return f'{self.image_base}/{name}'
 
     def answer(self, endpoint, query):
+        if endpoint in self.answer_overrides:
+            return self.answer_overrides[endpoint]
         if endpoint == 'lookupleague':
             row = self.leagues.get(int(query['id']))
             return {'leagues': [row] if row else None}

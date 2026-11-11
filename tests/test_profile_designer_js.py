@@ -165,5 +165,40 @@ class SettingsHostTests(_Base, unittest.TestCase):
         self.assertEqual(self.obs['closedByEscape']['modals'], 0)
 
 
+
+class SportsComboTests(_Base, unittest.TestCase):
+    """The {sports:...} fields are picked from a dropdown and inserted like a {tag:...}, and
+    the preview says their values come from TheSportsDB (dev/changelog/1498)."""
+    SCENARIO = 'sports_combo'
+
+    def test_the_dropdown_offers_the_fields(self):
+        self.assertEqual(self.obs['options'], ['league', 'event'])
+
+    def test_insert_puts_the_picked_field_at_the_cursor(self):
+        self.assertEqual(self.obs['template'], '{title} - {sports:event}')
+
+    def test_the_note_appears_only_once_the_template_has_a_field(self):
+        self.assertEqual(self.obs['noteBefore'], '')
+        self.assertIn('filled in from TheSportsDB', self.obs['noteAfter'])
+
+
+class UnknownFieldWarningTests(_Base, unittest.TestCase):
+    """The renderer leaves an unknown {sports:x} out and an unknown {x} in as typed; the warning
+    says which, never "appears literally" for a field that will not appear (dev/changelog/1498)."""
+    SCENARIO = 'unknown_fields'
+
+    def test_an_unknown_sports_field_is_said_to_be_left_out(self):
+        self.assertEqual(self.obs['sports'], '{sports:bogus} is not a variable - it will be left out of '
+                                             'the filename.')
+
+    def test_an_unknown_plain_field_still_appears_literally(self):
+        self.assertEqual(self.obs['plain'], '{bogus} is not a variable - it will appear literally in '
+                                            'the filename.')
+
+    def test_both_kinds_are_named_separately(self):
+        self.assertIn('appear literally', self.obs['both'])
+        self.assertIn('left out', self.obs['both'])
+
+
 if __name__ == '__main__':
     unittest.main()

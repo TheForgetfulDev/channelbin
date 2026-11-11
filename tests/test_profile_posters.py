@@ -480,7 +480,7 @@ class ModalJsTests(unittest.TestCase):
     """The pure helpers behind the modal's poster section (static/js/profile-modal.js),
     evaluated in node the way tests/test_profile_modal_js.py does."""
 
-    _EXPORTS = 'pmSizeAdvice, pmPosterSectionHtml'
+    _EXPORTS = 'pmSizeAdvice, pmPosterSectionHtml, pmPosterPayload'
     _HARNESS = f"""
 const escHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[c]);
 const fieldRow = (o) => `<div class="gd-field"><div class="gd-field-lbl">${{o.label}}</div><div class="gd-field-meta">${{o.meta}}</div><div class="gd-field-ctl">${{o.control}}</div></div>`;
@@ -523,6 +523,20 @@ console.log(JSON.stringify(eval(process.argv[2])));
         self.assertIn('PNG, 800 x 600', html)
         self.assertIn('This image is 800 x 600.', html)
         self.assertIn('data-poster-remove', html)
+
+    def test_the_sports_poster_switch_shows_its_stored_state(self):
+        """dev/changelog/1505."""
+        on = self.evaluate(f'pmPosterSectionHtml(null, {self.SPEC}, true)')
+        off = self.evaluate(f'pmPosterSectionHtml(null, {self.SPEC}, false)')
+        self.assertIn("Use TheSportsDB's poster when the game has one", on)
+        self.assertIn('id="pm-prefer-sports-poster" checked', on)
+        self.assertIn('id="pm-prefer-sports-poster">', off)
+
+    def test_the_switch_is_sent_on_every_save(self):
+        for checked in (True, False):
+            section = '{querySelector: () => ({checked: %s})}' % str(checked).lower()
+            self.assertEqual(self.evaluate(f'pmPosterPayload({section})'),
+                             {'prefer_sports_poster': checked})
 
 
 if __name__ == '__main__':

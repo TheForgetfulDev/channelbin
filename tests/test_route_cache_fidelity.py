@@ -46,6 +46,7 @@ def _fingerprint(app):
             'methods': sorted(rule.methods or ()),
             'defaults': repr(rule.defaults),
             'converters': sorted((k, type(v).__name__) for k, v in rule._converters.items()),
+            'arguments': sorted(rule.arguments),
             'trace': list(rule._trace),
         }
         try:
@@ -124,6 +125,48 @@ class RouteCacheFidelityTests(unittest.TestCase):
             return adapter.match(path, method='GET')
         except Exception as exc:  # noqa: BLE001 - the failure is the comparable value
             return f'<{type(exc).__name__}>'
+
+    def test_a_missing_value_is_a_build_error_on_a_memoized_app(self):
+        """dev/docs/BUGS.md 2026-11-10: a replayed rule had no `arguments`.
+
+        werkzeug decides whether a rule can build a URL from the values it was given by
+        reading the rule's `arguments`. With that set empty every rule looked buildable
+        from nothing, so url_for() with a value missing raised the builder's TypeError in
+        every test app after the first, where production raises BuildError.
+        """
+        from werkzeug.routing import BuildError
+
+        routecache.install()
+        for _ in range(2):
+            t = make_test_app()
+            try:
+                adapter = t.app.url_map.bind('localhost')
+                with_values = [rule for rule in t.app.url_map.iter_rules()
+                               if rule._converters and not rule.defaults]
+                self.assertTrue(with_values, 'no rule takes a value - the check would be vacuous')
+                for rule in with_values:
+                    self.assertEqual(rule.arguments, set(rule._converters), rule.rule)
+                    with self.assertRaises(BuildError, msg=rule.rule):
+                        adapter.build(rule.endpoint, {}, method=sorted(rule.methods)[0])
+            finally:
+                t.cleanup()
+
+    def test_a_replayed_rule_owns_its_arguments(self):
+        """The names are copied onto each rule, so one app adding to its set (werkzeug
+        never does, a test might) cannot reach the next app's rules."""
+        routecache.install()
+        first = make_test_app()
+        try:
+            for rule in first.app.url_map.iter_rules():
+                rule.arguments.add('added_by_the_first_app')
+        finally:
+            first.cleanup()
+        second = make_test_app()
+        try:
+            for rule in second.app.url_map.iter_rules():
+                self.assertNotIn('added_by_the_first_app', rule.arguments, rule.rule)
+        finally:
+            second.cleanup()
 
     def test_cached_builders_are_rebound_per_rule(self):
         """A replayed _build must belong to the rule it was replayed onto.

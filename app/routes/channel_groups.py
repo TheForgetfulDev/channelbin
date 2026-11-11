@@ -45,8 +45,8 @@ from ..channel_groups import (
     deregister_cancelled_recordings,
     report_orphaned_guide_groups, resolve_broken_guide_row,
     evaluate_and_reconcile_group, check_target_channels, teardown_test_job,
-    apply_format_strategy, strategy_lock_plan,
-    FORMAT_STRATEGY_LABELS,
+    apply_format_strategy, strategy_lock_plan, bitrate_window_days,
+    FORMAT_STRATEGY_LABELS, FORMAT_STRATEGIES,
     DEFAULT_FAILING_STREAK_THRESHOLD, plan_format_selection,
     MATCH_REASON_STRENGTH, FORMAT_STATUS_STRENGTH,
     build_group_with_members, group_name_conflict, serving_member, touch_group,
@@ -58,6 +58,7 @@ from ..logo_cache import resolve_logo_url
 from ..tz_utils import local_input_value, format_local
 from .channel_tests import (
     _serialize_dup_groups, _suggested_keep_id, _latest_tests_by_channel, _test_status_label,
+    _recent_tests_by_channel,
     _channel_result_row, _tally, get_job_result_counts, get_job_result_counts_batch,
     tally_tests, _recur_label, _fmt_et,
     ANY_JOB,
@@ -1091,6 +1092,11 @@ def group_detail_rows(group, job):
     # there is no job to scope to, so the second query only exists when the two differ.
     latest_any = latest if job is None else _latest_tests_by_channel(channel_ids,
                                                                     for_job_id=ANY_JOB)
+    # The recency window the standing strategy ranks bitrate over, loaded only for a group
+    # whose strategy ranks on buckets - the banner must describe the lock the engine
+    # would write, from the same tests (dev/changelog/1487).
+    window_any = (_recent_tests_by_channel(channel_ids, bitrate_window_days(cfg))
+                  if stored and group.format_strategy in FORMAT_STRATEGIES else None)
 
     ref_key = (group_reference_key(group, memberships, latest_any, streak_threshold)
                if stored else None)
@@ -1238,14 +1244,15 @@ def group_detail_rows(group, job):
                                   format_blocked_ids, format_override, best_active_id,
                                   monitored_ids, ref_key,
                                   lock_ranking_ids(memberships) if stored else None,
-                                  participating_ids=participating_ids)
+                                  participating_ids=participating_ids,
+                                  window_by_channel=window_any)
         if stored else None,
     }
 
 
 def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
                   format_override, best_active_id, monitored_ids, ref_key,
-                  rank_ids=None, participating_ids=None):
+                  rank_ids=None, participating_ids=None, window_by_channel=None):
     """Everything section 16's warning banners need, decided server-side.
 
     The banners are gated and counted here rather than in group-detail.js because every
@@ -1287,7 +1294,8 @@ def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
     # population, so the two agree - passing everything here while the engine ranked over
     # the recording-enabled members is how this banner came to describe a different
     # group's lock than the one on the row (dev/changelog/890).
-    plan = strategy_lock_plan(group, channels, latest, rank_ids=rank_ids)
+    plan = strategy_lock_plan(group, channels, latest, rank_ids=rank_ids,
+                              window_by_channel=window_by_channel)
     entry = plan['entry'] or {}
     no_winner = plan['manages_lock'] and entry.get('key') is None
 
@@ -1741,8 +1749,10 @@ def group_format_plan(group_id):
         rank_ids = (None if request.args.get('rank_scope') == 'all'
                     else lock_ranking_ids(memberships))
 
-    latest = _latest_tests_by_channel([ch.id for ch in channels], for_job_id=ANY_JOB)
-    plan = plan_format_selection(channels, latest, rank_ids=rank_ids)
+    channel_ids = [ch.id for ch in channels]
+    latest = _latest_tests_by_channel(channel_ids, for_job_id=ANY_JOB)
+    window = _recent_tests_by_channel(channel_ids, bitrate_window_days())
+    plan = plan_format_selection(channels, latest, rank_ids=rank_ids, window_by_channel=window)
     return jsonify({'success': True, **plan})
 
 

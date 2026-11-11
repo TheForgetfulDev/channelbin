@@ -13,14 +13,27 @@
   <h1>Sports Schedules
     {% if rows %}<span class="sub">{{ followed }} followed{% if not_followed %}, {{ not_followed }} not followed{% endif %} &middot; {{ upcoming_total }} upcoming</span>{% endif %}
   </h1>
-  <button type="button" class="btn btn-primary" id="sp-add">{{ icon('add') }} Add a league</button>
+  <button type="button" class="btn btn-primary" id="sp-add">{{ icon('add') }} Add league or team</button>
 </div>
 {% call page_about() %}
-  ChannelBin can keep the real schedule of the leagues and teams you follow, from TheSportsDB: who
-  is playing, where, and when. Nothing is fetched for anything you have not followed. The schedule
-  is not matched to your guide listings yet, so for now it is something to read. A recording never
-  waits on any of this. How far apart calls are, how far ahead a schedule reaches and how long past
-  games are kept are in <a href="{{ url_for('settings.settings', q='sports_data') }}">Settings</a>.
+  <p>Finding a live game, match, or race on a sports channel can often be harder than it should be.
+  The same event is listed again and again with nothing to say which airing is live, a guide's time
+  can be wrong, and many event channels have no real listings at all, only a name such as
+  "NFL | 1pm Cowboys at Colts". Sports Schedules gets the real schedule of the leagues and teams you
+  follow from TheSportsDB (who is playing, where, and when) and checks each event against your
+  guide. You can then see which channel an event is actually on, and which listing is the live one
+  and which is a replay.</p>
+  <p>Add a whole league, or a specific team you follow, and that league's page lists its events with
+  every channel carrying each one, whether it is the live airing or a replay, and why each listing
+  matched. If one is wrong, mark it a Wrong match and it stops counting. An event channel with no
+  listings is read by its name.</p>
+  <p>Once you've added a league or team, an <a href="{{ url_for('auto_rules.rules_page') }}">auto-record
+  rule</a> can use it to record that league's or team's events automatically. You can also include
+  TheSportsDB fields in filename templates: fields such as {sports:league} and {sports:event} are
+  filled in when the file is written.</p>
+  <p>You can configure TheSportsDB options, such as how far apart calls are, how far ahead a schedule
+  reaches, and how long past events are kept, in
+  <a href="{{ url_for('settings.settings', q='sports_data') }}">Settings</a>.</p>
 {% endcall %}
 
 <div id="sports-body">
@@ -44,7 +57,7 @@
 {% if not rows %}
 <div class="empty-state">
   <p><strong>No leagues followed</strong></p>
-  <p class="text-muted small">ChannelBin is making no calls to TheSportsDB. Add a league to see who is playing, where and when.</p>
+  <p class="text-muted small">Add a league or a team to see who is playing, where, and when, and where each event is in your guide.</p>
 </div>
 {% else %}
 <div class="menu-wrap sort-chip-wrap sp-sort">

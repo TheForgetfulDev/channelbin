@@ -106,3 +106,5 @@ await wait(30);
 out.category_puts = sent((r) => r.method === 'PUT' && /\/categories$/.test(r.path));
 
 console.log(JSON.stringify(out));
+// The page's live refresh keeps a timer running, so node would otherwise wait on it forever.
+process.exit(0);

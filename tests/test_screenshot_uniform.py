@@ -61,6 +61,25 @@ class ScreenshotUniformTests(unittest.TestCase):
         p = self._gen('nullsrc=s=320x180,geq=random(1)*255:128:128', 'noise.jpg')
         self.assertIsNone(_check_screenshot_uniform(p, _FFMPEG))
 
+    def test_a_dim_scene_with_lit_pixels_is_a_picture_not_black(self):
+        """dev/docs/BUGS.md 2026-11-09 (the black case). 8% of the frame at luma 50 on black:
+        the 64x64 contrast is 13.1 (under the 15 that reads as solid) so the old black case
+        called this blank, while the full-size count says 8% of its pixels are lit - the
+        shape of the three real dim scenes with people in them (dev/changelog/1433)."""
+        p = self._gen('color=c=black:s=320x180,drawbox=x=10:y=10:w=92:h=50:color=#323232:t=fill',
+                      'dim.jpg')
+        self.assertIsNone(_check_screenshot_uniform(p, _FFMPEG))
+
+    def test_a_logo_alone_on_black_is_black(self):
+        """The other direction: a 24x12 white mark on black lifts the 64x64 contrast to 16.5,
+        so the old test passed it as a picture; 0.5% of the pixels are lit, under the 1% the
+        full-size rule calls black."""
+        p = self._gen('color=c=black:s=320x180,drawbox=x=280:y=10:w=24:h=12:color=white:t=fill',
+                      'logo.jpg')
+        warn = _check_screenshot_uniform(p, _FFMPEG)
+        self.assertIsNotNone(warn)
+        self.assertIn('black', warn.lower())
+
     def test_missing_file_returns_none(self):
         # unreadable input → warning swallowed, returns None (no crash)
         self.assertIsNone(_check_screenshot_uniform(

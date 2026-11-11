@@ -8,7 +8,8 @@ poster is the image pinned to the recording's profile when it has one
 (app/profile_posters.py), otherwise TheSportsDB's poster or thumb for the recording's event
 (app/sports_images.py), otherwise the frame captured from inside the program itself
 (recorder.persist_poster_frame), otherwise the final-frame thumbnail. TheSportsDB's landscape
-thumb is also written as the background, `-fanart`, whatever the poster is.
+thumb is also written as the background, `-fanart`, whatever the poster is. A profile can put
+TheSportsDB's own poster ahead of its pinned one (`prefer_sports_poster`, dev/changelog/1505).
 
 The format is the Kodi one because it is the portable one. Jellyfin, Emby and Kodi have
 read it for years, and Plex reads it natively as of PMS 1.43.1 through its own "Plex NFO
@@ -308,10 +309,10 @@ def _sports_notes(art: dict) -> list:
 def _copy_poster(recording_id, cfg, video_path, profile, sports=None, art=None):
     """Put a poster beside the video. Returns `(path written or None, source, note)`.
 
-    Four sources, best first. The image pinned to the recording's profile wins outright
-    when there is one, in its own format (dev/changelog/1059) - it is the only one the user
-    chose. Below it is TheSportsDB's poster for the recording's event, or its landscape thumb
-    when the event has none (`art`, from sports_images.artwork(), dev/changelog/1465): designed
+    Four sources, best first (the profile's switch below can swap the first two). The image
+    pinned to the recording's profile wins when there is one, in its own format
+    (dev/changelog/1059) - it is the only one the user chose. Below it is TheSportsDB's poster
+    for the recording's event, or its landscape thumb when the event has none (`art`, from sports_images.artwork(), dev/changelog/1465): designed
     artwork beats a frame that landed on whatever graphic was on screen. Below that is the poster
     frame taken from inside the program itself
     (recorder.persist_poster_frame, dev/changelog/1060). Last is the final-frame thumbnail,
@@ -319,47 +320,77 @@ def _copy_poster(recording_id, cfg, video_path, profile, sports=None, art=None):
     on a postgame graphic - and is kept as the floor because every recording made before
     the poster frame existed has only that one.
 
+    A profile with `prefer_sports_poster` on moves TheSportsDB's own portrait poster above its
+    pinned image (dev/changelog/1505). Only the poster: the landscape thumb standing in for a
+    missing one stays below the pin, since a league with almost no posters (NHL: 7 of 572)
+    would otherwise trade the user's logo for a squeezed landscape on nearly every game.
+
     `note` is a sentence for the event when something worth saying happened - the pinned
-    file was gone from disk - so a recording whose cover is not the logo the user chose
-    can say why. No image at all is not a failure: the live-thumbnail feature can be
+    file was gone from disk, or the profile asked for TheSportsDB's poster first and either
+    got it or did not - so a recording whose cover is not the one the user expected can say
+    why. No image at all is not a failure: the live-thumbnail feature can be
     switched off, and a recording whose segments were all unreadable never got either
     image. The NFO simply carries no <thumb> then.
     """
     from .profile_posters import poster_path
     from .recorder import poster_frame_path
+    from .sports_images import POSTER, READY
     from .storage_dirs import THUMBNAILS, image_dir
 
     stem = os.path.splitext(video_path)[0]
-    note = None
+    notes = []
+    state, path, _ = (art or {}).get(POSTER, (None, None, None))
+    sports_ready = state == READY
+
+    def _copy_sports():
+        """Copy TheSportsDB's image as the poster; a failed copy is a note and a fall through,
+        since the downloaded copy, not the recording, is what failed."""
+        dest = stem + '-poster' + os.path.splitext(path)[1]
+        try:
+            shutil.copyfile(path, dest)
+        except OSError as exc:
+            notes.append(f"TheSportsDB's image could not be copied ({exc.strerror or exc})")
+            log.warning('Recording %d: %s', recording_id, notes[-1])
+            return None
+        _drop_stale_posters(stem, dest)
+        return dest
+
+    pinned = None
     if profile is not None and profile.poster_file:
         try:
             pinned = poster_path(cfg, profile.poster_file)
         except ValueError:
             pinned = None
-        if pinned and os.path.exists(pinned):
-            dest = stem + '-poster' + os.path.splitext(pinned)[1]
-            shutil.copyfile(pinned, dest)
-            _drop_stale_posters(stem, dest)
-            return dest, POSTER_FROM_PROFILE, None
-        note = (f'The poster pinned to profile "{profile.name}" was missing from disk '
-                f'({pinned or profile.poster_file}), so it could not be used')
-        log.warning('Recording %d: %s', recording_id, note)
+        if not (pinned and os.path.exists(pinned)):
+            notes.append(f'The poster pinned to profile "{profile.name}" was missing from disk '
+                         f'({pinned or profile.poster_file}), so it could not be used')
+            log.warning('Recording %d: %s', recording_id, notes[-1])
+            pinned = None
 
-    from .sports_images import POSTER, READY
-    state, path, _ = (art or {}).get(POSTER, (None, None, None))
-    if state == READY:
-        dest = stem + '-poster' + os.path.splitext(path)[1]
-        try:
-            shutil.copyfile(path, dest)
-        except OSError as exc:
-            # The downloaded copy, not the recording, is what failed: fall back to the frames.
-            sports_note = f"TheSportsDB's image could not be copied ({exc.strerror or exc})"
-            log.warning('Recording %d: %s', recording_id, sports_note)
-            note = '. '.join(x for x in (note, sports_note) if x)
-        else:
-            _drop_stale_posters(stem, dest)
-            return dest, (POSTER_FROM_SPORTS if sports.poster_url else POSTER_FROM_SPORTS_THUMB), note
+    prefer = pinned is not None and bool(profile.prefer_sports_poster)
+    if prefer and sports_ready and sports.poster_url:
+        dest = _copy_sports()
+        if dest:
+            notes.append(f'Profile "{profile.name}" puts TheSportsDB\'s poster ahead of its pinned one')
+            return dest, POSTER_FROM_SPORTS, '. '.join(notes)
+    if pinned is not None:
+        if prefer and sports is not None and not sports.poster_url:
+            notes.append(f'TheSportsDB has no poster for this event, so the one pinned to profile '
+                         f'"{profile.name}" was used')
+        # A poster TheSportsDB has but this server has not downloaded is said by write_sidecar's
+        # _sports_notes(), with its reason.
+        dest = stem + '-poster' + os.path.splitext(pinned)[1]
+        shutil.copyfile(pinned, dest)
+        _drop_stale_posters(stem, dest)
+        return dest, POSTER_FROM_PROFILE, '. '.join(notes) or None
 
+    if sports_ready:
+        dest = _copy_sports()
+        if dest:
+            return dest, (POSTER_FROM_SPORTS if sports.poster_url else POSTER_FROM_SPORTS_THUMB), \
+                '. '.join(notes) or None
+
+    note = '. '.join(notes) or None
     captured = [(poster_frame_path(recording_id, cfg), POSTER_FROM_FRAME),
                 (os.path.join(image_dir(cfg, THUMBNAILS), f'{recording_id}.jpg'),
                  POSTER_FROM_THUMBNAIL)]
@@ -475,9 +506,13 @@ def write_sidecar(recording_id: int, video_path: str, cfg: dict, profile=None):
         detail += '. No poster was available to copy, so the file carries no artwork'
     if fanart_path:
         detail += f", and {os.path.basename(fanart_path)} as its background (TheSportsDB's for its event)"
-    # A pinned image is the poster the user chose, so TheSportsDB's missing one is not news.
+    # A pinned image is the poster the user chose, so TheSportsDB's missing one is not news,
+    # unless the profile asked for TheSportsDB's poster first and it has one.
     from .sports_images import POSTER
-    unused = {k: v for k, v in art.items() if not (k == POSTER and poster_source == POSTER_FROM_PROFILE)}
+    wanted = bool(profile is not None and profile.prefer_sports_poster and sports is not None
+                  and sports.poster_url)
+    unused = {k: v for k, v in art.items()
+              if not (k == POSTER and poster_source == POSTER_FROM_PROFILE and not wanted)}
     for note in [n for n in (poster_note, fanart_note, art_note) if n] + _sports_notes(unused):
         detail += '. ' + note
 

@@ -39,12 +39,15 @@ from .database import (
     CANCEL_DURING_CONVERSION, CANCEL_GROUP_CHANGE, Channel, ChannelGroup, EPGEntry,
     REC_STATUS_ABORTED, REC_STATUS_FAILED, REC_STATUS_SCHEDULED, RECORDING_RULE_PROGRAM_MOVED,
     rule_status,
-    RECORDING_RULE_RELEASED, RECORDING_RULE_RETRACKED, RECORDING_RULE_SCHEDULED,
+    RECORDING_RULE_GAME_CHANGED, RECORDING_RULE_RELEASED, RECORDING_RULE_RETRACKED,
+    RECORDING_RULE_SCHEDULED,
     RECORDING_START_NOT_ARMED, Recording,
     RecordingProfile, RULE_MATCH_SCHEDULED,
     RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_EXISTING, RULE_MATCH_SKIPPED_LIMIT,
-    RULE_MATCH_SKIPPED_REPEAT, RULE_MATCH_SKIPS, RULE_MATCH_USER_MODIFIED, RuleMatch,
-    add_recording_event, detach_recording_references,
+    RULE_MATCH_SKIPPED_REPEAT, RULE_MATCH_SKIPPED_REPLAY, RULE_MATCH_SKIPS,
+    RULE_MATCH_USER_MODIFIED, RuleMatch, SPORTS_AIRING_REPLAY, SPORTS_AIRING_UNKNOWN,
+    add_recording_event,
+    detach_recording_references,
 )
 from .db_utils import retry_on_locked
 from .fmt_utils import iso_seconds_or_none
@@ -347,6 +350,7 @@ class _Lib:
     start: datetime
     stop: datetime
     rule_id: int | None
+    title: str = ''
 
 
 @dataclass
@@ -364,6 +368,9 @@ class _Row:
     channel_id: int | None
     group_id: int | None
     program_title: str | None
+    detail: str | None = None
+    # TheSportsDB's id of a game recorded from an event channel; None on a listing's row.
+    sports_event_tsdb_id: int | None = None
 
 
 @dataclass
@@ -402,6 +409,8 @@ class _Verdict:
     action: str
     detail: str
     lead: _Showing
+    sports_event_tsdb_id: int | None = None
+    sports_start_from: str | None = None
 
 
 @dataclass
@@ -454,7 +463,7 @@ def _library(extra_ids) -> list:
                  episode_raw=title_key(r.program_sub_title),
                  program_start=r.program_start_time, program_stop=r.program_stop_time,
                  channel_id=r.channel_id, group_id=r.group_id, start=r.start_time,
-                 stop=r.stop_time, rule_id=r.rule_id) for r in rows]
+                 stop=r.stop_time, rule_id=r.rule_id, title=r.program_title or '') for r in rows]
 
 
 def _row_snapshot(m: RuleMatch) -> _Row:
@@ -462,7 +471,8 @@ def _row_snapshot(m: RuleMatch) -> _Row:
                 start=m.program_start_time, stop=m.program_stop_time, action=m.action_taken,
                 recording_id=m.recording_id, removed_status=m.removed_status,
                 removed_cancel_reason=m.removed_cancel_reason, channel_id=m.channel_id,
-                group_id=m.group_id, program_title=m.program_title)
+                group_id=m.group_id, program_title=m.program_title, detail=m.detail,
+                sports_event_tsdb_id=m.sports_event_tsdb_id)
 
 
 # ---------------------------------------------------------------------------
@@ -730,9 +740,10 @@ def _raise_standing(alert_type, source, title, body):
 
 
 def _clear_rule_alerts(rule_id):
-    from .alerts import AUTO_RULE_BROKEN, AUTO_RULE_CAPPED, dismiss_open_alerts
+    from .alerts import AUTO_RULE_BROKEN, AUTO_RULE_CAPPED, AUTO_RULE_GAME_UNLISTED, dismiss_open_alerts
     dismiss_open_alerts(AUTO_RULE_CAPPED, f'auto-rule:{rule_id}:cap')
     dismiss_open_alerts(AUTO_RULE_BROKEN, f'auto-rule:{rule_id}:broken')
+    dismiss_open_alerts(AUTO_RULE_GAME_UNLISTED, f'auto-rule:{rule_id}:game')
 
 
 # ---------------------------------------------------------------------------
@@ -752,6 +763,9 @@ class _Run:
     tz: object
     h24: bool
     reach: '_Reach'
+    # The games of the leagues the run's rules name (app/auto_rules_sports.py), or None when no
+    # rule in the run names one - then nothing below reads TheSportsDB at all.
+    games: object = None
 
 
 def run_evaluation(trigger: str, rule_ids=None):
@@ -821,7 +835,8 @@ def _run(trigger, rule_ids):
                 RuleMatch.action_taken == RULE_MATCH_USER_MODIFIED,
                 RuleMatch.recording_id.isnot(None))},
             default_cap=default_cap(cfg),
-            tz=get_display_tz(), h24=is_24h(), reach=reach)
+            tz=get_display_tz(), h24=is_24h(), reach=reach,
+            games=_load_games(ids, now))
         # Two passes, so every rule's retrack (§5) lands before any rule judges a showing as
         # new: a rule judged first would otherwise find a moved program unclaimed - the rule
         # that owns its recording has not followed it yet - and schedule it a second time.
@@ -841,6 +856,25 @@ def _run(trigger, rule_ids):
                        for o in outcomes.values())
              or 'no enabled rule')
     return outcomes
+
+
+def _load_games(rule_ids, now):
+    """The GameIndex for the leagues these rules name, or None when none names one."""
+    leagues = {lid for (lid,) in db.session.query(AutoRule.sports_league_id).filter(
+        AutoRule.id.in_(list(rule_ids)), AutoRule.sports_league_id.isnot(None))}
+    if not leagues:
+        return None
+    from sqlalchemy.exc import SQLAlchemyError
+    from .auto_rules_sports import GameIndex
+    try:
+        return GameIndex.load(leagues, now)
+    except SQLAlchemyError:
+        # A rule naming a league then judges on the guide alone, as when TheSportsDB is down
+        # (DESIGN-sports-data.md 10), rather than this read stopping every rule in the run.
+        db.session.rollback()
+        log.warning('Auto-record: TheSportsDB games could not be read; rules naming a league are '
+                    'judged on the guide alone this run', exc_info=True)
+        return None
 
 
 def default_cap(cfg) -> int:
@@ -1032,6 +1066,7 @@ class _Prepared:
     outcome: RuleOutcome
     problems: list
     moved: set
+    state: object = None
 
 
 def _prepare_rule(rule_id, run):
@@ -1134,7 +1169,7 @@ def _prepare_rule(rule_id, run):
         return _abandon(rule_id, 'it changed while it was being checked')
     return _Prepared(rule_id=rule_id, revision=revision, settings=settings, now=now, rows=rows,
                      showings=showings, slots=slots, outcome=outcome, problems=problems,
-                     moved=moved)
+                     moved=moved, state=state)
 
 
 def _episode_fills(rows, slots) -> list:
@@ -1144,7 +1179,7 @@ def _episode_fills(rows, slots) -> list:
     held = {(r.title_key, r.episode_key, r.start) for r in rows}
     fills = []
     for r in rows:
-        if r.episode_key:
+        if r.episode_key or r.sports_event_tsdb_id:
             continue
         only = slots.only_episode(r.title_key, r.start)
         if only and (r.title_key, only, r.start) not in held:
@@ -1171,11 +1206,16 @@ def _judge_rule(p, run) -> RuleOutcome:
     ledger = {(r.title_key, r.episode_key, r.start): r for r in p.rows}
     programs = _programs(p.showings, p.slots)
     judge = _Judge(rule_id, settings, p.rows, run, p.slots, now)
+    programs = judge.games_first(programs)
     verdicts = []
+    # Games recorded from event channels join the listings in start order (§4.3), so tonight's
+    # game is not capped behind next week's listings (dev/changelog/1491).
+    items = _merge_events(programs, judge.followers,
+                          _event_candidates(p, run, judge, ledger, outcome, placement_errors))
 
     # 4. Judge, plan and create, one program at a time in start order.
-    for program in programs:
-        row = ledger.get(program.identity)
+    for program, pick, event_row in items:
+        row = event_row if pick is not None else ledger.get(program.identity)
         if row is not None:
             if row.action == RULE_MATCH_SCHEDULED:
                 if not _aborted_by_group_change(row, run.lib_by_id):
@@ -1199,11 +1239,15 @@ def _judge_rule(p, run) -> RuleOutcome:
             outcome.skipped[action] = outcome.skipped.get(action, 0) + 1
             if action == RULE_MATCH_SKIPPED_CAP:
                 outcome.capped += 1
-            if row is None or row.action != action:
+            # A verdict that stands but whose reason changed is rewritten too: a covered listing
+            # must not keep naming a recording that was since cancelled (dev/changelog/1490).
+            if row is None or row.action != action or row.detail != detail:
                 verdicts.append(_Verdict(program.identity, row.id if row else None,
-                                         action, detail, program.lead))
+                                         action, detail, program.lead,
+                                         sports_event_tsdb_id=pick.game.tsdb_id if pick else None,
+                                         sports_start_from=pick.source if pick else None))
             continue
-        result = _schedule(rule_id, revision, program, row, settings, run, judge)
+        result = _schedule(rule_id, revision, program, row, settings, run, judge, event=pick)
         if result is _CHANGED:
             return _abandon(rule_id, 'it changed while it was being checked')
         made, problem = result
@@ -1223,6 +1267,7 @@ def _judge_rule(p, run) -> RuleOutcome:
     if not _finish(rule_id, revision, now, reach, outcome.problems or None):
         return _abandon(rule_id, 'it changed while it was being checked')
     _rule_alerts_after_run(rule_id, revision, outcome, settings)
+    _game_alert_after_run(rule_id, revision, settings, judge, now, p.state)
     return outcome
 
 
@@ -1234,6 +1279,8 @@ class _RuleSettings:
     limit_window: timedelta | None
     cap: int
     profile_id: int | None
+    # What the rule is about from Sports Schedules (auto_rules_sports.Scope), or None.
+    scope: object = None
 
     @classmethod
     def of(cls, rule, run):
@@ -1241,9 +1288,11 @@ class _RuleSettings:
         if rule.limit_count and rule.limit_window_hours:
             limit = timedelta(hours=rule.limit_window_hours)
         cap = rule.max_upcoming if rule.max_upcoming is not None else run.default_cap
+        from .auto_rules_sports import scope_of
         return cls(name=rule.name, skip_repeats=bool(rule.skip_repeats),
                    limit_count=rule.limit_count if limit else None, limit_window=limit,
-                   cap=max(0, int(cap or 0)), profile_id=rule.profile_id)
+                   cap=max(0, int(cap or 0)), profile_id=rule.profile_id,
+                   scope=scope_of(rule) if run.games is not None else None)
 
     def profile_choice(self, rule_id):
         """What the planner is handed: 'default' (each showing's own) or the profile, read
@@ -1334,7 +1383,7 @@ class _LibIndex:
 
 
 class _Judge:
-    """The four checks of §4.3 step 4, over in-memory state extended by every recording this
+    """The checks of §4.3 step 4, over in-memory state extended by every recording this
     run commits - so each count includes what the run has already made, and no check queries."""
 
     def __init__(self, rule_id, settings, rows, run, slots, now):
@@ -1349,6 +1398,42 @@ class _Judge:
             self._index(rec)
         # This rule's picks, for the repeat check's ledger half and for the limit.
         self.picks = [r for r in rows if r.action == RULE_MATCH_SCHEDULED]
+        # {program identity: (Game, airing)} for a rule that names a league (games_first()).
+        self.scope = settings.scope
+        self.games = run.games if settings.scope is not None else None
+        self.game_of = {}
+        self.followers = set()
+
+    def games_first(self, programs):
+        """For a rule that names a league: each game's keeper - of its listings that are not a
+        known replay, the one most channels carry - is judged before the game's other listings,
+        so they find it scheduled and are covered by it (auto_rules_sports, dev/changelog/1490).
+        Everything else keeps its start order. A rule that names nothing is returned as it is."""
+        if self.games is None:
+            return programs
+        from .auto_rules_sports import keepers
+        for p in programs:
+            self.game_of[p.identity] = self.games.program_game(p, self.scope)
+        keep = keepers(programs, self.game_of)
+        followers = {p.identity for p in programs
+                     if p.identity not in keep and self.game_of[p.identity][0] is not None
+                     and any(self.game_of.get(k, (None,))[0] is self.game_of[p.identity][0]
+                             for k in keep)}
+        self.followers = followers
+        return ([p for p in programs if p.identity not in followers]
+                + [p for p in programs if p.identity in followers])
+
+    def note_created(self, program, holder, lead):
+        """A recording this run made of a game is one the game's other listings, and its
+        replays, are judged against - in this rule and in the rules the run judges after it."""
+        if self.games is None:
+            return
+        from .auto_rules_sports import Held
+        game, airing = self.game_of.get(program.identity, (None, None))
+        if game is not None:
+            self.games.held.setdefault(game.id, []).append(Held(
+                recording_id=holder['recording_id'], airing=airing,
+                where=lead.group_name or lead.channel_name, title=lead.title))
 
     def _index(self, rec):
         if (self.index.add(rec) and rec.rule_id == self.rule_id
@@ -1368,11 +1453,66 @@ class _Judge:
         """(action, detail) for a skip, or (None, None) when the program should be
         scheduled. Order matters: a repeat is judged before the limit, so the limit's one
         slot goes to the race rather than the replay (§3.5)."""
-        for check in (self._existing, self._repeat, self._limit, self._cap):
+        for check in (self._existing, self._same_game, self._replay, self._repeat, self._limit,
+                      self._cap):
             found = check(program)
             if found is not None:
                 return found
         return None, None
+
+    def _same_game(self, program):
+        """One recording per game, for a rule that names a league (DESIGN-autoschedule.md §3.3's
+        stated exception): a listing of a game a recording already covers - scheduled, recording,
+        recorded, or this rule's pick a person cancelled (R6) - is not recorded again. Only while
+        that recording's window covers this listing: a wrong time never costs a recording."""
+        if self.games is None:
+            return None
+        from .auto_rules_sports import PREGAME_SLACK, covers
+        game, _airing = self.game_of.get(program.identity, (None, None))
+        if game is None:
+            return None
+        lead = program.lead
+        for h in self.games.held.get(game.id, ()):
+            rec = self.run.lib_by_id.get(h.recording_id)
+            if rec is None or rec.status not in self.index.spoken:
+                continue
+            if covers(rec.start, rec.stop, lead.start, lead.stop):
+                where = f' on {h.where}' if h.where else ''
+                return (RULE_MATCH_SKIPPED_EXISTING,
+                        f'Same game, covered by the recording of "{h.title or rec.name}"{where}, '
+                        f'{self._when(rec.program_start or rec.start)}.')
+        for row in self.picks:
+            if row.recording_id is not None or not _pick_is_spoken_for(row, self.run.lib_by_id):
+                continue
+            picked, _a = self.games.row_game(row, self.scope)
+            # The same airing, not a containing window: an event pick is given more time than a
+            # listing, and a cancellation of either is of the game at that time. A pick 12 hours
+            # off is another airing and cancels nothing here.
+            if picked is game and abs(row.start - lead.start) <= PREGAME_SLACK:
+                return (RULE_MATCH_SKIPPED_EXISTING,
+                        f'Same game: you cancelled this rule\'s recording of '
+                        f'"{row.program_title or game.title}", {self._when(row.start)}, so it is not '
+                        'recorded from another listing either.')
+        return None
+
+    def _replay(self, program):
+        """Skip game replays: a listing TheSportsDB's matches call a replay is left out only while
+        a first airing of the game is actually scheduled, recording or recorded. A failed first
+        airing frees it, and an airing in doubt is never skipped (DESIGN-sports-data.md 10)."""
+        if self.games is None or not self.scope.skip_replays:
+            return None
+        from .auto_rules_sports import first_airing_held
+        game, airing = self.game_of.get(program.identity, (None, None))
+        if game is None or airing != SPORTS_AIRING_REPLAY:
+            return None
+        h = first_airing_held(self.games.held.get(game.id, ()), self.index.spoken,
+                              self.run.lib_by_id)
+        if h is None:
+            return None
+        rec = self.run.lib_by_id[h.recording_id]
+        return (RULE_MATCH_SKIPPED_REPLAY,
+                f'The first airing, {self._when(rec.program_start or rec.start)}, is '
+                f'{_state_phrase(rec.status)}.')
 
     def _existing(self, program):
         for rec in self.index.same_program(program.identity):
@@ -1433,17 +1573,21 @@ _CHANGED = object()
 _CHOSEN_OVER_NAMED = 5
 
 
-def _schedule(rule_id, revision, program, row, settings, run, judge):
-    """Plan and create one program's recording (§4.3 steps 6-7, §4.4). Returns (the new
+def _schedule(rule_id, revision, program, row, settings, run, judge, event=None):
+    """Plan and create one program's recording (§4.3 step 4.8-4.9, §4.4). Returns (the new
     ledger row's snapshot or None, a sentence for last_problems or ''), or _CHANGED when the
-    rule moved underneath it."""
+    rule moved underneath it. `event` is an auto_rules_sports.EventPick for a game read from an
+    event channel's name, which has no listing to plan from (DESIGN-sports-data.md 10)."""
     from .routes import recordings as rec_routes
     lead = program.lead
     when = judge._when(lead.start)
-    plans = rec_routes._plan_bulk_schedule([(lead.entry_id, lead.group_id)],
-                                           settings.profile_choice(rule_id), run.cfg,
-                                           skip_overlapped=False)
-    plan = plans[0]
+    if event is not None:
+        plan = rec_routes._plan_event_schedule(lead.channel_id, lead.title, lead.start, lead.stop,
+                                               settings.profile_choice(rule_id), run.cfg)
+    else:
+        plan = rec_routes._plan_bulk_schedule([(lead.entry_id, lead.group_id)],
+                                              settings.profile_choice(rule_id), run.cfg,
+                                              skip_overlapped=False)[0]
     args = plan.get('_create')
     if plan['verdict'] == rec_routes.BULK_SKIP or args is None:
         message = f'"{lead.title}" on {when} could not be placed: {plan.get("reason")}'
@@ -1453,7 +1597,7 @@ def _schedule(rule_id, revision, program, row, settings, run, judge):
     # never yields to a rule check) deletes and re-inserts a source's listings - SQLite can
     # hand a deleted id to a different program. Recording whatever holds the id now while the
     # ledger names the judged program would mark the race done and record something else.
-    if not _listing_is(args.get('entry'), lead):
+    if event is None and not _listing_is(args.get('entry'), lead):
         message = (f'"{lead.title}" on {when} could not be placed: the guide changed while '
                    'it was being checked.')
         log.warning('Auto-record rule #%d: %s - judged again next run', rule_id, message)
@@ -1465,7 +1609,7 @@ def _schedule(rule_id, revision, program, row, settings, run, judge):
                                      for s in program.showings[1:]))
     where = (f'{lead.group_name} (via {plan.get("member_name") or lead.channel_name})'
              if args.get('group_id') else plan.get('channel_name') or lead.channel_name)
-    detail = f'Scheduled on {where}.'
+    detail = (_event_detail(event, when) if event is not None else f'Scheduled on {where}.')
     if chosen_over:
         # A simulcast on a big provider can be twenty feeds; name a few and count the rest.
         shown = ', '.join(chosen_over[:_CHOSEN_OVER_NAMED])
@@ -1489,13 +1633,19 @@ def _schedule(rule_id, revision, program, row, settings, run, judge):
             extra={'rule_id': rule_id, 'rule_name': rule.name,
                    'program_start': lead.start.strftime('%Y-%m-%dT%H:%M:%S'),
                    'chosen_over_channel_ids': [s.channel_id for s in program.showings[1:]],
-                   'warnings': sorted(plan.get('warnings', {}))})
+                   'warnings': sorted(plan.get('warnings', {})),
+                   **({'sports_event_tsdb_id': event.game.tsdb_id, 'start_from': event.source}
+                      if event is not None else {})})
         m = db.session.get(RuleMatch, row.id) if row is not None and row.id else None
         if m is None:
             m = RuleMatch(rule_id=rule_id, title_key=program.identity[0],
                           episode_key=program.identity[1],
                           program_start_time=program.identity[2], created_at=datetime.utcnow())
             db.session.add(m)
+        if event is not None:
+            m.sports_event_tsdb_id = event.game.tsdb_id
+            m.sports_start_from = event.source
+            m.title_key, m.program_start_time = program.identity[0], program.identity[2]
         m.channel_id = rec.channel_id
         m.group_id = rec.group_id
         m.program_title = lead.title
@@ -1529,10 +1679,160 @@ def _schedule(rule_id, revision, program, row, settings, run, judge):
             return None, f'"{lead.title}" on {when} could not be scheduled: {describe_error(exc)}'
         log.exception('Auto-record rule #%d: recording #%d was created but a step after its '
                       'commit failed; re-arming its start', rule_id, holder['recording_id'])
+        judge.note_created(program, holder, lead)
         return _snapshot_created(holder, program, lead, judge), _rearm(rule_id, holder)
     if rec is None:
         return _CHANGED
+    judge.note_created(program, holder, lead)
     return _snapshot_created(holder, program, lead, judge), ''
+
+
+def _event_detail(event, when) -> str:
+    """Why an event-channel recording exists and what its start rests on, said on its ledger row
+    and its RECORDING_RULE_SCHEDULED event (DESIGN-sports-data.md 10)."""
+    from .auto_rules_sports import START_FROM_NAME, START_FROM_TSDB
+    head = (f'Read from the channel name "{event.named.channel_name}", not a guide listing: the guide '
+            'has no listing of this game.')
+    if event.source == START_FROM_NAME:
+        return f'{head} Start: {when}, the time its name gives.'
+    if event.source == START_FROM_TSDB:
+        return (f'{head} Start not confirmed: the name gives no time zone, so this is TheSportsDB\'s '
+                f'time, {when}, which has matched your guide for this league. When the guide lists the '
+                'game, a listing this recording does not cover is scheduled too.')
+    raise ValueError(f'unknown event start source {event.source!r}')
+
+
+def _event_program(pick):
+    """An event pick as the judge reads a program: one showing, on the event channel, at the start
+    the rule stands behind. Its identity is the game's title at that start, with no episode, so the
+    repeat check never reads it and retrack never follows it."""
+    tkey = title_key(pick.game.title)
+    showing = _Showing(entry_id=0, channel_id=pick.named.channel_id, channel_name=pick.named.channel_name,
+                       group_id=None, group_name=None, title=pick.game.title, sub_title='',
+                       title_key=tkey, episode_raw='', start=pick.start, stop=pick.stop,
+                       score=pick.named.score)
+    return _Program(identity=(tkey, '', pick.start), showings=[showing])
+
+
+def recordable_pick(games, game, state, ctx):
+    """The event pick a rule would record `game` from, or None: one exists (auto_rules_sports.
+    event_pick), and its channel and start pass the search's account, when, day and time filters.
+    One question for the engine, the alert and the rule's page."""
+    from .auto_rules_sports import event_pick
+    from .channel_search import account_passes, start_passes
+    pick, _why = event_pick(games, game)
+    if pick is None or not account_passes(state, pick.named.account_id) or not start_passes(state, pick.start, ctx):
+        return None
+    return pick
+
+
+#: How far an event pick's start may now read from where its recording sits before the rule says
+#: so: the recording keeps its slot either way, since nothing here moves one (design 10).
+_EVENT_DRIFT = timedelta(minutes=5)
+
+
+def _event_candidates(p, run, judge, ledger, outcome, problems) -> list:
+    """Record from event channels (DESIGN-sports-data.md 10, dev/changelog/1491): [(program, pick,
+    its ledger row or None)] for each game in the rule's own scope that the guide has no listing of
+    at all, with a channel the rule would record it from (recordable_pick). A game the guide lists
+    is the search's to decide, even when the search leaves it out. A game whose pick is still
+    SCHEDULED is checked for a change instead; one a person edited is left alone."""
+    if judge.scope is None or not judge.scope.event_channels:
+        return []
+    games, scope = judge.games, judge.scope
+    rows = {r.sports_event_tsdb_id: r for r in p.rows if r.sports_event_tsdb_id}
+    out = []
+    for game in games.in_scope(scope):
+        row = rows.get(game.tsdb_id)
+        if row is not None:
+            if row.action == RULE_MATCH_SCHEDULED:
+                if _fate(row, judge.run.lib_by_id)[0] in _spoken_for():
+                    outcome.already += 1
+                note = _event_drift(row, game, games, judge, p.revision)
+                if note:
+                    problems.append(note)
+                continue
+            if row.action == RULE_MATCH_USER_MODIFIED:
+                continue
+            if row.action not in RULE_MATCH_SKIPS:
+                log.error('Auto-record rule #%d: ledger row %s has unknown action %r; left alone',
+                          p.rule_id, row.id, row.action)
+                continue
+        if game.id in games.listed:
+            continue
+        pick = recordable_pick(games, game, p.state, run.ctx)
+        if pick is None or pick.stop <= p.now:
+            continue
+        program = _event_program(pick)
+        held = ledger.get(program.identity)
+        if held is not None and held.sports_event_tsdb_id != game.tsdb_id:
+            # A listing of this game's title at this very start was judged before and decides it;
+            # a second row on that anchor is one the ledger refuses (uq_rule_matches_anchor).
+            continue
+        judge.game_of[program.identity] = (game, SPORTS_AIRING_UNKNOWN)
+        out.append((program, pick, row))
+    return out
+
+
+def _merge_events(programs, followers, events) -> list:
+    """[(program, pick or None, event row or None)]: the listings in the judge's order with the event
+    candidates placed by start among them. A game's followers stay last (games_first)."""
+    lead = [p for p in programs if p.identity not in followers]
+    tail = [p for p in programs if p.identity in followers]
+    merged, events = [], sorted(events, key=lambda e: (e[0].lead.start, e[1].game.tsdb_id))
+    for prog in lead:
+        while events and events[0][0].lead.start < prog.lead.start:
+            merged.append(events.pop(0))
+        merged.append((prog, None, None))
+    merged += events
+    return merged + [(prog, None, None) for prog in tail]
+
+
+def _event_drift(row, game, games, judge, revision) -> str:
+    """A sentence when an event-channel pick still SCHEDULED may be missed: its channel no longer
+    names the game, or the start it can now stand behind reads differently. The recording keeps its
+    slot (TheSportsDB never moves one); the rule's last_problems says so every check, and the
+    recording's own event says so once. '' when nothing changed."""
+    from .auto_rules_sports import event_pick
+    if _fate(row, judge.run.lib_by_id)[0] != REC_STATUS_SCHEDULED:
+        return ''
+    title = row.program_title or game.title
+    names = {n.channel_id for n in games.named_by.get(game.id, ())}
+    if row.channel_id not in names:
+        reason = 'renamed'
+        sentence = (f'"{title}", {judge._when(row.start)}: its event channel no longer names the game, so '
+                    'the recording may catch whatever the channel shows next. It keeps its slot; check '
+                    'the channel, or record the game from another one.')
+    else:
+        pick, _why = event_pick(games, game)
+        if pick is None or abs(pick.start - row.start) <= _EVENT_DRIFT:
+            return ''
+        reason = 'start'
+        sentence = (f'"{title}": its start now reads {judge._when(pick.start)}, not '
+                    f'{judge._when(row.start)}, where the recording sits. It keeps its slot; move it if '
+                    'the game moved.')
+    if sentence not in (row.detail or ''):
+        _note_event_drift(row, sentence, reason, judge, revision)
+    return sentence
+
+
+def _note_event_drift(row, sentence, reason, judge, revision):
+    @retry_on_locked()
+    def _write():
+        if not _claim_rule(judge.rule_id, revision):
+            db.session.rollback()
+            return
+        m = db.session.get(RuleMatch, row.id)
+        if m is None or m.recording_id is None:
+            db.session.rollback()
+            return
+        m.detail = _append(m.detail or '', sentence)
+        add_recording_event(m.recording_id, RECORDING_RULE_GAME_CHANGED, detail=sentence,
+                            extra={'rule_id': judge.rule_id, 'reason': reason,
+                                   'sports_event_tsdb_id': row.sports_event_tsdb_id})
+        db.session.commit()
+    _write()
+    row.detail = _append(row.detail or '', sentence)
 
 
 def _listing_is(entry, showing) -> bool:
@@ -1579,7 +1879,7 @@ def _snapshot_created(holder, program, lead, judge):
                episode_raw=program.identity[1], program_start=lead.start,
                program_stop=lead.stop, channel_id=holder['channel_id'],
                group_id=holder['group_id'], start=holder['start'], stop=holder['stop'],
-               rule_id=judge.rule_id)
+               rule_id=judge.rule_id, title=lead.title)
     row = _Row(id=holder['row_id'], title_key=program.identity[0],
                episode_key=program.identity[1], start=program.identity[2], stop=lead.stop,
                action=RULE_MATCH_SCHEDULED, recording_id=rec.id, removed_status=None,
@@ -1916,10 +2216,15 @@ def _move_recording(m, rec, showing, rule_name, run, now) -> dict:
 
     renamed = ''
     if m.rec_name is not None and rec.name == m.rec_name:
-        name = _rendered_name(showing, profile, run)
+        naming = _rendered_name(showing, profile, run)
+        name, sports_template = naming if naming else (None, None)
         if name and name != rec.name:
             rec.name = m.rec_name = name
             renamed = f' Its name follows the program: "{old_name}" is now "{name}".'
+        if name:
+            # The rule's own name, so its TheSportsDB fields stay the template's to fill
+            # (dev/changelog/1498).
+            rec.sports_name_template = sports_template
 
     m.program_start_time, m.program_stop_time = showing.start, showing.stop
     m.program_title, m.program_sub_title = showing.title, showing.sub_title or None
@@ -2022,12 +2327,12 @@ def _moved_extra(m, rule_name, reason, old_start, old_stop, showing) -> dict:
 
 
 def _rendered_name(showing, profile, run):
-    """The name the planner would give this showing under `profile` - the same template,
-    cleanup, tags and timezone a new recording of it gets - or None when its listing no
-    longer reads as the program judged (an import replaced it mid-run), in which case the
-    name is left alone."""
+    """(name, sports_name_template) the planner would give this showing under `profile` - the
+    same template, cleanup, tags and timezone a new recording of it gets - or None when its
+    listing no longer reads as the program judged (an import replaced it mid-run), in which case
+    the name is left alone."""
     from .accounts import filename_naming_for
-    from .channel_search_rows import _suggested_name
+    from .channel_search_rows import _suggested_naming
     from .database import Tag
     entry = db.session.get(EPGEntry, showing.entry_id)
     if not _listing_is(entry, showing):
@@ -2036,7 +2341,7 @@ def _rendered_name(showing, profile, run):
     if ch is None:
         return None
     tags = {t.name: t for t in Tag.query.all()}
-    return _suggested_name(ch, entry, filename_naming_for(run.cfg, profile), tags, run.tz)
+    return _suggested_naming(ch, entry, filename_naming_for(run.cfg, profile), tags, run.tz)
 
 
 def _rearm_moved(rule_id, done) -> str:
@@ -2096,6 +2401,11 @@ def _write_verdicts(rule_id, revision, verdicts) -> bool:
                               episode_key=v.identity[1], program_start_time=v.identity[2],
                               created_at=now)
                 db.session.add(m)
+            if v.sports_event_tsdb_id is not None:
+                # Found by its game, so the start used and the game's name follow it.
+                m.sports_event_tsdb_id = v.sports_event_tsdb_id
+                m.sports_start_from = v.sports_start_from
+                m.title_key, m.program_start_time = v.identity[0], v.identity[2]
             m.channel_id = v.lead.channel_id
             m.group_id = v.lead.group_id
             m.program_title = v.lead.title
@@ -2150,6 +2460,66 @@ def _rule_alerts_after_run(rule_id, revision, outcome, settings):
                     f'{settings.cap} scheduled recordings. They are scheduled as earlier ones '
                     'finish; if it should hold more, raise its cap with Edit settings on the '
                     'rule\'s page. This clears itself when nothing is held back.')
+    _unless_rule_moved(rule_id, revision)
+
+
+def unrecordable_games(games, scope, now, is_held, recordable=None) -> list:
+    """The rule's games that start within ALERT_AHEAD with nothing this rule can record them from: no
+    guide listing on a channel you are offered, no event channel it would actually record from
+    (`recordable(game)`, recordable_pick() over the rule's search, when the rule records from event
+    channels), and no recording of them held (`is_held(Held)`). One reader for the alert and the
+    rule's page. A weak name, a copy of a stream, a name with no start to stand behind or one the
+    search's filters leave out holds nothing back."""
+    from .auto_rules_sports import ALERT_AHEAD
+    out = []
+    for g in games.in_scope(scope):
+        if g.start is None or not (now <= g.start <= now + ALERT_AHEAD):
+            continue
+        if g.id in games.listed or (scope.event_channels and recordable is not None and recordable(g)):
+            continue
+        if any(is_held(h) for h in games.held.get(g.id, ())):
+            continue
+        out.append(g)
+    return out
+
+
+def unrecordable_reason(missing, scope, games) -> str:
+    """Why the rule cannot record these games, as the start of a sentence ending in a comma."""
+    it = 'it' if len(missing) == 1 else 'them'
+    if not any(g.id in games.named for g in missing):
+        return f'No guide listing and no event channel names {it},'
+    if scope.event_channels:
+        return (f'No guide listing names {it}, and no event channel naming {it} is one this rule can '
+                'record from (a strong match, with a start it can stand behind, inside its search\'s '
+                'account, day and time filters),')
+    return (f'No guide listing names {it}, and this rule does not record from the event channel '
+            f'that does,')
+
+
+def _game_alert_after_run(rule_id, revision, settings, judge, now, state):
+    """One standing WARNING per rule while a game it is about starts within hours with nothing to
+    record it from (dev/changelog/1490). A game days ahead with no listing yet is normal and is only
+    shown on the rule's page (dev/changelog/923)."""
+    from .alerts import AUTO_RULE_GAME_UNLISTED, dismiss_open_alerts
+    if judge.games is None:
+        # Names nothing. A rule that stopped naming a league had its alerts cleared by the edit.
+        return
+    source = f'auto-rule:{rule_id}:game'
+    lib = judge.run.lib_by_id
+    missing = unrecordable_games(
+        judge.games, judge.scope, now,
+        lambda h: h.recording_id in lib and lib[h.recording_id].status in judge.index.spoken,
+        lambda g: recordable_pick(judge.games, g, state, judge.run.ctx) is not None)
+    if not missing:
+        dismiss_open_alerts(AUTO_RULE_GAME_UNLISTED, source)
+        return
+    games = '; '.join(f'{g.title}, {_local(g.start, judge.run)}' for g in missing)
+    _raise_standing(AUTO_RULE_GAME_UNLISTED, source,
+                    f'Auto-record rule "{settings.name}" has a game with nothing to record it from',
+                    f'{games}. {unrecordable_reason(missing, judge.scope, judge.games)} so this rule '
+                    f'cannot record {"it" if len(missing) == 1 else "them"}. If a channel you know of carries '
+                    f'{"it" if len(missing) == 1 else "one"}, record that channel by hand. This '
+                    'clears itself when a listing or an event channel appears, or the game starts.')
     _unless_rule_moved(rule_id, revision)
 
 
@@ -2216,6 +2586,56 @@ class RuleValues:
     limit_count: int | None
     limit_window_hours: int | None
     max_upcoming: int | None
+    # What it is about from Sports Schedules (DESIGN-sports-data.md 10): both None for nothing,
+    # and the two options are False whenever nothing is named.
+    sports_league_id: int | None = None
+    sports_team_tsdb_id: int | None = None
+    sports_skip_replays: bool = False
+    sports_event_channels: bool = False
+
+
+def _flag(raw) -> bool:
+    if isinstance(raw, str):
+        return raw.strip().lower() in ('1', 'true', 'on', 'yes')
+    return bool(raw)
+
+
+def _read_sports(data: dict, existing) -> tuple:
+    """(league id, team id, skip replays, event channels) from a create or edit body. A body that
+    says nothing about them keeps what the rule has - the Programs search's Save to rule sends only
+    the search. A league must be on Sports Schedules; a team must play in it, as its stored games
+    say, since that is the only team list the free key gives (DESIGN-sports-data.md 2)."""
+    from .database import SportsEvent, SportsLeague
+
+    def keep(key, fallback):
+        return data[key] if key in data else (getattr(existing, key) if existing else fallback)
+
+    def whole(raw, label):
+        if raw in (None, '', 0, '0'):
+            return None
+        if isinstance(raw, bool):
+            raise RuleError(f'{label} must be chosen from the list.')
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            raise RuleError(f'{label} must be chosen from the list.') from None
+
+    league_id = whole(keep('sports_league_id', None), 'The league')
+    team_id = whole(keep('sports_team_tsdb_id', None), 'The team')
+    if league_id is None:
+        return None, None, False, False
+    if db.session.get(SportsLeague, league_id) is None:
+        raise RuleError('That league is no longer on Sports Schedules.')
+    # Only a team being chosen now is checked against the stored games: off-season, retention
+    # prunes a team's games, and a rule naming it must still save a rename or a new search.
+    unchanged = (existing is not None and team_id == existing.sports_team_tsdb_id
+                 and league_id == existing.sports_league_id)
+    if team_id is not None and not unchanged and db.session.query(SportsEvent.id).filter(
+            SportsEvent.league_id == league_id,
+            or_(SportsEvent.home_team_id == team_id, SportsEvent.away_team_id == team_id)).first() is None:
+        raise RuleError('That team has no games stored for this league. Pick it again from the list.')
+    return (league_id, team_id, _flag(keep('sports_skip_replays', False)),
+            _flag(keep('sports_event_channels', False)))
 
 
 def read_rule_values(data: dict, existing: AutoRule | None = None) -> RuleValues:
@@ -2253,10 +2673,32 @@ def read_rule_values(data: dict, existing: AutoRule | None = None) -> RuleValues
     limit_window = opt_int('limit_window_hours', 'The limit\'s window', 1)
     if (limit_count is None) != (limit_window is None):
         raise RuleError('Set both halves of "at most X within Y hours", or neither.')
+    league_id, team_id, skip_replays, event_channels = _read_sports(data, existing)
     return RuleValues(name=name, search_params=params, profile_id=profile_id,
                       skip_repeats=bool(skip), limit_count=limit_count,
                       limit_window_hours=limit_window,
-                      max_upcoming=opt_int('max_upcoming', 'The cap', 0))
+                      max_upcoming=opt_int('max_upcoming', 'The cap', 0),
+                      sports_league_id=league_id, sports_team_tsdb_id=team_id,
+                      sports_skip_replays=skip_replays, sports_event_channels=event_channels)
+
+
+def _apply_sports(rule, values, now) -> bool:
+    """The rule's sports columns and the follow it owns, in the caller's write unit. True when a
+    league became followed, so the caller starts the worker after its commit."""
+    from .sports_data import set_rule_follow
+    rule.sports_league_id = values.sports_league_id
+    rule.sports_team_tsdb_id = values.sports_team_tsdb_id
+    rule.sports_skip_replays = values.sports_skip_replays
+    rule.sports_event_channels = values.sports_event_channels
+    db.session.flush()
+    return set_rule_follow(rule.id, values.sports_league_id, values.sports_team_tsdb_id, now)
+
+
+def _start_sports_worker(needed: bool):
+    """After a save's commit: a league newly followed has queue rows the worker must pick up."""
+    if needed:
+        from .sports_data import ensure_worker
+        ensure_worker()
 
 
 def create_rule(values: RuleValues) -> int:
@@ -2270,9 +2712,13 @@ def create_rule(values: RuleValues) -> int:
                         max_upcoming=values.max_upcoming, enabled=True, revision=1,
                         created_at=now, updated_at=now)
         db.session.add(rule)
+        db.session.flush()
+        followed = _apply_sports(rule, values, now)
         db.session.commit()
-        return rule.id
-    return _create()
+        return rule.id, followed
+    rule_id, followed = _create()
+    _start_sports_worker(followed)
+    return rule_id
 
 
 UNMATCHED_CANCEL = 'cancel'
@@ -2317,8 +2763,10 @@ def unmatched_by_search(rule_id: int, search_params: str) -> Unmatched:
     now = datetime.utcnow()
     picks = db.session.query(
         Recording.id, Recording.name, Recording.start_time, RuleMatch.title_key,
-        RuleMatch.episode_key, RuleMatch.program_start_time,
-    ).join(RuleMatch, RuleMatch.recording_id == Recording.id).filter(
+        RuleMatch.episode_key, RuleMatch.program_start_time, RuleMatch.sports_event_tsdb_id,
+        Channel.account_id,
+    ).join(RuleMatch, RuleMatch.recording_id == Recording.id).outerjoin(
+        Channel, Channel.id == Recording.channel_id).filter(
         RuleMatch.rule_id == rule_id, RuleMatch.action_taken == RULE_MATCH_SCHEDULED,
         Recording.rule_id == rule_id, Recording.status == REC_STATUS_SCHEDULED,
         RuleMatch.program_start_time > now,
@@ -2355,13 +2803,54 @@ def unmatched_by_search(rule_id: int, search_params: str) -> Unmatched:
     for e in entries:
         exact.add((title_key(e.title), title_key(e.sub_title), e.start))
         titled.add((title_key(e.title), e.start))
-    left = [r for r in picks if not _is_listed(exact, titled, r.title_key,
-                                               r.episode_key or '', r.program_start_time)]
+    listed_picks = [r for r in picks if not r.sports_event_tsdb_id]
+    left = [r for r in listed_picks if not _is_listed(exact, titled, r.title_key,
+                                                      r.episode_key or '', r.program_start_time)]
     if left:
         exact, titled = _guide_keys({r.program_start_time for r in left})
         left = [r for r in left if _is_listed(exact, titled, r.title_key,
                                               r.episode_key or '', r.program_start_time)]
+    # A game recorded from an event channel is not found by the search at all; only its account,
+    # day and time filters apply to it (DESIGN-sports-data.md 10, dev/changelog/1491).
+    from .channel_search import start_passes
+    from .channel_search import account_passes
+    left += [r for r in picks if r.sports_event_tsdb_id and not (
+        account_passes(state, r.account_id) and start_passes(state, r.program_start_time, run.ctx))]
+    left.sort(key=lambda r: (r.start_time, r.id))
     return Unmatched(described(left))
+
+
+def unmatched_events(rule, values: RuleValues) -> Unmatched:
+    """The rule's upcoming SCHEDULED event-channel picks that `values` would no longer make
+    (DESIGN-sports-data.md 10, dev/changelog/1491): every one when recording from event channels is
+    turned off or the league changes, and a game the newly named team does not play in when the team
+    changes. Asked about exactly as a changed search's are (§8, dev/changelog/1203); never dropped
+    unasked. Reads only."""
+    from .database import SportsEvent
+    from .tz_utils import format_local, get_display_tz, is_24h
+    now = datetime.utcnow()
+    picks = db.session.query(
+        Recording.id, Recording.name, Recording.start_time, RuleMatch.sports_event_tsdb_id,
+    ).join(RuleMatch, RuleMatch.recording_id == Recording.id).filter(
+        RuleMatch.rule_id == rule.id, RuleMatch.sports_event_tsdb_id.isnot(None),
+        RuleMatch.action_taken == RULE_MATCH_SCHEDULED, Recording.rule_id == rule.id,
+        Recording.status == REC_STATUS_SCHEDULED, RuleMatch.program_start_time > now,
+    ).order_by(Recording.start_time, Recording.id).all()
+    if not picks:
+        return Unmatched([])
+    if not values.sports_event_channels or values.sports_league_id != rule.sports_league_id:
+        left = picks
+    elif values.sports_team_tsdb_id and values.sports_team_tsdb_id != rule.sports_team_tsdb_id:
+        team = values.sports_team_tsdb_id
+        plays = {t for (t,) in db.session.query(SportsEvent.tsdb_id).filter(
+            SportsEvent.tsdb_id.in_([p.sports_event_tsdb_id for p in picks]),
+            or_(SportsEvent.home_team_id == team, SportsEvent.away_team_id == team))}
+        left = [p for p in picks if p.sports_event_tsdb_id not in plays]
+    else:
+        left = []
+    tz, h24 = get_display_tz(), is_24h()
+    return Unmatched([{'id': r.id, 'name': r.name,
+                       'when': format_local(r.start_time, 'day_datetime', tz=tz, h24=h24)} for r in left])
 
 
 def _cancel_scheduled(rec):
@@ -2394,8 +2883,8 @@ def _settle_unmatched(rule, action, ids) -> tuple:
             rec.rule_id = None
             add_recording_event(
                 rec.id, RECORDING_RULE_RELEASED,
-                detail=(f'Auto-record rule "{rule.name}" had its search changed and no longer '
-                        'matches this program. Kept as an ordinary recording: it still records '
+                detail=(f'Auto-record rule "{rule.name}" was changed and no longer '
+                        'records this. Kept as an ordinary recording: it still records '
                         'as scheduled, but no longer counts toward the rule\'s cap.'),
                 extra={'rule_id': rule.id, 'rule_name': rule.name})
             kept += 1
@@ -2429,6 +2918,7 @@ def update_rule(rule_id: int, values: RuleValues, unmatched=None):
         rule.limit_count = values.limit_count
         rule.limit_window_hours = values.limit_window_hours
         rule.max_upcoming = values.max_upcoming
+        followed = _apply_sports(rule, values, datetime.utcnow())
         # A SQL expression, not the loaded value plus one: the loaded value was read outside
         # this write, and an engine claim between the two would be overwritten as unchanged.
         rule.revision = AutoRule.revision + 1
@@ -2442,11 +2932,13 @@ def update_rule(rule_id: int, values: RuleValues, unmatched=None):
         # lock is held and no evaluation can commit a change to these recordings meanwhile.
         settled = _settle_unmatched(rule, *unmatched) if unmatched else ([], 0)
         db.session.commit()
-        return settled
+        return settled, followed
 
     result = _update()
     if result is None:
         return None
+    result, followed = result
+    _start_sports_worker(followed)
     for rid in result[0]:
         unschedule_recording(rid)
     _clear_rule_alerts(rule_id)
@@ -2533,6 +3025,10 @@ def delete_rule(rule_id: int, cancel_scheduled: bool):
                 rec.rule_id = None
                 kept += 1
         RuleMatch.query.filter_by(rule_id=rule_id).delete(synchronize_session=False)
+        # The follow the rule owned goes with it, and a league nothing else follows stops being
+        # fetched (DESIGN-sports-data.md 3).
+        from .sports_data import set_rule_follow
+        set_rule_follow(rule_id, None, None, datetime.utcnow())
         db.session.delete(rule)  # hidden-recompute-ok: an auto-record rule, not a group
         db.session.commit()
         return cancelled, kept

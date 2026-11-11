@@ -36,10 +36,12 @@ WIDEN_SSEOF_SECONDS = 9.0
 # A frame counts as black when under BLACK_FRAME_MAX_BRIGHT_PERCENT of its pixels are brighter
 # than BLACK_FRAME_LUMA. Counted at full size, because any downscale averages a small bright
 # thing away or spreads it, and that is what makes a contrast figure the wrong test: over 1,362
-# real frames, _check_screenshot_uniform() in channel_tester.py called 3 frames with people in
-# them black, while a station logo alone on black reads as not black to it. Under this rule the
-# darkest real picture scored 6.2%, credits and slates on black 1.2% to 3.7%, and what fell
-# under 1% was pure black, a logo on near-black and one credit name (dev/changelog/1433).
+# real frames, the 64x64 contrast test that _check_screenshot_uniform() in channel_tester.py
+# used for its black case called 3 frames with people in them black, while a station logo
+# alone on black read as not black to it. Under this rule the darkest real picture scored
+# 6.2%, credits and slates on black 1.2% to 3.7%, and what fell under 1% was pure black, a
+# logo on near-black and one credit name (dev/changelog/1433). The poster frame and the health
+# check's screenshot both read it since dev/changelog/1488.
 BLACK_FRAME_LUMA = 32
 BLACK_FRAME_MAX_BRIGHT_PERCENT = 1.0
 _BRIGHT_PIXEL_TABLE = bytes(0 if luma <= BLACK_FRAME_LUMA else 1 for luma in range(256))

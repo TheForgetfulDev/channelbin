@@ -15,6 +15,7 @@ Runnable with no third-party deps:  python3 tests/test_format_selection.py
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -38,18 +39,20 @@ class FakeTest:
     _test_status_label (status, error_detail) and format_buckets (resolution, fps,
     bitrate_kbps, bits_per_pixel_frame)."""
     def __init__(self, resolution=None, fps=None, status='COMPLETED', error_detail=None,
-                 bitrate_kbps=None, bits_per_pixel_frame=None):
+                 bitrate_kbps=None, bits_per_pixel_frame=None, test_started_at=None):
         self.resolution = resolution
         self.fps = fps
         self.status = status
         self.error_detail = error_detail
         self.bitrate_kbps = bitrate_kbps
         self.bits_per_pixel_frame = bits_per_pixel_frame
+        self.test_started_at = test_started_at
 
 
-def _pass(key, bitrate=None, bpp=None):
+def _pass(key, bitrate=None, bpp=None, test_started_at=None):
     return FakeTest(key[0], key[1], status='COMPLETED', error_detail=None,
-                     bitrate_kbps=bitrate, bits_per_pixel_frame=bpp)
+                     bitrate_kbps=bitrate, bits_per_pixel_frame=bpp,
+                     test_started_at=test_started_at)
 
 
 def _warn(key, bitrate=None, bpp=None):
@@ -295,6 +298,114 @@ class RankingPopulationTests(unittest.TestCase):
         latest[8] = _pass(SD30, bitrate=3000)
         plan = plan_format_selection(_channels(8), latest, rank_ids={7, 8})
         self.assertEqual(HD60, plan['strategies']['balanced']['key'])
+
+
+class BitrateWindowTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-09 02:09 PM (the bitrate window): a channel's ranking bitrate is
+    the median of its own checks inside the window, its latest check alone when it has
+    none there, and the winner's rationale says how many checks it rested on and how far
+    apart they were."""
+
+    def _day(self, n):
+        return datetime(2026, 11, 1) + timedelta(days=n)
+
+    def test_a_channel_ranks_on_the_median_of_its_window_not_its_latest_check(self):
+        """Same feed, 5659 then 3234 kbps a day apart (CW Tampa Bay, 2026-09-04/05): the
+        window reads the middle of the channel's own history, not whichever came last."""
+        latest = {1: _pass(HD60, bitrate=3234), 2: _pass(SD30, bitrate=4000)}
+        window = {1: [_pass(HD60, bitrate=5659, test_started_at=self._day(1)),
+                      _pass(HD60, bitrate=4800, test_started_at=self._day(2)),
+                      _pass(HD60, bitrate=3234, test_started_at=self._day(3))]}
+        buckets = {b['key']: b for b in format_buckets(_channels(2), latest,
+                                                       window_by_channel=window)}
+        self.assertEqual(4800, buckets[HD60]['rank_median_bitrate_kbps'])
+        self.assertEqual(4800, buckets[HD60]['median_bitrate_kbps'])
+        self.assertEqual(3, buckets[HD60]['rank_measurement_count'])
+        plan = plan_format_selection(_channels(2), latest, window_by_channel=window)
+        self.assertEqual(HD60, plan['strategies']['highest_bitrate']['key'])
+
+    def test_a_channel_with_nothing_in_the_window_falls_back_to_its_latest_check(self):
+        latest = {1: _pass(HD60, bitrate=3000, test_started_at=self._day(-30)),
+                  2: _pass(SD30, bitrate=4000)}
+        window = {2: [_pass(SD30, bitrate=4000, test_started_at=self._day(5))]}
+        buckets = {b['key']: b for b in format_buckets(_channels(2), latest,
+                                                       window_by_channel=window)}
+        self.assertEqual(3000, buckets[HD60]['rank_median_bitrate_kbps'])
+        self.assertEqual(1, buckets[HD60]['rank_measurement_count'])
+        self.assertEqual(self._day(-30).isoformat(), buckets[HD60]['rank_measured_from'])
+
+    def test_no_window_at_all_ranks_on_the_latest_checks_as_before(self):
+        latest = {1: _pass(HD60, bitrate=3000), 2: _pass(SD30, bitrate=4000)}
+        with_none = format_buckets(_channels(2), latest, window_by_channel=None)
+        bare = format_buckets(_channels(2), latest)
+        self.assertEqual([b['rank_median_bitrate_kbps'] for b in bare],
+                         [b['rank_median_bitrate_kbps'] for b in with_none])
+        self.assertEqual([3000, 4000], sorted(b['rank_median_bitrate_kbps'] for b in bare))
+
+    def test_the_format_comes_from_the_latest_check_and_only_its_checks_feed_the_median(self):
+        """A channel that measured 1080p60 last week and 720p30 last night sits in the
+        720p30 bucket - that is what the feed is now - and last week's 1080p60 bitrate does
+        not lift that bucket's median: bitrate scales with the picture, so a 720p median
+        carried up on 1080p readings is the non-comparable number the window exists to
+        remove."""
+        latest = {1: _pass(SD30, bitrate=3000)}
+        window = {1: [_pass(HD60, bitrate=6000, test_started_at=self._day(1)),
+                      _pass(SD30, bitrate=3000, test_started_at=self._day(7))]}
+        buckets = format_buckets(_channels(1), latest, window_by_channel=window)
+        self.assertEqual([SD30], [b['key'] for b in buckets])
+        self.assertEqual(3000, buckets[0]['rank_median_bitrate_kbps'])
+        self.assertEqual(1, buckets[0]['rank_measurement_count'])
+
+    def test_a_failed_check_in_the_window_does_not_feed_the_median(self):
+        """A FAILED check stores the bitrate of whatever it captured before the verdict -
+        a provider's offline clip, a stalled capture - and that is not the feed."""
+        latest = {1: _pass(HD60, bitrate=5000)}
+        window = {1: [_pass(HD60, bitrate=5000, test_started_at=self._day(1)),
+                      FakeTest(HD60[0], HD60[1], status='FAILED', bitrate_kbps=300,
+                               test_started_at=self._day(2)),
+                      _cancelled(HD60),
+                      _pass(HD60, bitrate=5200, test_started_at=self._day(3))]}
+        buckets = format_buckets(_channels(1), latest, window_by_channel=window)
+        self.assertEqual(5100, buckets[0]['rank_median_bitrate_kbps'])
+        self.assertEqual(2, buckets[0]['rank_measurement_count'])
+
+    def test_the_winner_says_how_many_checks_and_how_far_apart(self):
+        latest = {1: _pass(HD60, bitrate=5000), 2: _pass(HD60, bitrate=5200),
+                  3: _pass(SD30, bitrate=4000)}
+        window = {1: [_pass(HD60, bitrate=5000, test_started_at=self._day(0)),
+                      _pass(HD60, bitrate=5100, test_started_at=self._day(10))],
+                  2: [_pass(HD60, bitrate=5200, test_started_at=self._day(21))],
+                  3: [_pass(SD30, bitrate=4000, test_started_at=self._day(21))]}
+        plan = plan_format_selection(_channels(3), latest, window_by_channel=window)
+        entry = plan['strategies']['highest_bitrate']
+        self.assertEqual(HD60, entry['key'])
+        self.assertIn('the median of 3 health checks spanning 21 days', entry['rationale'])
+        self.assertEqual(3, entry['measurement_count'])
+        self.assertEqual(self._day(0).isoformat(), entry['measured_from'])
+        self.assertEqual(self._day(21).isoformat(), entry['measured_to'])
+        self.assertEqual(21, entry['measured_span_days'])
+        balanced = plan['strategies']['balanced']
+        self.assertIn('spanning 21 days', balanced['rationale'])
+        # The strategies that rank on something else do not claim a bitrate spread.
+        self.assertNotIn('health check', plan['strategies']['highest_resolution']['rationale'])
+
+    def test_checks_all_on_one_day_say_so(self):
+        latest = {1: _pass(HD60, bitrate=5000)}
+        window = {1: [_pass(HD60, bitrate=5000, test_started_at=self._day(0)),
+                      _pass(HD60, bitrate=5100,
+                            test_started_at=self._day(0) + timedelta(hours=3))]}
+        plan = plan_format_selection(_channels(1), latest, window_by_channel=window)
+        self.assertIn('2 health checks, all within one day',
+                      plan['strategies']['highest_bitrate']['rationale'])
+
+    def test_a_fake_test_with_no_start_time_still_ranks(self):
+        """The shape-compatible stand-ins and a pre-window row carry no start time; the
+        spread is simply unknown then, never an error."""
+        latest = {1: _pass(HD60, bitrate=5000), 2: _pass(SD30, bitrate=4000)}
+        plan = plan_format_selection(_channels(2), latest, window_by_channel={})
+        entry = plan['strategies']['highest_bitrate']
+        self.assertIsNone(entry['measured_span_days'])
+        self.assertIn('the median of 1 health check', entry['rationale'])
 
 
 class BucketStatusCountsTests(unittest.TestCase):

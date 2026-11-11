@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from .content import PROFILES, RADIO_PROFILE, ContentError, profile_for_format
 from .faults import (FORM_HLS_MASTER, FORM_HLS_PLAYLIST, FORM_HLS_SEGMENT, FORM_RADIO, FORM_TS,
                      STAGE_REDIRECT, STAGE_SERVE, drifted_credentials)
-from .lineup import KIND_NO_ID, KIND_RADIO, channel_label
+from .lineup import KIND_LIVE, KIND_NO_ID, KIND_RADIO, BackendChannel, channel_label
 from .mp3 import SAMPLES_PER_FRAME
 from .rand import derive
 from .stream_faults import OpenPlan, LiveFaults, epoch_ns, plan_open, shape
@@ -669,6 +669,7 @@ class Headend:
         self._by_id = {b: {c.stream_id: c for c in lu.channels} for b, lu in world.lineups.items()}
         self._by_slug = {b: {c.slug: c for c in lu.channels if c.slug}
                          for b, lu in world.lineups.items()}
+        self._stand_ins: dict = {}
         self._host_backend = {}
         for b in world.backends.values():
             for h in b.stream_host_names():
@@ -775,7 +776,21 @@ class Headend:
                 ch = self._by_id[backend].get(sid - a.params['offset'])
                 if ch is not None:
                     return ch
+        spec = self.world.backends[backend]
+        if spec.any_stream_id:
+            return self._stand_in(spec, sid)
         return None
+
+    def _stand_in(self, spec, sid: int):
+        """A live channel for a stream id the lineup does not list (BackendSpec.any_stream_id),
+        the same object every time it is asked for, so its clock and seats stay its own."""
+        key = (spec.name, sid)
+        ch = self._stand_ins.get(key)
+        if ch is None:
+            ch = self._stand_ins.setdefault(key, BackendChannel(
+                -1, sid, KIND_LIVE, f'Stream {sid}', '', None, None, None, None,
+                spec.stream_host_names()[0], None))
+        return ch
 
     def profile_for(self, backend: str, ch) -> str:
         if ch.kind == KIND_RADIO:

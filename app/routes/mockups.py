@@ -101,8 +101,13 @@ _LISTING = """<!doctype html>
   {% else %}
   <p class="empty">No files in dev/mockups/.</p>
   {% endif %}
+  {% if has_devnav %}<script src="devnav.js"></script>{% endif %}
 </body>
 </html>"""
+
+# The dev-page nav strip (Mockups / Worklog / Test Bench) is a dev-only file in the folder
+# itself; the listing loads it only when it is there, so a checkout without it is unchanged.
+_DEVNAV = 'devnav.js'
 
 
 @mockups_bp.route('/mockups/')
@@ -131,7 +136,8 @@ def index():
         })
     mockups.sort(key=lambda m: m['num'])
 
-    return render_template_string(_LISTING, mockups=mockups, files=files)
+    return render_template_string(_LISTING, mockups=mockups, files=files,
+                                  has_devnav=_DEVNAV in files)
 
 
 @mockups_bp.route('/mockups/<path:filename>')

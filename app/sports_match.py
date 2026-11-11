@@ -100,6 +100,18 @@ def league_trusted(league) -> bool:
     return sample >= TRUST_MIN_SAMPLE and agreed >= TRUST_SHARE * sample
 
 
+def combined_airing(airings) -> str:
+    """One listing's airing from what its matches say on each channel that carries it: a first airing
+    if any channel's match says so, a replay only when every one does, and doubt otherwise. Doubt is
+    never skipped (6.5), so a listing reads as a replay only when nothing argues against it."""
+    seen = set(airings)
+    if SPORTS_AIRING_FIRST in seen:
+        return SPORTS_AIRING_FIRST
+    if seen == {SPORTS_AIRING_REPLAY}:
+        return SPORTS_AIRING_REPLAY
+    return SPORTS_AIRING_UNKNOWN
+
+
 def time_disagrees(event) -> bool:
     """Most of the event's channels list it more than 90 minutes from TheSportsDB's start (6.5)."""
     return (event.start_at is not None and event.guide_start is not None
@@ -265,8 +277,13 @@ def _offered():
     """A channel the user is offered: never a hidden one. Hiding decides where a channel is offered,
     and a match is an offer to record it (DESIGN-channel-hiding.md §1). A hidden channel carries no
     guide rows, so without this it read as an event channel with nothing but its name: 33 of the 85
-    event channels on prod's accounts for the week of 2026-11-08 were hidden (dev/changelog/1471)."""
-    return Channel.hidden.is_(False)
+    event channels on prod's accounts for the week of 2026-11-08 were hidden (dev/changelog/1471).
+
+    Written as `hidden + 0` so SQLite cannot use ix_channels_standing for it. Nearly every channel is
+    visible, so that index narrows nothing, and with no table statistics the planner took it anyway:
+    it walked all ~200,000 visible channels and probed the matches for each, where starting from the
+    matches for a page's events takes under a millisecond (dev/changelog/1495)."""
+    return (db.type_coerce(Channel.hidden, db.Integer) + 0).is_(0)
 
 
 def _candidate_rows(lt: LeagueText, lo: datetime, hi: datetime) -> list:
@@ -986,6 +1003,7 @@ def run(now: datetime = None, pause: float = PAUSE_SECONDS) -> str:
             totals.update(match_league(league_id, now, pause, clock))
         from .sports_data import link_unfinished_recordings
         linked = link_unfinished_recordings(now)
+        _queue_rule_checks(league_ids)
         seconds = time_mod.monotonic() - started
         note = (f'Found {counted(totals["matched"], "event")} of {totals["events"]} in the guide, on '
                 f'{counted(totals["rows"], "listing")}, in {seconds:.1f} seconds.')
@@ -1005,6 +1023,21 @@ def run(now: datetime = None, pause: float = PAUSE_SECONDS) -> str:
         raise
     finally:
         admission.release(ticket)
+
+
+def _queue_rule_checks(league_ids: list):
+    """A rule that names a league judges its listings by these matches (design 10), and the guide
+    import's own check can run before this matcher has caught up with it. So a run over a league an
+    enabled rule names asks for one more check, which several asks fold into (dev/changelog/1490)."""
+    from .database import AutoRule
+    if not league_ids:
+        return
+    named = db.session.query(AutoRule.id).filter(AutoRule.enabled.is_(True),
+                                                 AutoRule.sports_league_id.in_(league_ids)).first()
+    db.session.rollback()
+    if named is not None:
+        from .auto_rules import queue_evaluation
+        queue_evaluation('TheSportsDB matches were updated')
 
 
 def _clock():

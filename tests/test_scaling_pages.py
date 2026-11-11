@@ -371,10 +371,15 @@ def _seed_auto_rules(n):
     is there to be looked up: auto_rules_view.list_context() reads the next recordings, the
     cap counts and those names in a fixed number of grouped queries however many rules
     there are."""
-    from app.database import RULE_MATCH_ACTIONS, RULE_MATCH_SCHEDULED, AutoRule, RuleMatch
+    from app.database import (RULE_MATCH_ACTIONS, RULE_MATCH_SCHEDULED, AutoRule, RuleMatch,
+                              SportsLeague)
     profile = RecordingProfile(name='Scaling profile', pre_padding_minutes=2,
                                post_padding_minutes=30)
     db.session.add(profile)
+    # Half the rules name a team by id with no stored game, so the edit dialog's team name is
+    # read for every rule at once (dev/changelog/1490).
+    league = SportsLeague(tsdb_id=8200, name='Scaling rules league', match_terms='[]')
+    db.session.add(league)
     acc = seed.make_account(name='Scaling rules account')
     db.session.flush()
     now = datetime.utcnow()
@@ -390,7 +395,9 @@ def _seed_auto_rules(n):
                         last_evaluated_at=now - timedelta(minutes=i),
                         last_guide_reach=now + timedelta(days=2) if i % 2 else None,
                         last_error='The search names a tag that is gone.' if i % 7 == 0 else None,
-                        last_problems='"Show" could not be placed.' if i % 7 == 3 else None)
+                        last_problems='"Show" could not be placed.' if i % 7 == 3 else None,
+                        sports_league_id=league.id if i % 2 else None,
+                        sports_team_tsdb_id=9000 + i if i % 2 else None)
         db.session.add(rule)
         db.session.flush()
         base = now + timedelta(days=2, hours=i)
@@ -517,6 +524,65 @@ def _seed_sports_league_page(n):
 def _scaling_sports_league_id():
     from app.database import SportsLeague
     return SportsLeague.query.filter_by(name='Scaling league').one().id
+
+
+def _seed_sports_rule(n):
+    """One auto-record rule that names a team, with n of its games in the next weeks: each listed
+    on two channels and matched, named by an event channel, judged by the rule and recorded, and
+    linked to its recording (dev/changelog/1490). The rule's page reads its games, their matches,
+    counts and links in a fixed handful of queries however many games there are."""
+    from app.database import (RULE_MATCH_SCHEDULED, AutoRule, RecordingSports, RuleMatch,
+                              SportsEvent, SportsFollow, SportsLeague, SportsMatch, SportsState)
+    now = datetime.utcnow()
+    league = SportsLeague(tsdb_id=8100, name='Scaling League', sport='Pretend Ball', match_terms='[]',
+                          trust_sample=12, trust_agreed=12)
+    db.session.add(league)
+    db.session.add(SportsState(id=1, last_match_at=now))
+    db.session.flush()
+    rule = AutoRule(name='Scaling sports rule', search_params='q=gulls&grain=airings', enabled=True,
+                    skip_repeats=True, revision=1, last_evaluated_at=now,
+                    last_guide_reach=now + timedelta(days=2), sports_league_id=league.id,
+                    sports_team_tsdb_id=101, sports_skip_replays=True, sports_event_channels=True)
+    db.session.add(rule)
+    db.session.flush()
+    db.session.add(SportsFollow(league_id=league.id, team_tsdb_id=101, rule_id=rule.id))
+    acc = seed.make_account(name='Scaling sports account')
+    for i in range(n):
+        start = now + timedelta(hours=6 + i * 4)
+        event = SportsEvent(tsdb_id=810000 + i, league_id=league.id, name=f'Game {i}', season='2099',
+                            round=i, home_team_id=101, away_team_id=200 + i, home_name='Gulls',
+                            away_name=f'Visitors {i}', venue='Field', city='Town', start_at=start,
+                            local_date=start.date(), previous_start=start - timedelta(hours=1) if i % 3 else None,
+                            start_changed_at=now if i % 3 else None)
+        db.session.add(event)
+        db.session.flush()
+        chans = [seed.make_channel(acc, name=f'Sports channel {i} {k}') for k in range(3)]
+        title = f'Pretend Ball: Visitors {i} at Gulls'
+        for ch in chans[:2]:
+            db.session.add(SportsMatch(event_id=event.id, channel_id=ch.id, kind='guide',
+                                       program_start_time=start, program_stop_time=start + timedelta(hours=3),
+                                       title_key=title.lower(), episode_key='', program_title=title,
+                                       strength='strong', airing='first', reason='Both teams by name.'))
+        db.session.add(SportsMatch(event_id=event.id, channel_id=chans[2].id, kind='channel_name',
+                                   title_key=f'event {i}', strength='strong', airing='unknown',
+                                   reason="Read from the channel's name."))
+        rec = seed.make_recording(status=REC_STATUS_SCHEDULED, name=f'sports_{i}', rule_id=rule.id,
+                                  channel_id=chans[0].id, start_time=start,
+                                  stop_time=start + timedelta(hours=3), program_title=title,
+                                  program_start_time=start)
+        db.session.add(RuleMatch(rule_id=rule.id, title_key=title.lower(), episode_key='',
+                                 program_title=title, program_start_time=start,
+                                 program_stop_time=start + timedelta(hours=3), action_taken=RULE_MATCH_SCHEDULED,
+                                 channel_id=chans[0].id, recording_id=rec.id, detail='Scheduled.'))
+        db.session.add(RecordingSports(recording_id=rec.id, tsdb_event_id=event.tsdb_id,
+                                       league_name='Scaling League', event_name=f'Game {i}',
+                                       strength='strong', airing='first', reason='Both teams by name.'))
+    db.session.commit()
+
+
+def _scaling_sports_rule_id():
+    from app.database import AutoRule
+    return AutoRule.query.filter_by(name='Scaling sports rule').one().id
 
 
 def _scaling_rule_id():
@@ -983,6 +1049,9 @@ class PageScalingTests(unittest.TestCase):
     def test_rule_page(self):
         self._assert_row_independent(_seed_auto_rule_history,
                                      lambda: f'/rules/{_scaling_rule_id()}')
+
+    def test_rule_page_naming_a_league(self):
+        self._assert_row_independent(_seed_sports_rule, lambda: f'/rules/{_scaling_sports_rule_id()}')
 
     def test_sports_page(self):
         self._assert_row_independent(_seed_sports_leagues, '/sports')

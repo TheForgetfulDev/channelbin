@@ -365,6 +365,8 @@ def _airing_rows(result, state, ctx) -> list:
         account = ctx.accounts_by_id.get(ch.account_id)
         state_name, since = lifecycle.get(ch.id, (None, None))
         rec = recordings.get(entry.id)
+        suggested, sports_template = _suggested_naming(ch, entry, namings[ch.id],
+                                                       tags_by_name, ctx.display_tz)
         out.append({
             'id': entry.id,
             'title': entry.title or '',
@@ -400,8 +402,7 @@ def _airing_rows(result, state, ctx) -> list:
             # default profile and the {tag:...} tokens resolve against Tag rows, neither of
             # which the browser has. It is what the Schedule Recording modal opens prefilled
             # with, so leaving it out would cost a round trip per Record click.
-            'suggested_name': _suggested_name(ch, entry, namings[ch.id],
-                                              tags_by_name, ctx.display_tz),
+            'suggested_name': suggested,
             'matched_tags': _matched_tags(all_tags, entry),
             # The group this showing STANDS FOR, or None. Present only while "Collapse
             # channel groups" is on: that option is what makes this one row the group's row
@@ -439,6 +440,10 @@ def _airing_rows(result, state, ctx) -> list:
             },
             'why': _airing_why(ch.id, hits),
         })
+        if sports_template is not None:
+            # Only when the template has a {sports:...} field: the record dialog posts it back
+            # so the join can fill those fields in (dev/changelog/1498).
+            out[-1]['suggested_name_template'] = sports_template
     return out
 
 
@@ -614,16 +619,20 @@ def _filename_namings(channels, ctx) -> dict:
     return {c.id: effective_filename_naming(ctx.cfg, c) for c in channels}
 
 
-def _suggested_name(ch, entry, naming, tags_by_name, tz) -> str:
-    """`naming` is the (template, tag_cleanup) pair from accounts.filename_naming_for()."""
-    from .accounts import render_filename_template
+def _suggested_naming(ch, entry, naming, tags_by_name, tz) -> tuple:
+    """`naming` is the (template, tag_cleanup) pair from accounts.filename_naming_for().
+
+    (name, sports_name_template): the suggested name, and the half-rendered template a
+    recording created with that name keeps for the join, or None when the template has no
+    {sports:...} field (accounts.split_sports_name(), dev/changelog/1498)."""
+    from .accounts import render_filename_template, split_sports_name
     # tags_by_name is what keeps this out of the N+1 class: this runs once per showing, and
     # without a prefetched map the renderer would issue up to two Tag queries per row.
     # tests/test_scaling_pages.py is the guard (dev/changelog/441). tz is the same fix,
     # one call site over: without it the renderer calls get_display_tz() -> load_config()
     # per showing.
     template, tag_cleanup = naming
-    return render_filename_template(template, {
+    return split_sports_name(template, render_filename_template(template, {
         'start_time': entry.start_time,
         'stop_time': entry.stop_time,
         'title': entry.title or ch.name,
@@ -631,7 +640,8 @@ def _suggested_name(ch, entry, naming, tags_by_name, tz) -> str:
         'description': entry.description or '',
         'channel_name': ch.name,
         'category': entry.category or '',
-    }, tag_cleanup=tag_cleanup, tags_by_name=tags_by_name, tz=tz)
+    }, tag_cleanup=tag_cleanup, tags_by_name=tags_by_name, tz=tz, keep_sports=True),
+        entry.title or '')
 
 
 def _matched_tags(tags, entry) -> list:

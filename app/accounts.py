@@ -671,6 +671,94 @@ def tag_template_variables() -> list[tuple[str, str]]:
 
 _TAG_TOKEN_RE = re.compile(r'\{tag:([\w-]+)\}')
 
+# The facts a recording's TheSportsDB event carries, as {sports:<field>} template fields. They
+# are filled in when the file is written, never when the recording is scheduled: an auto-record
+# rule schedules a game about 30 seconds after a guide import and the matcher links it at about
+# 60, so a schedule-time value would be empty for nearly every rule-made game. The recording
+# carries the half-rendered template in Recording.sports_name_template until then
+# (dev/changelog/1498). Values come from sports_data.template_values().
+SPORTS_TEMPLATE_FIELDS = [
+    ('league',     "TheSportsDB's name for the league"),
+    ('event',      "The event's name, such as a matchup or a race"),
+    ('home',       'Home team, empty for a race'),
+    ('away',       'Away team, empty for a race'),
+    ('season',     'Season, such as 2026 or 2026-2027'),
+    ('round',      'Round or week number, empty for preseason and playoff rounds'),
+    ('venue',      'Venue'),
+    ('city',       'City'),
+    ('date',       "The event's date (YYYY-MM-DD)"),
+    ('start_time', "The event's start time (HHMM, 24-hour), empty when TheSportsDB has no time"),
+]
+
+_SPORTS_TOKEN_RE = re.compile(r'\{sports:([a-z_]+)\}')
+
+
+def has_sports_fields(template: str) -> bool:
+    return bool(template) and _SPORTS_TOKEN_RE.search(template) is not None
+
+
+def _safe_template_value(val) -> str:
+    return re.sub(r'[\\/:*?"<>|]', '_', str(val)).strip()
+
+
+def _collapse_separators(result: str) -> str:
+    # Collapse repeated " - "-style separators left behind by empty substitutions
+    # (e.g. a non-matching {tag:x} producing "Show -  - Channel") and trim stray
+    # leading/trailing separators.
+    result = re.sub(r'(?:\s*-\s*){2,}', ' - ', result)
+    result = re.sub(r'^\s*-\s*|\s*-\s*$', '', result)
+    return result.strip()
+
+
+def fill_sports_fields(text: str, values: dict | None) -> str:
+    """`text` with each {sports:field} replaced from `values` ({field: str}), and the
+    separators an empty one leaves collapsed the way render_filename_template() collapses an
+    empty {sub_title}. None or {} renders every field empty - the name of a recording with no
+    event. A field `values` does not hold, a misspelled one included, renders empty too: the
+    designer names it as unknown, and a literal `{sports:x}` in a file name helps nobody."""
+    values = values or {}
+    filled = _SPORTS_TOKEN_RE.sub(
+        lambda m: _safe_template_value(values.get(m.group(1)) or ''), text)
+    return _collapse_separators(filled)
+
+
+def _names_a_program(template: str) -> bool:
+    """Whether a template has a field from the program or channel ({title}, {date} and the rest),
+    as opposed to only {sports:...} fields, {tag:...} fields and literal text."""
+    rest = _TAG_TOKEN_RE.sub('', _SPORTS_TOKEN_RE.sub('', template or ''))
+    return re.search(r'\{[a-z_]+\}', rest) is not None
+
+
+def unmatched_sports_name(template: str, empty_name: str, title: str) -> str:
+    """The name a template with {sports:...} fields gives a recording no game is matched to,
+    from `empty_name`, its rendering with those fields empty. A template that names no program,
+    such as the designer's `{sports:league} {sports:date} {sports:event}` or
+    `{sports:home} vs {sports:away}`, would leave nothing or a stray `vs`, so the program's
+    `title` is used instead; so is an empty rendering (dev/changelog/1498)."""
+    title = (title or '').strip()
+    if title and (not empty_name or not _names_a_program(template)):
+        return title
+    return empty_name
+
+
+def split_sports_name(template: str, rendered: str, title: str) -> tuple:
+    """(name, sports_name_template) for `rendered`, render_filename_template(template,
+    keep_sports=True)'s output: the name a recording is created with, and the half-rendered text
+    to keep on it for the join, or None when the template has no TheSportsDB field and there is
+    nothing to finish. `title` is the program's title, for unmatched_sports_name()."""
+    if not has_sports_fields(rendered):
+        return rendered, None
+    return unmatched_sports_name(template, fill_sports_fields(rendered, None), title), rendered
+
+
+def sports_name_matches(name: str, pending: str, title: str = '') -> bool:
+    """Whether `name` is still the name split_sports_name() gave for `pending` - the check that
+    keeps a typed name from being filled in. The raw template is gone by then, so the program's
+    `title` is accepted whenever there is one, since unmatched_sports_name() may have used it: a
+    person who typed exactly the program's title is taken to have kept the suggestion."""
+    title = (title or '').strip()
+    return name == fill_sports_fields(pending, None) or bool(title and name == title)
+
 
 def tags_matching(tags, *texts) -> list:
     """The tags whose pattern(s) appear (case-insensitive substring) across `texts`.
@@ -797,8 +885,15 @@ def backfill_profile_filename_cleanup(cfg):
 
 
 def render_filename_template(template: str, program: dict, tag_cleanup: list = None,
-                             tags_by_name: dict = None, tz=None) -> str:
+                             tags_by_name: dict = None, tz=None, sports: dict = None,
+                             keep_sports: bool = False) -> str:
     """Substitute EPG program data into a filename template string.
+
+    {sports:field} placeholders (SPORTS_TEMPLATE_FIELDS) render from `sports`, a
+    sports_data.template_values() dict, or empty when it is None. With keep_sports=True they
+    are left in the result as written, for split_sports_name() and the join to finish
+    (dev/changelog/1498). Either way the tag cleanup pass never sees them or their values: it
+    is about the guide's text, and a tag pattern must not be able to rewrite a field's name.
 
     program dict keys: title, description, channel_name, category,
                        start_time (datetime UTC naive), stop_time (datetime UTC naive)
@@ -848,6 +943,17 @@ def render_filename_template(template: str, program: dict, tag_cleanup: list = N
     sub_title = program.get('sub_title', '') or ''
     description = program.get('description', '') or ''
 
+    # Each {sports:...} token is held out as a placeholder no substitution, cleanup pattern or
+    # separator collapse can match, and put back at the end.
+    held = []
+
+    def _hold(m):
+        held.append(m.group(0))
+        # A private-use character, not a digit: a tag pattern could be a digit.
+        return f'\x00{chr(0xE000 + len(held) - 1)}\x00'
+
+    template = _SPORTS_TOKEN_RE.sub(_hold, template)
+
     tag_names: set[str] = {m.group(1) for m in _TAG_TOKEN_RE.finditer(template)}
 
     tag_subs: dict[str, str] = {}
@@ -871,8 +977,7 @@ def render_filename_template(template: str, program: dict, tag_cleanup: list = N
     }
     result = template
     for key, val in subs.items():
-        safe_val = re.sub(r'[\\/:*?"<>|]', '_', str(val)).strip()
-        result = result.replace('{' + key + '}', safe_val)
+        result = result.replace('{' + key + '}', _safe_template_value(val).replace('\x00', ''))
     for token, val in tag_subs.items():
         result = result.replace(token, val)
 
@@ -913,12 +1018,13 @@ def render_filename_template(template: str, program: dict, tag_cleanup: list = N
                 re.escape(p) for p in sorted(replacements, key=len, reverse=True))
             result = re.sub(alternation, lambda m: replacements[m.group(0)], result)
 
-    # Collapse repeated " - "-style separators left behind by empty substitutions
-    # (e.g. a non-matching {tag:x} producing "Show -  - Channel") and trim stray
-    # leading/trailing separators.
-    result = re.sub(r'(?:\s*-\s*){2,}', ' - ', result)
-    result = re.sub(r'^\s*-\s*|\s*-\s*$', '', result)
-    return result.strip()
+    result = _collapse_separators(result)
+    if not held:
+        return result
+    result = re.sub('\x00(.)\x00', lambda m: held[ord(m.group(1)) - 0xE000], result)
+    if keep_sports:
+        return result
+    return fill_sports_fields(result, sports)
 
 
 # ── Account sync ──────────────────────────────────────────────────────────────

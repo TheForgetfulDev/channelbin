@@ -5,6 +5,7 @@ import time
 from flask import Blueprint, abort, jsonify, render_template, request
 
 from .. import sports_data, sports_match, sports_view
+from ..fmt_utils import join_labels
 
 sports_bp = Blueprint('sports', __name__)
 
@@ -57,7 +58,8 @@ def _too_soon(exc: sports_data.TryAgain):
 
 @sports_bp.route('/api/sports/lookup', methods=['POST'])
 def lookup():
-    """Check what was picked or typed, with one call. Saves nothing."""
+    """Check what was picked or typed, with one call. Saves nothing. `best_match` marks the answer
+    to a name search, which on the free key is TheSportsDB's single best match, never a list."""
     data = request.get_json(silent=True) or {}
     if data.get('tsdb_id'):
         kind, value = 'league', data['tsdb_id']
@@ -66,8 +68,9 @@ def lookup():
     if kind == 'team' and not value:
         return jsonify({'error': 'Type a league, a team or a link.'}), 400
     if kind == 'badlink':
-        return jsonify({'error': 'That link is not a league. League links look like '
-                                 'https://www.thesportsdb.com/league/4391-NFL.'}), 400
+        return jsonify({'error': 'That link is not a league or a team. Links look like '
+                                 'https://www.thesportsdb.com/league/4391-NFL or '
+                                 'https://www.thesportsdb.com/team/134936-philadelphia-eagles.'}), 400
     if kind == 'league' and not str(value).isdigit():
         return jsonify({'error': 'That is not a league number.'}), 400
     try:
@@ -75,21 +78,33 @@ def lookup():
             league = sports_data.lookup_league(int(value))
             _remember(league)
             return jsonify({'success': True, 'league': league})
-        teams = sports_data.search_teams(value)
+        if kind == 'teamlink':
+            team = sports_data.lookup_team(value)
+            _remember(team['league'], team)
+            return jsonify({'success': True, 'league': team['league'], 'team': team})
+        teams, defunct = sports_data.search_teams(value)
     except sports_data.TryAgain as exc:
         return _too_soon(exc)
     except sports_data.LeagueNotFound as exc:
         return jsonify({'error': str(exc)}), 404
     except sports_data.LookupFailed as exc:
         return jsonify({'error': str(exc)}), 502
+    if not teams and defunct:
+        found = (f'TheSportsDB\'s best match for "{value}" is {defunct[0]["team"]}, a defunct team, so it is'
+                 if len(defunct) == 1 else
+                 f'TheSportsDB found only defunct teams for "{value}" ({join_labels([t["team"] for t in defunct])}), '
+                 'so they are')
+        return jsonify({'error': f'{found} left out. Type more of the name, such as the city and nickname.'}), 404
     if not teams:
         return jsonify({'error': f'TheSportsDB found no team called "{value}". A league with no teams, such as a '
                                  'racing series, can be added with its number or a link to its page on TheSportsDB.'}), 404
     for team in teams:
         _remember(team['league'], team)
+    skipped = [t['team'] for t in defunct]
     if len(teams) == 1:
-        return jsonify({'success': True, 'league': teams[0]['league'], 'team': teams[0]})
-    return jsonify({'success': True, 'choices': teams})
+        return jsonify({'success': True, 'league': teams[0]['league'], 'team': teams[0],
+                        'best_match': True, 'skipped': skipped})
+    return jsonify({'success': True, 'choices': teams, 'skipped': skipped})
 
 
 @sports_bp.route('/api/sports/leagues', methods=['POST'])
@@ -136,7 +151,11 @@ def stop_following(league_id):
 
 @sports_bp.route('/api/sports/leagues/<int:league_id>', methods=['DELETE'])
 def delete_league(league_id):
-    if not sports_data.delete_league(league_id):
+    try:
+        deleted = sports_data.delete_league(league_id)
+    except sports_data.LeagueInUse as exc:
+        return jsonify({'error': str(exc)}), 409
+    if not deleted:
         return jsonify({'error': 'That league no longer exists.'}), 404
     sports_data.ensure_worker()
     return jsonify({'success': True})
