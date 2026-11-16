@@ -639,6 +639,12 @@ class SportsDefaultRebuildTests(unittest.TestCase):
     def _fresh_tables(self, build):
         return {table: sql for table, (sql, _idx) in build.items()}
 
+    #: Step 124 (dev/changelog/1517).
+    ADDED_AFTER_118 = frozenset({
+        ('sports_feed_channels', 'team_tsdb_id', '0'), ('sports_feed_channels', 'number', '0'),
+        ('sports_feed_channels', 'enabled', '0'), ('sports_leagues', 'feed_league_channels', '0'),
+    })
+
     def test_the_list_is_what_the_models_declare(self):
         """The step's table is hand-written so it stays frozen; this holds it equal to the
         sports models, so a sports column gaining a server_default lands in the step too."""
@@ -650,6 +656,10 @@ class SportsDefaultRebuildTests(unittest.TestCase):
                 for c in tbl.columns:
                     if c.server_default is not None:
                         declared.add((name, c.name, str(c.server_default.arg.text)))
+        # A column a later step adds arrives with its DEFAULT in that step's own DDL, which the
+        # no-op and hand-written-table checks above hold equal to the model, so step 118 has
+        # nothing to repair on it.
+        declared -= self.ADDED_AFTER_118
         self.assertEqual(set(M._SPORTS_DEFAULTS), declared)
         self.assertEqual(len(M._SPORTS_DEFAULTS), len(set(M._SPORTS_DEFAULTS)))
 

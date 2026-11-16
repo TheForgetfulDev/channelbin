@@ -144,16 +144,16 @@ class PreferSportsPosterTests(_Base):
         for sent, expected in ((True, True), (False, False), (None, False)):
             RecordingProfile.query.delete()
             db.session.commit()
-            resp = self.post(prefer_sports_poster=sent)
+            resp = self.post(prefer_sports_art=sent)
             self.assertEqual(resp.status_code, 200)
-            self.assertIs(RecordingProfile.query.one().prefer_sports_poster, expected)
-            self.assertIs(resp.get_json()['profile']['prefer_sports_poster'], expected)
+            self.assertIs(RecordingProfile.query.one().prefer_sports_art, expected)
+            self.assertIs(resp.get_json()['profile']['prefer_sports_art'], expected)
 
     def test_an_edit_turns_it_off(self):
-        p = self.make_profile(prefer_sports_poster=True)
-        self.assertEqual(self.put(p.id, prefer_sports_poster=False).status_code, 200)
+        p = self.make_profile(prefer_sports_art=True)
+        self.assertEqual(self.put(p.id, prefer_sports_art=False).status_code, 200)
         db.session.expire_all()
-        self.assertIs(db.session.get(RecordingProfile, p.id).prefer_sports_poster, False)
+        self.assertIs(db.session.get(RecordingProfile, p.id).prefer_sports_art, False)
 
 
 class ValidationTests(_Base):

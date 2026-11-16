@@ -88,6 +88,7 @@
       'tags': ep.startswith('tags.'),
       'epg': ep.startswith('epg_manager.'),
       'sports': ep.startswith('sports.'),
+      'output': ep.startswith('iptv_output.'),
       'accounts': ep.startswith('accounts.'),
       'rules': ep.startswith('auto_rules.'),
       'recprof': ep.startswith('profiles.'),
@@ -123,6 +124,7 @@
     {# EPG Manager (dev/changelog/1325): the tools that work across every account's guide. #}
     <a class="nav-link{% if on['epg'] %} active{% endif %}" href="{{ url_for('epg_manager.epg_manager') }}">{{ icon('nav-epg-manager', 'nav-i') }}<span class="nav-t">EPG Manager</span></a>
     <a class="nav-link{% if on['sports'] %} active{% endif %}" href="{{ url_for('sports.sports_page') }}">{{ icon('nav-sports', 'nav-i') }}<span class="nav-t">Sports Schedules</span></a>
+    <a class="nav-link{% if on['output'] %} active{% endif %}" href="{{ url_for('iptv_output.page') }}">{{ icon('nav-iptv-output', 'nav-i') }}<span class="nav-t">IPTV Output</span></a>
     </div>
     {% call nav_fold('setup', 'Setup', ['Accounts', 'Auto-record', 'Recording Profiles', 'Health Check Profiles'],
                      on['accounts'] or on['rules'] or on['recprof'] or on['hcprof']) %}

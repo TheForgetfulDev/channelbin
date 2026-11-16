@@ -24,6 +24,7 @@ from .auto_rules import auto_rules_bp
 from .setup import setup_bp
 from .epg_manager import epg_manager_bp
 from .sports import sports_bp
+from .iptv_output import iptv_output_bp
 
 
 def register_blueprints(app):
@@ -56,3 +57,4 @@ def register_blueprints(app):
     app.register_blueprint(output_feed_bp)
     app.register_blueprint(setup_bp)
     app.register_blueprint(epg_manager_bp)
+    app.register_blueprint(iptv_output_bp)

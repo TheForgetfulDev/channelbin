@@ -420,6 +420,10 @@ DIMENSIONS = (
     # return nothing. Hidden so the rail does not pay for another count on every search
     # (dev/changelog/1437).
     Dimension('listings', 'Listings', hidden=True, grain=GRAIN_CHANNELS),
+    # What a league page's Search programs links to: the listings matched to one TheSportsDB
+    # event, by its id (dev/changelog/1539). Programs only - a channel is not a game - and
+    # hidden, since it is reached from that page and never picked from a rail.
+    Dimension('event', 'Event', hidden=True, grain=GRAIN_AIRINGS),
 )
 DIMENSION_BY_KEY = {d.key: d for d in DIMENSIONS}
 #: Every non-hidden dimension, in registry order, across both grains. `dimensions_for()` is
@@ -1284,6 +1288,8 @@ def describe_value(key: str, value: str, *, account_names=None, channel_names=No
         return name or f'#{value}'
     if key == 'listings':
         return LISTINGS_PHRASES[value]['label'] if value in LISTINGS_PHRASES else value
+    if key == 'event':
+        return f'TheSportsDB event #{value}'
     return value
 
 
@@ -2297,6 +2303,23 @@ def _mark_predicate(value: str):
                            f'{", ".join(MARK_VALUES)}')
 
 
+def _event_predicate(value: str):
+    """"Is this SHOWING a listing matched to this TheSportsDB event". Every guide match still in
+    the guide and not marked a wrong match, of either strength, so the search shows the listings
+    the league page counts as "On N channels" (dev/changelog/1539). A value that is not an id
+    matches nothing, like an unknown channel id."""
+    from sqlalchemy import select, tuple_
+    from .database import SPORTS_MATCH_KIND_GUIDE, SportsEvent, SportsMatch
+    tsdb = _optional_int(value)
+    if tsdb is None:
+        return db.false()
+    keys = (select(SportsMatch.channel_id, SportsMatch.program_start_time)
+            .join(SportsEvent, SportsEvent.id == SportsMatch.event_id)
+            .where(SportsEvent.tsdb_id == tsdb, SportsMatch.kind == SPORTS_MATCH_KIND_GUIDE,
+                   SportsMatch.rejected_at.is_(None), SportsMatch.gone_since.is_(None)))
+    return tuple_(EPGEntry.channel_id, EPGEntry.start_time).in_(keys)
+
+
 def _tod_predicate(value: str, ctx: 'SearchContext'):
     """"Does this SHOWING start inside this clock-time range" - both ends included.
 
@@ -2426,6 +2449,8 @@ def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str 
         return _duration_predicate(value)
     if dim_key == 'mark':
         return _mark_predicate(value)
+    if dim_key == 'event':
+        return _event_predicate(value)
     if dim_key == 'tag':
         tag = ctx.tags_by_name.get(value)
         # Tags read both indexes, so they need both to be trustworthy.

@@ -1168,6 +1168,21 @@ def _score_sentence(rec) -> str:
             f'restarts and reconnects - {tail}')
 
 
+def schedule_edit_payload(rec) -> dict:
+    """What guide.js::openModal needs to open a SCHEDULED recording in edit mode, from a page
+    that has no program to hand it: the Recordings list's Edit schedule and a league page's Edit
+    recording (dev/changelog/1539). edit_recording_json only reads name/url/start_time/stop_time/
+    profile_id from the posted form, so channel_id/group_id only need to be roughly right."""
+    return {
+        'url': rec.url,
+        'start_iso': rec.start_time.isoformat(),
+        'stop_iso': rec.stop_time.isoformat(),
+        'channel_id': rec.channel_id,
+        'group_id': rec.group_id,
+        'profile_id': rec.profile_id,
+    }
+
+
 def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
                thumb_enabled=True):
     """file_formats is channel_groups.file_format_stretches() over the recording's format
@@ -1295,18 +1310,7 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
 
     # edit-modal payload (SCHEDULED only) - feeds guide.js's openModal() so "Edit schedule"
     # opens the same modal the TV Guide uses, instead of the old standalone edit page.
-    # edit_recording_json only reads name/url/start_time/stop_time/profile_id from the
-    # posted form, so channel_id/group_id here only need to be roughly right.
-    edit = None
-    if rec.status == REC_STATUS_SCHEDULED:
-        edit = {
-            'url': rec.url,
-            'start_iso': rec.start_time.isoformat(),
-            'stop_iso': rec.stop_time.isoformat(),
-            'channel_id': rec.channel_id,
-            'group_id': rec.group_id,
-            'profile_id': rec.profile_id,
-        }
+    edit =schedule_edit_payload(rec) if rec.status == REC_STATUS_SCHEDULED else None
 
     # channel/group pill (channel/group relationships are lazy='joined')
     pill = None
@@ -1580,7 +1584,8 @@ def _segment_stderr_tails(rec) -> dict:
 def _segment_channels(rec) -> dict:
     """{channel_id: Channel} for every channel referenced by rec.segments, batch-fetched once
     so the Segments table's Channel column costs no per-row query (CLAUDE.md no-hidden-I/O
-    rule). Legacy segments predating recording_segments.channel_id are simply absent.
+    rule). A segment with no channel_id is simply absent: one that predates the column, or
+    one whose channel has since been deleted (database.detach_channel_references).
     Channel.account is preloaded too, so showing each segment's account (and building the
     header's distinct-accounts pills) costs no additional query either."""
     from sqlalchemy.orm import joinedload
@@ -2951,6 +2956,16 @@ def new_recording_json():
     source_epg_id_raw = request.form.get('source_epg_id', '').strip()
     entry = (db.session.get(EPGEntry, int(source_epg_id_raw))
              if source_epg_id_raw.isdigit() else None)
+    sports_event_raw = request.form.get('sports_event_id', '').strip()
+    if entry is None and sports_event_raw.isdigit():
+        # A league page's Record on a game only an event channel names (dev/changelog/1539): no
+        # listing to snapshot, so the program times are the pick's, worked out again here from
+        # the event, as an auto-record rule's are (_plan_event_schedule). The window is the
+        # person's, like any recording's.
+        from ..sports_view import event_record_check
+        entry, why = event_record_check(int(sports_event_raw), channel_id)
+        if entry is None:
+            return jsonify({'error': why}), 409
     rec = _create_scheduled_recording(
         cfg, name=name, url=url, start_utc=start_utc, stop_utc=stop_utc,
         channel_id=channel_id, group_id=group_id, profile_id=profile_id,

@@ -7,9 +7,11 @@ plus a poster image, both named after the video so no folder restructuring is ne
 poster is the image pinned to the recording's profile when it has one
 (app/profile_posters.py), otherwise TheSportsDB's poster or thumb for the recording's event
 (app/sports_images.py), otherwise the frame captured from inside the program itself
-(recorder.persist_poster_frame), otherwise the final-frame thumbnail. TheSportsDB's landscape
-thumb is also written as the background, `-fanart`, whatever the poster is. A profile can put
-TheSportsDB's own poster ahead of its pinned one (`prefer_sports_poster`, dev/changelog/1505).
+(recorder.persist_poster_frame), otherwise the final-frame thumbnail. The background,
+`-fanart`, follows the same order with landscape images: the one pinned to the profile
+(dev/changelog/1508), TheSportsDB's landscape thumb whatever the poster is, then the captured
+frame (dev/changelog/1507). A profile can put
+TheSportsDB's own images ahead of its pinned ones (`prefer_sports_art`, dev/changelog/1505, 1508).
 
 The format is the Kodi one because it is the portable one. Jellyfin, Emby and Kodi have
 read it for years, and Plex reads it natively as of PMS 1.43.1 through its own "Plex NFO
@@ -269,6 +271,21 @@ POSTER_ORIGINS = {
     POSTER_FROM_SPORTS_THUMB: "TheSportsDB's background for its event, which has no poster",
 }
 
+#: How each source of a written background reads in the event's sentence. The same source words
+#: as the poster's, so `fanart_source` in the event's extra is read with the same vocabulary.
+FANART_ORIGINS = {
+    POSTER_FROM_PROFILE: 'the image pinned to its profile',
+    POSTER_FROM_SPORTS_THUMB: "TheSportsDB's for its event",
+    POSTER_FROM_FRAME: 'a frame from inside the program',
+    POSTER_FROM_THUMBNAIL: 'the final frame of the recording',
+}
+_FANART_COPY_FAILED = {
+    POSTER_FROM_PROFILE: "The background pinned to its profile could not be copied",
+    POSTER_FROM_SPORTS_THUMB: "TheSportsDB's background could not be copied",
+    POSTER_FROM_FRAME: 'The frame from inside the program could not be copied as the background',
+    POSTER_FROM_THUMBNAIL: 'The final frame could not be copied as the background',
+}
+
 
 def _drop_stale_posters(stem: str, keep: str, suffixes=POSTER_SUFFIXES):
     """Remove any other poster name beside the video, so the folder never holds a
@@ -320,7 +337,7 @@ def _copy_poster(recording_id, cfg, video_path, profile, sports=None, art=None):
     on a postgame graphic - and is kept as the floor because every recording made before
     the poster frame existed has only that one.
 
-    A profile with `prefer_sports_poster` on moves TheSportsDB's own portrait poster above its
+    A profile with `prefer_sports_art` on moves TheSportsDB's own portrait poster above its
     pinned image (dev/changelog/1505). Only the poster: the landscape thumb standing in for a
     missing one stays below the pin, since a league with almost no posters (NHL: 7 of 572)
     would otherwise trade the user's logo for a squeezed landscape on nearly every game.
@@ -332,10 +349,8 @@ def _copy_poster(recording_id, cfg, video_path, profile, sports=None, art=None):
     switched off, and a recording whose segments were all unreadable never got either
     image. The NFO simply carries no <thumb> then.
     """
-    from .profile_posters import poster_path
-    from .recorder import poster_frame_path
+    from .profile_posters import POSTER as POSTER_SLOT
     from .sports_images import POSTER, READY
-    from .storage_dirs import THUMBNAILS, image_dir
 
     stem = os.path.splitext(video_path)[0]
     notes = []
@@ -355,19 +370,8 @@ def _copy_poster(recording_id, cfg, video_path, profile, sports=None, art=None):
         _drop_stale_posters(stem, dest)
         return dest
 
-    pinned = None
-    if profile is not None and profile.poster_file:
-        try:
-            pinned = poster_path(cfg, profile.poster_file)
-        except ValueError:
-            pinned = None
-        if not (pinned and os.path.exists(pinned)):
-            notes.append(f'The poster pinned to profile "{profile.name}" was missing from disk '
-                         f'({pinned or profile.poster_file}), so it could not be used')
-            log.warning('Recording %d: %s', recording_id, notes[-1])
-            pinned = None
-
-    prefer = pinned is not None and bool(profile.prefer_sports_poster)
+    pinned = _pinned_image(recording_id, cfg, profile, POSTER_SLOT, notes)
+    prefer = pinned is not None and bool(profile.prefer_sports_art)
     if prefer and sports_ready and sports.poster_url:
         dest = _copy_sports()
         if dest:
@@ -391,12 +395,7 @@ def _copy_poster(recording_id, cfg, video_path, profile, sports=None, art=None):
                 '. '.join(notes) or None
 
     note = '. '.join(notes) or None
-    captured = [(poster_frame_path(recording_id, cfg), POSTER_FROM_FRAME),
-                (os.path.join(image_dir(cfg, THUMBNAILS), f'{recording_id}.jpg'),
-                 POSTER_FROM_THUMBNAIL)]
-    for src, source in captured:
-        if not os.path.exists(src):
-            continue
+    for src, source in _captured_frames(recording_id, cfg):
         dest = stem + POSTER_SUFFIX
         shutil.copyfile(src, dest)
         _drop_stale_posters(stem, dest)
@@ -404,25 +403,76 @@ def _copy_poster(recording_id, cfg, video_path, profile, sports=None, art=None):
     return None, None, note
 
 
-def _copy_fanart(recording_id, video_path, art):
-    """Put TheSportsDB's landscape thumb beside the video as its background, or remove one an
-    earlier write left when there is none now. Returns `(path written or None, note)`: a background
-    that cannot be copied is left out and said, never a reason to lose the whole file."""
+def _pinned_image(recording_id, cfg, profile, slot, notes):
+    """The path of the image `profile` pins in `slot` (app/profile_posters.SLOTS), or None. One
+    the row names that is gone from disk is a sentence in `notes`, since the user chose it."""
+    from .profile_posters import pinned, poster_path
+    filename = pinned(profile, slot)[0] if profile is not None else None
+    if not filename:
+        return None
+    try:
+        path = poster_path(cfg, filename)
+    except ValueError:
+        path = None
+    if path and os.path.exists(path):
+        return path
+    notes.append(f'The {slot.role} pinned to profile "{profile.name}" was missing from disk '
+                 f'({path or filename}), so it could not be used')
+    log.warning('Recording %d: %s', recording_id, notes[-1])
+    return None
+
+
+def _captured_frames(recording_id, cfg):
+    """The images taken from the recording itself that exist on disk, best first: the poster
+    frame from inside the program (dev/changelog/1060), then the final-frame thumbnail."""
+    from .recorder import final_frame_path, poster_frame_path
+    return [(src, source) for src, source in ((poster_frame_path(recording_id, cfg), POSTER_FROM_FRAME),
+                                              (final_frame_path(recording_id, cfg), POSTER_FROM_THUMBNAIL))
+            if os.path.exists(src)]
+
+
+def _copy_fanart(recording_id, cfg, video_path, art, profile=None, sports=None):
+    """Put a background beside the video. Returns `(path written or None, source, note)`.
+
+    The background pinned to the recording's profile first (dev/changelog/1508), then
+    TheSportsDB's landscape thumb for its event, then the frame captured from the program, then
+    the final frame (dev/changelog/1507). A profile with `prefer_sports_art` on puts the thumb
+    ahead of its pinned background, as it does the poster. Every recording with a captured image
+    gets one, since a media server's widescreen tiles (Plex's Continue Watching for a movie) show
+    its own fallback for an item with no background. Both frames are landscape, which is the
+    shape this slot wants and the poster slot does not. A background that cannot be copied is
+    said and falls through, never a reason to lose the whole file; with no image at all, one an
+    earlier write left is removed.
+    """
+    from .profile_posters import BACKGROUND as BACKGROUND_SLOT
     from .sports_images import BACKGROUND, READY
     stem = os.path.splitext(video_path)[0]
+    notes = []
     state, path, _ = (art or {}).get(BACKGROUND, (None, None, None))
-    if state == READY:
-        dest = stem + '-fanart' + os.path.splitext(path)[1]
+    theirs = [(path, POSTER_FROM_SPORTS_THUMB)] if state == READY else []
+    pin_path = _pinned_image(recording_id, cfg, profile, BACKGROUND_SLOT, notes)
+    pin = [(pin_path, POSTER_FROM_PROFILE)] if pin_path else []
+    prefer = bool(pin) and bool(profile.prefer_sports_art)
+    candidates = (theirs + pin if prefer else pin + theirs) + _captured_frames(recording_id, cfg)
+    for src, source in candidates:
+        dest = stem + '-fanart' + os.path.splitext(src)[1]
         try:
-            shutil.copyfile(path, dest)
+            shutil.copyfile(src, dest)
         except OSError as exc:
-            note = f"TheSportsDB's background could not be copied ({exc.strerror or exc}), so it was left out"
-            log.warning('Recording %d: %s', recording_id, note)
-            return None, note
+            notes.append(f'{_FANART_COPY_FAILED[source]} ({exc.strerror or exc})')
+            log.warning('Recording %d: %s', recording_id, notes[-1])
+            continue
         _drop_stale_posters(stem, dest, FANART_SUFFIXES)
-        return dest, None
+        if prefer and source == POSTER_FROM_SPORTS_THUMB:
+            notes.append(f'Profile "{profile.name}" puts TheSportsDB\'s background ahead of its pinned one')
+        elif prefer and source == POSTER_FROM_PROFILE and sports is not None and not sports.thumb_url:
+            notes.append(f'TheSportsDB has no background for this event, so the one pinned to profile '
+                         f'"{profile.name}" was used')
+        return dest, source, '. '.join(notes) or None
     _drop_stale_posters(stem, None, FANART_SUFFIXES)
-    return None, None
+    if notes:
+        notes[-1] += ', so the file has no background'
+    return None, None, '. '.join(notes) or None
 
 
 def write_sidecar(recording_id: int, video_path: str, cfg: dict, profile=None):
@@ -470,7 +520,8 @@ def write_sidecar(recording_id: int, video_path: str, cfg: dict, profile=None):
     try:
         poster_path, poster_source, poster_note = _copy_poster(
             recording_id, cfg, video_path, profile, sports, art)
-        fanart_path, fanart_note = _copy_fanart(recording_id, video_path, art)
+        fanart_path, fanart_source, fanart_note = _copy_fanart(recording_id, cfg, video_path, art,
+                                                               profile, sports)
         xml = render_nfo(rec, tz,
                          poster_name=os.path.basename(poster_path) if poster_path else None,
                          sports=sports,
@@ -505,14 +556,16 @@ def write_sidecar(recording_id: int, video_path: str, cfg: dict, profile=None):
     else:
         detail += '. No poster was available to copy, so the file carries no artwork'
     if fanart_path:
-        detail += f", and {os.path.basename(fanart_path)} as its background (TheSportsDB's for its event)"
-    # A pinned image is the poster the user chose, so TheSportsDB's missing one is not news,
-    # unless the profile asked for TheSportsDB's poster first and it has one.
-    from .sports_images import POSTER
-    wanted = bool(profile is not None and profile.prefer_sports_poster and sports is not None
-                  and sports.poster_url)
+        detail += f', and {os.path.basename(fanart_path)} as its background ({FANART_ORIGINS[fanart_source]})'
+    # A pinned image is the one the user chose, so TheSportsDB's missing one is not news,
+    # unless the profile asked for TheSportsDB's images first and it has that one.
+    from .sports_images import BACKGROUND, POSTER
+    prefer = bool(profile is not None and profile.prefer_sports_art and sports is not None)
+    pinned_used = {POSTER: (poster_source == POSTER_FROM_PROFILE, prefer and bool(sports.poster_url)),
+                   BACKGROUND: (fanart_source == POSTER_FROM_PROFILE, prefer and bool(sports.thumb_url))} \
+        if sports is not None else {}
     unused = {k: v for k, v in art.items()
-              if not (k == POSTER and poster_source == POSTER_FROM_PROFILE and not wanted)}
+              if not (k in pinned_used and pinned_used[k][0] and not pinned_used[k][1])}
     for note in [n for n in (poster_note, fanart_note, art_note) if n] + _sports_notes(unused):
         detail += '. ' + note
 
@@ -521,7 +574,8 @@ def write_sidecar(recording_id: int, video_path: str, cfg: dict, profile=None):
         add_recording_event(recording_id, METADATA_SIDECAR_WRITTEN, detail=detail,
                             extra={'poster': bool(poster_path),
                                    'poster_source': poster_source,
-                                   'fanart': bool(fanart_path)})
+                                   'fanart': bool(fanart_path),
+                                   'fanart_source': fanart_source})
         db.session.commit()
 
     _log_written_and_commit()

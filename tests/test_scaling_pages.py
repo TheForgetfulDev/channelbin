@@ -250,6 +250,82 @@ def _enable_output_feed(t):
         'enabled': True, 'username': 'tv', 'password': 'tv'}}})
 
 
+def _seed_iptv_output(n):
+    """The IPTV Output page at its widest: the guide scope with its sports channels, n lines
+    of Recent plays, and n IPTV players watching n different channels (dev/changelog/1526)."""
+    import time
+    import app.output_feed as feed
+    from app.database import FEED_PLAY_ENDED, FEED_PLAY_REFUSED, OutputFeedPlay
+    _seed_sports_feed(n)
+    now = datetime.utcnow()
+    watched = Channel.query.filter(Channel.in_guide.is_(True)).order_by(Channel.id).limit(n).all()  # guide-flag-read-ok: seeding the feed's own rows
+    for i, ch in enumerate(watched):
+        db.session.add(OutputFeedPlay(
+            kind=FEED_PLAY_REFUSED if i % 2 else FEED_PLAY_ENDED, at=now - timedelta(minutes=i),
+            first_at=now - timedelta(minutes=i + 5), feed_id=feed.feed_id_for_channel(ch.id),
+            label=f'channel {ch.id} ({ch.name})', client='192.168.1.23', channel_id=ch.id,
+            channel_name=ch.name, account_id=ch.account_id, message='The IPTV player stopped watching.'))
+        s = feed.RelaySession(
+            id=f'scale-{i}', feed_id=feed.feed_id_for_channel(ch.id), label=f'channel {ch.id} ({ch.name})',
+            client=f'192.168.1.{i}', group_id=None, channel_id=ch.id, channel_name=ch.name,
+            account_id=ch.account_id, ring=feed.Ring(1024, 0), started_mono=time.monotonic())
+        s.state = feed.STATE_STREAMING
+        with feed._lock:
+            feed._sessions[s.id] = s
+    db.session.commit()
+
+
+@contextlib.contextmanager
+def _relays_stopped_after():
+    """The seeded IPTV players are live relay sessions, which a test may not leave running."""
+    import app.output_feed as feed
+    try:
+        yield
+    finally:
+        feed.stop_all()
+
+
+def _enable_output_feed_wide(t):
+    """The feed on with room for every seeded IPTV player, so the page draws them all."""
+    t.sandbox_config({'integrations': {'output_feed': {
+        'enabled': True, 'username': 'tv', 'password': 'tv', 'max_viewers': 500}}})
+
+
+def _seed_sports_feed(n):
+    """The guide scope, plus ChannelBin's own sports channels on the output feed: a league followed
+    whole with its numbered channels on, n teams each with its channel on, and n games each listed
+    by n channels' guides (app/sports_feed.py, dev/changelog/1517)."""
+    from app.database import (SportsEvent, SportsFeedChannel, SportsFollow, SportsLeague, SportsMatch,
+                              SportsTeam)
+    _seed_guide_scope(n)
+    now = datetime.utcnow()
+    league = SportsLeague(tsdb_id=9100, name='Feed league', sport='Pretend Ball', match_terms='[]',
+                          feed_league_channels=True)
+    db.session.add(league)
+    db.session.flush()
+    db.session.add(SportsFollow(league_id=league.id, team_tsdb_id=0, rule_id=0))
+    acc = seed.make_account(name='Sports feed')
+    channels = [seed.make_channel(acc, name=f'Local {i}') for i in range(n)]
+    for i in range(n):
+        db.session.add(SportsTeam(tsdb_id=3000 + i, full_name=f'Team {i}'))
+        db.session.add(SportsFeedChannel(league_id=league.id, team_tsdb_id=3000 + i, enabled=True))
+        db.session.add(SportsFeedChannel(league_id=league.id, number=i + 1))
+        start = now + timedelta(hours=1 + i)
+        # Every other game opened with Go live now (dev/changelog/1530).
+        opened = dict(live_now_at=now, live_now_until=start + timedelta(hours=5)) if i % 2 else {}
+        event = SportsEvent(tsdb_id=600000 + i, league_id=league.id, name=f'Game {i}', home_team_id=3000 + i,
+                            away_team_id=3000 + (i + 1) % n, home_name=f'Team {i}', away_name='Away',
+                            start_at=start, local_date=start.date(), feed_number=i + 1, **opened)
+        db.session.add(event)
+        db.session.flush()
+        for ch in channels:
+            db.session.add(SportsMatch(event_id=event.id, channel_id=ch.id, kind='guide', strength='strong',
+                                       airing='first', program_start_time=start,
+                                       program_stop_time=start + timedelta(hours=3), title_key='game',
+                                       reason='seeded'))
+    db.session.commit()
+
+
 def _seed_get_started(n):
     """The Readiness shape, plus n health check results and n recordings - every table the
     Get started page's steps read (dev/changelog/1280). The page draws a fixed eight steps
@@ -481,11 +557,14 @@ def _seed_sports_leagues(n):
 
 
 def _seed_sports_league_page(n):
-    """One followed league with n upcoming games, n teams, n queue rows, n tied categories, n guide
-    matches per game on n channels and n event channels naming each game: a league's own page with its
-    Where it's on column and Matching card (dev/changelog/1463, 1472)."""
-    from app.database import (SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsLeagueCategory,
-                              SportsMatch, SportsTeam)
+    """One followed league with n upcoming games, n teams each with its sports channel on, n queue
+    rows, n tied categories, n guide matches per game on n channels and n event channels naming each
+    game, every other game opened with Go live now: a league's own page with its Where it's on
+    column, its row menus and Matching card (dev/changelog/1463, 1472, 1530). A third of the games
+    are named only by the event channels, a third have a rule's scheduled recording and a third one
+    recording now, so each row's Record, pill and Manage recording are all read (dev/changelog/1539)."""
+    from app.database import (AutoRule, RecordingSports, SportsEvent, SportsFeedChannel, SportsFetch, SportsFollow,
+                              SportsLeague, SportsLeagueCategory, SportsMatch, SportsTeam)
     now = datetime.utcnow()
     league = SportsLeague(tsdb_id=9000, name='Scaling league', sport='Pretend Ball', current_season='2099',
                           match_terms='["Scaling league"]', trust_sample=n, trust_agreed=n)
@@ -498,18 +577,31 @@ def _seed_sports_league_page(n):
     events = []
     for i in range(n):
         db.session.add(SportsTeam(tsdb_id=1000 + i, full_name=f'Team {i}'))
+        db.session.add(SportsFeedChannel(league_id=league.id, team_tsdb_id=1000 + i, enabled=True))
         db.session.add(SportsFetch(target=f'round:9000:2099:{i}', kind='round', league_id=league.id,
                                    last_at=now, next_due_at=now + timedelta(hours=9), outcome='ok'))
         db.session.add(SportsLeagueCategory(league_id=league.id, category_name=f'Scaling league {i}'))
         start = now + timedelta(hours=i + 1)
         event = SportsEvent(tsdb_id=500000 + i, league_id=league.id, name=f'Game {i}', season='2099', round=i,
                             home_team_id=1000 + i, away_team_id=1000, home_name=f'Team {i}', away_name='Team 0',
-                            start_at=start, local_date=start.date(), guide_start=start + timedelta(hours=12))
+                            start_at=start, local_date=start.date(), guide_start=start + timedelta(hours=12),
+                            **(dict(live_now_at=now, live_now_until=start + timedelta(hours=5)) if i % 2 else {}))
         db.session.add(event)
         events.append(event)
+    rule = AutoRule(name='Scaling league games', search_params='grain=airings', enabled=True)
+    db.session.add(rule)
     db.session.flush()
-    for event in events:
-        for ch in channels:
+    for i, event in enumerate(events):
+        if i % 3:
+            rec = seed.make_recording(status='SCHEDULED' if i % 3 == 1 else 'IN_PROGRESS', name=f'Game {i}',
+                                      channel_id=channels[i].id, start_time=event.start_at,
+                                      stop_time=event.start_at + timedelta(hours=3), rule_id=rule.id)
+            db.session.flush()
+            db.session.add(RecordingSports(recording_id=rec.id, tsdb_event_id=event.tsdb_id, league_name=league.name,
+                                           event_name=event.name, strength='strong', airing='first', reason='x',
+                                           linked_at=now, updated_at=now))
+    for i, event in enumerate(events):
+        for ch in channels if i % 3 else ():
             db.session.add(SportsMatch(event_id=event.id, channel_id=ch.id, kind='guide',
                                        program_start_time=event.start_at, program_stop_time=event.start_at + timedelta(hours=3),
                                        title_key='scaling league', program_title='Scaling league', strength='strong',
@@ -1071,11 +1163,27 @@ class PageScalingTests(unittest.TestCase):
 
     def test_output_feed_catalog(self):
         """Not a page: the output feed's catalog, playlist and guide answers are built for an
-        IPTV app from the guide scope, and each is one keyed query however many channels and
+        IPTV player from the guide scope, and each is one keyed query however many channels and
         groups the guide holds (DESIGN-output-feed.md 7)."""
         self._assert_row_independent(
             _seed_guide_scope, '/player_api.php?username=tv&password=tv&action=get_live_streams',
             configure=_enable_output_feed)
+
+    def test_output_feed_catalog_with_sports_channels(self):
+        self._assert_row_independent(
+            _seed_sports_feed, '/player_api.php?username=tv&password=tv&action=get_live_streams',
+            configure=_enable_output_feed)
+
+    def test_output_feed_xmltv_with_sports_channels(self):
+        self._assert_row_independent(_seed_sports_feed, '/xmltv.php?username=tv&password=tv',
+                                     configure=_enable_output_feed)
+
+    def test_iptv_output_page(self):
+        """The feed's own page: every guide row with what it plays from, who is watching
+        with the program on now, Recent plays and the accounts (dev/changelog/1526)."""
+        self._assert_row_independent(_seed_iptv_output, '/iptv-output',
+                                     prepare=_relays_stopped_after,
+                                     configure=_enable_output_feed_wide)
 
     def test_output_feed_playlist(self):
         self._assert_row_independent(_seed_guide_scope, '/get.php?username=tv&password=tv',
@@ -1290,6 +1398,7 @@ COVERED = {
     'jobs.jobs_page': 'test_jobs_page',
     'setup.get_started': 'test_get_started_page',
     'output_feed.player_api': 'test_output_feed_catalog',
+    'iptv_output.page': 'test_iptv_output_page',
     'output_feed.get_php': 'test_output_feed_playlist',
     'output_feed.xmltv': 'test_output_feed_xmltv',
 }
@@ -1354,7 +1463,7 @@ NOT_ROW_SCALING = {
         'Opens one recording\'s file and answers with one JSON object about it. Not a page and '
         'renders no rows.'),
     'output_feed.live': (
-        'Plays ONE channel to an IPTV app: resolves one feed id and either redirects or relays '
+        'Plays ONE channel to an IPTV player: resolves one feed id and either redirects or relays '
         'its stream. Not a page and renders no rows; the catalog answers it lists from carry '
         'their own cases (test_output_feed_catalog and siblings).'),
 }

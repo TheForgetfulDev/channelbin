@@ -31,7 +31,7 @@ from .database import (
     SPORTS_MATCH_KIND_CHANNEL_NAME, SPORTS_MATCH_KIND_GUIDE, SPORTS_MATCH_STRONG, SPORTS_MATCH_WEAK, SportsEvent, SportsLeague,
     SportsLeagueCategory, SportsMatch, SportsState, SportsTeam,
 )
-from .db_utils import retry_on_locked
+from .db_utils import chunked, retry_on_locked
 from .fmt_utils import counted
 from .program_titles import strip_marks, title_key
 from .tz_utils import format_local, get_display_tz, is_24h
@@ -69,8 +69,18 @@ _NOT_A_RACE = re.compile(r'\b(practice|qualifying|qualifier|pole|classics?|highl
 #: Words that say nothing about which race a row is (6.4).
 _RACE_FILLER = frozenset('live new race series cup championship the at from in on of and coverage motor '
                          'motorsport motorsports racing nascar'.split())
+#: A listing of a game already played, which a lookup by name would ask about on the wrong day. Read
+#: only where a lookup is queued: a replay of a stored game still matches it, as a replay (6.5).
+_RERUN = re.compile(r'\b(replay|rewind|encore|classics?)\b')
+_YEAR = re.compile(r'\b(19\d\d|20\d\d)\b')
+#: One word each for the sports a provider's sports channels carry. A league's category says which
+#: channels carry it, not that every listing on them is its game: prod's "College Football Package"
+#: carries college basketball, volleyball and soccer too (dev/docs/BUGS.md 2026-11-14 @ 11:28:49 am).
+_SPORT_WORDS = frozenset('basketball baseball softball volleyball hockey soccer football lacrosse rugby cricket '
+                         'wrestling tennis golf gymnastics swimming'.split())
 _NOT_WORD = re.compile(r"[^\w']+")
-_APOSTROPHES = str.maketrans({'’': "'", '‘': "'", '`': "'"})
+#: `&` is read as `and`, the way TheSportsDB spells `Texas A and M` and a guide `Texas A&M`.
+_SPELLING = str.maketrans({'’': "'", '‘': "'", '`': "'", '&': ' and '})
 
 
 def normalize(text: str | None) -> str:
@@ -78,7 +88,7 @@ def normalize(text: str | None) -> str:
     but letters, digits and apostrophes turned to spaces, so `Dallas 🏈 [NFL] Cowboys` reads as
     `dallas nfl cowboys` and `Montréal` as `montreal`. Marks come off before folding, since folding
     turns `ᴸᶦᵛᵉ` into the word `live`."""
-    text = strip_marks(text).translate(_APOSTROPHES)
+    text = strip_marks(text).translate(_SPELLING)
     text = ''.join(ch for ch in unicodedata.normalize('NFKD', text) if not unicodedata.combining(ch))
     text = _NOT_WORD.sub(' ', text.casefold()).replace('_', ' ')
     return ' '.join(text.split())
@@ -141,6 +151,8 @@ class LeagueText:
     other_terms: list
     other_categories: set
     teams: dict = field(default_factory=dict)
+    #: The words of the league's own sport, read once from league.sport.
+    own_sport: frozenset | None = None
 
     def evidence(self, text: str, category: str | None) -> str | None:
         """'text' or 'category' for this league, or None. A row that names another league and not
@@ -149,9 +161,38 @@ class LeagueText:
             return 'text'
         if any(_has(text, t) for t in self.other_terms):
             return None
-        if category is not None and category in self.categories:
+        if category is not None and category in self.categories and not self.names_other_sport(text):
             return 'category'
         return None
+
+    def name_evidence(self, text: str, category: str | None) -> str | None:
+        """evidence(), or 'sport' for a channel name that names the league's own sport and no other
+        sport or league: ESPN+'s `Football: Duke vs. #7 Miami`, Flo's `football: Maine vs UAlbany`.
+        Read for a game's name only, where both teams must face off in it, and never for a race: a
+        tour's `Golf: ...` names would all read as the one tournament of the day (dev/changelog/1562)."""
+        found = self.evidence(text, category)
+        if (found is not None or any(_has(text, t) for t in self.other_terms) or self.names_other_sport(text)
+                or category in self.other_categories):
+            return found
+        return 'sport' if any(w in self.sport_words() for w in text.split()) else None
+
+    def sport_words(self) -> frozenset:
+        """The words of the league's sport as TheSportsDB spells it that name a sport: `football` for
+        American Football, `soccer` for Soccer. Never the `football` names_other_sport() allows a
+        soccer league, or every soccer league would read ESPN+'s college football names."""
+        return frozenset(normalize(self.league.sport).split()) & _SPORT_WORDS
+
+    def names_other_sport(self, text: str) -> bool:
+        """The row's text names a sport that is not this league's: `College Basketball` on a channel
+        in a college football category. A league whose sport is not known reads nothing here."""
+        own = self._own_sport()
+        return bool(own) and any(w in _SPORT_WORDS and w not in own for w in text.split())
+
+    def _own_sport(self) -> frozenset:
+        if self.own_sport is None:
+            sport = normalize(self.league.sport).split()
+            self.own_sport = frozenset(sport) | (frozenset({'football'}) if 'soccer' in sport else frozenset())
+        return self.own_sport
 
 
 _ASCII_RUN = re.compile(r'[A-Za-z0-9]+')
@@ -193,13 +234,16 @@ def leagues_for_listing(title, sub_title, category) -> list:
             if _league_text(league, [o for o in leagues if o.id != league.id], categories).evidence(text, category)]
 
 
-def _load_teams(lt: LeagueText, events: list):
+def _load_teams(lt: LeagueText, events: list, every_team: bool = False):
     """Each team's names and usable city (6.2). Until a team's lookup has run only its full name from
     the event counts. A city shared by two of the league's teams, anywhere in its stored schedule and
-    not only in this run's games, reads as neither."""
+    not only in this run's games, reads as neither. `every_team` loads all the league's stored teams
+    rather than only this run's games', for finding listings of games not stored at all."""
     ids = {i for e in events for i in (e.home_team_id, e.away_team_id) if i}
     league_ids = {i for pair in db.session.query(SportsEvent.home_team_id, SportsEvent.away_team_id)
                   .filter(SportsEvent.league_id == lt.league.id).distinct().all() for i in pair if i} | ids
+    if every_team:
+        ids = league_ids
     rows = {t.tsdb_id: t for t in SportsTeam.query.filter(SportsTeam.tsdb_id.in_(league_ids)).all()}
     fallback = {}
     for e in events:
@@ -330,6 +374,86 @@ class Found:
     #: A person marked it a wrong match: still stored, so it is never marked gone, but it takes no
     #: part in the guide's start, the first airing or the trust measurement.
     rejected: bool = False
+
+
+#: A ranking in front of a team, `#7 BYU vs. #23 Baylor`, which would otherwise stand between the joiner
+#: and the team.
+_RANKING = re.compile(r'#\s*\d+\s*')
+_HOME_SECOND = frozenset(('at', '@'))
+
+
+def _named_pair(parts: tuple, teams: dict):
+    """(first team id, second team id, joiner) for a title or episode name that names exactly two of
+    the league's teams by name with only a joiner between them, else None. A team named only inside
+    another's longer name is not named: `Florida Atlantic at Tulsa` names Florida Atlantic, not
+    Florida. Cities are never read here, since a lookup by a guessed team costs a call."""
+    for part in parts:
+        if not part:
+            continue
+        text = normalize(part)
+        named = [tid for tid, team in teams.items() if any(_has(text, n) for n in team.names)]
+        if len(named) < 2:
+            continue
+        folded = _RANKING.sub('', _fold(part))
+        spans = {tid: _spans(folded, TeamText(teams[tid].names)) for tid in named}
+        every = [(s, tid) for tid, found in spans.items() for s in found]
+        kept = {tid for tid, found in spans.items()
+                if any(not any(o[0] <= s[0] and s[1] <= o[1] and o != s for o, other in every if other != tid)
+                       for s in found)}
+        if len(kept) != 2:
+            continue
+        a, b = sorted(kept)
+        for first, second in ((a, b), (b, a)):
+            for s1 in spans[first]:
+                for s2 in spans[second]:
+                    if (s1[1] <= s2[0] and _JOINER.fullmatch(folded[s1[1]:s2[0]])
+                            and not _HYPHEN_AFTER.match(folded[s2[1]:])):
+                        return first, second, folded[s1[1]:s2[0]].strip()
+    return None
+
+
+#: A word hyphened onto the second team's name makes it another team: `Wyoming at Texas-El Paso` is not
+#: Texas, and the guide's spelling matches none of TheSportsDB's (UTEP), so no longer name rules it out.
+#: The first team needs no such check, since the text between it and the second must be a joiner. Only
+#: a hyphen with no space: `Baylor at BYU - Live` is a separator.
+_HYPHEN_AFTER = re.compile(r'-\w')
+
+
+def _names_past_year(text: str, season: str | None) -> bool:
+    """A year before the season's first, `2022 Rose Bowl Ohio State vs Utah`: a game long played."""
+    first = (season or '')[:4]
+    return first.isdigit() and any(int(y) < int(first) for y in _YEAR.findall(text))
+
+
+def _unstored_games(lt: LeagueText, rows: list, hits: dict, capped: list, now: datetime) -> list:
+    """[(UTC day, home id, away id)] to look up by name: listings where a round answer was cut, with
+    the league, of a game not over yet, naming two of its teams side by side, that matched no stored
+    game. `Away at Home` gives the order; any other joiner could be either, so both are asked. One
+    check per distinct title a day, however many channels list it. A listing that says it is a
+    replay, or names an earlier season's year, is a game already played and is never looked up: on
+    prod they were asked about on the day they re-aired (dev/docs/BUGS.md 2026-11-14 @ 11:28:49 am)."""
+    from .sports_data import lookup_days
+    matched = {id(hit[0]) for found in hits.values() for hit in found}
+    by_text = {}
+    for row in rows:
+        if id(row) in matched or row.stop <= now or row.minutes < MIN_GAME_MINUTES or _NOT_A_GAME.search(row.text):
+            continue
+        if not any(lo <= row.start <= hi for lo, hi in capped) or lt.evidence(row.text, row.category) is None:
+            continue
+        if _RERUN.search(row.text) or _names_past_year(row.text, lt.league.current_season):
+            continue
+        key = (row.title, row.sub_title, row.start.date())
+        if key not in by_text or row.start < by_text[key]:
+            by_text[key] = row.start
+    out = []
+    for (title, sub_title, _day), start in sorted(by_text.items(), key=lambda kv: kv[1]):
+        pair = _named_pair((title, sub_title), lt.teams)
+        if pair is None:
+            continue
+        first, second, joiner = pair
+        orders = [(second, first)] if joiner in _HOME_SECOND else [(first, second), (second, first)]
+        out += [(day, home, away) for home, away in orders for day in lookup_days(start)]
+    return list(dict.fromkeys(out))
 
 
 def _identify_matchups(lt: LeagueText, events: list, rows: list) -> dict:
@@ -526,7 +650,7 @@ def _judge_field_events(lt: LeagueText, events: list, rows: list, trusted: bool,
 
 
 # ---------------------------------------------------------------------------
-# Event channels: a channel with no real guide listing, whose name is the only one (6.8)
+# Event channels: a channel with no real guide listing at a game's time, whose name is the only one (6.8)
 # ---------------------------------------------------------------------------
 
 #: How far ahead a name may name a game. On a Wednesday night one account already named all of
@@ -560,17 +684,18 @@ class NameFound:
 
 
 def _candidate_names(lt: LeagueText, now: datetime) -> list:
-    """Channels not hidden, with no guide rows but filler, whose name carries one of the league's terms
-    or that sit in one of its tied categories. A tied category supplies the league, so `US| NHL PPV`'s
-    names need not say NHL. LIKE only narrows; the whole-word check is in Python."""
-    conds = [Channel.name.ilike(f'%{needle}%') for needle in lt.needles]
+    """Channels not hidden whose name carries one of the league's terms or a word for its sport, or
+    that sit in one of its tied categories. A tied category supplies the league, so `US| NHL PPV`'s
+    names need not say NHL. LIKE only narrows; the whole-word check is in Python. Whether the
+    channel's guide lists something real at a game's time is _drop_listed's question, asked once a
+    name has picked the game."""
+    conds = [Channel.name.ilike(f'%{needle}%') for needle in sorted(set(lt.needles) | lt.sport_words())]
     if lt.categories:
         conds.append(Channel.category_name.in_(list(lt.categories)))
     if not conds:
         return []
-    listed = db.session.query(EPGEntry.id).filter(EPGEntry.channel_id == Channel.id, ~_filler()).exists()
     q = db.session.query(Channel.id, Channel.account_id, Channel.category_name, Channel.name, Channel.last_seen_at
-                         ).filter(or_(*conds), ~listed, _offered())
+                         ).filter(or_(*conds), _offered())
     rows = q.all()
     # Only a name the account's latest sync still listed: a channel the provider dropped keeps its last
     # name forever, and that name would match the next game of the same pair. A sync stamps every
@@ -600,7 +725,7 @@ def _match_name_matchups(lt: LeagueText, events: list, channels: list, trusted: 
     for ch in channels:
         if _NOT_A_GAME.search(ch.text):
             continue
-        league = lt.evidence(ch.text, ch.category)
+        league = lt.name_evidence(ch.text, ch.category)
         if league is None:
             continue
         named = []
@@ -610,8 +735,11 @@ def _match_name_matchups(lt: LeagueText, events: list, channels: list, trusted: 
             if a is None or b is None:
                 continue
             got_a, got_b = _team_in(ch.text, a), _team_in(ch.text, b)
-            if got_a and got_b:
-                folded = folded if folded is not None else _fold(ch.name)
+            # A sport word is shared by every league of that sport, so with it a city is not enough:
+            # `Football: Pittsburgh vs. Miami` is college football, not the Steelers and Dolphins.
+            if got_a and got_b and (league != 'sport' or got_a == got_b == 'name'):
+                # ESPN+ ranks a team after the joiner: `Football: Duke vs. #7 Miami`.
+                folded = folded if folded is not None else _RANKING.sub('', _fold(ch.name))
                 if _faces_off(folded, a, b):
                     named.append((candidates, got_a, got_b))
         if len(named) != 1:
@@ -633,7 +761,7 @@ _JOINER = re.compile(r"\s*(?:vs?\.?|versus|at|@|x|[-–—])\s*")
 def _fold(name: str) -> str:
     """A channel name casefolded with accents and marks off, its punctuation kept, since the joiner
     between two teams is often only an `@` or a `-`, which normalize() turns to a space."""
-    text = strip_marks(name).translate(_APOSTROPHES)
+    text = strip_marks(name).translate(_SPELLING)
     return ''.join(ch for ch in unicodedata.normalize('NFKD', text) if not unicodedata.combining(ch)).casefold()
 
 
@@ -689,7 +817,14 @@ def _judge_name(event, lt: LeagueText, ch: NamedChannel, league: str, got_a: str
     else:
         strength = SPORTS_MATCH_WEAK
         evidence = 'the teams by city' if got_a == got_b == 'city' else 'one team by name and one by city'
-    where = 'the league named in it' if league == 'text' else f'its category, {ch.category}'
+    if league == 'text':
+        where = 'the league named in it'
+    elif league == 'sport':
+        where = 'the sport named in it'
+    elif league == 'category':
+        where = f'its category, {ch.category}'
+    else:
+        raise ValueError(f'league evidence nothing handles: {league!r}')
     when, strength, agrees = _name_when(event, ch.read.clock, strength, in_range, trusted, clock)
     found = NameFound(ch, strength, f'{_NAME_PREFIX}: matched on {where}, {evidence}, {when}.')
     found.airing = _name_airing(lt.categories.get(ch.category), ch, agrees)
@@ -770,6 +905,42 @@ def _match_name_races(lt: LeagueText, events: list, channels: list) -> dict:
         found.airing = _name_airing(lt.categories.get(ch.category), ch, False)
         out[event.id].append(found)
     return out
+
+
+def _event_spans(event) -> list:
+    """From TheSportsDB's start (or the middle of its day) and from the guide's own start, when one is
+    stored, for the event's minimum length: a listing far from TheSportsDB's time is still matched as
+    a listing (6.5), and its channel must not be read by its name beside it."""
+    length = timedelta(minutes=MIN_GAME_MINUTES if (event.home_team_id or event.away_team_id) else MIN_RACE_MINUTES)
+    starts = {_anchor(event)} | ({event.guide_start} if event.guide_start is not None else set())
+    return [(s, s + length) for s in sorted(starts)]
+
+
+def _drop_listed(named: dict, events: dict) -> dict:
+    """The name matches whose channel's guide has nothing real at the event's time: a channel with a
+    listing then is read by its listing (6.3), never by its name as well. Asked per event rather than
+    per channel, since an event channel renamed for its next game keeps its earlier blocks under its
+    former name (`NCAAF 27:` before `NCAAF 27: 1pm Arkansas State at Coastal Carolina`), which no
+    longer equal its name and so are not filler. Asking whether the channel had any real row at all
+    left 10 of 2026-11-14's college football games matched to nothing (dev/changelog/1562)."""
+    ids = sorted({f.channel.channel_id for items in named.values() for f in items})
+    if not ids:
+        return named
+    spans = {eid: _event_spans(events[eid]) for eid, items in named.items() if items}
+    lo = min(s[0] for each in spans.values() for s in each)
+    hi = max(s[1] for each in spans.values() for s in each)
+    listed = defaultdict(list)
+    for chunk in chunked(ids, 500):
+        for channel_id, start, stop in (
+                db.session.query(EPGEntry.channel_id, EPGEntry.start_time, EPGEntry.stop_time)
+                .join(Channel, Channel.id == EPGEntry.channel_id)
+                .filter(EPGEntry.channel_id.in_(chunk), EPGEntry.start_time < hi, EPGEntry.stop_time > lo,
+                        ~_filler()).all()):
+            listed[channel_id].append((start, stop))
+    return {eid: [f for f in items
+                  if not any(start < hi_ and stop > lo_ for start, stop in listed[f.channel.channel_id]
+                             for lo_, hi_ in spans[eid])]
+            for eid, items in named.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -927,7 +1098,7 @@ def match_league(league_id: int, now: datetime, pause: float = PAUSE_SECONDS, cl
     name one. Returns counts for the run's note. `clock` writes a time into a reason sentence, in the
     display timezone; run() builds it once."""
     clock = clock or _clock()
-    empty = {'events': 0, 'matched': 0, 'rows': 0, 'named': 0, 'channels': 0}
+    empty = {'events': 0, 'matched': 0, 'rows': 0, 'named': 0, 'channels': 0, 'lookups': 0}
     league = db.session.get(SportsLeague, league_id)
     if league is None:
         return empty
@@ -935,19 +1106,27 @@ def match_league(league_id: int, now: datetime, pause: float = PAUSE_SECONDS, cl
     guide_end = db.session.query(db.func.max(EPGEntry.start_time)).scalar() or now
     events = _events_in_range(league_id, now - LOOKBACK, max(guide_end, now) + WINDOW)
     name_events = _events_in_range(league_id, now - LOOKBACK, now + NAME_AHEAD)
-    if not events and not name_events:
+    from .sports_data import capped_spans
+    # Clipped to the guide still to come: a round cut with every game already started reaches to
+    # datetime.max, and its stored games can all be over (the NBA's round 0, dev/changelog/1550).
+    capped = [(max(lo, now - LOOKBACK), min(hi, max(guide_end, now) + WINDOW)) for lo, hi in capped_spans(league_id)]
+    capped = [(lo, hi) for lo, hi in capped if lo <= hi]
+    if not events and not name_events and not capped:
         return empty
     leagues = SportsLeague.query.all()
     lt = _league_text(league, [o for o in leagues if o.id != league.id], SportsLeagueCategory.query.all())
-    _load_teams(lt, list({e.id: e for e in events + name_events}.values()))
+    _load_teams(lt, list({e.id: e for e in events + name_events}.values()), every_team=bool(capped))
     trusted = league_trusted(league)
     matchups = [e for e in events if e.home_team_id or e.away_team_id]
     fields = [e for e in events if not (e.home_team_id or e.away_team_id)]
     results = {}
     rows = []
-    if events:
-        spans = [(_anchor(e) - WINDOW, _anchor(e) + WINDOW) for e in matchups] + [_band(e) for e in fields]
+    hits = {}
+    unstored = []
+    spans = [(_anchor(e) - WINDOW, _anchor(e) + WINDOW) for e in matchups] + [_band(e) for e in fields] + capped
+    if spans:
         rows = _candidate_rows(lt, min(s[0] for s in spans), max(s[1] for s in spans))
+    if events:
         rejected = {(m.event_id, m.channel_id, m.program_start_time, m.title_key) for m in SportsMatch.query.filter(
             SportsMatch.event_id.in_([e.id for e in events]), SportsMatch.kind == SPORTS_MATCH_KIND_GUIDE,
             SportsMatch.rejected_at.isnot(None)).all()}
@@ -957,6 +1136,8 @@ def match_league(league_id: int, now: datetime, pause: float = PAUSE_SECONDS, cl
         field_results = _judge_field_events(lt, fields, rows, trusted, now, rejected)
         for event in fields:
             results[event.id] = field_results.get(event.id, ([], None, 0))
+    if capped:
+        unstored = _unstored_games(lt, rows, hits, capped, now)
     # A name is judged against the guide start already stored, so an event whose time disagrees is
     # at worst one run behind.
     named = {}
@@ -966,6 +1147,7 @@ def match_league(league_id: int, now: datetime, pause: float = PAUSE_SECONDS, cl
                                      channels, trusted, now, clock)
         named.update(_match_name_races(lt, [e for e in name_events if not (e.home_team_id or e.away_team_id)],
                                        channels))
+        named = _drop_listed(named, {e.id: e for e in name_events})
     db.session.rollback()   # no read transaction held across the writes and pauses below
 
     matched = rows_matched = 0
@@ -977,9 +1159,12 @@ def match_league(league_id: int, now: datetime, pause: float = PAUSE_SECONDS, cl
             time_mod.sleep(pause)
     _store_names([e.id for e in name_events], named, now)
     _store_trust(league_id, now)
+    from .sports_data import queue_guide_lookups
+    lookups = queue_guide_lookups(league_id, unstored, now) if unstored else 0
     return {'events': len(events), 'matched': matched, 'rows': rows_matched,
             'named': sum(1 for items in named.values() if items),
-            'channels': len({f.channel.channel_id for items in named.values() for f in items})}
+            'channels': len({f.channel.channel_id for items in named.values() for f in items}),
+            'lookups': lookups}
 
 
 def run(now: datetime = None, pause: float = PAUSE_SECONDS) -> str:
@@ -1001,9 +1186,13 @@ def run(now: datetime = None, pause: float = PAUSE_SECONDS) -> str:
         totals = Counter()
         for league_id in league_ids:
             totals.update(match_league(league_id, now, pause, clock))
-        from .sports_data import link_unfinished_recordings
+        from .sports_data import ROUND_ROW_CAP, link_unfinished_recordings
         linked = link_unfinished_recordings(now)
         _queue_rule_checks(league_ids)
+        # A guide match is what gives a field event its time, so a league's numbered channels on
+        # the output feed take their new games here as well as at a schedule update.
+        from .sports_feed import place_all_guarded
+        place_all_guarded(now)
         seconds = time_mod.monotonic() - started
         note = (f'Found {counted(totals["matched"], "event")} of {totals["events"]} in the guide, on '
                 f'{counted(totals["rows"], "listing")}, in {seconds:.1f} seconds.')
@@ -1012,6 +1201,9 @@ def run(now: datetime = None, pause: float = PAUSE_SECONDS) -> str:
                      f'read from their names.')
         if linked:
             note += f' Linked {counted(linked, "recording")} to its event.'
+        if totals['lookups']:
+            note += (f' Queued {counted(totals["lookups"], "lookup")} by name for games the guide lists where '
+                     f"TheSportsDB's schedule came back cut at {ROUND_ROW_CAP} games.")
         _store_note(note, now, ran=True)
         log.info('Sports match: %s', note)
         return note
@@ -1083,6 +1275,45 @@ def game_counts(event_ids: list) -> dict:
     return {event_id: {'channels': channels, 'first': int(first or 0), 'replay': int(replay or 0),
                        'unknown': int(unknown or 0), 'wrong': int(wrong or 0)}
             for event_id, channels, first, replay, unknown, wrong in rows}
+
+
+def _playable():
+    """The guide matches a sports channel on the output feed may play from: a strong match still in
+    the guide, not marked wrong, and not a listing the guide calls a replay. An unknown airing is
+    doubt, which nothing skips (6.5)."""
+    return _live_matches().filter(SportsMatch.strength == SPORTS_MATCH_STRONG,
+                                  SportsMatch.airing != SPORTS_AIRING_REPLAY)
+
+
+def airing_now(event_ids: list, now: datetime, before: timedelta = timedelta(0),
+               after: timedelta = timedelta(0)) -> list:
+    """[(event id, channel id, program start, program stop)] for each listing of these events on a
+    visible channel that is within reach of `now`: it starts no more than `before` from now and
+    ended no more than `after` ago. With both at zero that is the listings on at `now`. One query
+    (app/sports_feed.py decides which of them a play takes)."""
+    if not event_ids:
+        return []
+    return [tuple(row) for row in (
+        _playable().with_entities(SportsMatch.event_id, SportsMatch.channel_id,
+                                  SportsMatch.program_start_time, SportsMatch.program_stop_time)
+        .join(Channel, Channel.id == SportsMatch.channel_id)
+        .filter(SportsMatch.event_id.in_(event_ids), SportsMatch.program_start_time <= now + before,
+                SportsMatch.program_stop_time > now - after, _offered()).distinct().all())]
+
+
+def listing_windows(event_ids: list) -> dict:
+    """{event id: [(channel id, account id, program start, program stop)]} over the listings a
+    sports channel may play from, on visible channels, in one query (app/sports_feed.py)."""
+    out = {}
+    if not event_ids:
+        return out
+    rows = (_playable().with_entities(SportsMatch.event_id, SportsMatch.channel_id, Channel.account_id,
+                                      SportsMatch.program_start_time, SportsMatch.program_stop_time)
+            .join(Channel, Channel.id == SportsMatch.channel_id)
+            .filter(SportsMatch.event_id.in_(event_ids), _offered()).all())
+    for event_id, channel_id, account_id, start, stop in rows:
+        out.setdefault(event_id, []).append((channel_id, account_id, start, stop))
+    return out
 
 
 #: What the listings dialog calls each airing. Every value of the vocabulary is named here.

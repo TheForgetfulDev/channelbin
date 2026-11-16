@@ -1743,7 +1743,9 @@ function addSecondsToUtcIso(isoStr, seconds) {
    empty box is worse than no box. The caller hides the container on ''. `withTitle: false`
    is for a surface whose own heading already carries the title (the program chooser). */
 function progHeadHtml(prog, { withTitle = true } = {}) {
-  if (!prog.id || prog.is_dummy || !prog.title) return '';
+  // A game only an event channel names has no listing, and its head is drawn from the times the
+  // server picked for it (dev/changelog/1539).
+  if ((!prog.id && !prog.sports_event_id) || prog.is_dummy || !prog.title) return '';
   const fmtT = iso => fmtTimeTz(utcIsoToDate(iso));
   const start = new Date(prog.start_time + 'Z');
   const mins = Math.round((new Date(prog.stop_time + 'Z') - start) / 60000);
@@ -2041,6 +2043,21 @@ function openModal(prog, ch, opts = {}) {
   // normal schedule/edit.
   const replaceRecId = opts.replaceRecId || null;
   document.getElementById('modal-replace-id').value = replaceRecId || '';
+  // A league page's Record (dev/changelog/1539): the notice saying which listing it picked and
+  // why, and for a game only an event channel names, the event the server re-reads. Both
+  // cleared on every other open, like replace mode.
+  const sportsEvent = document.getElementById('modal-sports-event');
+  if (sportsEvent) sportsEvent.value = opts.sportsEventId || '';
+  const pickNote = document.getElementById('modal-pick-note');
+  if (pickNote) {
+    const n = opts.notice;
+    pickNote.className = `notice ${n && n.tone === 'warn' ? 'notice-warn' : 'notice-info'}`;
+    pickNote.innerHTML = n
+      ? `<div><strong>${escHtml(n.strong)}</strong> ${escHtml(n.text)}${n.searchUrl
+        ? ` <a href="${escHtml(n.searchUrl)}">Pick another listing in Programs ${icon('forward')}</a>` : ''}</div>`
+      : '';
+    pickNote.style.display = n ? '' : 'none';
+  }
 
   const isTerminal = prog.has_recording && prog.recording_id &&
     TERMINAL_STATUSES.has(prog.recording_status);
@@ -2071,7 +2088,7 @@ function openModal(prog, ch, opts = {}) {
   modalTimes().stop.set(new Date(stopSrc + 'Z'));
   if (isEdit && !replaceRecId) setOpenedWindow(startSrc, stopSrc);
   else setOpenedWindow(null, null);
-  document.getElementById('modal-epg-id').value     = prog.id;
+  document.getElementById('modal-epg-id').value     = prog.id || '';
   // Prefer the program's own channel_id: a group row's ch.id is the synthetic
   // 'g<id>' DOM key, while prog.channel_id is the group's real active member.
   document.getElementById('modal-channel-id').value = prog.channel_id || ((ch && ch.id) ? ch.id : '');

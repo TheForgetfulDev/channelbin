@@ -497,6 +497,12 @@ _DEFAULTS = {
         # None → DEFAULT_PIDFILE_PATH (instance/channelbin.pid). Raw-YAML-only, same as
         # serve_mockups - not something a normal install ever needs to change.
         'pidfile_path': None,
+        # ChannelBin's own address as other devices reach it, whole, with its http:// or
+        # https://: https://channelbin.example.com, http://192.168.1.1:5000.
+        # Used where ChannelBin has to name itself with no request to read the address from
+        # (links in push notifications) and shown as the server address on the IPTV Output
+        # page. An IPTV player is always handed the address it connected on, never this.
+        'public_url': '',
     },
     # A door on something that was standing open, not a hardened auth system: one shared
     # password, no usernames/accounts/roles/2FA. Off by default so existing installs are
@@ -515,7 +521,7 @@ _DEFAULTS = {
             'enabled': False,
             'api_key_hash': '',           # werkzeug scrypt hash - NEVER the plaintext
         },
-        # The output feed: ChannelBin as an Xtream/M3U/XMLTV source an IPTV app adds as an
+        # The output feed: ChannelBin as an Xtream/M3U/XMLTV source an IPTV player adds as an
         # account, serving the TV Guide's channels and groups (app/output_feed.py,
         # dev/docs/DESIGN-output-feed.md). The first optional module: off by default, one
         # switch, nothing runs or is written while it is off. None of these keys needs a
@@ -528,15 +534,25 @@ _DEFAULTS = {
             # including the one that starts each play, and check_password_hash measured
             # 147 ms per call where a constant-time compare is 1 us (design doc section 6.2).
             'password': '',
-            'mode': 'proxy',              # proxy | redirect - output_feed.MODES
+            'mode': 'proxy',              # proxy | mixed | redirect - output_feed.MODES
             'accounts': [],               # account ids the feed may serve from; [] = all
-            'held_seats': {},             # account id -> seats kept free for the IPTV app (redirect mode)
-            'buffer_mb': 16,              # the in-memory ring per viewer (proxy mode)
-            'reserve_seconds': 3,         # how far behind live the IPTV app plays; 0 = pass-through
+            'held_seats': {},             # account id -> seats kept free for the IPTV player (redirect, mixed)
+            # The in-memory ring per relayed viewer (proxy, mixed), a ceiling and not an allocation: it
+            # holds what is waiting to go out. Sized for a connection's opening burst plus
+            # the reserve - 29 s of burst and 3 s of reserve is 32 MB at 8 Mbps and 64 MB at
+            # 16 Mbps (dev/changelog/942, 1527). 16 lost the head of every HD play.
+            'buffer_mb': 64,
+            'reserve_seconds': 3,         # how far behind live the IPTV player plays; 0 = pass-through
             'max_viewers': 3,             # concurrent relay sessions
             'idle_seconds': 30,           # a client that has read nothing for this long is gone
             'max_session_hours': 12,      # the hard cap on one session
             'xmltv_days': 3,              # listings depth in xmltv.php
+            # A sports channel plays the channel whose guide lists its game from this long
+            # before the listing starts to this long after it ends, every mode: a viewer
+            # tuning in for the pregame, or to a game running long, expects something on
+            # (dev/changelog/1529). 0 and 0 is the listing's own time.
+            'sports_before_minutes': 60,
+            'sports_after_minutes': 120,
         },
     },
     'database': {
@@ -914,18 +930,19 @@ _DEFAULTS = {
     # Auto-record rules (app/auto_rules.py, DESIGN-autoschedule.md §9).
     'sports_data': {
         # Seconds between calls to TheSportsDB. Together with the jitter, a shortest possible
-        # wait under 12 seconds is refused: the fastest pace measured clean
-        # (dev/docs/DESIGN-sports-data.md 4.1).
-        'call_spacing_seconds': 60,
+        # wait under sports_data.MIN_WAIT_SECONDS (8) is refused: the free key answers about
+        # 10 calls a minute from one address (dev/changelog/1551).
+        'call_spacing_seconds': 10,
         # Each wait is the spacing plus or minus a random amount up to this.
-        'call_jitter_seconds': 20,
+        'call_jitter_seconds': 2,
         # How far ahead a schedule is kept. Further ahead means more calls.
         'horizon_days': 21,
         # How long a past event is kept.
         'history_keep_days': 30,
         # Download the event's poster and background for a recording matched to one, for the
-        # files written beside it for media servers (app/sports_images.py, dev/changelog/1465).
-        # Off, nothing is downloaded and none already downloaded is used.
+        # files written beside it for media servers (app/sports_images.py, dev/changelog/1465),
+        # and the badges of the teams playing next on the output feed's sports channels
+        # (dev/changelog/1532). Off, nothing is downloaded and none already downloaded is used.
         'download_images': True,
     },
     'auto_scheduling': {
@@ -940,7 +957,6 @@ _DEFAULTS = {
     },
     'notifications': {
         'push_rate_limit_seconds': 60,
-        'base_url': '',   # e.g. http://192.168.1.50:5000 - used to build links in push notifications
         'services': {
             'discord':        {'enabled': False, 'url': ''},
             'home_assistant': {'enabled': False, 'url': ''},
@@ -1632,6 +1648,49 @@ def _cfg_m008_drop_index_janitor_grace(cfg):
     return cfg
 
 
+def _cfg_m009_public_url(cfg: dict) -> dict:
+    """notifications.base_url becomes flask.public_url: the address was only ever ChannelBin's
+    own, and the IPTV Output page shows it too (dev/changelog/1525). A value already typed
+    under the new key wins; an empty old value carries nothing."""
+    present, value = _pop_config_path(cfg, ('notifications', 'base_url'))
+    if not present:
+        return cfg
+    value = str(value or '').strip()
+    flask_cfg = cfg.get('flask')
+    if not isinstance(flask_cfg, dict):
+        flask_cfg = {}
+        cfg['flask'] = flask_cfg
+    if value and not str(flask_cfg.get('public_url') or '').strip():
+        flask_cfg['public_url'] = value
+        log.info('config migration: notifications.base_url (%s) moved to flask.public_url', value)
+    return cfg
+
+
+def public_url_problem(value) -> str:
+    """Why `value` cannot be `flask.public_url`, or ''. Blank is allowed and means unset.
+    The address starts every link in a push notification and is typed into an IPTV player
+    as it stands, so it has to be a whole one."""
+    from urllib.parse import urlsplit
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    try:
+        parts = urlsplit(text)
+        host = parts.hostname
+    except ValueError:
+        parts, host = None, None
+    if parts is None or parts.scheme not in ('http', 'https') or not host:
+        return ('Type the whole address, starting with http:// or https://, like '
+                'https://channelbin.example.com or http://192.168.1.1:5000.')
+    return ''
+
+
+def public_url(cfg: dict) -> str:
+    """ChannelBin's own address from `flask.public_url`, with no trailing slash, or '' when
+    none is set. The one reader, so every surface that names ChannelBin agrees."""
+    return str((cfg.get('flask') or {}).get('public_url') or '').strip().rstrip('/')
+
+
 CONFIG_MIGRATIONS = [
     (1, "rename legacy 'xtream' section to 'sync'", _cfg_m001_xtream_to_sync),
     (2, "channel_testing.failing_score_threshold -> failing_band", _cfg_m002_failing_band),
@@ -1647,6 +1706,8 @@ CONFIG_MIGRATIONS = [
      _cfg_m007_reference_minutes_follows_test_duration),
     (8, 'search.index_janitor_grace_minutes dropped, the janitor repairs on its first tick',
      _cfg_m008_drop_index_janitor_grace),
+    (9, 'notifications.base_url -> flask.public_url, ChannelBin\'s own address',
+     _cfg_m009_public_url),
 ]
 
 CURRENT_CONFIG_VERSION = CONFIG_MIGRATIONS[-1][0]

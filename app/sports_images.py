@@ -1,4 +1,4 @@
-"""TheSportsDB's poster and background for a recording matched to one of its events.
+"""TheSportsDB's images: a recording's poster and background, and a team's badge.
 
 A recording's cover is otherwise a frame from the program, and for a game that is whatever graphic
 it landed on. TheSportsDB has a designed portrait poster for many events and a landscape thumb for
@@ -22,6 +22,11 @@ the frame it would otherwise fall back to is landscape as well (dev/changelog/14
 - **Teardown:** a file is shared by every recording naming its address, so it goes only with the
   last of them: recorder.recording_image_paths() lists it then, database.detach_recording_references()
   forgets its row, and the worker's daily prune catches a link that moved or was dropped.
+- **A badge belongs to a team, not a recording.** It is what a sports channel's waiting screen
+  draws a team with (app/sports_screen.py), so it is downloaded only for a team in the coming games
+  of a sports channel the output feed serves (sports_feed.screen_team_ids()), after any recording's
+  image, through the same checks. It is kept while its team's row names its address, so the daily
+  prune takes it once the team is gone or TheSportsDB gives it another badge.
 """
 import hashlib
 import logging
@@ -39,7 +44,7 @@ from urllib3.util import parse_url
 from . import db
 from .database import (
     REC_ENDED_STATUSES, SPORTS_FETCH_OK, SPORTS_FETCH_RATE_LIMITED, SPORTS_FETCH_REFUSED, Recording,
-    RecordingSports, SportsImage,
+    RecordingSports, SportsImage, SportsTeam,
 )
 from .db_utils import retry_on_locked
 from .profile_posters import EXTENSIONS, MAX_BYTES, sniff_image, write_image_file
@@ -132,6 +137,20 @@ def _wanting():
             .order_by(RecordingSports.linked_at, RecordingSports.recording_id).all())
 
 
+def _badge_urls(cfg: dict, now: datetime) -> list:
+    """The badge addresses a waiting screen would draw now, or [] while the output feed is off:
+    nobody can tune in to a screen then. A few queries, whatever the count."""
+    from .output_feed import feed_config, is_enabled
+    if not is_enabled(feed_config(cfg)):
+        return []
+    from .sports_feed import screen_team_ids
+    ids = screen_team_ids(now)
+    if not ids:
+        return []
+    return [u for (u,) in db.session.query(SportsTeam.badge_url).filter(
+        SportsTeam.tsdb_id.in_(ids), SportsTeam.badge_url.isnot(None)).order_by(SportsTeam.tsdb_id)]
+
+
 def needed() -> bool:
     """An unfinished recording has an address to download, so the worker has work even with nothing
     followed (sports_data.worker_needed())."""
@@ -146,12 +165,15 @@ def _file_present(cfg: dict, img) -> bool:
 
 
 def next_due(cfg: dict, now: datetime):
-    """The address to download next, or None. Only for a recording whose metadata file is on, since
-    that is the only place an image is used: nothing is fetched that nobody gets. A file that went
-    missing is downloaded again. Two queries, whatever the count."""
+    """The address to download next, or None. A recording's image only for a recording whose
+    metadata file is on, since that is the only place one is used, and a badge only for a team a
+    waiting screen would draw: nothing is fetched that nobody gets. A recording's come first, since
+    it has a deadline. A file that went missing is downloaded again. A few queries, whatever the
+    count."""
     from .metadata_sidecar import sidecar_enabled
-    urls = list(dict.fromkeys(u for link, rec in _wanting() if sidecar_enabled(cfg, rec.profile, rec)
-                              for u in (link.poster_url, link.thumb_url) if u))
+    urls = [u for link, rec in _wanting() if sidecar_enabled(cfg, rec.profile, rec)
+            for u in (link.poster_url, link.thumb_url) if u]
+    urls = list(dict.fromkeys(urls + _badge_urls(cfg, now)))
     if not urls:
         return None
     known = {i.url: i for i in SportsImage.query.filter(SportsImage.url.in_(urls))}
@@ -266,7 +288,7 @@ def _record(url, name, outcome, reason, settings, now, called):
 
 
 # ---------------------------------------------------------------------------
-# Reading: the sidecar and the recording page
+# Reading: the sidecar, the recording page and the waiting screen
 # ---------------------------------------------------------------------------
 
 def images_for(link) -> dict:
@@ -303,15 +325,25 @@ def artwork(cfg: dict, link, finished: bool = True, used: bool = True) -> dict:
     return {role: image_state(cfg, url, known.get(url), finished, used) for role, url in role_urls(link).items()}
 
 
+def badge_path(cfg: dict, url: str):
+    """The downloaded badge at `url`, or None while there is none: the screen then draws the team's
+    short code in its color. One query; stats only the images folder."""
+    if not url or not enabled(cfg):
+        return None
+    img = SportsImage.query.filter_by(url=url).first()
+    return image_path(cfg, img.file_name) if img is not None and _file_present(cfg, img) else None
+
+
 # ---------------------------------------------------------------------------
 # Teardown
 # ---------------------------------------------------------------------------
 
 def _named(url_column):
-    """Whether any recording_sports row names this address, as a SQL condition: a subquery, so the
-    cost does not grow with a list of bound values."""
+    """Whether any recording_sports row or any team names this address, as a SQL condition:
+    subqueries, so the cost does not grow with a list of bound values."""
     return or_(url_column.in_(db.session.query(RecordingSports.poster_url).filter(RecordingSports.poster_url.isnot(None))),
-               url_column.in_(db.session.query(RecordingSports.thumb_url).filter(RecordingSports.thumb_url.isnot(None))))
+               url_column.in_(db.session.query(RecordingSports.thumb_url).filter(RecordingSports.thumb_url.isnot(None))),
+               url_column.in_(db.session.query(SportsTeam.badge_url).filter(SportsTeam.badge_url.isnot(None))))
 
 
 def owned_paths(recording_id: int, cfg: dict) -> list:
@@ -324,6 +356,7 @@ def owned_paths(recording_id: int, cfg: dict) -> list:
     shared = {u for row in db.session.query(RecordingSports.poster_url, RecordingSports.thumb_url).filter(
         RecordingSports.recording_id != recording_id,
         or_(RecordingSports.poster_url.in_(mine), RecordingSports.thumb_url.in_(mine))) for u in row if u}
+    shared.update(u for (u,) in db.session.query(SportsTeam.badge_url).filter(SportsTeam.badge_url.in_(mine)))
     out = []
     for img in SportsImage.query.filter(SportsImage.url.in_(set(mine) - shared), SportsImage.file_name.isnot(None)):
         try:

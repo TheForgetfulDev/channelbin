@@ -109,6 +109,13 @@ class SportsListScriptTests(unittest.TestCase):
     def test_an_action_refresh_lands_after_a_timed_one_already_in_flight(self):
         self.assertEqual(self.obs['live_race'], {'mark': 'action', 'deletes': 1})
 
+    def test_stop_following_asks_in_the_leagues_own_noun(self):
+        """The confirm said "games" of a racing league (dev/changelog/1568)."""
+        text = self.obs['stop_confirm']
+        self.assertIn("stops checking TheSportsDB for", text)
+        self.assertIn('races', text)
+        self.assertNotIn('game', text)
+
     def test_thesportsdb_is_a_link_in_a_new_tab_in_the_dialog(self):
         self.assertEqual(self.obs['hint_link']['text'], 'TheSportsDB')
         self.assertEqual(self.obs['hint_link']['target'], '_blank')

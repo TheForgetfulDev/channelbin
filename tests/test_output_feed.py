@@ -1,4 +1,4 @@
-"""The output feed: ChannelBin as an Xtream/M3U/XMLTV source for an IPTV app
+"""The output feed: ChannelBin as an Xtream/M3U/XMLTV source for an IPTV player
 (app/output_feed.py, app/routes/output_feed.py, dev/docs/DESIGN-output-feed.md,
 dev/changelog/1364).
 
@@ -8,7 +8,7 @@ order, a group as one channel with its members unlisted, the allowlist, categori
 listings join), the guide half (xmltv.php from one query, UTC with an explicit offset,
 get.php as the feed's own URLs), the self-sync proof (ChannelBin's own XtreamClient and
 sync against the running feed over loopback), the relay (a real ffmpeg over a synthesized
-clip: bytes reach the IPTV app, every end has a name and releases everything, a recording preempts
+clip: bytes reach the IPTV player, every end has a name and releases everything, a recording preempts
 a viewer and both the alert and the recording's timeline say so, a dead group member is
 replaced inside the same response, the cap and the connection limit refuse by name), the
 ring's bounds, redirect mode (a 302 per tune-in, held seats subtracted from the recorder's
@@ -128,7 +128,7 @@ class ConfigTests(unittest.TestCase):
 
 class AccessLogMaskingTests(unittest.TestCase):
     def test_the_feeds_credentials_are_masked_in_an_access_log_line(self):
-        """The IPTV app sends the pair in the stream path and in the .php query, and werkzeug's
+        """The IPTV player sends the pair in the stream path and in the .php query, and werkzeug's
         access line reaches the log handlers through CredentialMaskingFilter
         (DESIGN-output-feed.md section 8)."""
         from app.url_utils import mask_creds_in_text
@@ -196,12 +196,27 @@ class GateTests(unittest.TestCase):
         self.assertTrue(load_config()['integrations']['output_feed']['enabled'])
         r = post('reserve_seconds', 60)
         self.assertEqual(r.status_code, 400)
-        self.assertIn('12 seconds fits', r.get_json()['error'])
+        self.assertIn('50 seconds fits', r.get_json()['error'])
         self.assertEqual(post('mode', 'teleport').status_code, 400)
+        self.assertEqual(post('mode', 'mixed').status_code, 200)
+        self.assertEqual(load_config()['integrations']['output_feed']['mode'], 'mixed')
+        settings = self.client.get('/settings').get_data(as_text=True)
+        for value in ('proxy', 'mixed', 'redirect'):
+            self.assertIn(f'<option value="{value}"', settings)
+        # Ids 1 to 3; the third allows two connections at once, the others one.
+        for n, limit in ((1, 1), (2, 1), (3, 2)):
+            make_account(f'Acct {n}', max_connections=limit)
+        db.session.commit()
         self.assertEqual(post('held_seats', ['2: 1', '3:2']).status_code, 200)
         self.assertEqual(load_config()['integrations']['output_feed']['held_seats'],
                          {'2': 1, '3': 2})
         self.assertEqual(post('held_seats', ['two']).status_code, 400)
+        over = post('held_seats', ['2: 2'])
+        self.assertEqual(over.status_code, 400)
+        self.assertIn('allows 1 connection at once', over.get_json()['error'])
+        self.assertIn('no account with id 9', post('held_seats', ['9: 1']).get_json()['error'])
+        self.assertEqual(load_config()['integrations']['output_feed']['held_seats'],
+                         {'2': 1, '3': 2})
         self.assertEqual(post('accounts', ['2', ' 3 ']).status_code, 200)
         self.assertEqual(load_config()['integrations']['output_feed']['accounts'], [2, 3])
 
@@ -441,6 +456,29 @@ class RingTests(unittest.TestCase):
         ring.append(b'a')
         self.assertEqual(ring.take(timeout=0.1), b'a')
 
+    def test_a_ring_past_its_pressure_mark_releases_ahead_of_the_reserve_and_counts_it(self):
+        """dev/docs/BUGS.md 2026-11-12: a provider's opening burst held for the whole reserve
+        in a ring it did not fit was evicted before any of it could be taken, so the play
+        ended at nothing sent. Past the pressure mark the head goes out whatever its age."""
+        ring = feed.Ring(capacity=feed.READ_CHUNK * 8, reserve=100.0)
+        self.assertEqual(ring.pressure, feed.READ_CHUNK * 6)
+        for i in range(6):
+            ring.append(bytes([i]) * feed.READ_CHUNK)
+        self.assertIsNone(ring.take(timeout=0.05), 'at the mark, not past it: the reserve holds')
+        ring.append(b'\x06' * feed.READ_CHUNK)
+        self.assertEqual(ring.take(timeout=0.05)[0], 0, 'the oldest chunk goes first')
+        self.assertEqual(ring.released_early, feed.READ_CHUNK)
+        self.assertIsNone(ring.take(timeout=0.05), 'back at the mark, the reserve holds again')
+        self.assertEqual((ring.dropped, ring.dropped_unripe), (0, 0))
+
+    def test_the_default_ring_holds_a_providers_longest_burst_and_the_reserve(self):
+        """29 s is the longest connect burst measured on a real account (dev/changelog/942),
+        and 16 Mbps is twice the HD bitrate the reserve check assumes."""
+        from app.config import config_default
+        ring_bytes = config_default('integrations.output_feed.buffer_mb') * 1024 * 1024
+        reserve = config_default('integrations.output_feed.reserve_seconds')
+        self.assertGreaterEqual(ring_bytes, (29 + reserve) * 2 * feed.RESERVE_BYTES_PER_SECOND)
+
     def test_a_chunk_evicted_before_its_reserve_is_counted_apart_from_one_the_viewer_left(self):
         """A reserve the ring cannot hold at the stream's bitrate evicts chunks the viewer
         could never have taken; those must not read as the viewer being slow
@@ -483,7 +521,7 @@ class ReaperJudgementTests(_FeedCase):
 
     def test_drops_the_viewer_could_not_have_taken_name_the_buffer_not_the_viewer(self):
         """dev/docs/BUGS.md 2026-11-01: a chunk evicted before it aged the reserve was never
-        releasable, so cutting the session as "the IPTV app fell behind" blamed the wrong
+        releasable, so cutting the session as "the IPTV player fell behind" blamed the wrong
         party."""
         from unittest import mock
         proc = mock.Mock()
@@ -497,7 +535,29 @@ class ReaperJudgementTests(_FeedCase):
             feed._check(session)
         self.assertFalse(session.live)
         self.assertEqual(session.reason, feed.REASON_BUFFER_TOO_SMALL)
-        self.assertIn('reserve', session.detail)
+        # The number is named for what it is: what was lost, beside what the buffer holds.
+        self.assertIn(f'{feed.fmt_bytes(feed.READ_CHUNK)} of the stream was lost', session.detail)
+        self.assertIn(f'{feed.fmt_bytes(feed.READ_CHUNK * 2)} buffer', session.detail)
+
+    def test_a_play_that_ran_short_of_its_reserve_says_so_once_and_on_its_line(self):
+        from unittest import mock
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        ring = feed.Ring(capacity=feed.READ_CHUNK * 4, reserve=100.0)
+        for _ in range(4):
+            ring.append(b'x' * feed.READ_CHUNK)
+        self.assertIsNotNone(ring.take(timeout=0.05))
+        session = self._session(proc=proc, ring=ring)
+        session.launched_mono = time.monotonic()
+        session.state = feed.STATE_STREAMING
+        session.last_data_mono = time.monotonic()
+        with self.assertLogs('app.output_feed', 'WARNING') as logs:
+            feed._check(session)
+            feed._check(session)
+        self.assertTrue(session.live, 'less reserve than asked for is not a reason to cut')
+        self.assertEqual(sum('less than its 100s reserve' in line for line in logs.output), 1)
+        self.assertIn('went out sooner than 100s behind live', feed.reserve_short_note(ring))
+        self.assertEqual(feed.reserve_short_note(feed.Ring(feed.READ_CHUNK, 0)), '')
 
     def test_drops_the_viewer_left_behind_still_name_the_viewer(self):
         from unittest import mock
@@ -592,7 +652,7 @@ class RelayLifecycleTests(_Relay):
         resp.close()
         self.assertTrue(_wait(lambda: not session.live, 5))
         self.assertEqual(session.reason, feed.REASON_CLIENT_GONE)
-        self.assertIsNotNone(proc.poll(), 'ffmpeg must be dead once the IPTV app is gone')
+        self.assertIsNotNone(proc.poll(), 'ffmpeg must be dead once the IPTV player is gone')
         self.assertEqual(connlim._holders.get(self.account.id, []), [])
         self.assertFalse(os.path.exists(session.stderr_path))
         self.assertEqual(session.ring.size, 0)
@@ -626,11 +686,68 @@ class RelayLifecycleTests(_Relay):
         ch2.in_guide = True
         db.session.commit()
         self._play(feed.feed_id_for_channel(ch.id))
-        for _ in range(2):
-            resp = self._play(feed.feed_id_for_channel(ch2.id), expect=503)
-            self.assertIn('viewer cap (1 at once)', resp.get_json()['error'])
+        from unittest import mock
+        with mock.patch.object(feed, 'SWITCH_GRACE_SECONDS', 0.3):
+            for _ in range(2):
+                asked = time.monotonic()
+                resp = self._play(feed.feed_id_for_channel(ch2.id), expect=503)
+                self.assertIn('as many IPTV players as it allows at once (1)',
+                              resp.get_json()['error'])
+                self.assertIn('"IPTV players at once"', resp.get_json()['error'])
+                self.assertGreaterEqual(time.monotonic() - asked, 0.3,
+                                        'refused only after the wait for a channel change')
         self.assertEqual(Alert.query.filter_by(alert_type='VIEWER_REFUSED').count(), 1)
         self.assertEqual(len(feed.live_sessions()), 1)
+
+    def _change_channel(self, first, second):
+        """Play `first`, ask for `second` while it is still live, and close `first` half a
+        second later: the order an IPTV player changes channel in. Returns the old session."""
+        old_resp = self._play(feed.feed_id_for_channel(first.id))
+        old = self._session()
+        self._read(old_resp)
+        closer = threading.Timer(0.5, old_resp.close)
+        closer.start()
+        self.addCleanup(closer.cancel)
+        asked = time.monotonic()
+        self._play(feed.feed_id_for_channel(second.id))
+        waited = time.monotonic() - asked
+        self.assertGreaterEqual(waited, 0.4, 'the new play can only have started after the old one ended')
+        self.assertLess(waited, feed.SWITCH_GRACE_SECONDS)
+        return old
+
+    def _assert_changed_without_a_refusal(self, old, second):
+        self.assertEqual((old.live, old.reason), (False, feed.REASON_CLIENT_GONE))
+        new = self._session()
+        self.assertEqual(new.channel_id, second.id)
+        self.assertEqual(Alert.query.filter_by(alert_type='VIEWER_REFUSED').count(), 0)
+        self.assertEqual(feed.recent_refused(), [])
+
+    def test_a_channel_change_at_the_viewer_cap_waits_for_the_old_play_and_is_not_refused(self):
+        """dev/docs/BUGS.md 2026-11-12: the player asks for the new channel before the old
+        connection is seen to close, and at a cap of 1 every change of channel was refused
+        three or four times first."""
+        self.t.sandbox_config(_feed_cfg(max_viewers=1))
+        ch = self._clip_channel('Paced')
+        ch.in_guide = True
+        other = make_account('Other', max_connections=1)
+        ch2 = self._clip_channel('Second', account=other)
+        ch2.in_guide = True
+        db.session.commit()
+        old = self._change_channel(ch, ch2)
+        self._assert_changed_without_a_refusal(old, ch2)
+
+    def test_a_channel_change_on_a_one_connection_account_waits_for_the_seat(self):
+        """The same race one step later: under the viewer cap, with both channels on an
+        account that allows one connection, the old play still holds the seat."""
+        self.t.sandbox_config(_feed_cfg(max_viewers=3))
+        ch = self._clip_channel('Paced')
+        ch.in_guide = True
+        ch2 = self._clip_channel('Second')
+        ch2.in_guide = True
+        db.session.commit()
+        old = self._change_channel(ch, ch2)
+        self._assert_changed_without_a_refusal(old, ch2)
+        self.assertEqual(connlim._holders.get(self.account.id), [('viewer', self._session().id)])
 
     def test_a_recording_preempts_the_viewer_and_both_surfaces_say_so(self):
         from app.recorder import _try_acquire_slot_with_preemption
@@ -808,6 +925,97 @@ class RelayFailoverTests(_Relay):
         self.assertIn('Game feeds', alert.title)
 
 
+class SportsRelayTests(_Relay):
+    """A sports channel through the relay (app/sports_feed.py, dev/changelog/1517): it plays the
+    channel whose guide lists the game, and a dead one is replaced by another carrying the same
+    game, with no group to log against."""
+
+    def _team_channel(self, *clip_names, scores=(90.0, 50.0)):
+        from app import sports_feed
+        from app.database import SportsEvent, SportsFollow, SportsLeague, SportsMatch
+        now = datetime.utcnow()
+        league = SportsLeague(tsdb_id=9001, name='Pretend League', match_terms='[]')
+        db.session.add(league)
+        db.session.flush()
+        db.session.add(SportsFollow(league_id=league.id, team_tsdb_id=0, rule_id=0))
+        start = now - timedelta(minutes=30)
+        event = SportsEvent(tsdb_id=7001, league_id=league.id, name='g', home_team_id=101, away_team_id=102,
+                            home_name='Ironvale Bears', away_name='Harborview Gulls', start_at=start,
+                            local_date=start.date())
+        db.session.add(event)
+        db.session.flush()
+        members = []
+        for clip, score in zip(clip_names, scores):
+            account = self.account if not members else make_account(f'Other {len(members)}', max_connections=1)
+            ch = self._clip_channel(f'Local {clip}', clip=clip, account=account)
+            ch.health_score = score
+            db.session.add(SportsMatch(event_id=event.id, channel_id=ch.id, kind='guide', strength='strong',
+                                       airing='first', program_start_time=start,
+                                       program_stop_time=start + timedelta(hours=3), title_key='g', reason='r'))
+            members.append(ch)
+        db.session.commit()
+        sports_feed.set_team_channel(league.id, 101, True)
+        from app.database import SportsFeedChannel
+        return feed.feed_id_for_sports(SportsFeedChannel.query.one().id), members
+
+    def test_a_dead_channel_is_replaced_by_another_carrying_the_game(self):
+        feed_id, (a, b) = self._team_channel('a.ts', 'b.ts')
+        resp = self._play(feed_id)
+        self._read(resp, 1)
+        session = self._session()
+        self.assertEqual(session.channel_id, a.id)
+        self.assertIsNone(session.group_id)
+        self.assertIn('Harborview Gulls at Ironvale Bears', session.label)
+        session.proc.kill()
+        self.assertTrue(_wait(lambda: bool(session.failovers) and session.channel_id == b.id, 15), session)
+        self.assertTrue(session.live)
+        self.assertEqual(connlim._holders.get(b.account_id), [('viewer', session.id)])
+        self.assertEqual(connlim._holders.get(self.account.id, []), [])
+        before = session.bytes_sent
+        self._read(resp, 2)
+        self.assertGreater(session.bytes_sent, before)
+        self.assertEqual(ChannelGroupEvent.query.count(), 0, 'a sports channel is not a group')
+
+    def test_a_failover_stays_on_the_game_the_play_started_on(self):
+        from app.database import SportsEvent, SportsMatch
+        feed_id, (a, b) = self._team_channel('a.ts', 'b.ts')
+        resp = self._play(feed_id)
+        self._read(resp, 1)
+        session = self._session()
+        first = SportsEvent.query.one()
+        self.assertEqual(session.event_id, first.id)
+        # The team's next game starts being listed, on a healthier channel, while this play runs.
+        start = datetime.utcnow() - timedelta(minutes=1)
+        later = SportsEvent(tsdb_id=7002, league_id=first.league_id, name='h', home_team_id=103,
+                            away_team_id=101, home_name='Northgate Panthers', away_name='Ironvale Bears',
+                            start_at=start, local_date=start.date())
+        db.session.add(later)
+        db.session.flush()
+        c = self._clip_channel('Local c', clip='a.ts', account=make_account('Third', max_connections=1))
+        c.health_score = 99.0
+        db.session.add(SportsMatch(event_id=later.id, channel_id=c.id, kind='guide', strength='strong',
+                                   airing='first', program_start_time=start,
+                                   program_stop_time=start + timedelta(hours=3), title_key='h', reason='r'))
+        db.session.commit()
+        self.assertEqual(feed.resolve_play(feed_id).member.id, c.id, 'a new tune-in gets the later game')
+        session.proc.kill()
+        self.assertTrue(_wait(lambda: bool(session.failovers), 15), session)
+        self.assertEqual(session.channel_id, b.id)
+
+    def test_nothing_left_carrying_the_game_ends_by_name_in_sports_words(self):
+        feed_id, (a,) = self._team_channel('a.ts')
+        resp = self._play(feed_id)
+        self._read(resp, 1)
+        session = self._session()
+        session.proc.kill()
+        self.assertTrue(_wait(lambda: not session.live, 15))
+        self.assertEqual(session.reason, feed.REASON_NO_MEMBER)
+        self.assertEqual(session.reason_text(), feed.SPORTS_REASON_TEXT[feed.REASON_NO_MEMBER])
+        self.assertNotIn('group', session.reason_text())
+        self.assertIn('already failed this play', session.detail)
+        self.assertEqual(connlim._holders.get(self.account.id, []), [])
+
+
 # ── Redirect mode ──────────────────────────────────────────────────────────────────────────
 
 class RedirectModeTests(_FeedCase):
@@ -850,6 +1058,158 @@ class RedirectModeTests(_FeedCase):
                                         enabled=False))
         self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 1))
         connlim.release(self.account.id, 'recording', 1)
+
+
+# ── Mixed mode (dev/changelog/1536) ────────────────────────────────────────────────────────
+
+class MixedModeDecisionTests(unittest.TestCase):
+    def test_relays_is_decided_by_the_feed_id_kind(self):
+        ch, grp, sp = feed.feed_id_for_channel(3), feed.feed_id_for_group(3), feed.feed_id_for_sports(3)
+        self.assertEqual([feed.relays({'mode': 'proxy'}, f) for f in (ch, grp, sp)], [True, True, True])
+        self.assertEqual([feed.relays({'mode': 'mixed'}, f) for f in (ch, grp, sp)], [False, True, True])
+        self.assertEqual([feed.relays({'mode': 'redirect'}, f) for f in (ch, grp, sp)], [False, False, False])
+        self.assertTrue(feed.relays({'mode': 'nonsense'}, ch), 'an unknown mode is proxy, as mode_of says')
+        self.assertIn('mixed', feed.MODES)
+
+
+class MixedModeHeldSeatTests(_FeedCase):
+    """In mixed mode the held seats are the IPTV players': a relayed play ("viewer") is never
+    kept off one, and one it sits on is not taken from recordings a second time."""
+
+    def _mixed(self, account, held, connections):
+        account.max_connections = connections
+        db.session.commit()
+        self.t.sandbox_config(_feed_cfg(mode='mixed', held_seats={str(account.id): held}))
+
+    def _seat(self, kind, holder):
+        self.assertTrue(connlim.try_acquire(self.account.id, kind, holder), (kind, holder))
+        self.addCleanup(connlim.release, self.account.id, kind, holder)
+
+    def test_held_seats_apply_in_mixed_mode(self):
+        self._mixed(self.account, held=1, connections=1)
+        self.assertFalse(connlim.try_acquire(self.account.id, 'recording', 1))
+
+    def test_a_relayed_play_may_use_a_held_seat(self):
+        self._mixed(self.account, held=1, connections=1)
+        self._seat('viewer', 'v1')
+
+    def test_a_relayed_play_on_a_held_seat_leaves_the_other_seat_to_recordings(self):
+        self._mixed(self.account, held=1, connections=2)
+        self._seat('viewer', 'v1')
+        self._seat('recording', 7)
+        self.assertFalse(connlim.try_acquire(self.account.id, 'recording', 8), 'two seats, both used')
+
+    def test_a_recording_never_ends_a_play_sitting_on_a_held_seat(self):
+        from app.recorder import _try_acquire_slot_with_preemption
+        self._mixed(self.account, held=1, connections=1)
+        self._seat('viewer', 'v1')
+        rec = make_recording(status='SCHEDULED', name='Held', channel_id=None)
+        db.session.commit()
+        self.addCleanup(connlim.release, self.account.id, 'recording', rec.id)
+        self.assertEqual(connlim.preempt_viewers_for_slot(self.account.id), [])
+        self.assertFalse(_try_acquire_slot_with_preemption(self.t.app, rec.id, self.account.id))
+        self.assertEqual(connlim._holders.get(self.account.id), [('viewer', 'v1')])
+
+    def test_only_the_plays_beyond_the_held_seats_are_preempted(self):
+        self._mixed(self.account, held=1, connections=2)
+        self._seat('viewer', 'v1')
+        self._seat('viewer', 'v2')
+        self.assertFalse(connlim.try_acquire(self.account.id, 'recording', 9))
+        self.assertEqual(connlim.preempt_viewers_for_slot(self.account.id), [('v2', self.account.id)])
+        self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 9))
+        connlim.release(self.account.id, 'recording', 9)
+
+    def test_a_recording_waiting_on_held_seats_says_so(self):
+        """DESIGN-output-feed.md 5.3 promised it; the wait blamed "another recording"."""
+        from app.recorder import _slot_wait_reason
+        self.assertIn('in use by another recording', _slot_wait_reason(self.account.id))
+        self._mixed(self.account, held=1, connections=1)
+        why = _slot_wait_reason(self.account.id)
+        self.assertIn('1 connection is left alone for IPTV players', why)
+        self.assertNotIn('another recording', why)
+        self.t.sandbox_config(_feed_cfg(mode='redirect', held_seats={str(self.account.id): 1}))
+        self.assertIn('left alone for IPTV players', _slot_wait_reason(self.account.id))
+
+    def test_recent_plays_offers_both_kinds_a_mixed_output_writes(self):
+        from app.output_feed_view import _recent
+        from app.database import FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED
+        with self.t.app.test_request_context('/iptv-output'):
+            chips = _recent({}, feed.MODE_MIXED, {}, datetime.utcnow(), None, False)['chips']
+        self.assertEqual([c['key'] for c in chips],
+                         ['all', FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED])
+
+    def test_proxy_mode_still_preempts_every_viewer(self):
+        self.account.max_connections = 1
+        db.session.commit()
+        self.t.sandbox_config(_feed_cfg(mode='proxy', held_seats={str(self.account.id): 1}))
+        self._seat('viewer', 'v1')
+        self.assertEqual(connlim.preempt_viewers_for_slot(self.account.id), [('v1', self.account.id)])
+
+
+class MixedModeRouteTests(_Relay):
+    FEED = _feed_cfg(mode='mixed')
+
+    def test_a_plain_channel_is_redirected_and_a_group_is_relayed(self):
+        plain = self._clip_channel('Plain')
+        plain.in_guide = True
+        member = self._clip_channel('Member', clip='b.ts')
+        group = make_group('G', members=[member])
+        db.session.commit()
+        resp = self.client.get(f'/live/{USER}/{PASS}/{feed.feed_id_for_channel(plain.id)}.ts')
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp.headers['Location'], plain.stream_url)
+        self.assertEqual([r['channel_id'] for r in feed.recent_redirects()], [plain.id])
+        self.assertEqual(feed.live_sessions(), [])
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self.assertEqual(resp.mimetype, 'video/mp2t')
+        self._read(resp, 1)
+        session = self._session()
+        self.assertEqual(session.channel_id, member.id)
+        self.assertEqual(connlim._holders.get(self.account.id), [('viewer', session.id)])
+
+    def test_a_recording_ends_only_the_play_beyond_the_held_seats(self):
+        from app.recorder import _try_acquire_slot_with_preemption
+        self.account.max_connections = 2
+        db.session.commit()
+        self.t.sandbox_config(_feed_cfg(mode='mixed', held_seats={str(self.account.id): 1}))
+        a = self._clip_channel('A')
+        b = self._clip_channel('B', clip='b.ts')
+        ga, gb = make_group('GA', members=[a]), make_group('GB', members=[b])
+        rec = make_recording(status='SCHEDULED', name='The big game', channel_id=a.id)
+        db.session.commit()
+        self._read(self._play(feed.feed_id_for_group(ga.id)), 1)
+        first = feed.live_sessions()[0]
+        self._read(self._play(feed.feed_id_for_group(gb.id)), 1)
+        second = [s for s in feed.live_sessions() if s is not first][0]
+        self.assertTrue(_try_acquire_slot_with_preemption(self.t.app, rec.id, self.account.id))
+        self.addCleanup(connlim.release, self.account.id, 'recording', rec.id)
+        self.assertTrue(first.live, 'the play on the held seat plays on')
+        self.assertFalse(second.live)
+        self.assertEqual(second.reason, feed.REASON_PREEMPTED)
+        self.assertEqual(sorted(map(str, connlim._holders.get(self.account.id))),
+                         sorted(map(str, [('viewer', first.id), ('recording', rec.id)])))
+
+    def test_the_page_dashboard_and_readiness_say_how_each_plays(self):
+        from html import unescape
+        plain = self._clip_channel('Plain')
+        plain.in_guide = True
+        member = self._clip_channel('Member', clip='b.ts')
+        make_group('G', members=[member])
+        db.session.commit()
+        self.client.get(f'/live/{USER}/{PASS}/{feed.feed_id_for_channel(plain.id)}.ts')
+        html = unescape(self.client.get('/iptv-output').get_data(as_text=True))
+        self.assertIn('Through ChannelBin', html)
+        self.assertIn('Straight from your IPTV provider', html)
+        self.assertIn('In mixed mode only channel groups and sports channels play through ChannelBin', html)
+        self.assertIn('Recordings leave alone', html)
+        self.assertIn('Current streams', html)
+        self.assertIn('<option value="mixed" selected>', html)
+        dash = self.client.get('/').get_data(as_text=True)
+        self.assertIn('REDIRECTED', dash)
+        self.assertIn('sent to Plain', dash)
+        from app.readiness import Context, _check_output_feed
+        self.assertIn('groups and sports channels relayed through ChannelBin',
+                      _check_output_feed(Context()).found)
 
 
 # ── Surfaces ───────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,210 @@
+/* Drives the REAL IPTV Output page (static/js/iptv-output.js over the markup the app rendered)
+   in jsdom and prints what it observed as JSON. Called by tests/test_iptv_output_page_js.py,
+   which owns every assertion - this file only reports. Faked: fetch (every request recorded;
+   a GET of the page answers the same render), the clipboard, setInterval (recorded, so the
+   live refresh's turn is run by hand) and layout (jsdom_layout.mjs). */
+import fs from 'fs';
+import { JSDOM, VirtualConsole } from 'jsdom';
+import { fakeLayout } from './jsdom_layout.mjs';
+
+const [, , DIR, REPO] = process.argv;
+const HTML = fs.readFileSync(`${DIR}/page.html`, 'utf8');
+const JS = ['util.js', 'iptv-output.js'].map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
+const PASSWORD = 'p&w=1';
+const wait = (ms = 15) => new Promise((r) => setTimeout(r, ms));
+
+const errors = [];
+const vc = new VirtualConsole();
+vc.on('jsdomError', (e) => { errors.push(e.message); });
+const dom = new JSDOM(HTML, { runScripts: 'outside-only', pretendToBeVisual: true,
+                              url: 'http://localhost:5000/iptv-output', virtualConsole: vc });
+const w = dom.window;
+const d = w.document;
+fakeLayout(w);
+w.scrollTo = () => {};
+const intervals = [];
+w.setInterval = (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; };
+const copied = [];
+Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: (t) => { copied.push(t); return Promise.resolve(); } } });
+const requests = [];
+const REFUSE = new Set();
+w.fetch = (url, opts = {}) => {
+  const method = (opts.method || 'GET').toUpperCase();
+  const path = String(url).replace('http://localhost:5000', '');
+  const body = opts.body ? JSON.parse(opts.body) : null;
+  requests.push({ method, path, body });
+  const json = (status, payload) => Promise.resolve({ ok: status < 400, status, statusText: 'x',
+    json: () => Promise.resolve(payload), text: () => Promise.resolve(HTML) });
+  if (path.startsWith('/api/settings/reveal')) return json(200, { success: true, value: PASSWORD });
+  if (REFUSE.has(path)) return json(400, { error: 'Refused by the server.' });
+  if (method === 'POST' && path.startsWith('/api/iptv-output/rows/')) return json(200, { success: true, name: 'x', on: body.on, cut: body.on ? 0 : 1 });
+  return json(200, { success: true });
+};
+w.eval(JS[0]);
+w.eval(JS[1]);
+
+const click = async (el) => { el.dispatchEvent(new w.MouseEvent('click', { bubbles: true })); await wait(); };
+const change = async (el) => { el.dispatchEvent(new w.Event('change', { bubbles: true })); await wait(); };
+const flip = async (input) => { input.checked = !input.checked; await change(input); };
+const visible = () => Array.from(d.querySelectorAll('#of-rows tr[data-feed]')).filter((tr) => !tr.hidden).map((tr) => tr.dataset.name);
+const modal = () => d.querySelector('.modal');
+const modalButton = (label) => Array.from(modal().querySelectorAll('.modal-foot .btn')).find((b) => b.textContent.trim() === label);
+const since = (n) => requests.slice(n).map((r) => `${r.method} ${r.path}`);
+const toasts = () => Array.from(d.querySelectorAll('.toast')).map((t) => t.textContent.trim());
+const row = (name) => d.querySelector(`#of-rows tr[data-name="${name}"]`);
+const out = { errors, live_ms: intervals.map((i) => i.ms) };
+
+/* The channel list's tools */
+out.all_rows = visible();
+const q = d.getElementById('of-q');
+q.value = 'BET';
+q.dispatchEvent(new w.Event('input', { bubbles: true }));
+out.searched = visible();
+out.none_hidden_on_a_hit = d.getElementById('of-none').hidden;
+await click(d.querySelector('[data-show="hidden"]'));
+out.hidden_chip_rows = visible();
+out.none_shown_on_no_hit = !d.getElementById('of-none').hidden;
+out.hidden_chip_active = d.querySelector('[data-show="hidden"]').classList.contains('active');
+await click(d.querySelector('[data-show="all"]'));
+
+/* Paging, two to a page here whatever the server's own size. */
+const pager = d.getElementById('of-chan-pager');
+const pagerText = () => d.getElementById('of-chan-n').textContent;
+const pagerBtn = (dir) => pager.querySelector(`[data-dir="${dir}"]`);
+q.value = '';
+q.dispatchEvent(new w.Event('input', { bubbles: true }));
+out.pager_hidden_on_one_page = pager.hidden;
+d.getElementById('of-rows').dataset.perPage = '2';
+await click(d.querySelector('[data-show="all"]'));
+out.page_one = { rows: visible(), text: pagerText(), hidden: pager.hidden, prev_off: pagerBtn(-1).disabled, next_off: pagerBtn(1).disabled };
+await click(pagerBtn(1));
+out.page_two = { rows: visible(), text: pagerText(), prev_off: pagerBtn(-1).disabled, next_off: pagerBtn(1).disabled };
+q.value = 'alp';
+q.dispatchEvent(new w.Event('input', { bubbles: true }));
+out.search_from_page_two = { rows: visible(), pager_hidden: pager.hidden };
+q.value = '';
+q.dispatchEvent(new w.Event('input', { bubbles: true }));
+await click(pagerBtn(1));
+await click(pagerBtn(-1));
+out.back_to_page_one = visible();
+d.getElementById('of-rows').dataset.perPage = '25';
+q.value = 'BET';
+q.dispatchEvent(new w.Event('input', { bubbles: true }));
+
+/* A switch on an unwatched row: one POST, then the page is swapped, and the search is kept. */
+let mark = requests.length;
+await flip(row('Beta').querySelector('input'));
+await wait(40);
+out.unwatched_off = since(mark);
+out.unwatched_body = requests[mark].body;
+out.modal_for_unwatched = Boolean(modal());
+out.search_kept_after_swap = { value: d.getElementById('of-q').value, rows: visible() };
+out.hide_toast = toasts().some((t) => t.includes('is hidden from the IPTV output'));
+q.value = '';
+q.dispatchEvent(new w.Event('input', { bubbles: true }));
+
+/* A watched row asks first. Cancel leaves it on and posts nothing. */
+mark = requests.length;
+await flip(row('Alpha').querySelector('input'));
+out.watched_asks = modal() ? modal().querySelector('.modal-body').textContent.trim() : '';
+await click(modalButton('Cancel'));
+out.cancel_posts = since(mark);
+out.cancel_leaves_on = row('Alpha').querySelector('input').checked;
+await flip(row('Alpha').querySelector('input'));
+await click(modalButton('Hide'));
+await wait(40);
+out.confirm_posts = since(mark);
+
+/* A refused switch goes back to where it was. */
+const gameFeed = row('Game feeds').dataset.feed;
+REFUSE.add(`/api/iptv-output/rows/${gameFeed}`);
+await flip(row('Game feeds').querySelector('input'));
+await wait(40);
+out.refused_back_on = row('Game feeds').querySelector('input').checked;
+out.refused_toast = toasts().some((t) => t.includes('Refused by the server.'));
+
+/* Connection details */
+await click(d.querySelector('[data-tab="playlist"]'));
+out.playlist_shown = !d.querySelector('[data-pane="playlist"]').hidden && d.querySelector('[data-pane="xtream"]').hidden;
+const m3u = d.querySelector('[data-pane="playlist"] .of-conn');
+out.m3u_masked = m3u.querySelector('.v').textContent;
+await click(m3u.querySelector('[data-act="reveal"]'));
+out.m3u_revealed = m3u.querySelector('.v').textContent;
+await click(m3u.querySelector('[data-act="reveal"]'));
+out.m3u_masked_again = m3u.querySelector('.v').textContent;
+await click(m3u.querySelector('[data-act="copy"]'));
+const pw = d.querySelector('[data-pane="xtream"] [data-secret-text]').closest('.of-conn');
+await click(pw.querySelector('[data-act="reveal"]'));
+out.xtream_revealed = pw.querySelector('.v').textContent;
+await click(pw.querySelector('[data-act="reveal"]'));
+out.xtream_masked_again = pw.querySelector('.v').textContent;
+await click(d.querySelector('[data-pane="xtream"] [data-secret] '));
+await click(d.querySelector('[data-pane="xtream"] [data-act="copy"]'));
+out.copied = copied.slice();
+
+/* Accounts */
+mark = requests.length;
+await flip(d.querySelector('#of-accounts input[data-act="account"]'));
+await wait(40);
+out.account_post = requests[mark] ? { path: requests[mark].path, body: requests[mark].body } : null;
+
+/* Settings card: a number is saved as a number, through the Settings page's route. */
+mark = requests.length;
+const max = d.querySelector('[data-setting-path="integrations.output_feed.max_viewers"]');
+max.value = '5';
+// The next row is already being typed in when the save lands.
+const idle = d.querySelector('[data-setting-path="integrations.output_feed.idle_seconds"]');
+idle.value = '4';
+await change(max);
+await wait(40);
+out.half_typed_survives_a_save = d.querySelector('[data-setting-path="integrations.output_feed.idle_seconds"]').value;
+out.saved_field_shows_what_was_saved = d.querySelector('[data-setting-path="integrations.output_feed.max_viewers"]').value;
+out.setting_post = requests[mark] ? { path: requests[mark].path, body: requests[mark].body } : null;
+mark = requests.length;
+const modeSel = d.querySelector('[data-setting-path="integrations.output_feed.mode"]');
+modeSel.value = 'redirect';
+await change(modeSel);
+await wait(40);
+out.mode_post = requests[mark] ? requests[mark].body : null;
+
+/* Recent plays: a chip is a link, swapped through the page's one queue. */
+mark = requests.length;
+await click(d.querySelector('#of-recent a[data-hist="refused"]'));
+await wait(40);
+out.chip_fetch = since(mark);
+out.chip_address = w.location.pathname + w.location.search;
+w.history.replaceState(null, '', '/iptv-output');
+
+/* Stop this play */
+mark = requests.length;
+await click(d.querySelector('[data-act="stop"]'));
+out.stop_asks = modal() ? modal().querySelector('.modal-head h2').textContent.trim() : '';
+await click(modalButton('Stop'));
+await wait(40);
+out.stop_posts = since(mark);
+
+/* Change login: an empty password is sent as empty, never a mask. */
+mark = requests.length;
+await click(d.querySelector('[data-act="login"]'));
+out.login_prefill = { user: d.getElementById('of-user').value, pass: d.getElementById('of-pass').value };
+d.getElementById('of-user').value = 'den';
+await click(modalButton('Save'));
+await wait(40);
+out.login_post = requests[mark] ? { path: requests[mark].path, body: requests[mark].body } : null;
+
+/* The live refresh swaps only what moves, and waits while a dialog is open. */
+mark = requests.length;
+intervals[0].fn();
+await wait(40);
+out.tick_fetches = since(mark);
+await click(d.querySelector('[data-act="power"]'));
+out.power_asks = modal() ? modal().querySelector('.modal-body').textContent.trim() : '';
+mark = requests.length;
+intervals[0].fn();
+await wait(40);
+out.tick_under_dialog = since(mark);
+await click(modalButton('Turn off'));
+await wait(40);
+out.power_post = requests.slice(mark).find((r) => r.method === 'POST') || null;
+
+console.log(JSON.stringify(out));

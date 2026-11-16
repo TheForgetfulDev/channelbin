@@ -25,12 +25,13 @@ from .database import (
     REC_ENDED_STATUSES, RECORDING_SPORTS_LINKED, RECORDING_SPORTS_REMOVED, SPORTS_MATCH_KIND_CHANNEL_NAME, SPORTS_MATCH_KIND_GUIDE,
     SPORTS_MATCH_STRONG, SPORTS_MATCH_WEAK, ChannelGroupMember, Recording, RecordingEvent, RecordingSports,
     add_recording_event,
-    SPORTS_FETCH_EMPTY, SPORTS_FETCH_OK, SPORTS_FETCH_RATE_LIMITED, SPORTS_FETCH_REFUSED,
-    SPORTS_FETCH_SHRUNK, SPORTS_KIND_LEAGUE, SPORTS_KIND_NEXT, SPORTS_KIND_ROUND, SPORTS_KIND_TEAM,
-    SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsLeagueCategory, SportsMatch, SportsState,
+    SPORTS_FETCH_CAPPED, SPORTS_FETCH_CAPPED_PAST, SPORTS_FETCH_EMPTY, SPORTS_FETCH_OK, SPORTS_FETCH_RATE_LIMITED, SPORTS_FETCH_REFUSED,
+    SPORTS_FETCH_SHRUNK, SPORTS_KIND_EVENT, SPORTS_KIND_LEAGUE, SPORTS_KIND_NEXT, SPORTS_KIND_ROUND, SPORTS_KIND_SEARCH,
+    SPORTS_KIND_TEAM, SPORTS_KIND_TEAM_NEXT, SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsLeagueCategory, SportsMatch, SportsState,
     SportsTeam,
 )
 from .db_utils import retry_on_locked
+from .fmt_utils import join_labels
 from .program_titles import title_key
 from .tz_utils import to_local
 
@@ -41,9 +42,16 @@ BASE_URL = 'https://www.thesportsdb.com/api/v1/json'
 #: tested here (design 8). It is not a secret, so nothing masks it.
 FREE_KEY = '123'
 TIMEOUT_SECONDS = 20
-#: The fastest pace measured clean: 429s came at one call every 4 seconds, and about 85 calls at one
-#: every 12 seconds were clean. The floor under every call, whatever the config says.
-MIN_WAIT_SECONDS = 12
+#: The floor under every call, whatever the config says. The docs say 30 calls a minute; the free key
+#: answers about 10 from one address: ten calls 2.5 seconds apart were answered and the eleventh drew
+#: a 429 (2026-11-14, dev/changelog/1551). 8 seconds is at most 7.5 a minute, which leaves room for
+#: another caller behind the same address.
+MIN_WAIT_SECONDS = 8
+#: What a 429 without a usable Retry-After waits. The measured header said 120, every call inside it
+#: was refused, and the first one after it was answered (dev/changelog/1551). The docs say a minute,
+#: so a header asking for less is not believed.
+DEFAULT_RETRY_AFTER_SECONDS = 120
+MIN_RETRY_AFTER_SECONDS = 60
 MAX_BACKOFF_SECONDS = 3600
 #: Clean calls in a row that halve a backoff.
 CLEAN_CALLS_TO_EASE = 5
@@ -51,6 +59,33 @@ MISSING_KEEP_DAYS = 7
 EMPTY_RECHECK_DAYS = 3
 REFUSED_RETRY_HOURS = 6
 MATCH_AFTER_REFRESH_SECONDS = 180
+#: The most rows the free key's eventsround sends. A college football week is bigger, and the answer
+#: then carries 50 of its games with nothing saying it was cut. Which 50 changed from call to call on
+#: NCAA Division 1 Football, and was the season's first 50 every time on the NBA's round 0 (measured
+#: 2026-11-14, dev/changelog/1549 and 1550).
+ROUND_ROW_CAP = 50
+#: A stored game a cut answer left out is re-read by its number when it starts within this long.
+EVENT_RECHECK_DAYS = 7
+#: How far past a cut round's first and last stored games a guide listing still counts as in that week.
+CAPPED_SPAN_MARGIN = timedelta(hours=13)
+#: parse_event's reason for a row of another league. A lookup by name that finds only such a row found
+#: another league's game of that name, which is an answer and not a row gone bad (dev/changelog/1552).
+WRONG_LEAGUE = 'wrong league'
+#: How long before its game a listing can open: one that opens this close to midnight UTC is looked up
+#: on both days.
+LOOKUP_LEAD = timedelta(hours=1)
+#: In a league with a cut round, a team's next game is asked for again this long after it starts, when
+#: it is over, so the game after it is found before it begins. eventsnext sends one game, home or away:
+#: UTEP and Wyoming both gave the UTEP game round 11 left out, and the Nuggets their away game
+#: (measured 2026-11-14, dev/changelog/1553). The docs' "home games only" is wrong.
+TEAM_NEXT_AFTER_START = timedelta(hours=4)
+#: The soonest a team is asked again, so an answer still naming a game already played (TheSportsDB is
+#: slow to mark one finished) is not asked for on every tick.
+TEAM_NEXT_MIN_WAIT = timedelta(hours=3)
+#: Calls about one game, made after a round answer was cut. They are not the schedule itself, so they
+#: never make a league read as still getting it, and Schedule updates shows one only when it failed;
+#: the league's notice counts them.
+ONE_GAME_KINDS = (SPORTS_KIND_EVENT, SPORTS_KIND_SEARCH, SPORTS_KIND_TEAM_NEXT)
 
 #: The Add league or team picks, in the order the dialog shows them: alphabetical. Names and numbers only,
 #: ChannelBin ships no event data (design 8), and following one is always the user's own click.
@@ -64,12 +99,15 @@ SHIPPED_LEAGUES = (
 )
 
 #: Names guides use for a league that TheSportsDB does not list, by TheSportsDB's league number
-#: (design 5.1). Both were seen in prod's guide: TheSportsDB calls 5093 `NASCAR Truck Series`, and
-#: still calls 4573 `NASCAR Xfinity Series` after its 2025 rename. Seeded when a league is added,
-#: and offered on its page while missing.
+#: (design 5.1). All were seen in prod's guide: TheSportsDB calls 5093 `NASCAR Truck Series`, and
+#: still calls 4573 `NASCAR Xfinity Series` after its 2025 rename. 4479's event channels say only
+#: `NCAAF 27: 1pm Arkansas State at Coastal Carolina`; all 186 channel names carrying the word on
+#: 2026-11-14 were college football (dev/changelog/1562). Seeded when a league is added, and offered
+#: on its page while missing.
 KNOWN_EXTRA_TERMS = {
     5093: ('NASCAR Craftsman Truck Series',),
     4573: ("NASCAR O'Reilly Auto Parts Series",),
+    4479: ('NCAAF',),
 }
 
 _client_lock = threading.Lock()
@@ -97,6 +135,18 @@ class Answer:
     reason: str = ''
     #: The answer reached us and carried nothing, as opposed to failing.
     empty: bool = False
+    #: Seconds a 429 asked for; 0 on any other answer, and on a 429 that came without one.
+    retry_after: int = 0
+
+
+def retry_after_seconds(value) -> int:
+    """A Retry-After header as seconds, kept between a minute and the longest backoff. A missing or
+    HTTP-date value is the measured 120."""
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_RETRY_AFTER_SECONDS
+    return min(MAX_BACKOFF_SECONDS, max(MIN_RETRY_AFTER_SECONDS, seconds))
 
 
 def _call(endpoint: str, params: dict, list_key: str) -> Answer:
@@ -112,7 +162,9 @@ def _call(endpoint: str, params: dict, list_key: str) -> Answer:
     except requests.RequestException as exc:
         return Answer(SPORTS_FETCH_REFUSED, reason=f'Could not reach TheSportsDB ({type(exc).__name__}).')
     if resp.status_code == 429:
-        return Answer(SPORTS_FETCH_RATE_LIMITED, reason='HTTP 429, too many requests.')
+        wait = retry_after_seconds(resp.headers.get('Retry-After'))
+        return Answer(SPORTS_FETCH_RATE_LIMITED, retry_after=wait,
+                      reason=f'HTTP 429, too many requests. TheSportsDB asked for {wait} seconds without calls.')
     if resp.status_code != 200:
         return Answer(SPORTS_FETCH_REFUSED,
                       reason=f'HTTP {resp.status_code}, and the answer was not a schedule.')
@@ -152,7 +204,7 @@ def pace_error(spacing, jitter) -> str:
     """Why this spacing and jitter may not be saved, or '' when they may."""
     if spacing - jitter < MIN_WAIT_SECONDS:
         return (f'Seconds between calls minus the variation has to be at least {MIN_WAIT_SECONDS}: '
-                f'faster than that has been measured drawing "too many requests" from TheSportsDB. '
+                f'TheSportsDB answers about 10 calls a minute, then refuses every call for two minutes. '
                 f'This would be {spacing - jitter}.')
     return ''
 
@@ -179,10 +231,11 @@ def _daily_at(now: datetime, offset_seconds: int, days: int = 1) -> datetime:
 
 
 def _note_call(state: SportsState, settings: dict, answer: Answer, now: datetime):
-    """What any call does to the pace, the worker's or a person's. A 429 doubles the spacing up to
-    an hour; clean calls bring it back down."""
+    """What any call does to the pace, the worker's or a person's. A 429 waits out the pause
+    TheSportsDB asked for, then doubles the spacing up to an hour; clean calls bring it back down."""
     state.last_call_at = now
-    if answer.outcome == SPORTS_FETCH_RATE_LIMITED:
+    limited = answer.outcome == SPORTS_FETCH_RATE_LIMITED
+    if limited:
         state.backoff_seconds = min(MAX_BACKOFF_SECONDS,
                                     max(settings['call_spacing_seconds'], state.backoff_seconds) * 2)
         state.clean_calls = 0
@@ -192,7 +245,11 @@ def _note_call(state: SportsState, settings: dict, answer: Answer, now: datetime
             halved = state.backoff_seconds // 2
             state.backoff_seconds = 0 if halved <= settings['call_spacing_seconds'] else halved
             state.clean_calls = 0
-    earliest = now + timedelta(seconds=_next_wait(settings, state.backoff_seconds))
+    wait = _next_wait(settings, state.backoff_seconds)
+    if limited:
+        # Every call inside the pause is refused as well, so the first one after a 429 waits it out.
+        wait = max(wait, answer.retry_after or DEFAULT_RETRY_AFTER_SECONDS)
+    earliest = now + timedelta(seconds=wait)
     state.next_call_at = max(state.next_call_at, earliest) if state.next_call_at else earliest
 
 
@@ -205,6 +262,15 @@ def _int(value) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _round_number(value):
+    """intRound as a number, or None when it is not one. 0 is a real round: the NBA's whole regular
+    season is round 0 (measured 2026-11-14, dev/changelog/1550)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _text(value):
@@ -241,7 +307,7 @@ def parse_event(row: dict, league_tsdb_id: int):
     if not tsdb_id:
         return None, 'no event id'
     if _int(row.get('idLeague')) != league_tsdb_id:
-        return None, 'wrong league'
+        return None, WRONG_LEAGUE
     start = _parse_when(row.get('strTimestamp'))
     local_date = _parse_date(row.get('dateEventLocal')) or _parse_date(row.get('dateEvent'))
     if start is None and local_date is None:
@@ -250,7 +316,7 @@ def parse_event(row: dict, league_tsdb_id: int):
     if name is None:
         return None, 'no name'
     return {
-        'tsdb_id': tsdb_id, 'season': _text(row.get('strSeason')), 'round': _int(row.get('intRound')) or None,
+        'tsdb_id': tsdb_id, 'season': _text(row.get('strSeason')), 'round': _round_number(row.get('intRound')),
         'name': name, 'home_team_id': _int(row.get('idHomeTeam')), 'away_team_id': _int(row.get('idAwayTeam')),
         'home_name': _text(row.get('strHomeTeam')), 'away_name': _text(row.get('strAwayTeam')),
         'venue': _text(row.get('strVenue')), 'city': _text(row.get('strCity')),
@@ -274,10 +340,40 @@ def _team_names(row: dict):
     return names, city
 
 
+_COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
+
+
+def _team_look(row: dict) -> dict:
+    """A team's colors, short name and badge address from one lookupteam row, as SportsTeam's
+    columns. Measured 2026-11-13 (DESIGN-sports-data.md 2): colors are `#RRGGBB` in either case,
+    and a team without one sends '', as it does for a missing short name. Anything else in a color
+    is stored as unknown and named in the log, so a screen drawn in gray can be explained."""
+    out = {}
+    for n in (1, 2, 3):
+        value = _text(row.get(f'strColour{n}'))
+        if value is not None and not _COLOR_RE.match(value):
+            log.warning('TheSportsDB team %s (%s): strColour%d %r is not a #RRGGBB color, so it is '
+                        'drawn as unknown', row.get('idTeam'), row.get('strTeam'), n, value)
+            value = None
+        out[f'color{n}'] = value.lower() if value else None
+    short = _text(row.get('strTeamShort'))
+    out['short_name'] = short[:32] if short else None
+    out['badge_url'] = _text(row.get('strBadge'))
+    return out
+
+
 def event_shape_is_matchup(event) -> bool:
     """An event with team ids is a matchup; one with none is a field event, such as a race. The shape
     comes from the event, never a list of sports (6.1)."""
     return bool(event.home_team_id or event.away_team_id)
+
+
+def event_game_name(event) -> str:
+    """What an event is called where one line names it: 'Away at Home' for a matchup that names
+    both, else TheSportsDB's own name."""
+    if event_shape_is_matchup(event) and event.away_name and event.home_name:
+        return f'{event.away_name} at {event.home_name}'
+    return event.name
 
 
 # ---------------------------------------------------------------------------
@@ -333,10 +429,10 @@ def _record_outcome(row: SportsFetch, outcome: str, reason: str, now: datetime):
     row.last_at = now
 
 
-def _apply_round(row: SportsFetch, league: SportsLeague, answer: Answer, season: str, number: int,
-                 settings: dict, offset: int, now: datetime):
+def _parse_rows(rows: list, league: SportsLeague) -> tuple:
+    """(parsed, {why: count dropped}) for one answer's rows."""
     parsed, dropped, seen_ids = [], {}, set()
-    for raw in answer.rows:
+    for raw in rows:
         event, why = parse_event(raw, league.tsdb_id)
         if event is None:
             dropped[why] = dropped.get(why, 0) + 1
@@ -345,7 +441,12 @@ def _apply_round(row: SportsFetch, league: SportsLeague, answer: Answer, season:
         else:
             seen_ids.add(event['tsdb_id'])
             parsed.append(event)
+    return parsed, dropped
 
+
+def _store_parsed(league: SportsLeague, parsed: list, now: datetime):
+    """Write each parsed event over its stored copy, or as a new one. Being in an answer is what
+    clears a game's missing mark."""
     ids = [e['tsdb_id'] for e in parsed]
     existing = {e.tsdb_id: e for e in SportsEvent.query.filter(SportsEvent.tsdb_id.in_(ids)).all()} if ids else {}
     for fields in parsed:
@@ -362,9 +463,36 @@ def _apply_round(row: SportsFetch, league: SportsLeague, answer: Answer, season:
         event.last_seen = now
         event.missing_since = None
 
+
+def _recheck_left_out(league: SportsLeague, season: str, number: int, ids: list, now: datetime):
+    """After a cut answer: the round's stored games it left out, starting within EVENT_RECHECK_DAYS,
+    each get one lookup by number, so a moved time still reaches the matcher. Their missing marks are
+    cleared, since a cut answer is no evidence; the lookup marks a game again if TheSportsDB has
+    really dropped it."""
+    left_out = SportsEvent.query.filter(
+        SportsEvent.league_id == league.id, SportsEvent.season == season, SportsEvent.round == number,
+        SportsEvent.tsdb_id.notin_(ids)).all()
+    soon = now + timedelta(days=EVENT_RECHECK_DAYS)
+    for event in left_out:
+        event.missing_since = None
+        start = event.start_at or datetime.combine(event.local_date, time(23, 59))
+        if now - timedelta(hours=3) <= start <= soon:
+            _ensure_fetch(f'event:{event.tsdb_id}', SPORTS_KIND_EVENT, league.id, now)
+
+
+def _apply_round(row: SportsFetch, league: SportsLeague, answer: Answer, season: str, number: int,
+                 settings: dict, offset: int, now: datetime):
+    parsed, dropped = _parse_rows(answer.rows, league)
+    ids = [e['tsdb_id'] for e in parsed]
+    _store_parsed(league, parsed, now)
+    capped = len(answer.rows) >= ROUND_ROW_CAP
+
     # A smaller answer is named and deletes nothing. A stored event missing from a good answer may
     # have moved rounds, so it is marked rather than dropped, and only when the answer held games.
-    if parsed:
+    # A cut answer marks nothing: which 50 games it carries can change from call to call.
+    if capped:
+        _recheck_left_out(league, season, number, ids, now)
+    elif parsed:
         gone = SportsEvent.query.filter(
             SportsEvent.league_id == league.id, SportsEvent.season == season,
             SportsEvent.round == number, SportsEvent.missing_since.is_(None),
@@ -374,7 +502,22 @@ def _apply_round(row: SportsFetch, league: SportsLeague, answer: Answer, season:
 
     count = len(parsed)
     previous = row.row_count
-    if previous is not None and count < previous:
+    starts = [e['start_at'] or datetime.combine(e['local_date'], time()) for e in parsed]
+    if capped and not any(s > now for s in starts) and _is_current_round(league, season, number, now):
+        # The answer is the round's first 50 and the round is still the league's current one, so its
+        # games go on past the cut: the NBA files its whole season as round 0, and the same 50 come
+        # back every time (measured 2026-11-14). A college week re-read once it is over is not: the
+        # league's next game is in a later round (dev/docs/BUGS.md 2026-11-14 @ 05:42:50 pm).
+        outcome = SPORTS_FETCH_CAPPED_PAST
+        reason = (f'{len(answer.rows)} rows, the most TheSportsDB sends for one call, and every one had already '
+                  f'started, so the rest of this round comes after them and will not be sent. Each team is asked '
+                  f'for its next game instead, again after each game it plays.')
+    elif capped:
+        outcome = SPORTS_FETCH_CAPPED
+        reason = (f'{len(answer.rows)} rows, the most TheSportsDB sends for one call, so this round may have more '
+                  f'games than came back. A game left out is not marked missing, and each team with no game in '
+                  f'the answer is asked for its next one.')
+    elif previous is not None and count < previous:
         outcome = SPORTS_FETCH_SHRUNK
         reason = f'{count} rows, down from {previous}. Nothing was deleted, in case the answer is wrong.'
     elif count == 0:
@@ -393,7 +536,6 @@ def _apply_round(row: SportsFetch, league: SportsLeague, answer: Answer, season:
     row.row_count = count
     row.dropped_count = sum(dropped.values())
 
-    starts = [e['start_at'] or datetime.combine(e['local_date'], time()) for e in parsed]
     if not parsed:
         # May just not be published yet, so it is asked again, but never a past season's: a round
         # that does not exist, such as NFL 19, would otherwise make calls for as long as it is followed.
@@ -405,6 +547,109 @@ def _apply_round(row: SportsFetch, league: SportsLeague, answer: Answer, season:
     if parsed and starts and max(starts) <= now + timedelta(days=settings['horizon_days']):
         _ensure_fetch(f'round:{league.tsdb_id}:{season}:{number + 1}', SPORTS_KIND_ROUND, league.id, now)
     _ensure_team_rows(league, parsed, now)
+    if outcome in (SPORTS_FETCH_CAPPED, SPORTS_FETCH_CAPPED_PAST):
+        _ask_teams_next(league, _teams_without_a_game(league, season, number, outcome, now), now)
+
+
+def _is_current_round(league: SportsLeague, season: str, number: int, now: datetime) -> bool:
+    """Whether the league's soonest stored game still to come is in this round. eventsnextleague's
+    game is stored, so this is the round TheSportsDB says is next. Nothing stored ahead reads as
+    current, which is what a cut answer of played games meant before this was asked."""
+    soonest = (db.session.query(SportsEvent.round)
+               .filter(SportsEvent.league_id == league.id, SportsEvent.season == season, SportsEvent.start_at > now)
+               .order_by(SportsEvent.start_at).first())
+    return soonest is None or soonest[0] == number
+
+
+def _teams_without_a_game(league: SportsLeague, season: str, number: int, outcome: str, now: datetime) -> set:
+    """The league's teams a cut answer may have left a game out for: those with no stored game in the
+    round, or, when the round runs on past the cut, with no stored game still to come. A team is known
+    from the league's stored games, since lookup_all_teams answers every league with the same English
+    League 1 sides on the free key (measured 2026-11-14)."""
+    teams = set(_league_team_ids(league.id))
+    covered = db.session.query(SportsEvent.home_team_id, SportsEvent.away_team_id).filter(SportsEvent.league_id == league.id)
+    if outcome == SPORTS_FETCH_CAPPED_PAST:
+        covered = covered.filter(or_(SportsEvent.start_at > now,
+                                     and_(SportsEvent.start_at.is_(None), SportsEvent.local_date >= now.date())))
+    else:
+        covered = covered.filter(SportsEvent.season == season, SportsEvent.round == number)
+    return teams - {i for pair in covered.all() for i in pair if i}
+
+
+def _teams_followed(league: SportsLeague):
+    """The team ids a follow of this league covers, or None for the whole league."""
+    ids = {t for (t,) in db.session.query(SportsFollow.team_tsdb_id).filter_by(league_id=league.id).all()}
+    return None if 0 in ids else ids
+
+
+def _league_is_cut(league: SportsLeague) -> bool:
+    """Whether a round of the league's current season last came back cut. A team's next game is asked
+    for again after each game only while one has."""
+    return league.current_season is not None and SportsFetch.query.filter(
+        SportsFetch.league_id == league.id, SportsFetch.kind == SPORTS_KIND_ROUND,
+        SportsFetch.target.like(f'round:{league.tsdb_id}:{league.current_season}:%'),
+        SportsFetch.outcome.in_((SPORTS_FETCH_CAPPED, SPORTS_FETCH_CAPPED_PAST))).first() is not None
+
+
+def _ask_teams_next(league: SportsLeague, team_ids: set, now: datetime):
+    """A row asking each team for its next game, due now, for the followed teams among `team_ids`. A row
+    already waiting keeps its time: it is set for after the game its last answer named, and that game is
+    the team's next. One that stopped is made due again after EMPTY_RECHECK_DAYS."""
+    followed = _teams_followed(league)
+    wanted = {t for t in team_ids if t and (followed is None or t in followed)}
+    if not wanted:
+        return
+    targets = {f'teamnext:{league.tsdb_id}:{t}': t for t in wanted}
+    rows = {r.target: r for r in SportsFetch.query.filter(SportsFetch.target.in_(list(targets))).all()}
+    for target in sorted(targets):
+        row = rows.get(target)
+        if row is None:
+            db.session.add(SportsFetch(target=target, kind=SPORTS_KIND_TEAM_NEXT, league_id=league.id, next_due_at=now))
+        elif row.next_due_at is None and (row.last_at is None or now - row.last_at >= timedelta(days=EMPTY_RECHECK_DAYS)):
+            row.next_due_at = now
+
+
+def _raw_start(row: dict):
+    """When an answer row's game starts, from the raw row, for a game parse_event does not keep."""
+    start = _parse_when(row.get('strTimestamp'))
+    if start is None:
+        day = _parse_date(row.get('dateEventLocal')) or _parse_date(row.get('dateEvent'))
+        start = datetime.combine(day, time(23, 59)) if day else None
+    return start
+
+
+def _apply_team_next(row, league, answer, team_id, now):
+    """One team's next game. Asked again once that game is over, while the league has a cut round and
+    the team is followed, so every game is some team's next one before it starts."""
+    parsed, dropped = _parse_rows(answer.rows, league)
+    elsewhere = dropped.pop(WRONG_LEAGUE, 0)
+    row.row_count = len(answer.rows)
+    row.dropped_count = sum(dropped.values())
+    starts = [s for s in (_raw_start(r) for r in answer.rows) if s is not None]
+    followed = _teams_followed(league)
+    again = _league_is_cut(league) and (followed is None or team_id in followed)
+    if starts and again:
+        row.next_due_at = max(max(starts) + TEAM_NEXT_AFTER_START, now + TEAM_NEXT_MIN_WAIT)
+    else:
+        row.next_due_at = now + timedelta(days=EMPTY_RECHECK_DAYS) if again else None
+    if parsed:
+        game = parsed[0]
+        stored = SportsEvent.query.filter_by(tsdb_id=game['tsdb_id']).first() is not None
+        _store_parsed(league, parsed, now)
+        _ensure_team_rows(league, parsed, now)
+        said = f'Its next game, {game["name"]}, was already stored.' if stored else f'Found {game["name"]}, which the schedule had left out.'
+        _record_outcome(row, SPORTS_FETCH_OK, said, now)
+        return
+    if dropped:
+        why = ', '.join(sorted(dropped))
+        _record_outcome(row, SPORTS_FETCH_OK, f'Its answer could not be used ({why}).', now)
+        return
+    if elsewhere:
+        others = sorted({_text(r.get('strLeague')) for r in answer.rows if _text(r.get('strLeague'))})
+        where = f', {join_labels(others)}' if others else ''
+        _record_outcome(row, SPORTS_FETCH_EMPTY, f'Its next game is in another league{where}.', now)
+        return
+    _record_outcome(row, SPORTS_FETCH_EMPTY, 'TheSportsDB lists no next game for this team.', now)
 
 
 def _ensure_team_rows(league: SportsLeague, parsed: list, now: datetime):
@@ -443,11 +688,15 @@ def _apply_next(row, league, answer, settings, offset, now):
         _record_outcome(row, SPORTS_FETCH_OK, f'Its next event could not be read: {why}.', now)
         return
     season, number = event['season'], event['round']
-    if not season or not number:
+    if not season or number is None:
         row.dropped_count = 1
         _record_outcome(row, SPORTS_FETCH_OK, 'Its next event has no season or round, so its schedule could not be asked for.', now)
         return
     stored = SportsEvent.query.filter_by(tsdb_id=event['tsdb_id']).first() is not None
+    # Stored, so the round it names reads as the league's current one (_is_current_round) even when a
+    # cut answer of that round leaves it out.
+    _store_parsed(league, [event], now)
+    _ensure_team_rows(league, [event], now)
     # The self-check: whatever its number, this is what finds NFL round 160 in January without a
     # list of rounds, since rounds are not consecutive (4.3). It runs for a stored event too, because
     # following a league again has no round rows left, and the walk forward starts here.
@@ -504,8 +753,148 @@ def _apply_team(row, answer, tsdb_id, now):
         team.full_name = names[0]
         team.names = json.dumps(names)
     team.city = city
+    for column, value in _team_look(answer.rows[0]).items():
+        setattr(team, column, value)
     team.last_looked_up = now
     _record_outcome(row, SPORTS_FETCH_OK, '', now)
+
+
+def _apply_event(row, league, answer, tsdb_id, now):
+    """One stored game re-read by its number. An empty answer is the one thing here that marks a game
+    missing: it was asked for by itself, not left out of a cut list. Some other event in the answer
+    says nothing about this one."""
+    row.next_due_at = None
+    event = SportsEvent.query.filter_by(tsdb_id=tsdb_id).first()
+    parsed, dropped = _parse_rows([r for r in answer.rows if _int(r.get('idEvent')) == tsdb_id], league)
+    row.row_count = len(answer.rows)
+    row.dropped_count = sum(dropped.values())
+    if parsed:
+        _store_parsed(league, parsed, now)
+        _ensure_team_rows(league, parsed, now)
+        _record_outcome(row, SPORTS_FETCH_OK, '', now)
+        return
+    if dropped:
+        why = ', '.join(sorted(dropped))
+        _record_outcome(row, SPORTS_FETCH_OK, f'Its answer could not be used ({why}), so the stored copy stands.', now)
+        return
+    if answer.rows:
+        _record_outcome(row, SPORTS_FETCH_OK, 'TheSportsDB answered with a different event, so the stored copy stands.', now)
+        return
+    if event is not None and event.missing_since is None:
+        event.missing_since = now
+    _record_outcome(row, SPORTS_FETCH_EMPTY, 'TheSportsDB has no event by this number any more. It is kept for '
+                    f'{MISSING_KEEP_DAYS} days in case it comes back.', now)
+
+
+def _apply_search(row, league, answer, name, now):
+    """One game the guide names, by its name on TheSportsDB. Asked once: not found stays an answer."""
+    row.next_due_at = None
+    parsed, dropped = _parse_rows(answer.rows, league)
+    elsewhere = dropped.pop(WRONG_LEAGUE, 0)
+    row.row_count = len(answer.rows)
+    row.dropped_count = sum(dropped.values())
+    if parsed:
+        _store_parsed(league, parsed, now)
+        _ensure_team_rows(league, parsed, now)
+        _record_outcome(row, SPORTS_FETCH_OK, f'Found {parsed[0]["name"]}.', now)
+        return
+    if dropped:
+        why = ', '.join(sorted(dropped))
+        _record_outcome(row, SPORTS_FETCH_OK, f'Its answer could not be used ({why}).', now)
+        return
+    on = 'that day' if _is_day(search_parts(row.target)[0]) else 'this season'
+    if elsewhere:
+        # The listing was another league's game: prod's college football channels carry basketball
+        # (dev/docs/BUGS.md 2026-11-14 @ 11:28:49 am).
+        others = sorted({_text(r.get('strLeague')) for r in answer.rows
+                         if _int(r.get('idLeague')) != league.tsdb_id and _text(r.get('strLeague'))})
+        where = f', {join_labels(others)}' if others else ''
+        _record_outcome(row, SPORTS_FETCH_EMPTY, f'TheSportsDB has a game named "{name}" {on} only in another '
+                        f'league{where}, so it is not a {league.name} game.', now)
+        return
+    _record_outcome(row, SPORTS_FETCH_EMPTY, f'TheSportsDB has no game named "{name}" {on}.', now)
+
+
+def capped_spans(league_id: int) -> list:
+    """[(lo, hi)] around each of the league's rounds whose last answer was cut, from its stored
+    games' first and last starts, CAPPED_SPAN_MARGIN wider each side. A round cut with every game
+    already started has no end in sight, so its hi is datetime.max. Two queries."""
+    capped = {tuple(f.target.split(':')[2:4]): f.outcome for f in SportsFetch.query.filter(
+        SportsFetch.league_id == league_id, SportsFetch.kind == SPORTS_KIND_ROUND,
+        SportsFetch.outcome.in_((SPORTS_FETCH_CAPPED, SPORTS_FETCH_CAPPED_PAST))).all()}
+    if not capped:
+        return []
+    rows = (db.session.query(SportsEvent.season, SportsEvent.round, db.func.min(SportsEvent.start_at),
+                             db.func.max(SportsEvent.start_at))
+            .filter(SportsEvent.league_id == league_id, SportsEvent.start_at.isnot(None))
+            .group_by(SportsEvent.season, SportsEvent.round).all())
+    out = []
+    for season, number, lo, hi in rows:
+        outcome = capped.get((season, str(number)))
+        if outcome is not None:
+            open_top = outcome == SPORTS_FETCH_CAPPED_PAST
+            out.append((lo - CAPPED_SPAN_MARGIN, datetime.max if open_top else hi + CAPPED_SPAN_MARGIN))
+    return out
+
+
+def lookup_days(start: datetime) -> list:
+    """The UTC days to look a listing's game up on. searchevents' `d` is TheSportsDB's dateEvent,
+    the UTC date (measured 2026-11-14), and a listing can open up to an hour before a game that
+    starts after midnight UTC, which is 7 PM Eastern, so such a listing asks both days."""
+    days = [start.date().isoformat()]
+    after = (start + LOOKUP_LEAD).date().isoformat()
+    return days + [after] if after != days[0] else days
+
+
+@retry_on_locked()
+def queue_guide_lookups(league_id: int, wants: list, now: datetime) -> int:
+    """A search row for each (UTC day, home tsdb id, away tsdb id) the matcher found in the guide with
+    no stored game near it, where a round answer was cut. Each pair is asked once a day: a row that
+    exists is never made due again, so "not found" stays an answer. By day, never by season: two
+    teams can meet several times a season, and a search by season finds whichever one it likes
+    (dev/changelog/1550). Only for a followed league. Returns how many were queued."""
+    league = db.session.get(SportsLeague, league_id)
+    followed = SportsFollow.query.filter_by(league_id=league_id).first() is not None
+    targets = {f'search:{league.tsdb_id}:{day}:{home}:{away}' for day, home, away in wants} if league else set()
+    if not (followed and targets):
+        db.session.rollback()
+        return 0
+    have = {t for (t,) in db.session.query(SportsFetch.target).filter(SportsFetch.target.in_(list(targets))).all()}
+    new = sorted(targets - have)
+    for target in new:
+        db.session.add(SportsFetch(target=target, kind=SPORTS_KIND_SEARCH, league_id=league_id, next_due_at=now))
+    db.session.commit()
+    return len(new)
+
+
+def search_name(home: str, away: str) -> str:
+    """The name searchevents finds a game by: TheSportsDB's own `Home vs Away`, home team first,
+    the reverse of a TV listing's `Away at Home` (measured on NCAA Division 1 Football 2026-11-14)."""
+    return f'{home} vs {away}'
+
+
+_DAY_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _is_day(when: str) -> bool:
+    """A search target's third part is a UTC day (`2026-11-15`). Rows written by dev/changelog/1549
+    hold a season (`2026`, `2026-2027`) there instead, and are still read as one until they prune."""
+    return bool(_DAY_RE.match(when))
+
+
+def search_parts(target: str) -> tuple:
+    """(day or season, home tsdb id, away tsdb id) from a `search:<league>:<day>:<home>:<away>`
+    target. Neither a day nor a season holds a colon."""
+    _, _, when, home, away = target.split(':')
+    return when, int(home), int(away)
+
+
+def _search_teams(target: str) -> tuple:
+    """(day or season, the name to search for) for a search row, from the stored team names."""
+    when, home_id, away_id = search_parts(target)
+    names = dict(db.session.query(SportsTeam.tsdb_id, SportsTeam.full_name)
+                 .filter(SportsTeam.tsdb_id.in_([home_id, away_id])).all())
+    return when, search_name(names.get(home_id, str(home_id)), names.get(away_id, str(away_id)))
 
 
 def _call_for(kind: str, target: str, tsdb_league_id: int) -> Answer:
@@ -518,6 +907,16 @@ def _call_for(kind: str, target: str, tsdb_league_id: int) -> Answer:
         return _call('eventsround', {'id': tsdb_league_id, 's': parts[2], 'r': parts[3]}, 'events')
     if kind == SPORTS_KIND_TEAM:
         return _call('lookupteam', {'id': parts[1]}, 'teams')
+    if kind == SPORTS_KIND_EVENT:
+        return _call('lookupevent', {'id': parts[1]}, 'events')
+    if kind == SPORTS_KIND_TEAM_NEXT:
+        return _call('eventsnext', {'id': parts[2]}, 'events')
+    if kind == SPORTS_KIND_SEARCH:
+        when, name = _search_teams(target)
+        db.session.rollback()  # holds no read transaction across the outbound call
+        # TheSportsDB's own spelling of a name in a URL: underscores for spaces. The key is `event`,
+        # singular, unlike every other schedule call (measured 2026-11-14).
+        return _call('searchevents', {'e': name.replace(' ', '_'), 'd' if _is_day(when) else 's': when}, 'event')
     raise ValueError(f'unknown sports fetch kind {kind!r}')
 
 
@@ -558,13 +957,28 @@ def tick(now: datetime = None) -> str:
             log.exception('TheSportsDB %s: the answer could not be stored', target)
             _record_unstorable(fetch_id, answer, type(exc).__name__, settings, now)
             return SPORTS_FETCH_REFUSED
-        if kind == SPORTS_KIND_ROUND and answer.rows:
+        if kind in (SPORTS_KIND_ROUND, SPORTS_KIND_NEXT, *ONE_GAME_KINDS) and answer.rows:
+            # New games take their place on a league's numbered feed channels once they are
+            # stored (app/sports_feed.py). Its own unit, after the schedule's, so nothing it does
+            # can undo the answer just stored.
+            from .sports_feed import place_all_guarded
+            place_all_guarded(now)
+        if kind in (SPORTS_KIND_ROUND, *ONE_GAME_KINDS) and answer.rows:
             # Longer than the call spacing, so a first fill's rounds become one match after the last.
             from .scheduler import queue_sports_match
             queue_sports_match(MATCH_AFTER_REFRESH_SECONDS, f'{target} refreshed')
         return answer.outcome
     finally:
         _client_lock.release()
+
+
+def next_call_at():
+    """The worker's stored earliest next call, naive UTC, or None. The job wakes itself then rather
+    than at its next interval tick (app/scheduler.py::_sports_worker_job)."""
+    state = db.session.get(SportsState, 1)
+    when = state.next_call_at if state is not None else None
+    db.session.rollback()
+    return when
 
 
 @retry_on_locked()
@@ -595,6 +1009,12 @@ def _apply_answer(fetch_id: int, answer: Answer, settings: dict, now: datetime):
             _apply_league(row, league, answer, offset, now)
         elif row.kind == SPORTS_KIND_TEAM:
             _apply_team(row, answer, int(row.target.split(':')[1]), now)
+        elif row.kind == SPORTS_KIND_EVENT:
+            _apply_event(row, league, answer, int(row.target.split(':')[1]), now)
+        elif row.kind == SPORTS_KIND_SEARCH:
+            _apply_search(row, league, answer, _search_teams(row.target)[1], now)
+        elif row.kind == SPORTS_KIND_TEAM_NEXT:
+            _apply_team_next(row, league, answer, int(row.target.split(':')[2]), now)
         else:
             raise ValueError(f'unknown sports fetch kind {row.kind!r}')
     db.session.commit()
@@ -621,8 +1041,8 @@ def _prune_if_due(cfg: dict, settings: dict, now: datetime):
 
 @retry_on_locked()
 def _prune(settings: dict, now: datetime):
-    """Past events after history_keep_days, missing ones after 7 days, and the queue rows of rounds
-    nothing is left of. Events of a league nobody follows prune here too, which is what "they stay
+    """Past events after history_keep_days, missing ones after 7 days, and the queue rows of rounds,
+    re-reads and lookups nothing is left of. Events of a league nobody follows prune here too, which is what "they stay
     until retention" means (design 3)."""
     state = _state()
     keep = settings['history_keep_days']
@@ -635,7 +1055,8 @@ def _prune(settings: dict, now: datetime):
     SportsMatch.query.filter(SportsMatch.event_id.in_(old.with_entities(SportsEvent.id).scalar_subquery())
                              ).delete(synchronize_session=False)
     old.delete(synchronize_session=False)
-    SportsFetch.query.filter(SportsFetch.kind == SPORTS_KIND_ROUND, SportsFetch.next_due_at.is_(None),
+    SportsFetch.query.filter(SportsFetch.kind.in_((SPORTS_KIND_ROUND, *ONE_GAME_KINDS)),
+                             SportsFetch.next_due_at.is_(None),
                              SportsFetch.last_at < cutoff).delete(synchronize_session=False)
     state.last_pruned_at = now
     db.session.commit()
@@ -674,11 +1095,14 @@ def _person_call(endpoint: str, params: dict, list_key: str) -> Answer:
         now = datetime.utcnow()
         state = db.session.get(SportsState, 1)
         last = state.last_call_at if state is not None else None
+        # While backed off, a person waits like the worker: a call inside a 429's pause is refused too.
+        held_until = state.next_call_at if state is not None and state.backoff_seconds else None
         db.session.rollback()
-        if last is not None:
-            left = MIN_WAIT_SECONDS - (now - last).total_seconds()
-            if left > 0:
-                raise TryAgain(int(left) + 1)
+        left = MIN_WAIT_SECONDS - (now - last).total_seconds() if last is not None else 0
+        if held_until is not None:
+            left = max(left, (held_until - now).total_seconds())
+        if left > 0:
+            raise TryAgain(int(left) + 1)
         answer = _call(endpoint, params, list_key)
         _note_person_call(answer, now)
         return answer
@@ -928,6 +1352,8 @@ def delete_league(league_id: int) -> bool:
     SportsFollow.query.filter_by(league_id=league_id).delete(synchronize_session=False)
     SportsFetch.query.filter_by(league_id=league_id).delete(synchronize_session=False)
     SportsLeagueCategory.query.filter_by(league_id=league_id).delete(synchronize_session=False)
+    from .sports_feed import delete_for_league
+    delete_for_league(league_id)
     SportsMatch.query.filter(SportsMatch.event_id.in_(
         db.session.query(SportsEvent.id).filter(SportsEvent.league_id == league_id).scalar_subquery())
     ).delete(synchronize_session=False)

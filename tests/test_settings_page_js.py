@@ -361,12 +361,13 @@ def _gpu_gated(prefix):
 def _feed_gated():
     """The output feed's rows on first paint: the feed is off, so every one of its gated
     rows names that; the held seats also name the mode, which rests on proxy."""
-    off = 'Not used while Output feed for an IPTV app is off'
+    off = 'Not used while Output feed for an IPTV player is off'
     of = 'integrations.output_feed'
     out = {f'{of}.{leaf}': off for leaf in ('mode', 'accounts', 'reserve_seconds', 'buffer_mb',
                                              'max_viewers', 'idle_seconds',
-                                             'max_session_hours', 'xmltv_days')}
-    out[f'{of}.held_seats'] = f'{off} and How the IPTV app gets the stream is Proxy'
+                                             'max_session_hours', 'xmltv_days',
+                                             'sports_before_minutes', 'sports_after_minutes')}
+    out[f'{of}.held_seats'] = f'{off} and How the IPTV player gets the stream is Proxy'
     return out
 
 

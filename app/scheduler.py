@@ -2198,7 +2198,9 @@ _DAY_MAP = {1: 'sun', 2: 'mon', 3: 'tue', 4: 'wed', 5: 'thu', 6: 'fri', 7: 'sat'
 AUTO_RULES_EVALUATE_JOB_ID = 'auto_rules_evaluate'
 AUTO_RULE_SWEEP_JOB_ID = 'auto_rule_sweep'
 SPORTS_WORKER_JOB_ID = 'sports_worker'
-# A tick decides whether a call is due; the pace itself is sports_data.call_spacing_seconds.
+# A tick decides whether a call is due; the pace itself is sports_data.call_spacing_seconds. This is
+# only how often an idle worker looks: after a call the job wakes itself at the stored next call, so a
+# pace under it still holds without a tick, and two APScheduler log lines, every few seconds.
 SPORTS_WORKER_TICK_SECONDS = 15
 #: How long a refused evaluation waits before asking admission again. Short, because what it
 #: yields to is usually a sync finishing, and the sync's own import queued it.
@@ -2290,8 +2292,22 @@ def schedule_sports_worker(app):
 
 def _sports_worker_job():
     with _app.app_context():
-        from .sports_data import tick
+        from .sports_data import next_call_at, tick
         tick()
+        due = next_call_at()
+    _wake_sports_worker_at(due)
+
+
+def _wake_sports_worker_at(due):
+    """Bring the worker's next tick forward to `due` (naive UTC) when that is sooner than its interval
+    would. A time already past is left to the interval: an idle worker's stored time stays in the
+    past, and waking for it would tick without end."""
+    if due is None or due <= datetime.utcnow():
+        return
+    job = _scheduler.get_job(SPORTS_WORKER_JOB_ID) if _scheduler is not None else None
+    if job is None or job.next_run_time is None or to_naive_utc(job.next_run_time) <= due:
+        return
+    _modify_job(SPORTS_WORKER_JOB_ID, next_run_time=due)
 
 
 SPORTS_MATCH_JOB_ID = 'sports_match'

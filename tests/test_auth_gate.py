@@ -164,7 +164,7 @@ class SelfGatedBlueprintPinTests(unittest.TestCase):
     def test_self_gated_blueprints_is_exactly_ha_and_the_output_feed(self):
         # Two blueprints whose clients are not browsers, each with its own before_request
         # credential check: the Home Assistant API (an API key) and the output feed (the
-        # Xtream username/password pair an IPTV app sends, dev/changelog/1365).
+        # Xtream username/password pair an IPTV player sends, dev/changelog/1365).
         self.assertEqual(authmod.SELF_GATED_BLUEPRINTS, {'ha', 'output_feed'})
 
 

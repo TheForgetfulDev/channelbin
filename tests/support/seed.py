@@ -167,7 +167,8 @@ def make_recording(status='SCHEDULED', name=None, channel_id=None, group_id=None
 
 
 def make_segment(recording, channel, started_at, ended_at, segment_number=0, **kw):
-    """A RecordingSegment captured on `channel` (None for a pre-column row). ended_at=None
+    """A RecordingSegment captured on `channel` (None for a pre-column row or one whose
+    channel was deleted). ended_at=None
     is a segment still capturing."""
     seg = RecordingSegment(
         recording_id=recording.id, channel_id=channel.id if channel is not None else None,

@@ -32,6 +32,9 @@
       <input type="hidden" name="group_id" id="modal-group-id" value="">
       {# Set only by "Find Another Airing" replace mode (guide.js openModal) #}
       <input type="hidden" name="replace_recording_id" id="modal-replace-id" value="">
+      {# Set only for a game only an event channel names, from a league page's Record: the
+         server works the program times out again from the event (dev/changelog/1539). #}
+      <input type="hidden" name="sports_event_id" id="modal-sports-event" value="">
       {# The instant each time field holds, which bare wall text cannot say inside an hour a
          DST change repeats; kept by util.js::wallTimeField, preferred by
          app/tz_utils.py::parse_form_time. The opened_* pair is the window an edit was
@@ -56,6 +59,10 @@
            under the program, the first thing read: lower down, a phone's sheet put it below
            the fold behind its own buttons (dev/changelog/1290). #}
         <div id="modal-late-note" class="notice notice-warn" style="display:none"></div>
+        {# Why this listing: a league page's Record picks one for the person and says which and
+           why (dev/changelog/1539). Filled by guide.js::openModal from its `notice` option and
+           cleared on every other open. #}
+        <div id="modal-pick-note" class="notice" style="display:none"></div>
         {# Group target only: names the member that would serve this recording right now and
            says the choice can still move. Filled by guide.js::showGroupNote - the answer is
            fetched per open because the recorder re-resolves it at start time, so a value

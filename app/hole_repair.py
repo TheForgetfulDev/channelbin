@@ -162,7 +162,7 @@ def remux_args(ffmpeg_path: str, source: str, dest: str, matches) -> list:
 
 def close_reconnect_holes(path: str, reported, *, ffmpeg_path: str, pre_output_timeout,
                           stall_seconds, on_spawn=None, scan_timeout: int = 600,
-                          label: str = 'hole repair') -> HoleRepair:
+                          label: str = 'hole repair', scratch_key=None) -> HoleRepair:
     """Close the `reported` holes in the segment at `path`, in place.
 
     Scans the file, matches the holes, remuxes into a sibling file and replaces the
@@ -171,6 +171,10 @@ def close_reconnect_holes(path: str, reported, *, ffmpeg_path: str, pre_output_t
     that fails any of those is removed and the segment is left exactly as it was - a
     repair must never be able to cost the recording the content it is repairing.
     Never raises.
+
+    `scratch_key` names the remux's progress and stderr files (proc_utils.supervise_ffmpeg).
+    A join passes its recording's id, the key recorder.recording_disk_paths() lists by, so
+    a killed remux's leftovers are deleted with the recording.
     """
     from .probe import parse_ffprobe, scan_timeline_jumps
     from .proc_utils import supervise_ffmpeg
@@ -195,7 +199,8 @@ def close_reconnect_holes(path: str, reported, *, ffmpeg_path: str, pre_output_t
     try:
         run = supervise_ffmpeg(
             remux_args(ffmpeg_path, path, dest, matches), dest,
-            scratch_prefix='concat', scratch_key=os.path.basename(path),
+            scratch_prefix='concat',
+            scratch_key=scratch_key if scratch_key is not None else os.path.basename(path),
             interval=5, pre_output_timeout=pre_output_timeout, stall_seconds=stall_seconds,
             progress_signal='size', noun='concat', on_spawn=on_spawn, label=label)
         if not run.success:

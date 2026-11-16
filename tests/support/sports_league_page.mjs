@@ -2,7 +2,8 @@
    in jsdom and prints what it observed as JSON: the listings dialog's closed groups, event channels and Wrong match,
    and the Matching card's names and categories (mockup 51). Called by
    tests/test_sports_league_matches.py, which owns every assertion - this file only reports. Faked:
-   fetch (answers per request) and swapFromServer. */
+   fetch (answers per request) and swapFromServer. The page also carries the shared record dialog
+   (#record-modal and #active-rec-modal, hidden, each with an id), so a dialog this drives is a .modal with no id. */
 import fs from 'fs';
 import { JSDOM, VirtualConsole } from 'jsdom';
 
@@ -39,20 +40,20 @@ w.eval(JS[1]);
 
 const click = async (el) => { el.dispatchEvent(new w.MouseEvent('click', { bubbles: true })); await wait(); };
 const out = { errors };
-const groups = () => Array.from(d.querySelectorAll('.modal .sp-group'));
+const groups = () => Array.from(d.querySelectorAll('.modal:not([id]) .sp-group'));
 const sent = (fn) => requests.filter(fn).map((r) => ({ method: r.method, path: r.path, body: r.body }));
 
 await click(d.querySelector('.sp-onguide'));
 await wait(30);
-out.dialog_title = d.querySelector('.modal h2').textContent;
+out.dialog_title = d.querySelector('.modal:not([id]) h2').textContent;
 out.groups = groups().length;
-out.closed = groups().every((g) => !g.classList.contains('open')) && d.querySelectorAll('.modal .sp-group .sp-chan').length === 0;
+out.closed = groups().every((g) => !g.classList.contains('open')) && d.querySelectorAll('.modal:not([id]) .sp-group .sp-chan').length === 0;
 out.group_counts = groups().map((g) => g.querySelector('.sp-why strong').textContent);
 out.group_buttons = groups().map((g) => {
   const b = g.querySelector('[data-wrong="1"]');
   return b ? { text: b.textContent.trim(), danger: b.classList.contains('btn-danger') } : null;
 });
-out.intro = d.querySelector('.modal .sp-dialog-body').textContent.replace(/\s+/g, ' ');
+out.intro = d.querySelector('.modal:not([id]) .sp-dialog-body').textContent.replace(/\s+/g, ' ');
 
 await click(groups()[0].querySelector('[data-toggle]'));
 out.opened_channels = groups()[0].querySelectorAll('.sp-chan').length;
@@ -65,16 +66,16 @@ await click(groups()[0].querySelector('.sp-gact [data-wrong="1"]'));
 await wait(30);
 out.wrong_posts = sent((r) => r.method === 'POST' && /\/wrong$/.test(r.path));
 out.still_open_after_reload = groups()[0].classList.contains('open');
-const enames = () => Array.from(d.querySelectorAll('.modal .sp-ename'));
+const enames = () => Array.from(d.querySelectorAll('.modal:not([id]) .sp-ename'));
 out.names = enames().map((r) => ({ text: r.querySelector('.sp-cname').firstChild.textContent.trim(),
   why: r.querySelector('.sp-why').textContent, badge: (r.querySelector('.badge') || {}).textContent || null,
   button: r.querySelector('button').textContent.trim() }));
-out.names_heading = (d.querySelector('.modal .sp-h3') || {}).textContent || null;
+out.names_heading = (d.querySelector('.modal:not([id]) .sp-h3') || {}).textContent || null;
 const beforeName = requests.length;
 await click(enames()[0].querySelector('[data-wrong="1"]'));
 await wait(30);
 out.name_posts = requests.slice(beforeName).filter((r) => r.method === 'POST').map((r) => r.body);
-await click(d.querySelector('.modal .modal-close'));
+await click(d.querySelector('.modal:not([id]) .modal-close'));
 await wait(30);
 out.swaps_after_close = w.SWAPS;
 
@@ -99,9 +100,9 @@ await click(d.querySelector('[data-act="untie"]'));
 await wait(30);
 await click(d.querySelector('[data-act="tie"]'));
 await wait(30);
-out.offer = Array.from(d.querySelectorAll('.modal .sp-offer input')).map((i) => i.value);
-d.querySelector('.modal .sp-offer input').checked = true;
-await click(Array.from(d.querySelectorAll('.modal .modal-foot button')).find((b) => b.textContent.trim() === 'Add'));
+out.offer = Array.from(d.querySelectorAll('.modal:not([id]) .sp-offer input')).map((i) => i.value);
+d.querySelector('.modal:not([id]) .sp-offer input').checked = true;
+await click(Array.from(d.querySelectorAll('.modal:not([id]) .modal-foot button')).find((b) => b.textContent.trim() === 'Add'));
 await wait(30);
 out.category_puts = sent((r) => r.method === 'PUT' && /\/categories$/.test(r.path));
 

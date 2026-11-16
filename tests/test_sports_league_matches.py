@@ -304,6 +304,18 @@ class EventChannelTests(LeaguePageCase):
 
 
 class ListingsAndWrongMatchTests(LeaguePageCase):
+    def test_an_undo_sent_as_text_is_refused_and_marks_nothing(self):
+        """dev/docs/BUGS.md 2026-11-15 @ 12:58:58 PM: `"wrong": "false"` is truthy, and marked the listing a
+        wrong match when the caller meant to undo one."""
+        league, (soon_ev, _), ch, soon = seed_league()
+        m = add_match(soon_ev, ch[0], soon)
+        db.session.commit()
+        r = self.client.post(f'/api/sports/events/{soon_ev.id}/wrong', json={'match_ids': [m.id], 'wrong': 'false'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('true or false', r.get_json()['error'])
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(SportsMatch, m.id).rejected_at)
+
     def test_listings_are_grouped_by_wording_with_every_channel(self):
         league, (soon_ev, _), ch, soon = seed_league()
         for c in ch[:3]:
@@ -428,7 +440,9 @@ class NamesAndCategoriesTests(LeaguePageCase):
             db.session.add(SportsTeam(tsdb_id=tid, full_name=full, names=json.dumps([full, nick]),
                                       city=full[:-len(nick)].strip(), last_looked_up=datetime.utcnow()))
         db.session.add(SportsState(id=1))
-        make_epg_entry(ch[0], title='Football: Harborview Gulls at Ironvale Bears', start_time=soon, duration_minutes=180)
+        # In the league's own sport: a listing naming another one is never read by its category
+        # (dev/changelog/1552).
+        make_epg_entry(ch[0], title='Pretend Ball: Harborview Gulls at Ironvale Bears', start_time=soon, duration_minutes=180)
         db.session.commit()
         sports_match.run(now=soon - timedelta(hours=1), pause=0)
         self.assertEqual(SportsMatch.query.count(), 0)

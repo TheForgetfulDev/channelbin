@@ -47,7 +47,7 @@ It's actually been really fun using the search and surfacing channels that I did
 - [Moving to another machine](#moving-to-another-machine)
 - [Versioning and upgrades](#versioning-and-upgrades)
 - [Home Assistant integration](#home-assistant-integration)
-- [Output feed for an IPTV app](#output-feed-for-an-iptv-app)
+- [Output feed for an IPTV player](#output-feed-for-an-iptv-player)
 - [Troubleshooting a provider sync](#troubleshooting-a-provider-sync)
 - [How I use AI on this project](#how-i-use-ai-on-this-project)
 - [Feedback and contributions](#feedback-and-contributions)
@@ -108,9 +108,10 @@ and hands them to whatever you already use to watch them.
 
 - Health checks that connect to a channel, measure resolution and bitrate against configurable
   thresholds, capture screenshots, and record the result.
-- An output feed: ChannelBin as an Xtream Codes source an IPTV app adds as an account, serving
-  exactly the TV Guide's channels and groups with the guide's listings, a group playing as one
-  channel with failover. Off by default.
+- An output feed: ChannelBin as an Xtream Codes source an IPTV player adds as an account, serving
+  the TV Guide's channels and groups with the guide's listings, a group playing as one
+  channel with failover. Its own page gives the details to connect with, lets you take a
+  channel off the output, and shows who is watching and why each play ended. Off by default.
 - A live preview: watch or listen to a channel's actual stream from its page, to confirm it is
   the right channel and that it plays before a recording relies on it. The stream is copied
   into a short HLS window, and a preview gives its connection up to any recording that needs
@@ -161,8 +162,15 @@ and hands them to whatever you already use to watch them.
 
 - Follow a league or specific teams and see who is playing, when and where for the next three weeks,
   in your own timezone. Schedule data comes from [TheSportsDB](https://www.thesportsdb.com/); ChannelBin
-  fetches it for you, slowly and only for what you follow, and ships none of it. For now the schedule
-  is read only: matching games to your guide and recording them from it is a work in progress.
+  fetches it for you, slowly and only for what you follow, and ships none of it.
+- Each game is matched to the listings in your own guide that carry it, with the reason for every
+  match and a Wrong match button, so a league's page says where a game is on and lets you record it
+  from there. A recording of a matched game says what it is, and can take the event's poster and its
+  league, teams, venue and date in its file name.
+- An auto-record rule can name a league or a team: it then shows the games it expects, records each
+  game once, can skip replays, and can record from an event channel when no guide lists the game.
+- A followed team or league can be a channel of its own on the output feed, which plays whichever of
+  your channels lists the game and shows a waiting screen between games.
 
 ## Install
 
@@ -623,37 +631,45 @@ and it answers the same way in either case, so a switch left off looks exactly l
 
 ---
 
-## Output feed for an IPTV app
+## Output feed for an IPTV player
 
-ChannelBin can be an Xtream Codes source itself. Turn the output feed on and an IPTV app such as
+ChannelBin can be an Xtream Codes source itself. Turn the output feed on and an IPTV player such as
 TiviMate adds ChannelBin as an account the way it adds a provider - and then sees exactly the
 TV Guide: every channel and group in it, in the guide's order, with the guide's own listings,
 instead of the provider's twenty-thousand-channel list. A group plays as one channel, from the
 member ChannelBin would record from right now, and moves to another member mid-stream if that
 one dies.
 
-Go to **Settings > Integrations**:
+Go to the **IPTV Output** page, under Channels & guide:
 
-1. Give the feed a username and password. They are typed on a remote, so short is fine; the
-   feed is only as reachable as this server is.
-2. Turn the **Output feed for an IPTV app** switch on.
-3. In the IPTV app, add an Xtream Codes account with the server set to the address shown beside
-   the switch (the one you opened Settings on) and that username and password.
+1. **Set login**: the username and password the IPTV player logs in with. They are typed on a
+   remote, so short is fine; the feed is only as reachable as this server is.
+2. **Turn on**.
+3. In the IPTV player, add an Xtream Codes account with the server address, username and
+   password from the page's **Connect an IPTV player** card (each has a Copy button). A player
+   that takes a playlist instead gets the M3U and XMLTV addresses from the same card.
 
-Two ways the stream can reach the IPTV app, chosen by **How the IPTV app gets the stream**:
+The page lists every channel the player gets, with a switch to take one off the output while it
+stays in your TV Guide.
+
+Three ways the stream can reach the IPTV player, chosen by **How the IPTV player gets the stream**:
 
 - **Proxy** (the default): ChannelBin plays the channel through itself. It holds a provider
-  connection for the IPTV app, buffers a few seconds behind live so a dropout or a failover plays
-  through, and can say why a play stopped. A recording always wins: an IPTV app holding the connection a
+  connection for the IPTV player, buffers a few seconds behind live so a dropout or a failover plays
+  through, and can say why a play stopped. A recording always wins: an IPTV player holding the connection a
   recording needs is cut, and the Alerts page names the recording that took it.
-- **Redirect**: the IPTV app is sent straight to the provider's stream for the member chosen at that
-  moment. No failover mid-stream, the provider's credentials reach the IPTV app, and ChannelBin never
+- **Redirect**: the IPTV player is sent straight to the provider's stream for the member chosen at that
+  moment. No failover mid-stream, the provider's credentials reach the IPTV player, and ChannelBin never
   sees when the play ends - so a recording that then needs the connection is refused by the
-  provider rather than warned about here. **Seats kept free for the IPTV app** tells the recorder how
-  many connections to leave alone on an account in this mode.
+  provider rather than warned about here. **Recordings leave alone**, per account on the IPTV
+  Output page, tells the recorder how many connections to leave for the player in this mode.
+- **Mixed**: channel groups and sports channels play through ChannelBin, as in Proxy, so a group
+  still moves to another member when a stream drops; every other channel is sent straight to the
+  provider, as in Redirect. Each channel's row on the page says which way it plays, and
+  **Recordings leave alone** applies here too.
 
-The Dashboard's **Watching now** section lists each IPTV app playing and how the last sessions ended,
-and the Readiness check says whether the feed can serve. The feed is off by default
+The page's **Watching now** and **Recent plays** cards list each IPTV player playing and how every
+play ended or why it was refused, and the Readiness check says whether the feed can serve. The feed is off by default
 and nothing of it runs while it is off.
 
 ---

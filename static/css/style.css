@@ -159,7 +159,7 @@ h3 { font-size: var(--fs-base); font-weight: 600; margin-bottom: 0.5rem; }
    appears, and greys out with a disabled control like any other (dev/changelog/1320). */
 .icon { width: 1em; height: 1em; fill: currentColor; vertical-align: -0.125em; flex: none; }
 .icon[data-icon="record"] { color: var(--live); }
-:disabled .icon[data-icon="record"] { color: inherit; }
+:disabled .icon[data-icon="record"], .disabled .icon[data-icon="record"] { color: inherit; }
 .text-warning { color: var(--warn); }
 /* Promoted out of channels/detail.html's scoped block during the channel-detail
    revamp - it sits beside .text-warning at every call site. */
@@ -209,6 +209,10 @@ code { font-family: var(--font-mono); background: var(--bg3); padding: 1px 5px; 
 .btn-sm { font-size: var(--fs-sm); padding: 4px 10px; }
 .btn-sm.btn-icon { padding: 4px 9px; }
 .btn:disabled, .btn[disabled] { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
+/* Greyed but still clickable, so the click can say why (a league page's Record, the Programs
+   search's rule actions on a one-game search - dev/changelog/1539): looks :disabled, keeps its
+   pointer events. */
+.btn.disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* ── Badges (DESIGN.md 3.4 - one badge system) ──────────────────────
    The color modifiers are the .b-* status set in the design-system section. The legacy
@@ -3010,6 +3014,7 @@ th.gd-c-part { text-align: center; }
    rather than `cover` because showing a logo cropped would misstate what the server gets. */
 .pm-poster { display: flex; gap: 12px; align-items: flex-start; margin: 8px 0; }
 .pm-poster-img { width: 72px; aspect-ratio: 2 / 3; object-fit: contain; flex-shrink: 0; display: block; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.pm-poster-img.is-wide { width: 128px; aspect-ratio: 16 / 9; }
 .pm-poster-meta { font-size: var(--fs-sm); color: var(--text-muted); line-height: 1.45; min-width: 0; }
 .pm-poster-meta .btn { margin-top: 8px; }
 .pm-poster-advice { color: var(--warn); }
@@ -4864,6 +4869,11 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .sp-onguide:hover { text-decoration: underline; }
 .sp-none { color: var(--text-muted); }
 .sp-kebab { width: 1%; white-space: nowrap; text-align: right; }
+/* A game's Record or Manage recording, then its kebab (mockup 54, dev/changelog/1539). A
+   recording the game already has is a .badge under its name, with its channel and rule on the
+   row's .s line under that. */
+.sp-acts { display: inline-flex; gap: 6px; align-items: center; white-space: nowrap; }
+.sp-held { display: block; margin-top: 4px; }
 
 /* The listings dialog: one closed group per wording, the expand caret turned a quarter when open
    (the Readiness rows' pattern), Wrong match on a group and on each channel. */
@@ -4918,8 +4928,19 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .sp-catbar { margin-top: 10px; }
 .sp-offer { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
 .sp-offer-row { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; padding: 4px 0; cursor: pointer; }
+/* A page of Upcoming games or On your IPTV output (mockup 57): the channel page's pager, under the
+   table and to its right, where a page ends. On a phone the words take their own line and Prev and
+   Next sit at the two edges below them. */
+.sp-pager { margin-top: 12px; justify-content: flex-end; flex-wrap: wrap; row-gap: 6px; }
+.sp-pager-n { margin-right: 4px; }
+.sp-feed-tools { margin-bottom: 10px; }
 @media (max-width: 960px) {
+  .sp-pager-n { order: -1; flex-basis: 100%; text-align: center; margin-right: 0; }
+  .sp-pager .sp-prev { margin-right: auto; }
+  .sp-pager .sp-next { margin-left: auto; }
+  .sp-feed-tools .search-wrap, .sp-feed-tools .search { width: 100%; }
   .sp-kebab { width: auto; text-align: left; }
+  .sp-acts { display: flex; }
   .sp-addterm { width: 100%; }
   .sp-addterm .form-control { flex: 1; width: auto; }
   .sp-chan { align-items: flex-start; }
@@ -4978,3 +4999,74 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   padding: 8px 12px; }
 .ar-searchbox-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
   margin-top: 6px; font-size: var(--fs-sm); color: var(--text-faint); }
+
+/* ── The IPTV Output page (templates/iptv_output.html, mockup 53, dev/changelog/1526) ──
+   The league page's shell (.gd-statezone, .gd-actionbar, .gd-sections, .card, .card-note,
+   table.tbl.tbl-cards.rl-tbl, .rl-filter, .switch, .notice, .frow); these are what it adds. */
+/* Off or not set up is louder than a badge: the shared .notice-banner, one step larger. */
+.of-banner { padding: 1rem 1.1rem; gap: 1rem; }
+.of-banner .notice-banner-title { font-size: var(--fs-xl); }
+.of-banner .notice-banner-sub { font-size: var(--fs-md); color: var(--text); }
+.of-banner-i { flex: none; width: 1.75rem; height: 1.75rem; color: var(--warn); }
+/* A card that describes what is offered while nothing is offered. */
+.of-inert { opacity: .45; }
+
+/* Connection details: one way to connect per tab, each a label, the value and its buttons. */
+.of-tabs { margin: 10px 0 8px; }
+.of-conn { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border-soft); }
+.of-conn .k { flex: 0 0 7.5rem; color: var(--text-muted); font-size: var(--fs-md); }
+.of-conn .v { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: var(--fs-md); overflow-wrap: anywhere; }
+.of-conn .a { flex: none; display: flex; gap: 6px; }
+.of-conn-foot { margin-top: 10px; }
+
+/* The channel list's tools sit inside the card, so the toolbar's page margins come off. */
+.of-tools { margin: 8px 0 10px; }
+.of-tools .search { flex: 1 1 180px; max-width: 280px; }
+.of-tools select.form-control { flex: 0 1 220px; width: auto; height: var(--ctl-h); }
+.of-tools .rl-filter { margin: 0; }
+.of-num { width: 1%; white-space: nowrap; color: var(--text-muted); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.of-sw { width: 1%; white-space: nowrap; }
+/* A row that is off stays in the list, quieter, with its switch at full strength. */
+.of-off td:not(.of-sw) { opacity: .55; }
+.of-plays .ch-pill { margin-left: 6px; vertical-align: baseline; }
+.of-plays .ch-pill:first-child { margin-left: 0; }
+.of-link { color: inherit; }
+/* Go live now under a sports row's game (dev/changelog/1530). */
+.of-live { display: block; margin-top: 6px; }
+.of-live .s { margin-bottom: 4px; }
+.of-link:hover { color: var(--accent-text); }
+.of-pager { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+.of-pager-n { color: var(--text-muted); font-size: var(--fs-sm); margin-right: 4px; }
+
+/* The accounts table: every column starts at its heading's left edge, and the columns sit
+   together at the left in place of spreading across the card. */
+.of-acct th, .of-acct td { text-align: left; }
+@media (min-width: 961px) {
+  .of-acct th:not(:last-child), .of-acct td:not(:last-child) { width: 1%; padding-right: .5rem; }
+  /* A value stays on one line; a heading may take two, so redirect mode's five columns and
+     its select fit a card beside the sidebar at 1100 wide (dev/changelog/1526). */
+  .of-acct td:not(:last-child) { white-space: nowrap; }
+  .of-acct th { white-space: normal; }
+  /* A long account name is cut before the table outgrows its card. Measured in redirect mode
+     with a 188px name (dev/changelog/1526): the table fits from 1000 wide with the name at
+     160px, so the name gets what the window has to spare and is whole from about 1020. */
+  .of-acct .acct-pill { max-width: max(6rem, calc(100vw - 830px)); overflow: hidden; white-space: nowrap; }
+}
+/* The cost of leaving every connection alone, in the warning color over .rl-prog's muted .s. */
+.of-acct .s.text-warning { color: var(--warn); }
+/* Sized by its longest choice, and the choices are short (output_feed_view._held_choices). */
+.of-held { width: auto; max-width: 100%; }
+.of-login label { display: block; margin-top: 12px; }
+.of-login .card-note { margin-top: 12px; }
+
+@media (max-width: 960px) {
+  .of-conn { flex-wrap: wrap; gap: 4px 10px; }
+  .of-conn .k { flex-basis: 100%; }
+  .of-num, .of-sw { width: auto; }
+  .of-tools .search { max-width: none; }
+  /* The notice's button goes under its sentence, which had a word or two to a line beside it. */
+  .of-addr { flex-direction: column; }
+}
+.of-conn-pane .of-conn:last-of-type { border-bottom: none; }
+/* The Settings page's rows inside a card body, which already has the side padding. */
+.of-settings .frow { padding-left: 0; padding-right: 0; }

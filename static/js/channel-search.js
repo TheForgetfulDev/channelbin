@@ -2383,6 +2383,11 @@
 
      Programs only, like every rule action: a rule records showings. */
   const ruleMode = () => (state.rule === null || !CFG.ruleCtx ? null : CFG.ruleCtx.mode);
+  // A search narrowed to one game (f.event, from a league page's Search programs): a rule for it
+  // would end with the game, so the rule actions are greyed and say so (dev/changelog/1539).
+  const oneEvent = () => state.filters.some((f) => f.key === 'event' && f.values.length);
+  const ONE_EVENT_WHY = 'A rule cannot be about one game - it would end with it. Use Record on the '
+    + "league's page in Sports Schedules to record one game, or make the rule about the league or a team.";
 
   function renderRuleBar() {
     const mode = ruleMode();
@@ -2399,13 +2404,17 @@
         $('#rule-x').dataset.tip = 'Stop editing the rule\'s search. The rule keeps the search it has.';
       }
       $('#rule-save').style.display = mode === 'edit' ? '' : 'none';
-      // Save to rule needs a Programs search to save.
+      // Save to rule needs a Programs search to save, and never one about a single game.
       $('#rule-save').disabled = !isAirings();
+      $('#rule-save').classList.toggle('disabled', oneEvent());
     }
     const mk = $('#sel-mkrule');
     if (mk) {
       mk.style.display = isAirings() && mode !== 'edit' ? '' : 'none';
-      mk.classList.toggle('btn-primary', mode === 'new');
+      mk.classList.toggle('btn-primary', mode === 'new' && !oneEvent());
+      // Greyed, keeping its click to say why (dev/changelog/1539): auto_rules.clean_search()
+      // refuses the save anyway.
+      mk.classList.toggle('disabled', oneEvent());
     }
   }
 
@@ -3853,6 +3862,10 @@
         const ch = pageChannels().find((c) => String(c.id) === String(value));
         return ch ? ch.name : `Channel #${value}`;
       }
+      case 'event': {
+        const ev = eventLabel(value);
+        return ev ? ev.name : `TheSportsDB event #${value} (no longer stored)`;
+      }
       default:       return value;
     }
   }
@@ -4571,7 +4584,16 @@
   }
 
   const dimByKey = (key) => (CAT ? CAT.dimensions.find((d) => d.key === key) : null) || null;
-  const dimName = (key) => (dimByKey(key) || {}).label || key;
+  // A league page's Search programs (f.event, dev/changelog/1539) names the game in the league's
+  // own noun - Game, Race, Event - from CFG.eventLabels, which the server resolved.
+  const eventLabel = (value) => (CFG.eventLabels || {})[String(value)] || null;
+  const dimName = (key) => {
+    if (key === 'event') {
+      const first = Object.values(CFG.eventLabels || {})[0];
+      if (first) return first.noun.charAt(0).toUpperCase() + first.noun.slice(1);
+    }
+    return (dimByKey(key) || {}).label || key;
+  };
 
   function filterChipHtml(f, forceEx) {
     const list = forceEx ? f.ex : f.values;
@@ -5978,6 +6000,8 @@
      results are re-run the way Schedule selected re-runs them. */
   function openRuleFromSearch() {
     if (!isAirings()) return;
+    // Every way in (the results bar's button, the Saved menu) asks this first.
+    if (oneEvent()) { showToast(ONE_EVENT_WHY, { type: 'warning' }); return; }
     if (typeof openAutoRuleModal !== 'function' || !CFG.autoRule) {
       showToast('The rule dialog did not load on this page.', { type: 'error' });
       return;
@@ -6026,6 +6050,7 @@
 
   $('#rule-save').addEventListener('click', async () => {
     if (ruleMode() !== 'edit' || !isAirings()) return;
+    if (oneEvent()) { showToast(ONE_EVENT_WHY, { type: 'warning' }); return; }
     const btn = $('#rule-save');
     btn.disabled = true;
     let res;

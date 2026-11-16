@@ -51,16 +51,33 @@ def league_row(tsdb_id=LEAGUE_ID, name='Pretend League', sport='Pretend Ball', s
             'strLeagueAlternate': alternate, 'strCountry': country}
 
 
-def team_row(tsdb_id, name, alternate='', league=LEAGUE_ID, league_name='Pretend League', sport='Pretend Ball'):
-    return {'idTeam': str(tsdb_id), 'strTeam': name, 'strTeamAlternate': alternate, 'strTeamShort': name[:3].upper(),
+def team_row(tsdb_id, name, alternate='', league=LEAGUE_ID, league_name='Pretend League', sport='Pretend Ball',
+             colors=('', '', ''), short=None, badge=None):
+    """One team as lookupteam spells it (measured 2026-11-13, DESIGN-sports-data.md 2): every key is
+    sent, a missing color or short name is '', and colors are `#RRGGBB` in either case ('#EF0107',
+    '#fbffff'). The default has no colors and no badge, like Forfar Athletic; `badge` is an address
+    from FakeSportsDB.badge()."""
+    c1, c2, c3 = (tuple(colors) + ('', '', ''))[:3]
+    return {'idTeam': str(tsdb_id), 'strTeam': name, 'strTeamAlternate': alternate,
+            'strTeamShort': name[:3].upper() if short is None else short,
             'idLeague': str(league), 'strLeague': league_name, 'strSport': sport,
-            'strLocation': 'Britannia Rd, Pretendville, Pretendia'}
+            'strLocation': 'Britannia Rd, Pretendville, Pretendia',
+            'strColour1': c1, 'strColour2': c2, 'strColour3': c3, 'strBadge': badge, 'strLogo': None}
 
 
 class FakeSportsDB:
     """Holds what each endpoint answers, and records every call. `fault` makes the next calls fail
-    the ways the real API has: 'rate_limited' (HTTP 429 with a non-JSON body), 'refused' (HTTP 503),
-    'not_json' (HTTP 200 with a non-JSON body)."""
+    the ways the real API has: 'rate_limited' (HTTP 429 with a non-JSON body and a `Retry-After`
+    of `retry_after`), 'refused' (HTTP 503),
+    'not_json' (HTTP 200 with a non-JSON body).
+
+    A round longer than `round_cap` comes back cut to that many rows with nothing saying so, as the
+    free key does at 50 (measured 2026-11-14 on NCAA Division 1 Football, dev/changelog/1549).
+    `round_pick(rows, n)` chooses which rows the n-th call of that round gets, since the real
+    answer's 50 change from call to call; by default the first ones. lookupevent and searchevents
+    find a game in any round, cut or not, or in `games`, which holds those in no round."""
+
+    ROUND_CAP = 50
 
     def __init__(self):
         self.leagues = {LEAGUE_ID: league_row(), FIELD_LEAGUE_ID: league_row(
@@ -69,12 +86,18 @@ class FakeSportsDB:
         self.next_event = {}  # league -> [rows]
         self.teams = {}      # id -> row
         self.team_search = {}  # lowercased name -> [rows]
+        self.games = {}      # event id -> row, for a game no round lists
+        self.round_cap = self.ROUND_CAP
+        self.round_pick = None
+        self._round_calls = {}
         # The image host: path -> (status, body bytes, content type, extra headers, send a length). Images are made
         # up by the test (tests/support/images.py), never TheSportsDB's (dev/changelog/1465).
         self.images = {}
         self.calls = []
         self.fault = None
+        self.retry_after = '120'  # a 429's Retry-After header; None sends none
         self.answer_overrides = {}  # endpoint -> the whole JSON answer, whatever was asked
+        self.clock = None  # what eventsnext counts as now, UTC 'YYYY-MM-DDTHH:MM:SS'
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -108,7 +131,9 @@ class FakeSportsDB:
                 endpoint = url.path.rsplit('/', 1)[-1].replace('.php', '')
                 fake.calls.append((endpoint, query, url.path))
                 if fake.fault == 'rate_limited':
-                    return self._send(429, 'error code: 1015', 'text/plain')
+                    # The header the real one sent (2026-11-14, dev/changelog/1551).
+                    return self._send(429, 'error code: 1015', 'text/plain',
+                                      headers={'Retry-After': fake.retry_after} if fake.retry_after else None)
                 if fake.fault == 'refused':
                     return self._send(503, '<html>Service Unavailable</html>', 'text/html')
                 if fake.fault == 'not_json':
@@ -127,6 +152,11 @@ class FakeSportsDB:
         self.images[f'/images/media/event/{name}'] = (status, body, ctype, headers, length)
         return f'{self.image_base}/{name}'
 
+    def badge(self, name, body, ctype='image/png', status=200) -> str:
+        """Serve `body` as a team badge and return its address."""
+        self.images[f'/images/media/team/badge/{name}'] = (status, body, ctype, None, True)
+        return f'{self.image_base.rsplit("/", 1)[0]}/team/badge/{name}'
+
     def answer(self, endpoint, query):
         if endpoint in self.answer_overrides:
             return self.answer_overrides[endpoint]
@@ -136,14 +166,50 @@ class FakeSportsDB:
         if endpoint == 'eventsnextleague':
             return {'events': self.next_event.get(int(query['id'])) or None}
         if endpoint == 'eventsround':
-            rows = self.rounds.get((int(query['id']), query['s'], int(query['r'])))
+            key = (int(query['id']), query['s'], int(query['r']))
+            rows = list(self.rounds.get(key) or [])
+            n = self._round_calls[key] = self._round_calls.get(key, 0) + 1
+            if len(rows) > self.round_cap:
+                rows = self.round_pick(rows, n) if self.round_pick else rows
+                rows = rows[:self.round_cap]
             return {'events': rows or None}
+        if endpoint == 'lookupevent':
+            row = self._every_game().get(str(query['id']))
+            return {'events': [row] if row else None}
+        if endpoint == 'searchevents':
+            # Exact name, home team first, underscores for spaces; one row at most. The key is
+            # `event`, singular (measured 2026-11-14). What a miss looks like was not measured: null,
+            # as every other empty answer is, is assumed. `d` matches dateEvent, the UTC date. By
+            # season alone the real one gave a Feb 13 NBA game for a pair that also meets in
+            # November (measured 2026-11-14); how it picks was not measured, and here it is the latest.
+            name = query['e'].replace('_', ' ')
+            found = [r for r in self._every_game().values()
+                     if r.get('strEvent') == name and ('s' not in query or r.get('strSeason') == query['s'])
+                     and ('d' not in query or r.get('dateEvent') == query['d'])]
+            found.sort(key=lambda r: r.get('strTimestamp') or '', reverse=True)
+            return {'event': found[:1] or None}
+        if endpoint == 'eventsnext':
+            # A team's next game, home or away, in any league, one row: UTEP and Wyoming both gave the
+            # UTEP game, and the Nuggets an away game (measured 2026-11-14, dev/changelog/1553). The
+            # docs' "home games only" is wrong. Next means after `clock` (UTC, 'YYYY-MM-DDTHH:MM:SS')
+            # when a test sets it, else any game not finished.
+            team = str(query['id'])
+            ahead = [r for r in self._every_game().values()
+                     if team in (r.get('idHomeTeam'), r.get('idAwayTeam')) and r.get('strStatus') != 'FT'
+                     and (self.clock is None or (r.get('strTimestamp') or '') > self.clock)]
+            ahead.sort(key=lambda r: r.get('strTimestamp') or '')
+            return {'events': ahead[:1] or None}
         if endpoint == 'lookupteam':
             row = self.teams.get(int(query['id']))
             return {'teams': [row] if row else None}
         if endpoint == 'searchteams':
             return {'teams': self.team_search.get(query['t'].lower()) or None}
         raise AssertionError(f'the app called {endpoint}, which the fake does not answer')
+
+    def _every_game(self) -> dict:
+        out = {r['idEvent']: r for rows in self.rounds.values() for r in rows}
+        out.update({str(k): v for k, v in self.games.items()})
+        return out
 
     def calls_to(self, endpoint):
         return [c for c in self.calls if c[0] == endpoint]

@@ -6,20 +6,24 @@ recorded, never from a count of what is stored. "Round" is TheSportsDB's word fo
 games and means nothing to a viewer, so it appears only beside the dates in Schedule updates.
 """
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import func, or_
 
 from . import db, sports_match
 from .database import (
-    SPORTS_FETCH_EMPTY, SPORTS_FETCH_OK, SPORTS_FETCH_RATE_LIMITED, SPORTS_FETCH_REFUSED,
-    SPORTS_FETCH_SHRUNK, SPORTS_KIND_LEAGUE, SPORTS_KIND_NEXT, SPORTS_KIND_ROUND, SPORTS_KIND_TEAM,
+    SPORTS_FETCH_CAPPED, SPORTS_FETCH_CAPPED_PAST, SPORTS_FETCH_EMPTY, SPORTS_FETCH_OK, SPORTS_FETCH_RATE_LIMITED, SPORTS_FETCH_REFUSED,
+    SPORTS_FETCH_SHRUNK, SPORTS_KIND_EVENT, SPORTS_KIND_LEAGUE, SPORTS_KIND_NEXT, SPORTS_KIND_ROUND, SPORTS_KIND_SEARCH,
+    SPORTS_KIND_TEAM, SPORTS_KIND_TEAM_NEXT,
     SPORTS_AIRING_UNKNOWN, SPORTS_MATCH_STRONG, EPGEntry, SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsLeagueCategory, SportsState, SportsTeam,
 )
 from .config import load_config
 from .fmt_utils import counted
-from .sports_data import SHIPPED_LEAGUES, _settings, event_shape_is_matchup, link_has_time
-from .tz_utils import ago, date_label, day_label, format_local, get_display_tz, is_24h, to_local
+from .sports_data import (
+    MISSING_KEEP_DAYS, ONE_GAME_KINDS, ROUND_ROW_CAP, SHIPPED_LEAGUES, search_parts, _settings, capped_spans, event_game_name, event_shape_is_matchup,
+    link_has_time,
+)
+from .tz_utils import ago, date_label, day_label, format_local, get_display_tz, is_24h, to_local, to_naive_utc
 
 STATUS_OK = 'ok'
 STATUS_FILLING = 'filling'
@@ -49,10 +53,12 @@ RESULTS = {
     SPORTS_FETCH_SHRUNK: ('b-warn', 'Fewer games'),
     SPORTS_FETCH_REFUSED: ('b-fail', 'Refused'),
     SPORTS_FETCH_RATE_LIMITED: ('b-warn', 'Slowed down'),
+    SPORTS_FETCH_CAPPED: ('b-warn', f'Cut at {ROUND_ROW_CAP}'),
+    SPORTS_FETCH_CAPPED_PAST: ('b-warn', f'Cut at {ROUND_ROW_CAP}'),
 }
-
-SECTIONS = ('about', 'upcoming', 'matching', 'updates')
-SECTION_NAMES = {'about': 'This league', 'upcoming': 'Upcoming games', 'matching': 'Matching your guide',
+SECTIONS = ('about', 'upcoming', 'feed', 'matching', 'updates')
+SECTION_NAMES = {'about': 'This league', 'upcoming': 'Upcoming games', 'feed': 'On your IPTV output',
+                 'matching': 'Matching your guide',
                  'updates': 'Schedule updates'}
 SECTIONS_PREF_KEY = 'sports_league_sections'
 #: The latest queue rows Schedule updates shows. Team lookups only show when one has a problem.
@@ -61,13 +67,14 @@ SCOPE_FOLLOWED = 'followed'
 SCOPE_ALL = 'all'
 
 #: Why a league with a follow has no game to show, by its status. A refusal must not read as "no games".
+#: `{many}` is the league's noun.
 NO_GAME_HEAD = {
     STATUS_FAILED: ('Not known', 'The last update failed'),
     STATUS_SLOW: ('Not known', 'Waiting to ask again'),
     STATUS_FILLING: ('Not known yet', 'Still getting the schedule'),
     STATUS_LOOK: ('Nothing listed', 'In the days this schedule covers'),
     STATUS_OK: ('Nothing listed', 'In the days this schedule covers'),
-    STATUS_OFF: ('Not followed', 'Not checking for games'),
+    STATUS_OFF: ('Not followed', 'Not checking for {many}'),
 }
 
 
@@ -80,7 +87,7 @@ def league_status(follows: list, fetches: list, missing: int) -> str:
         return STATUS_FAILED
     if SPORTS_FETCH_RATE_LIMITED in outcomes:
         return STATUS_SLOW
-    if any(f.last_at is None for f in fetches):
+    if any(f.last_at is None and f.kind not in ONE_GAME_KINDS for f in fetches):
         return STATUS_FILLING
     if (SPORTS_FETCH_SHRUNK in outcomes or missing or any(f.dropped_count for f in fetches)
             or any(f.kind == SPORTS_KIND_LEAGUE and f.outcome == SPORTS_FETCH_EMPTY for f in fetches)):
@@ -121,7 +128,7 @@ def _when_text(day: str, clock: str) -> str:
 def _game_row(event, now, tz, h24) -> dict:
     day, clock = event_when(event, now, tz, h24)
     matchup = event_shape_is_matchup(event)
-    game = f'{event.away_name} at {event.home_name}' if matchup and event.away_name and event.home_name else event.name
+    game = event_game_name(event)
     notes = []
     if event.postponed:
         notes.append('Postponed')
@@ -141,10 +148,12 @@ def _is_followed(event, follows) -> bool:
     return 0 in teams or event.home_team_id in teams or event.away_team_id in teams
 
 
-def _upcoming_query(now, settings, tz):
+def _upcoming_query(now, settings, tz, since=None):
+    """The events from `since` (default now) to the horizon. `since` earlier than now is the
+    league page's _league_page_since()."""
     today = to_local(now, tz).date()
     return SportsEvent.query.filter(
-        or_(SportsEvent.start_at >= now,
+        or_(SportsEvent.start_at >= (since or now),
             # A placeholder's 00:00 can already be behind us on the day it means.
             SportsEvent.local_date >= today),
         or_(SportsEvent.start_at.is_(None),
@@ -156,6 +165,28 @@ def _still_ahead(event, now, tz) -> bool:
     if event.start_at is None or (not event_shape_is_matchup(event) and (event.start_at.hour, event.start_at.minute) == (0, 0)):
         return event.local_date >= to_local(now, tz).date()
     return event.start_at >= now
+
+
+#: How long after its start a league page keeps a game that began before today: a late game is
+#: still on, or still recording, after midnight (dev/docs/BUGS.md 2026-11-14).
+LEAGUE_PAGE_KEEP = timedelta(hours=6)
+
+
+def _league_page_since(now, tz) -> datetime:
+    """The earliest start a league page shows, as naive UTC: the start of today in the display
+    time zone, or LEAGUE_PAGE_KEEP ago when that is earlier."""
+    day_start = to_naive_utc(datetime.combine(to_local(now, tz).date(), time.min, tzinfo=tz))
+    return min(day_start, now - LEAGUE_PAGE_KEEP)
+
+
+def _on_league_page(event, since, now, tz) -> bool:
+    """A league page keeps a game for the rest of the day it starts on, and at least
+    LEAGUE_PAGE_KEEP after its start, so a game being recorded, one on now and a morning game's
+    later replay can still be acted on there (dev/changelog/1539). The All Leagues list's next
+    game is still the next one to start (_still_ahead)."""
+    if event.start_at is None or (not event_shape_is_matchup(event) and (event.start_at.hour, event.start_at.minute) == (0, 0)):
+        return event.local_date >= to_local(now, tz).date()
+    return event.start_at >= since
 
 
 def _follow_text(league, follows, team_names, plural) -> str:
@@ -218,7 +249,8 @@ def _banner(statuses, fetches_by_league, follows, state, settings, now, tz, h24)
         limited = [f.last_at for f in rows if f.outcome == SPORTS_FETCH_RATE_LIMITED]
         at = f' at {format_local(max(limited), "clock", tz=tz, h24=h24)}' if limited else ''
         return {'tone': 'warn', 'title': f'TheSportsDB asked ChannelBin to slow down{at}.',
-                'sub': f'Calls are now about {_minutes(state.backoff_seconds)} apart, and clean calls bring that back down. '
+                'sub': f'ChannelBin stops for as long as TheSportsDB asks, then calls about {_minutes(state.backoff_seconds)} '
+                       'apart until clean calls bring that back down. '
                        'Nothing stored has changed, and recordings are not affected.',
                 'settings': True}
     failed = sum(1 for s in statuses if s == STATUS_FAILED)
@@ -226,7 +258,7 @@ def _banner(statuses, fetches_by_league, follows, state, settings, now, tz, h24)
         return {'tone': 'warn', 'title': f"{counted(failed, 'league')} could not update.",
                 'sub': 'Open it to see why. What is stored has not changed, and ChannelBin tries again later.',
                 'settings': False}
-    filling = [f for f in rows if f.last_at is None]
+    filling = [f for f in rows if f.last_at is None and f.kind not in ONE_GAME_KINDS]
     if filling:
         names = sorted({lid for lid in {f.league_id for f in filling}})
         return {'tone': 'plain', 'title': f'Getting schedules: at least {counted(len(filling), "more call")}.',
@@ -268,7 +300,7 @@ def list_context() -> dict:
         status = league_status(lfollows, lfetches, missing.get(league.id, 0))
         badge, label, edge, rank, tip = STATUSES[status]
         mine = [e for e in events if _is_followed(e, lfollows)]
-        _, plural = _noun(league, events)
+        one, plural = _noun(league, events)
         updated = _last_updated(lfetches)
         first = mine[0] if mine else None
         nxt = None
@@ -278,14 +310,16 @@ def list_context() -> dict:
             'id': league.id, 'name': league.name, 'status': status, 'badge': badge, 'label': label,
             'edge': edge, 'rank': rank, 'tip': tip, 'followed': bool(lfollows),
             'summary': _follow_text(league, lfollows, teams, plural) if lfollows else (league.sport or 'Not followed'),
-            'next': nxt, 'next_sort': _sort_key(first), 'no_game': NO_GAME_HEAD[status],
+            'next': nxt, 'next_sort': _sort_key(first),
+            'no_game': tuple(text.format(many=plural) for text in NO_GAME_HEAD[status]),
             'count': len(mine) if lfollows else 0,
             'updated': ago(updated, now), 'updated_at': format_local(updated, 'day_datetime', none_value='', tz=tz, h24=h24),
             'updated_sort': int((now - updated).total_seconds()) if updated else 10 ** 9,
             'has_teams': any(event_shape_is_matchup(e) for e in events),
             # The person's own follow, as on the league's page; a rule's is changed on the rule.
             'dialog': _dialog(league, [f for f in lfollows if not f.rule_id], teams, events, settings,
-                              sorted(rule_names[f.rule_id] for f in lfollows if f.rule_id in rule_names)),
+                              sorted(rule_names[f.rule_id] for f in lfollows if f.rule_id in rule_names),
+                              one=one, many=plural),
         })
     rows.sort(key=lambda r: (r['next_sort'], r['name']))
     followed = sum(1 for r in rows if r['followed'])
@@ -304,10 +338,11 @@ def _sort_key(event) -> str:
     return (event.start_at or datetime.combine(event.local_date, datetime.min.time())).strftime('%Y%m%d%H%M')
 
 
-def _dialog(league, follows, teams, events, settings, rules=()) -> dict:
+def _dialog(league, follows, teams, events, settings, rules=(), one='game', many='games') -> dict:
     """What the row's dialogs act on, read from the row itself so it is never older than the page.
     `rules` names the auto-record rules that name the league, so Delete league says it cannot before
-    it is pressed (dev/changelog/1491)."""
+    it is pressed (dev/changelog/1491). `one` and `many` are the league's noun, so a dialog never
+    calls a race a game."""
     names = {}
     for e in events:
         if e.home_team_id:
@@ -315,6 +350,7 @@ def _dialog(league, follows, teams, events, settings, rules=()) -> dict:
         if e.away_team_id:
             names[e.away_team_id] = e.away_name
     return {'id': league.id, 'name': league.name, 'stored': len(events), 'keep_days': settings['history_keep_days'],
+            'one': one, 'many': many,
             'chosen': sorted(f.team_tsdb_id for f in follows if f.team_tsdb_id),
             'whole': any(f.team_tsdb_id == 0 for f in follows),
             'followed': bool(follows), 'rules': list(rules),
@@ -336,7 +372,9 @@ def _round_dates(league_id, now, tz) -> dict:
     return out
 
 
-def _update_row(fetch, rounds, one, many, now, tz, h24) -> dict:
+def _update_row(fetch, rounds, one, many, now, tz, h24, teams=None, games=None) -> dict:
+    """`teams` ({tsdb id: name}) and `games` ({tsdb event id: event}) name the game a one-game call
+    was about."""
     sub = ''
     if fetch.kind == SPORTS_KIND_ROUND:
         _, _, season, number = fetch.target.split(':')
@@ -349,6 +387,18 @@ def _update_row(fetch, rounds, one, many, now, tz, h24) -> dict:
         what = "The league's details"
     elif fetch.kind == SPORTS_KIND_TEAM:
         what = 'A team name'
+    elif fetch.kind == SPORTS_KIND_EVENT:
+        what = f'A {one} re-read by its number'
+        event = (games or {}).get(int(fetch.target.split(':')[1]))
+        sub = event_game_name(event) if event is not None else ''
+    elif fetch.kind == SPORTS_KIND_SEARCH:
+        what = f'A {one} from your guide, looked up by name'
+        _season, home, away = search_parts(fetch.target)
+        sub = f'{(teams or {}).get(away, away)} at {(teams or {}).get(home, home)}'
+    elif fetch.kind == SPORTS_KIND_TEAM_NEXT:
+        what = f"A team's next {one}"
+        team = int(fetch.target.split(':')[2])
+        sub = (teams or {}).get(team, str(team))
     else:
         raise ValueError(f'unknown sports fetch kind {fetch.kind!r}')
     if fetch.last_at is None:
@@ -358,7 +408,92 @@ def _update_row(fetch, rounds, one, many, now, tz, h24) -> dict:
             'what': what, 'sub': sub, 'badge': badge, 'note': fetch.reason or ''}
 
 
-def _notices(league, status, fetches, missing_events, one, many, stored, keep_days, now, tz) -> list:
+def _lookups_by_game(fetches) -> dict:
+    """The answered lookups by name, grouped into the games they were for. A listing that does not
+    say which team is home is asked both ways round, and one that opens near midnight UTC on both
+    days, so one game can be up to four calls: the same two teams on the same or the next day are
+    one game."""
+    asks = []
+    for f in fetches:
+        if f.kind == SPORTS_KIND_SEARCH and f.last_at is not None:
+            when, home, away = search_parts(f.target)
+            asks.append((frozenset((home, away)), when, f, home, away))
+    games, last = {}, {}
+    for pair, when, f, home, away in sorted(asks, key=lambda a: (sorted(a[0]), a[1])):
+        try:
+            day = date.fromisoformat(when)
+        except ValueError:
+            day = None   # a season, from a row written before lookups went by day
+        prev = last.get(pair)
+        if prev is not None and day is not None and prev[1] is not None and 0 <= (day - prev[1]).days <= 1:
+            # Measured from the group's first day, so a chain of days never grows into one game. Two
+            # meetings on back-to-back days count as one here: this is a count on a notice, and
+            # telling them apart would need the listing each lookup came from.
+            key = prev[0]
+        else:
+            key = (pair, when)
+            last[pair] = (key, day)
+        games.setdefault(key, []).append((f, home, away))
+    return games
+
+
+def _cut_notice(fetches, rounds, one, many, teams) -> tuple | None:
+    """What a round answer cut at ROUND_ROW_CAP means and what was done about it, or None."""
+    cut = [f for f in fetches if f.kind == SPORTS_KIND_ROUND
+           and f.outcome in (SPORTS_FETCH_CAPPED, SPORTS_FETCH_CAPPED_PAST)]
+    if not cut:
+        return None
+    weeks = []
+    for f in sorted(cut, key=lambda f: f.target):
+        if f.outcome != SPORTS_FETCH_CAPPED:
+            continue
+        _, _, season, number = f.target.split(':')
+        dates = rounds.get((season, int(number)))
+        if dates:
+            weeks.append(dates[0])
+    text = f'TheSportsDB sends at most {ROUND_ROW_CAP} {many} for one call.'
+    if any(f.outcome == SPORTS_FETCH_CAPPED for f in cut):
+        which = f" for {' and '.join(weeks)}" if weeks else ''
+        text += (f' Its answer{which} came back with exactly that many, so it may have left some out. A {one} '
+                 f'left out of a cut answer is not marked missing.')
+    if any(f.outcome == SPORTS_FETCH_CAPPED_PAST for f in cut):
+        # The NBA files its whole season as one round, and the answer is its first 50 (dev/changelog/1550).
+        text += (f' TheSportsDB files this whole stretch of the schedule as one round, and it sent only the '
+                 f'first {ROUND_ROW_CAP}, all already played.')
+    asked = [f for f in fetches if f.kind == SPORTS_KIND_TEAM_NEXT and f.last_at is not None]
+    if asked:
+        # eventsnext sends one game, so a team is asked again after each game it plays (dev/changelog/1553).
+        named = sum(1 for f in asked if _found(f))
+        text += (f' ChannelBin asked {counted(len(asked), "team")} for its next {one}, and {named} named one in '
+                 f'this league. Each is asked again after that {one}, so the one after it is found before it starts.')
+    reread = [f for f in fetches if f.kind == SPORTS_KIND_EVENT and f.last_at is not None]
+    waiting = sum(1 for f in fetches if f.kind in ONE_GAME_KINDS and f.last_at is None)
+    pairs = _lookups_by_game(fetches)
+    if reread:
+        text += f' ChannelBin re-read {counted(len(reread), one)} it already had by number.'
+    if pairs:
+        found = sum(1 for asks in pairs.values() if any(_found(f) for f, _h, _a in asks))
+        text += f' It looked up {counted(len(pairs), one)} your guide lists by name and found {found}.'
+        absent = [asks[0] for asks in pairs.values() if all(f.outcome == SPORTS_FETCH_EMPTY for f, _h, _a in asks)]
+        if absent:
+            names = [f'{teams.get(away, away)} at {teams.get(home, home)}' for _f, home, away in absent[:5]]
+            more = f' and {len(absent) - 5} more' if len(absent) > 5 else ''
+            text += f" Not found by name: {', '.join(names)}{more}."
+    unusable = sum(1 for f in fetches if f.kind in ONE_GAME_KINDS and f.dropped_count)
+    if unusable:
+        text += f' {counted(unusable, "lookup")} came back with an answer ChannelBin could not use.'
+    if waiting:
+        text += f' {counted(waiting, "more lookup")} waiting.'
+    return ('info', f'Some {many} may be missing from TheSportsDB\'s answer.', text)
+
+
+def _found(fetch) -> bool:
+    """A lookup's answer held a game that was stored: answered, with more rows than it dropped."""
+    return fetch.outcome == SPORTS_FETCH_OK and (fetch.row_count or 0) > (fetch.dropped_count or 0)
+
+
+def _notices(league, status, fetches, missing_events, one, many, stored, keep_days, now, tz,
+             rounds=None, teams=None) -> list:
     """Why the league's badge says what it says: (tone, strong, text). Each failure names itself."""
     out = []
     if status == STATUS_OFF:
@@ -375,15 +510,20 @@ def _notices(league, status, fetches, missing_events, one, many, stored, keep_da
             out.append(('bad', 'The last update failed.', f'{f.reason} First seen {since}. What is stored has not changed, and ChannelBin tries again later.'))
             break
     if any(f.outcome == SPORTS_FETCH_RATE_LIMITED for f in fetches):
-        out.append(('warn', 'TheSportsDB asked ChannelBin to slow down.', 'That is not read as "no games", and nothing stored has changed.'))
+        out.append(('warn', 'TheSportsDB asked ChannelBin to slow down.', f'That is not read as "no {many}", and nothing stored has changed.'))
     for f in fetches:
         if f.outcome == SPORTS_FETCH_SHRUNK:
             out.append(('warn', 'An update came back smaller.', f.reason or ''))
+    cut = _cut_notice(fetches, rounds or {}, one, many, teams or {})
+    if cut is not None:
+        out.append(cut)
     for e in missing_events[:5]:
         since = date_label(to_local(e.missing_since, tz).date(), now, tz)
         out.append(('warn', f'A {one} is missing.', f"{e.away_name} at {e.home_name}" if event_shape_is_matchup(e) else e.name))
-        out[-1] = (out[-1][0], out[-1][1], f"{out[-1][2]} was not in TheSportsDB's latest answer on {since}. It is kept for 7 days in case it moved.")
-    dropped = sum(f.dropped_count or 0 for f in fetches if f.kind != SPORTS_KIND_NEXT)
+        out[-1] = (out[-1][0], out[-1][1], f"{out[-1][2]} was not in TheSportsDB's latest answer on {since}. It is kept for {counted(MISSING_KEEP_DAYS, 'day')} in case it moved.")
+    # Only the calls Schedule updates lists, which is where this sends the reader. A lookup's unusable
+    # answer is named in the cut notice (dev/docs/BUGS.md 2026-11-14 @ 11:28:49 am).
+    dropped = sum(f.dropped_count or 0 for f in fetches if f.kind not in (SPORTS_KIND_NEXT, SPORTS_KIND_TEAM, *ONE_GAME_KINDS))
     if dropped:
         out.append(('warn', f'{counted(dropped, "row")} from TheSportsDB could not be used.', 'Schedule updates below says why.'))
     if status == STATUS_FILLING:
@@ -404,18 +544,78 @@ def _no_games_note(status: str, horizon_days: int) -> str:
     }[status]
 
 
-def page_context(league_id: int, scope: str = SCOPE_FOLLOWED):
+#: How many rows a page of the league page's Upcoming games or On your IPTV output holds (mockup 57).
+#: A page of games runs on to the end of the day it reaches this on, so no day is split.
+PAGE_SIZE = 25
+#: The longest team filter the IPTV output card takes, as the route reads it.
+FEED_FILTER_MAX = 120
+
+
+def day_pages(items: list, day_of, size: int = PAGE_SIZE) -> list:
+    """`items`, in their own order, as pages that end at the end of a day once they hold `size`.
+    A busy Saturday is one long page rather than two halves you page between, and today's games are
+    all on page 1. `day_of` reads an item's day label; consecutive items with the same label are one
+    day. Never empty: no items is one empty page."""
+    pages, cur = [], []
+    for i, item in enumerate(items):
+        cur.append(item)
+        last = i + 1 == len(items)
+        if last or (len(cur) >= size and day_of(items[i + 1]) != day_of(item)):
+            pages.append(cur)
+            cur = []
+    return pages or [[]]
+
+
+def _pager(page: int, pages: int, first: str, last: str, link) -> dict:
+    """The pager under a paged card, None when everything fits on one page. `first` and `last` name
+    what the page runs from and to; `link(n)` is page n's address."""
+    if pages <= 1:
+        return None
+    span = first if first == last else f'{first} to {last}'
+    return {'text': f'Page {page} of {pages}: {span}',
+            'prev': link(page - 1) if page > 1 else '', 'next': link(page + 1) if page < pages else ''}
+
+
+def _clamp(page: int, pages: int) -> int:
+    return min(max(1, page or 1), pages)
+
+
+def _feed_page(feed: dict, league, q: str, page: int, link) -> dict:
+    """One page of the IPTV output card's team channels, filtered first by `q` (a piece of the
+    team's name, any case) and then paged. The league's own row is not a team: it is on every page,
+    unless a filter is in and the league's name does not have it."""
+    teams = feed['teams']
+    needle = q.casefold()
+    shown = [t for t in teams if needle in t['name'].casefold()] if needle else teams
+    pages = [shown[i:i + PAGE_SIZE] for i in range(0, len(shown), PAGE_SIZE)] or [[]]
+    page = _clamp(page, len(pages))
+    here = pages[page - 1]
+    return {'q': q, 'page': page, 'filterable': len(teams) > PAGE_SIZE or bool(needle),
+            'show_league': feed['whole'] and (not needle or needle in league.name.casefold()),
+            'page_teams': here,
+            'pager': _pager(page, len(pages), here[0]['name'], here[-1]['name'], lambda n: link(feed_page=n)) if here else None}
+
+
+def page_context(league_id: int, scope: str = SCOPE_FOLLOWED, page: int = 1, feed_page: int = 1, feed_q: str = ''):
+    """The league page. `page` and `feed_page` pick the page of Upcoming games and of On your IPTV
+    output, `feed_q` filters the latter by team; every link the page draws keeps the other card's."""
+    from flask import url_for
+    from . import sports_feed
     league = db.session.get(SportsLeague, league_id)
     if league is None:
         return None
+    from .config import load_config
+    cfg = load_config()
     now = datetime.utcnow()
     tz, h24 = get_display_tz(), is_24h()
     settings = _settings()
     fetches = SportsFetch.query.filter_by(league_id=league_id).all()
     follows = SportsFollow.query.filter_by(league_id=league_id).all()
     teams = {t.tsdb_id: t.full_name for t in SportsTeam.query.all()}
-    all_events = [e for e in _upcoming_query(now, settings, tz).filter(SportsEvent.league_id == league_id).all()
-                  if _still_ahead(e, now, tz)]
+    since = _league_page_since(now, tz)
+    all_events = [e for e in _upcoming_query(now, settings, tz, since=since)
+                  .filter(SportsEvent.league_id == league_id).all()
+                  if _on_league_page(e, since, now, tz)]
     missing_events = SportsEvent.query.filter(SportsEvent.league_id == league_id,
                                               SportsEvent.missing_since.isnot(None)).order_by(SportsEvent.start_at).all()
     stored = SportsEvent.query.filter_by(league_id=league_id).count()
@@ -425,13 +625,28 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED):
     whole = any(f.team_tsdb_id == 0 for f in follows)
     picked_teams = bool(follows) and not whole
     mine = [e for e in all_events if _is_followed(e, follows)] if follows else all_events
+    scope = SCOPE_ALL if scope == SCOPE_ALL and picked_teams else SCOPE_FOLLOWED
     shown = all_events if (scope == SCOPE_ALL or not picked_teams) else mine
+    feed_q = (feed_q or '').strip()[:FEED_FILTER_MAX]
+    paged = day_pages([(_game_row(e, now, tz, h24), e) for e in shown], lambda pair: pair[0]['day'])
+    page = _clamp(page, len(paged))
+    here = paged[page - 1]
+    where = {'scope': scope, 'page': page, 'feed_page': feed_page or 1, 'feed_q': feed_q}
+
+    def link(**over):
+        s = {**where, **over}
+        args = {'scope': SCOPE_ALL} if s['scope'] == SCOPE_ALL else {}
+        args.update({k: s[k] for k in ('page', 'feed_page') if s[k] > 1})
+        if s['feed_q']:
+            args['feed_q'] = s['feed_q']
+        return url_for('sports.league_page', league_id=league.id, **args)
+
     updated = _last_updated(fetches)
     follow_text = _follow_text(league, follows, teams, many)
     # A rule's follow is changed on the rule, so the buttons and the Following row are about the
     # person's own; the rules that follow it have a row of their own (dev/changelog/1490).
     person = [f for f in follows if not f.rule_id]
-    rule_follows = _rule_follows(follows, teams)
+    rule_follows = _rule_follows(follows, teams, many)
     if picked_teams:
         lead = f'Following {follow_text.replace(", ", " and ")}.'
     elif whole:
@@ -441,48 +656,61 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED):
     bits = [b for b in (league.sport, f'{league.current_season} season' if league.current_season else None) if b]
     rounds = _round_dates(league_id, now, tz)
     update_rows = sorted(
-        (f for f in fetches if f.kind != SPORTS_KIND_TEAM or f.outcome in (SPORTS_FETCH_REFUSED, SPORTS_FETCH_RATE_LIMITED)),
+        (f for f in fetches if f.kind not in (SPORTS_KIND_TEAM, *ONE_GAME_KINDS)
+         or f.outcome in (SPORTS_FETCH_REFUSED, SPORTS_FETCH_RATE_LIMITED)),
         key=lambda f: (f.last_at is None, -(f.last_at.timestamp() if f.last_at else 0)))[:UPDATES_SHOWN]
+    reread_ids = [int(f.target.split(':')[1]) for f in update_rows if f.kind == SPORTS_KIND_EVENT]
+    reread = ({e.tsdb_id: e for e in SportsEvent.query.filter(SportsEvent.tsdb_id.in_(reread_ids)).all()}
+              if reread_ids else {})
     next_update = _next_update(fetches, now, tz, h24) if follows else 'None'
     state = db.session.get(SportsState, 1)
     checked_at = state.last_match_at if state is not None else None
     counts = sports_match.game_counts([e.id for e in all_events])
-    names = sports_match.name_counts([e.id for e in shown])
+    names = sports_match.name_counts([e.id for _row, e in here])
     if follows:
         message = (f'Updated {ago(updated, now)}. Next update: {next_update.lower()}.' if updated
                    else f'Not updated yet. Next update: {next_update.lower()}.')
     else:
-        message = f'Last updated {ago(updated, now)}.' if updated else 'Not checking for games.'
+        message = f'Last updated {ago(updated, now)}.' if updated else f'Not checking for {many}.'
+    feed = sports_feed.card_context(league, follows, teams, all_events, cfg)
+    feed.update(_feed_page(feed, league, feed_q, feed_page, link))
+    where['feed_page'] = feed['page']
     return {
         'league': league, 'status': status, 'badge': badge, 'label': label, 'tip': tip, 'lead': f'{lead} {", ".join(bits)}.' if bits else lead,
         'added': format_local(league.created_at, 'date', tz=tz, h24=h24), 'message': message, 'followed': bool(person),
-        'notices': _notices(league, status, fetches, missing_events, one, many, stored, settings['history_keep_days'], now, tz),
+        'notices': _notices(league, status, fetches, missing_events, one, many, stored, settings['history_keep_days'], now, tz,
+                            rounds=rounds, teams=teams),
         'no_games_note': _no_games_note(status, settings['horizon_days']),
-        'games': _enrich_games([_game_row(e, now, tz, h24) for e in shown], shown, counts, names, checked_at,
-                               now, tz, h24),
+        'games': _enrich_games([row for row, _e in here], [e for _row, e in here], counts, names, checked_at,
+                               cfg, now, tz, h24, league=league, one=one),
+        'games_total': len(shown),
+        'games_pager': _pager(page, len(paged), here[0][0]['day'], here[-1][0]['day'],
+                              lambda n: link(page=n)) if here else None,
+        'scope_urls': {SCOPE_FOLLOWED: link(scope=SCOPE_FOLLOWED, page=1), SCOPE_ALL: link(scope=SCOPE_ALL, page=1)},
         'one': one, 'many': many,
         'trust': _trust_text(league), 'upcoming_note': _upcoming_note(league, many, settings['horizon_days']),
         'match_note': _match_note(state, sum(1 for e in all_events if (counts.get(e.id) or {}).get('channels')),
                                   len(all_events), one, many, now, tz, h24),
         'match_waiting': bool(state and (state.match_note or '').startswith(('Waiting', 'The last run'))),
         'matching': _matching_context(league),
-        'picked_teams': picked_teams, 'scope': SCOPE_ALL if scope == SCOPE_ALL and picked_teams else SCOPE_FOLLOWED,
+        'picked_teams': picked_teams, 'scope': scope,
         'mine_total': len(mine), 'all_total': len(all_events),
         'follow_text': _follow_text(league, person, teams, many) if person else 'Nothing',
         'next_update': next_update, 'horizon_days': settings['horizon_days'],
-        'updates': [_update_row(f, rounds, one, many, now, tz, h24) for f in update_rows],
+        'updates': [_update_row(f, rounds, one, many, now, tz, h24, teams, reread) for f in update_rows],
         # Change teams and Stop following act on the person's own follow only (sports_data.
         # set_following); a rule's follow is changed on the rule (dev/changelog/1490).
         'dialog': _dialog(league, person, teams, all_events, settings,
-                          sorted({r['name'] for r in rule_follows})),
+                          sorted({r['name'] for r in rule_follows}), one=one, many=many),
         'rule_follows': rule_follows,
+        'feed': feed,
         'can_change_teams': any(event_shape_is_matchup(e) for e in all_events),
         'section_names': {**SECTION_NAMES, 'upcoming': f'Upcoming {many}'},
         'league_url': f'https://www.thesportsdb.com/league/{league.tsdb_id}',
     }
 
 
-def _rule_follows(follows, teams) -> list:
+def _rule_follows(follows, teams, many='games') -> list:
     """[{name, url, what}] for each auto-record rule that follows this league (design 3): a follow a
     person cannot remove here, so the page says whose it is."""
     from flask import url_for
@@ -493,7 +721,7 @@ def _rule_follows(follows, teams) -> list:
     names = dict(db.session.query(AutoRule.id, AutoRule.name).filter(AutoRule.id.in_(ids)))
     out = []
     for f in sorted((f for f in follows if f.rule_id in names), key=lambda f: names[f.rule_id].lower()):
-        what = teams.get(f.team_tsdb_id, f'Team #{f.team_tsdb_id}') if f.team_tsdb_id else 'All its games'
+        what = teams.get(f.team_tsdb_id, f'Team #{f.team_tsdb_id}') if f.team_tsdb_id else f'All its {many}'
         out.append({'name': names[f.rule_id], 'what': what,
                     'url': url_for('auto_rules.rule_page', rule_id=f.rule_id)})
     return out
@@ -595,20 +823,431 @@ def _guide_cell(event, c, n, checked_at, guide_end, now, tz) -> dict:
     return {'state': 'missing', 'text': 'Not found in your guide', 'open': False, 'sub': what}
 
 
-def _enrich_games(rows, events, counts, names, checked_at, now, tz, h24) -> list:
+def _live_now(events, counts, cfg, now, tz, h24) -> dict:
+    """{event id: Go live now's offer} for each shown game the guide has found, and none for the
+    rest: before that there is no channel to play (dev/changelog/1530). The playable listings, the
+    served sports channels and the blocked accounts are read once for every game together."""
+    from . import output_feed, sports_feed
+    from .channel_groups import blocked_account_ids_now
+    found = [e for e in events if (counts.get(e.id) or {}).get('channels')]
+    if not found:
+        return {}
+    fcfg = output_feed.feed_config(cfg)
+    _before, after = output_feed.sports_window(fcfg)
+    blocked, allowed = blocked_account_ids_now(), output_feed.allowed_account_ids(fcfg)
+    listings = sports_match.listing_windows([e.id for e in found])
+    carrying = sports_feed.carriers(sports_feed.served_channels(), found)
+    return {e.id: sports_feed.live_now_offer(e, listings.get(e.id, ()), [c.name for c in carrying.get(e.id, ())],
+                                             now, after, tz, h24, blocked=blocked, allowed=allowed)
+            for e in found}
+
+
+def _enrich_games(rows, events, counts, names, checked_at, cfg, now, tz, h24, league=None, one='game') -> list:
     """The league page's extra columns, from counts read once for every shown event. Both times show
     only for a game with live listings and a real time from TheSportsDB: a race's 00:00 placeholder is
-    not a time to disagree with (7)."""
+    not a time to disagree with (7). Each row's Record button or recording comes from one batch too
+    (_record_rows)."""
     guide_end = db.session.query(func.max(EPGEntry.start_time)).scalar()
+    live = _live_now(events, counts, cfg, now, tz, h24)
+    acts = _record_rows(events, counts, names, league, guide_end, one, now, tz, h24) if league is not None else {}
     for row, event in zip(rows, events):
         c = counts.get(event.id)
         row['id'] = event.id
         row['tsdb_url'] = f'https://www.thesportsdb.com/event/{event.tsdb_id}'
         row['guide'] = _guide_cell(event, c, names.get(event.id), checked_at, guide_end, now, tz)
+        row['live'] = live.get(event.id)
         row['guide_time'] = (format_local(event.guide_start, 'clock', tz=tz, h24=h24)
                              if row['guide']['state'] == 'found' and row['time'] and sports_match.time_disagrees(event)
                              else '')
+        row.update(acts.get(event.id) or {})
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Record, Search programs and a game's recording (design 11, dev/changelog/1539)
+# ---------------------------------------------------------------------------
+
+#: What a game's recording shows as, by its status. Every status is named. A failed or aborted one
+#: frees Record, and still shows, so the row says what happened (principle 1).
+HELD_SCHEDULED = 'scheduled'
+HELD_RECORDING = 'recording'
+HELD_FINISHING = 'finishing'
+HELD_RECORDED = 'recorded'
+HELD_FAILED = 'failed'
+HELD_ABORTED = 'aborted'
+
+
+def _held_state(status):
+    from .database import (
+        REC_STATUS_ABORTED, REC_STATUS_ANALYZING, REC_STATUS_COMPLETED, REC_STATUS_CONCATENATING,
+        REC_STATUS_CONVERTING, REC_STATUS_FAILED, REC_STATUS_SCHEDULED, WINDOW_OPEN_STATUSES,
+    )
+    if status == REC_STATUS_SCHEDULED:
+        return HELD_SCHEDULED
+    if status in WINDOW_OPEN_STATUSES:
+        return HELD_RECORDING
+    if status in (REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING):
+        return HELD_FINISHING
+    if status == REC_STATUS_COMPLETED:
+        return HELD_RECORDED
+    if status == REC_STATUS_FAILED:
+        return HELD_FAILED
+    if status == REC_STATUS_ABORTED:
+        return HELD_ABORTED
+    raise ValueError(f'a recording status the league page does not name: {status!r}')
+
+
+#: Which of a game's recordings the row shows when it has several: the one recording now, then
+#: the next one to start, then one finishing, then the latest done.
+_HELD_RANK = {HELD_RECORDING: 0, HELD_SCHEDULED: 1, HELD_FINISHING: 2, HELD_RECORDED: 3}
+
+
+def _held_by_event(events, now, tz, h24) -> dict:
+    """{event id: {'main', 'replay', 'failed'}}, each a held recording or None, from the games'
+    recording_sports links, in a fixed four queries. A replay's recording is kept apart: the live
+    airing can still be recorded beside it. So is the latest one that failed or was aborted, which
+    leaves Record offered and says what became of it."""
+    from flask import url_for
+    from .database import SPORTS_AIRING_REPLAY, AutoRule, Channel, ChannelGroup, Recording, RecordingSports, rule_status
+    by_tsdb = {e.tsdb_id: e.id for e in events}
+    if not by_tsdb:
+        return {}
+    rows = (db.session.query(RecordingSports.tsdb_event_id, RecordingSports.airing, Recording)
+            .join(Recording, Recording.id == RecordingSports.recording_id)
+            .filter(RecordingSports.tsdb_event_id.in_(sorted(by_tsdb)), RecordingSports.removed_at.is_(None)).all())
+    if not rows:
+        return {}
+    chans = sorted({r.channel_id for _t, _a, r in rows if r.channel_id})
+    groups = sorted({r.group_id for _t, _a, r in rows if r.group_id})
+    rules = sorted({r.rule_id for _t, _a, r in rows if r.rule_id})
+    cnames = dict(db.session.query(Channel.id, Channel.name).filter(Channel.id.in_(chans))) if chans else {}
+    gnames = dict(db.session.query(ChannelGroup.id, ChannelGroup.name).filter(ChannelGroup.id.in_(groups))) if groups else {}
+    rnames = dict(db.session.query(AutoRule.id, AutoRule.name).filter(AutoRule.id.in_(rules))) if rules else {}
+    from .routes.recordings import schedule_edit_payload
+    out = {}
+    for tsdb, airing, rec in rows:
+        state = _held_state(rule_status(rec.status, rec.gave_up_reason))
+        held = {'id': rec.id, 'name': rec.name, 'state': state, 'start': rec.start_time,
+                'where': gnames.get(rec.group_id) or cnames.get(rec.channel_id) or 'a channel no longer in your channels',
+                'rule': rnames.get(rec.rule_id) or '', 'url': url_for('recordings.recording_detail', recording_id=rec.id),
+                'rule_url': url_for('auto_rules.rule_page', rule_id=rec.rule_id) if rec.rule_id in rnames else '',
+                'edit': schedule_edit_payload(rec) if state == HELD_SCHEDULED else None}
+        held['text'], held['sub'] = _held_words(held, airing == SPORTS_AIRING_REPLAY, now, tz, h24)
+        # The pill is the record red while it will record or is recording (mockup 54), the done
+        # green once it has. Manage recording offers what the Recordings list does in each state.
+        held['badge'] = ('b-done' if state in (HELD_FINISHING, HELD_RECORDED)
+                         else 'b-fail' if state in (HELD_FAILED, HELD_ABORTED) else 'b-live')
+        held['pulse'] = state == HELD_RECORDING
+        held['mark'] = state == HELD_SCHEDULED
+        held['can_edit'] = held['can_cancel'] = state == HELD_SCHEDULED
+        held['can_stop'] = state == HELD_RECORDING
+        held['link'] = {HELD_FAILED: 'Failed recording', HELD_ABORTED: 'Aborted recording'}.get(state, '')
+        slot = out.setdefault(by_tsdb[tsdb], {'main': None, 'replay': None, 'failed': None})
+        if state in (HELD_FAILED, HELD_ABORTED):
+            if slot['failed'] is None or held['start'] > slot['failed']['start']:
+                slot['failed'] = held
+            continue
+        key = 'replay' if airing == SPORTS_AIRING_REPLAY else 'main'
+        if slot[key] is None or (_HELD_RANK[state], held['start']) < (_HELD_RANK[slot[key]['state']], slot[key]['start']):
+            slot[key] = held
+    return out
+
+
+def _held_words(held, replay, now, tz, h24) -> tuple:
+    """(pill text, the line under it) for one game's recording."""
+    by = f', by the {held["rule"]} rule' if held['rule'] else ''
+    when = f'{day_label(held["start"], now, tz)} {format_local(held["start"], "clock", tz=tz, h24=h24)}'
+    state = held['state']
+    if state == HELD_SCHEDULED:
+        if replay:
+            return 'Replay scheduled', f'{when} on {held["where"]}{by}'
+        return 'Recording scheduled', f'On {held["where"]}{by}'
+    if state == HELD_RECORDING:
+        return 'Recording now', f'On {held["where"]} since {format_local(held["start"], "clock", tz=tz, h24=h24)}{by}'
+    if state == HELD_FINISHING:
+        return 'Recorded', f'On {held["where"]}{by}. Its file is being finished.'
+    if state == HELD_RECORDED:
+        return 'Recorded', f'On {held["where"]}{by}'
+    if state == HELD_FAILED:
+        return 'Recording failed', f'{when} on {held["where"]}{by}. Open recording says what happened.'
+    if state == HELD_ABORTED:
+        return 'Recording aborted', f'{when} on {held["where"]}{by}.'
+    raise ValueError(f'a held state with no words: {state!r}')
+
+
+def _listings_ahead(event_ids, now) -> dict:
+    """{event id: [(title key, episode key, start, stop, channel id, airing, strong)]} for the guide
+    listings of these events not yet over, on channels the user is offered, in one query."""
+    from .database import SPORTS_MATCH_KIND_GUIDE, Channel, SportsMatch
+    if not event_ids:
+        return {}
+    rows = (db.session.query(SportsMatch.event_id, SportsMatch.title_key, SportsMatch.episode_key,
+                             SportsMatch.program_start_time, SportsMatch.program_stop_time, SportsMatch.channel_id,
+                             SportsMatch.airing, SportsMatch.strength)
+            .join(Channel, Channel.id == SportsMatch.channel_id)
+            .filter(SportsMatch.event_id.in_(event_ids), SportsMatch.kind == SPORTS_MATCH_KIND_GUIDE,
+                    SportsMatch.rejected_at.is_(None), SportsMatch.gone_since.is_(None),
+                    SportsMatch.program_start_time.isnot(None), SportsMatch.program_stop_time > now,
+                    sports_match._offered()).all())
+    out = {}
+    for eid, tkey, ep, start, stop, cid, airing, strength in rows:
+        out.setdefault(eid, []).append((tkey or '', ep or '', start, stop, cid, airing, strength == SPORTS_MATCH_STRONG))
+    return out
+
+
+def _preview_pick(event_id, listings):
+    """(kind, starts at) of what Record would pick for a game from its strong listings ahead, in
+    auto_rules_sports.keepers()'s own order: the button's label. The dialog's pick is
+    auto_rules.game_pick(), which runs the same order over the Programs search."""
+    from types import SimpleNamespace
+    from .auto_rules import PICK_LIVE, PICK_REPLAY
+    from .auto_rules_sports import keepers
+    progs = {}
+    for tkey, ep, start, _stop, cid, airing, strong in listings:
+        if strong:
+            p = progs.setdefault((tkey, ep, start), {'channels': set(), 'airings': []})
+            p['channels'].add(cid)
+            p['airings'].append(airing)
+    stub = SimpleNamespace(id=event_id)
+    programs = [SimpleNamespace(identity=k, showings=sorted(v['channels']), lead=SimpleNamespace(start=k[2]))
+                for k, v in progs.items()]
+    games_of = {k: (stub, sports_match.combined_airing(v['airings'])) for k, v in progs.items()}
+    for kind, replays in ((PICK_LIVE, False), (PICK_REPLAY, True)):
+        keep = keepers(programs, games_of, replays=replays)
+        if keep:
+            return kind, next(iter(keep))[2]
+    return None, None
+
+
+def pick_why(why, one, guide_end, now, tz) -> str:
+    """Why Record has nothing to record, every auto_rules.WHY_* named."""
+    from . import auto_rules as ar
+    reach = f' Your guide reaches {day_label(guide_end, now, tz)}.' if guide_end else ''
+    if why == ar.WHY_ENDED:
+        return f'Every listing of this {one} in your guide has ended, so there is nothing left to record.'
+    if why == ar.WHY_UNSURE:
+        return (f'ChannelBin is not sure enough which listing in your guide is this {one} to pick one for you. '
+                'Listings on your guide shows what it found, and Search programs shows every listing.')
+    if why == ar.WHY_NO_START:
+        return (f"This {one} has no listing in your guide, only an event channel whose name mentions it, and there "
+                "is no start time ChannelBin can stand behind: the channel's name gives no time zone, and "
+                "TheSportsDB's times for this league have not matched your guide often enough to rely on. Event "
+                'channels naming it shows the channel, if you want to schedule it by hand.')
+    if why == ar.WHY_UNLISTED:
+        return f'This {one} is not in your guide yet, so there is nothing to record.{reach} ChannelBin looks again after each guide update.'
+    if why == ar.WHY_UNKNOWN:
+        return f'This {one} is outside the days ChannelBin reads to record from.'
+    if why == ar.WHY_TOO_MANY:
+        return f'This {one} has more listings than ChannelBin picks among. Search programs shows them all.'
+    raise ValueError(f'a Record reason with no words: {why!r}')
+
+
+def search_url(event) -> str:
+    """The Programs search narrowed to one event: Search programs, and the record dialog's way to
+    another listing."""
+    from .channel_search import DimensionFilter
+    from .routes.channels import airing_search_url
+    return airing_search_url(filters=(DimensionFilter('event', (str(event.tsdb_id),)),))
+
+
+def _record_rows(events, counts, names, league, guide_end, one, now, tz, h24) -> dict:
+    """{event id: {record, held, replay_held, search}} for each shown game: Record's label or why it
+    is greyed, the game's recording for the pill and Manage recording, and Search programs' link or
+    why not. A fixed number of queries for any number of games; an event channel's pick needs the
+    league's GameIndex, read only when some game has nothing but an event channel."""
+    from . import auto_rules as ar
+    held = _held_by_event(events, now, tz, h24)
+    ahead = _listings_ahead([e.id for e in events], now)
+    named_only = [e for e in events if not (counts.get(e.id) or {}).get('channels')
+                  and not (counts.get(e.id) or {}).get('wrong') and (names.get(e.id) or {}).get('channels')]
+    games = None
+    if named_only:
+        from .auto_rules_sports import GameIndex
+        games = GameIndex.load([league.id], now, lookback=ar.PICK_LOOKBACK)
+    out = {}
+    for e in events:
+        c = counts.get(e.id) or {}
+        h = held.get(e.id) or {}
+        row = {'held': h.get('main'), 'replay_held': h.get('replay'), 'failed': h.get('failed'),
+               'search': ({'url': search_url(e)} if c.get('channels') else
+                          {'why': (f"Programs searches guide listings, and this {one} has none yet: only an event "
+                                   f"channel's name mentions it. Event channels naming it shows that channel."
+                                   if (names.get(e.id) or {}).get('channels') else
+                                   f'This {one} has no listing in your guide, so a search would find nothing.'
+                                   + (f' Your guide reaches {day_label(guide_end, now, tz)}.' if guide_end else ''))})}
+        if row['held'] is None:
+            button = _record_button(e, c, ahead.get(e.id, ()), games, guide_end, one, now, tz)
+            if button.pop('replay', False) and row['replay_held'] is not None:
+                # Record would pick the replay the game already has a recording of: that recording
+                # is the game's now, and Manage recording takes Record's place.
+                row['held'], row['replay_held'] = row['replay_held'], None
+            else:
+                row['record'] = button
+        out[e.id] = row
+    return out
+
+
+def _day_words(dt, now, tz) -> str:
+    """'today', 'tomorrow' or 'on Mon Nov 16', to follow a clock in a sentence."""
+    day = day_label(dt, now, tz)
+    return day.lower() if day in ('Today', 'Tomorrow', 'Yesterday') else f'on {day}'
+
+
+def _length_words(length: timedelta) -> str:
+    hours, rest = divmod(int(length.total_seconds()) // 60, 60)
+    parts = ([counted(hours, 'hour')] if hours else []) + ([counted(rest, 'minute')] if rest else [])
+    return ' '.join(parts) or 'no time at all'
+
+
+def _pick_notice(pick, event, league, one, many, now, tz, h24) -> dict:
+    """{tone, strong, text}: the record dialog's one notice, saying which listing Record picked and
+    why. Every GamePick kind that records is named."""
+    from . import auto_rules as ar
+    from .auto_rules_sports import START_FROM_NAME
+    from .database import SPORTS_AIRING_FIRST
+    clock = (lambda dt: format_local(dt, 'clock', tz=tz, h24=h24))
+    if pick.kind in (ar.PICK_LIVE, ar.PICK_REPLAY):
+        s = pick.showing
+        c = sports_match.game_counts([event.id]).get(event.id) or {}
+        if s.group_id is not None:
+            source = (f'your channel group "{s.group_name}", which goes ahead of a single channel because it can '
+                      'switch channels if one fails')
+        else:
+            source = s.channel_name if pick.channels == 1 else f'{s.channel_name}, the healthiest of them'
+        if pick.kind == ar.PICK_REPLAY:
+            lead = (f'The live airing of this {one} is over' if c.get('first') or c.get('unknown')
+                    else f'Only replays of this {one} are in your guide')
+            return {'tone': 'warn', 'strong': 'This is a replay.',
+                    'text': (f'{lead}, so ChannelBin picked the replay most channels carry '
+                             f'({counted(pick.channels, "channel")}), recorded from {source}, at {clock(s.start)} '
+                             f'{_day_words(s.start, now, tz)}. An auto-record rule would not record a replay here.')}
+        what = 'the live airing' if pick.airing == SPORTS_AIRING_FIRST else 'the listing'
+        doubt = ('' if pick.airing == SPORTS_AIRING_FIRST
+                 else ' Your guide does not say yet whether it is live or a replay.')
+        differs = ''
+        if event.start_at is not None and event_shape_is_matchup(event) and abs(event.start_at - s.start) >= timedelta(minutes=1):
+            differs = f" TheSportsDB lists {clock(event.start_at)}; the recording follows the listing."
+        total = max(c.get('channels') or 0, pick.channels)
+        if pick.channels == total:
+            carried = (f'{what}, on the one channel with this {one}' if total == 1
+                       else f'{what}, on all {total} channels with this {one}')
+        else:
+            carried = f'{what} most of your channels carry ({pick.channels} of the {total} channels with this {one})'
+        return {'tone': 'info', 'strong': 'ChannelBin picked this listing.',
+                'text': (f'It is {carried}, recorded from {source}. An auto-record rule for this league would pick '
+                         f"the same one.{doubt} The times are the listing's.{differs}")}
+    if pick.kind == ar.PICK_EVENT:
+        ep = pick.event
+        if ep.source == START_FROM_NAME:
+            start = f'Its name gives the start, {clock(ep.start)} {_day_words(ep.start, now, tz)},'
+        else:
+            sample, agreed = league.trust_sample or 0, league.trust_agreed or 0
+            start = (f"Its name gives no time zone, so the start is TheSportsDB's ({clock(ep.start)} "
+                     f'{_day_words(ep.start, now, tz)}), which matched your guide on {agreed} of the last '
+                     f'{sample} {many},')
+        return {'tone': 'warn', 'strong': "From an event channel's name.",
+                'text': (f'This {one} has no listing in your guide yet. "{ep.named.channel_name}" mentions it, so '
+                         f'Record uses that channel. {start} and it records for {_length_words(ep.stop - ep.start)}, '
+                         'since there is no listing to say how long. Change either time below if you know better. '
+                         f'Providers rename these channels during the week, so look again closer to the {one}.')}
+    raise ValueError(f'a GamePick with no notice: {pick.kind!r}')
+
+
+def record_offer(event_id, cfg=None) -> tuple:
+    """(payload, HTTP status) for a league page's Record on one game: what the record dialog opens
+    on, worked out here from the event id alone (auto_rules.game_pick), never from anything the
+    page sent. A listing answers its EPG id and group for the shared record-context endpoint; an
+    event channel answers the dialog's program itself, since it has no listing. A game that has a
+    recording already, or nothing to record, is a 409 saying so: the page was out of date."""
+    from . import auto_rules as ar
+    from .accounts import default_profile_for
+    from .database import Channel
+    from .routes.recordings import BULK_SKIP, _plan_event_schedule
+    cfg = cfg or load_config()
+    now = datetime.utcnow()
+    tz, h24 = get_display_tz(), is_24h()
+    event = db.session.get(SportsEvent, event_id)
+    if event is None:
+        return {'error': 'That event is no longer stored.'}, 404
+    league = db.session.get(SportsLeague, event.league_id)
+    one, many = _noun(league, [event])
+    held = (_held_by_event([event], now, tz, h24).get(event.id) or {}).get('main')
+    if held is not None:
+        has = {HELD_SCHEDULED: 'already has a recording scheduled', HELD_RECORDING: 'is being recorded now',
+               HELD_FINISHING: 'has been recorded', HELD_RECORDED: 'has been recorded'}[held['state']]
+        return {'error': f'This {one} {has}. Reload the page to see it.'}, 409
+    pick = ar.game_pick(event.id, now, cfg)
+    if pick.kind == ar.PICK_REPLAY and (_held_by_event([event], now, tz, h24).get(event.id) or {}).get('replay'):
+        return {'error': f'This {one} already has its replay scheduled. Reload the page to see it.'}, 409
+    if pick.kind == ar.PICK_NONE:
+        guide_end = db.session.query(func.max(EPGEntry.start_time)).scalar()
+        return {'error': pick_why(pick.why, one, guide_end, now, tz)}, 409
+    notice = _pick_notice(pick, event, league, one, many, now, tz, h24)
+    if pick.kind in (ar.PICK_LIVE, ar.PICK_REPLAY):
+        return {'success': True, 'kind': pick.kind, 'epg_id': pick.showing.entry_id,
+                'group_id': pick.showing.group_id, 'notice': notice, 'search_url': search_url(event)}, 200
+    if pick.kind != ar.PICK_EVENT:
+        raise ValueError(f'a GamePick kind record_offer does not name: {pick.kind!r}')
+    ep = pick.event
+    plan = _plan_event_schedule(ep.named.channel_id, pick.game.title, ep.start, ep.stop, 'default', cfg)
+    if plan['verdict'] == BULK_SKIP or not plan.get('_create'):
+        return {'error': plan.get('reason') or 'The event channel cannot be recorded from.'}, 409
+    args = plan['_create']
+    ch = db.session.get(Channel, ep.named.channel_id)
+    profile = default_profile_for(ch, None)
+    iso = (lambda dt: dt.strftime('%Y-%m-%dT%H:%M:%S'))
+    return {'success': True, 'kind': pick.kind, 'notice': notice, 'sports_event_id': event.id,
+            'program': {'id': None, 'sports_event_id': event.id, 'title': pick.game.title, 'sub_title': '',
+                        'start_time': iso(ep.start), 'stop_time': iso(ep.stop), 'channel_id': ch.id,
+                        'channel_name': ch.name, 'group_id': None, 'stream_url': args['url'],
+                        'suggested_name': args['name'],
+                        'suggested_name_template': args.get('sports_name_template') or '',
+                        'has_recording': False, 'description': None},
+            'channel': {'id': ch.id, 'default_profile_id': profile.id if profile is not None else None}}, 200
+
+
+def event_record_check(event_id, channel_id):
+    """(stand-in listing, None) for a recording a person is saving from a league page's Record on a
+    game only an event channel names, or (None, the sentence why not). The pick is worked out again
+    here, and the channel the dialog opened on must still be it (dev/changelog/1539)."""
+    from types import SimpleNamespace
+    from . import auto_rules as ar
+    event = db.session.get(SportsEvent, event_id)
+    if event is None:
+        return None, 'That event is no longer stored.'
+    pick = ar.game_pick(event.id)
+    if pick.kind != ar.PICK_EVENT:
+        return None, ('What Record picks for this game changed since the dialog opened. Close it and press '
+                      'Record again.')
+    ep = pick.event
+    if ep.named.channel_id != channel_id:
+        return None, ('The event channel naming this game changed since the dialog opened. Close it and press '
+                      'Record again.')
+    return SimpleNamespace(channel_id=channel_id, start_time=ep.start, stop_time=ep.stop, title=pick.game.title,
+                           sub_title=None, description=None, category=None, rating=None), None
+
+
+def _record_button(event, c, listings, games, guide_end, one, now, tz) -> dict:
+    """{label} for a Record that records, or {label, why} for a greyed one."""
+    from . import auto_rules as ar
+    from .auto_rules_sports import event_pick
+    kind, start = _preview_pick(event.id, listings)
+    if kind is not None:
+        label = 'Record the replay' if kind == ar.PICK_REPLAY else 'Record'
+        return {'label': f'{label} now' if start <= now else label, 'replay': kind == ar.PICK_REPLAY}
+    if not c.get('channels') and c.get('wrong'):
+        return {'label': 'Record', 'why': (f'Every listing ChannelBin found for this {one} is marked a wrong match, '
+                                           'so there is nothing to record. Listings on your guide can undo that.')}
+    if c.get('channels'):
+        why = ar.WHY_UNSURE if listings else ar.WHY_ENDED
+    elif games is not None and event.id in games.games:
+        pick, _why = event_pick(games, games.games[event.id])
+        if pick is not None and pick.stop > now:
+            return {'label': 'Record now' if pick.start <= now else 'Record'}
+        why = ar.WHY_ENDED if pick is not None else (ar.WHY_NO_START if games.named_by.get(event.id) else ar.WHY_UNLISTED)
+    else:
+        why = ar.WHY_UNLISTED
+    return {'label': 'Record', 'why': pick_why(why, one, guide_end, now, tz)}
 
 
 def _matching_context(league) -> dict:
@@ -726,11 +1365,11 @@ def _artwork(rec, link, cfg, now, tz, h24):
     ready = [r for r in roles if art[r][0] == READY]
     out = []
     profile = rec.profile
-    pinned = profile is not None and bool(profile.poster_file)
+    pinned_poster = profile is not None and bool(profile.poster_file)
     if ready:
         what = ' and '.join(names[r] for r in ready).capitalize()
         # A pinned poster beats the thumb standing in for a missing one, whatever the profile prefers.
-        out.append(f'{what} from TheSportsDB.' if link.poster_url or pinned else
+        out.append(f'{what} from TheSportsDB.' if link.poster_url or pinned_poster else
                    f'{what} from TheSportsDB, also used as the poster, since the event has none.')
     known = images_for(link)
     unused = False
@@ -754,19 +1393,23 @@ def _artwork(rec, link, cfg, now, tz, h24):
             out.append(f'{name} not downloaded yet.{why}{when}')
     if unused:
         out.append('Not downloaded: this recording writes no metadata file, the one place they are used.')
-    if pinned:
-        if not profile.prefer_sports_poster:
-            out.append(f'The image pinned to profile "{profile.name}" is the poster.')
-        elif link.poster_url and art[POSTER][0] == READY:
-            out.append(f'Profile "{profile.name}" puts this poster ahead of its pinned one.')
-        elif link.poster_url and art[POSTER][0] in (MISSED, REFUSED):
-            out.append(f'The image pinned to profile "{profile.name}" is the poster, since TheSportsDB\'s '
-                       'was not downloaded.')
-        elif link.poster_url:
-            out.append(f'The image pinned to profile "{profile.name}" is the poster until TheSportsDB\'s '
-                       'is downloaded.')
+    # Which pinned image wins, poster and background alike (dev/changelog/1505, 1508).
+    for role, has_pin, url in ((POSTER, pinned_poster, link.poster_url),
+                               (BACKGROUND, profile is not None and bool(profile.background_file),
+                                link.thumb_url)):
+        if not has_pin:
+            continue
+        name, pin = names[role], f'The image pinned to profile "{profile.name}"'
+        if not profile.prefer_sports_art:
+            out.append(f'{pin} is the {name}.')
+        elif url and art[role][0] == READY:
+            out.append(f'Profile "{profile.name}" puts this {name} ahead of its pinned one.')
+        elif url and art[role][0] in (MISSED, REFUSED):
+            out.append(f'{pin} is the {name}, since TheSportsDB\'s was not downloaded.')
+        elif url:
+            out.append(f'{pin} is the {name} until TheSportsDB\'s is downloaded.')
         else:
-            out.append(f'The image pinned to profile "{profile.name}" is the poster, since the event has none.')
+            out.append(f'{pin} is the {name}, since the event has none.')
     return {'text': ' '.join(out), 'cls': 'ok' if len(ready) == len(roles) else 'warn',
             'links': [{'role': r, 'label': names[r]} for r in ready]}
 
@@ -802,11 +1445,16 @@ def _unlinked_note(rec):
         SportsEvent.league_id == league.id,
         or_(SportsEvent.start_at.between(lo, hi),
             (SportsEvent.start_at.is_(None) & SportsEvent.local_date.between(lo.date(), hi.date())))).count()
+    # A week whose round answer was cut may simply not have sent this game (dev/changelog/1549).
+    cut = ('' if not any(lo <= pst <= hi for lo, hi in capped_spans(league.id)) else
+           f" TheSportsDB's answer for that part of the schedule was cut at {ROUND_ROW_CAP} events, the most it "
+           f'sends for one call, so this one may not have been sent. A listing that names both teams is looked '
+           f'up by name.')
     if not nearby:
         hours = int(sports_match.WINDOW.total_seconds() // 3600)
         return (f'No {league.name} event within {hours} hours of this program is stored from TheSportsDB, so '
-                f'there was nothing to match it to.')
+                f'there was nothing to match it to.{cut}')
     lead = (f'The one {league.name} event around then did not match its listing.' if nearby == 1 else
             f'None of the {nearby} {league.name} events around then matched its listing.')
     return (f'{lead} A match needs the league and both teams, or for a race the series and the date, in the '
-            f'title or episode name, and the description is never read.')
+            f'title or episode name, and the description is never read.{cut}')

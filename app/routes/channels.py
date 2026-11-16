@@ -14,11 +14,9 @@ from ..database import (
     Account, Channel, ChannelGroup, ChannelGroupMember, EPGEntry, EpgAlternateEntry,
     EpgChannelKey, Recording,
     ChannelTest, ChannelEvent, ChannelHealthExclusion, OnDemandTestJob, Tag,
-    RecordingProfile, HealthCheckProfile, SportsMatch,
+    RecordingProfile, HealthCheckProfile, SportsMatch, detach_channel_references,
     CHANNEL_REMOVED_FROM_GUIDE, CHANNEL_HEALTH_OVERRIDE_CHANGED,
-    REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
-    REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_COMPLETED,
-    REC_STATUS_FAILED, REC_STATUS_ABORTED,
+    CHANNEL_NEEDING_STATUSES, REC_STATUS_SCHEDULED,
 )
 from ..accounts import (
     duplicate_groups_within, lifecycle_states_for_channels,
@@ -39,14 +37,11 @@ from ..fmt_utils import counted
 log = logging.getLogger(__name__)
 
 # Recording statuses that must block deleting the channel they reference outright -
-# an in-flight capture/concatenation still needs the channel row. Terminal statuses
-# (COMPLETED/FAILED/ABORTED) instead get channel_id set to NULL so the recording keeps
-# its own name-only historical record (recordings.py already renders rec.channel is
-# None as "Unknown channel" everywhere - this is a supported path, not new territory).
-ACTIVE_RECORDING_STATUSES = (REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED,
-                             REC_STATUS_RETRYING, REC_STATUS_CONCATENATING,
-                             REC_STATUS_ANALYZING)
-TERMINAL_RECORDING_STATUSES = (REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED)
+# an in-flight capture/concatenation still needs the channel row. Any other recording
+# instead gets channel_id set to NULL so it keeps its own name-only historical record
+# (recordings.py already renders rec.channel is None as "Unknown channel" everywhere -
+# this is a supported path, not new territory).
+ACTIVE_RECORDING_STATUSES = CHANNEL_NEEDING_STATUSES
 
 # Bulk SQL IN(...) chunk size for the missing-channel delete - keeps each statement well
 # under any SQLITE_MAX_VARIABLE_NUMBER a deployment might be compiled with (this build
@@ -336,6 +331,24 @@ def _replace_rec_context():
     return {'id': rec.id, 'name': rec.name}
 
 
+def _event_labels():
+    """{TheSportsDB event id: {'name', 'noun'}} for the `f.event` / `x.event` values in this
+    visit's URL: what a league page's Search programs chip reads (dev/changelog/1539). From the
+    database, never the URL; an id it does not hold is left out and the chip says so."""
+    from ..database import SportsEvent, SportsLeague
+    from ..sports_view import event_noun
+    from ..sports_data import event_game_name
+    # isdecimal: true only of what int() reads, where isdigit is also true of a superscript.
+    ids = sorted({int(v) for k in ('f.event', 'x.event') for v in request.args.getlist(k) if v.isdecimal()})
+    if not ids:
+        return {}
+    events = SportsEvent.query.filter(SportsEvent.tsdb_id.in_(ids)).all()
+    leagues = {lg.id: lg for lg in SportsLeague.query.filter(
+        SportsLeague.id.in_(sorted({e.league_id for e in events})))} if events else {}
+    return {str(e.tsdb_id): {'name': event_game_name(e), 'noun': event_noun(leagues.get(e.league_id), e)}
+            for e in events}
+
+
 def _rule_context():
     """The auto-record rule errand a `rule=` visit came on (dev/changelog/1189), resolved:
     {'mode': 'new'}, {'mode': 'edit', 'id', 'name', 'url'}, or None.
@@ -440,6 +453,7 @@ def _channel_search_page_context():
         'profiles': RecordingProfile.query.order_by(RecordingProfile.name).all(),
         'replace_rec': _replace_rec_context(),
         'rule_ctx': _rule_context(),
+        'event_labels': _event_labels(),
         # "Create rule from this search..." (static/js/auto-rule-modal.js): the cap a rule
         # without its own runs under, and the verdict wording its first-check toast uses.
         # The profile list it offers is the record modal's own picker, as Schedule
@@ -1378,12 +1392,8 @@ def missing_delete():
 
         unlinked_recordings = 0
         for chunk in chunked(ids, _DELETE_CHUNK_SIZE):
-            unlinked_recordings += (
-                db.session.query(Recording)
-                .filter(Recording.channel_id.in_(chunk))
-                .filter(Recording.status.in_(TERMINAL_RECORDING_STATUSES))
-                .update({'channel_id': None}, synchronize_session=False)
-            )
+            # No recording on an eligible channel is still capturing: an active one blocks it.
+            unlinked_recordings += detach_channel_references(chunk)
             db.session.query(ChannelGroupMember).filter(
                 ChannelGroupMember.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.query(ChannelTest).filter(

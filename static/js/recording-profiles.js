@@ -15,6 +15,7 @@
     profile,
     defaults: CFG.defaults,
     posterSpec: CFG.posterSpec,
+    backgroundSpec: CFG.backgroundSpec,
   });
 
   function openDelete(profile) {

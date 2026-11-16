@@ -546,16 +546,16 @@ class BundleContentsTests(_BundleTestCase):
         cfg = json.loads(_unzip(data).read('config.yaml'))
         self.assertIn('recording', cfg)
 
-    def test_config_yaml_notifications_base_url_is_redacted_too(self):
-        """Side effect explicitly confirmed as wanted: the app's own base_url
+    def test_config_yaml_public_url_is_redacted_too(self):
+        """Side effect explicitly confirmed as wanted: the app's own address
         (not a provider secret, just this server's LAN/domain address) is a URL, so
         it's in scope for the bundle even though _is_sensitive_path doesn't flag it."""
-        self.set_config({'notifications': {'base_url': 'http://192.168.1.50:5000'}})
+        self.set_config({'flask': {'public_url': 'http://192.168.1.50:5000'}})
 
         data = sb.build_support_bundle()
 
         cfg = json.loads(_unzip(data).read('config.yaml'))
-        self.assertEqual(cfg['notifications']['base_url'], 'http://[url redacted]')
+        self.assertEqual(cfg['flask']['public_url'], 'http://[url redacted]')
 
 
 class ReadinessReportTests(_BundleTestCase):

@@ -328,6 +328,32 @@ def warn_when_pool_is_exhausted(engine, label, ceiling):
         )
 
 
+def release_idle_connection():
+    """Hand this thread's pooled connection back before it goes idle, and say whether it did.
+
+    A session keeps the connection its last query checked out until a commit or rollback
+    ends the transaction, so a background thread that reads and then sleeps or waits holds
+    one of the pool's few connections the whole time. Eight conversions waiting their turn
+    held all twelve of prod's background connections for 4.7 hours, and fourteen recordings
+    could not start (dev/docs/BUGS.md 2026-11-14 @ 06:14:41 pm ET).
+
+    Rolls back only a session with nothing unsaved: a pending change is the caller's
+    unfinished write, so it is kept, the connection with it, and a WARNING names it. After a
+    release, loaded rows are expired and reload on their next read.
+    """
+    from . import db
+    session = db.session()  # the thread's Session itself: the scoped proxy lacks in_transaction
+    if not session.in_transaction():
+        return True
+    if session.new or session.dirty or session.deleted:
+        log.warning('Kept a database connection checked out: the session has unsaved changes '
+                    '(%d new, %d changed, %d deleted)',
+                    len(session.new), len(session.dirty), len(session.deleted))
+        return False
+    session.rollback()
+    return True
+
+
 def chunked(items, size):
     """Consecutive slices of `items` (a sequence) of at most `size`. The one spelling of
     the loop every bulk `IN (...)`, `executemany` and batched commit needs: SQLite caps the

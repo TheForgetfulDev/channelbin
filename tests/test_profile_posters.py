@@ -32,6 +32,7 @@ from app.metadata_sidecar import (  # noqa: E402
     NFO_SUFFIX, POSTER_SUFFIX, POSTER_FROM_PROFILE, POSTER_FROM_THUMBNAIL, write_sidecar,
 )
 from app.profile_posters import (  # noqa: E402
+    BACKGROUND,
     FILENAME_RE, MAX_BYTES, MAX_REQUEST_BYTES, POSTER_HEIGHT, POSTER_WIDTH,
     discard_poster_file, poster_path, size_advice, sniff_image, store_poster,
 )
@@ -323,12 +324,101 @@ class ProfilesPageTests(_RouteBase):
     def test_the_modal_is_told_the_size_and_the_cap_by_the_server(self):
         html = self.client.get('/profiles').get_data(as_text=True)
         spec = json.loads(html.split('posterSpec: ')[1].split(',\n')[0])
-        self.assertEqual(spec, {'width': POSTER_WIDTH, 'height': POSTER_HEIGHT,
-                                'maxMb': MAX_BYTES // (1024 * 1024)})
+        self.assertEqual(spec, {'width': POSTER_WIDTH, 'height': POSTER_HEIGHT, 'ratio': '2:3',
+                                'expected': 'a portrait poster', 'maxMb': MAX_BYTES // (1024 * 1024)})
+        spec = json.loads(html.split('backgroundSpec: ')[1].split(',\n')[0])
+        self.assertEqual(spec, {'width': 1920, 'height': 1080, 'ratio': '16:9',
+                                'expected': 'a landscape background', 'maxMb': MAX_BYTES // (1024 * 1024)})
 
 
-class SidecarPosterTests(unittest.TestCase):
-    """The pinned image is what lands beside the recording, in its own format."""
+class BackgroundRouteTests(_RouteBase):
+    """dev/changelog/1508: /api/profiles/<id>/background pins a landscape background through the
+    same rules as the poster, into its own columns, without touching the poster."""
+
+    def upload_bg(self, data, filename='banner.png'):
+        return self.client.post(f'/api/profiles/{self.profile.id}/background',
+                                data={'background': (io.BytesIO(data), filename)},
+                                content_type='multipart/form-data')
+
+    def test_a_background_is_stored_in_its_own_columns(self):
+        resp = self.upload_bg(png_bytes(1920, 1080))
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertIsNone(resp.get_json()['advice'])
+        p = self.stored()
+        self.assertRegex(p.background_file, FILENAME_RE)
+        self.assertEqual((p.background_width, p.background_height), (1920, 1080))
+        self.assertIsNone(p.poster_file)
+        bg = resp.get_json()['profile']['background']
+        self.assertTrue(bg['url'].startswith(f'/api/profiles/{p.id}/background?v='))
+        self.assertIsNone(resp.get_json()['profile']['poster'])
+
+    def test_its_advice_is_measured_against_16_9(self):
+        advice = self.upload_bg(png_bytes(1000, 1500)).get_json()['advice']
+        self.assertIn('a landscape background of 1920 x 1080 (16:9)', advice)
+        self.assertIn('right 16:9 shape', self.upload_bg(png_bytes(1280, 720)).get_json()['advice'])
+
+    def test_a_poster_field_is_not_a_background(self):
+        resp = self.client.post(f'/api/profiles/{self.profile.id}/background',
+                                data={'poster': (io.BytesIO(png_bytes(2, 3)), 'x.png')},
+                                content_type='multipart/form-data')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_replacing_one_slot_leaves_the_other(self):
+        self.upload(png_bytes(2, 3))
+        self.upload_bg(png_bytes(16, 9))
+        poster, bg = self.stored().poster_file, self.stored().background_file
+        self.upload_bg(jpeg_bytes(32, 18))
+        self.assertEqual(self.stored().poster_file, poster)
+        self.assertNotEqual(self.stored().background_file, bg)
+        self.assertEqual(sorted(self.files()), sorted([poster, self.stored().background_file]))
+
+    def test_remove_and_serve(self):
+        data = jpeg_bytes(16, 9)
+        self.upload_bg(data)
+        self.upload(png_bytes(2, 3))
+        resp = self.client.get(f'/api/profiles/{self.profile.id}/background')
+        self.assertEqual((resp.status_code, resp.mimetype, resp.data), (200, 'image/jpeg', data))
+        self.assertEqual(resp.headers.get('X-Content-Type-Options'), 'nosniff')
+        resp.close()
+        self.assertEqual(self.client.delete(f'/api/profiles/{self.profile.id}/background').status_code, 200)
+        p = self.stored()
+        self.assertIsNone(p.background_file)
+        self.assertIsNotNone(p.poster_file)
+        self.assertEqual(self.files(), [p.poster_file])
+        self.assertEqual(self.client.get(f'/api/profiles/{self.profile.id}/background').status_code, 404)
+
+    def test_a_row_naming_a_file_that_is_not_ours_is_a_404(self):
+        self.profile.background_file = '../../secret.txt'
+        db.session.commit()
+        self.assertEqual(self.client.get(f'/api/profiles/{self.profile.id}/background').status_code, 404)
+
+    def test_deleting_the_profile_removes_both_files(self):
+        self.upload(png_bytes(2, 3))
+        self.upload_bg(png_bytes(16, 9))
+        self.assertEqual(len(self.files()), 2)
+        self.assertEqual(self.client.delete(f'/api/profiles/{self.profile.id}').status_code, 200)
+        self.assertEqual(self.files(), [])
+
+    def test_a_commit_that_fails_leaves_no_file_behind(self):
+        """The file is written before the row is pointed at it; when that commit never lands, nothing
+        names the file, so it is removed rather than left in the folder for good."""
+        from sqlalchemy.exc import OperationalError
+        self.t.app.config['PROPAGATE_EXCEPTIONS'] = True
+        with patch('app.routes.profiles.db.session.commit',
+                   side_effect=OperationalError('x', {}, Exception('database is locked'))), \
+                patch('app.db_utils.time.sleep'):
+            with self.assertRaises(OperationalError):
+                self.upload_bg(png_bytes(16, 9))
+        self.assertEqual(self.files(), [])
+
+    def test_the_row_shows_the_backgrounds_size(self):
+        self.upload_bg(png_bytes(1920, 1080))
+        html = self.client.get('/profiles').get_data(as_text=True)
+        self.assertIn('<span class="p-ov"><span class="p-ok">Background</span>1920 x 1080</span>', html)
+
+
+class _SidecarBase(unittest.TestCase):
+    """A completed recording on a profile, with a video file in a temp tree."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -379,6 +469,11 @@ class SidecarPosterTests(unittest.TestCase):
         with open(os.path.join(self.dvr, 'Race' + NFO_SUFFIX)) as fh:
             return ET.fromstring(fh.read()).findtext('thumb')
 
+
+
+class SidecarPosterTests(_SidecarBase):
+    """The pinned image is what lands beside the recording, in its own format."""
+
     def test_the_pinned_png_wins_over_the_thumbnail_and_keeps_its_format(self):
         self._thumbnail()
         self._pin(png_bytes(2, 3), 'png')
@@ -408,7 +503,9 @@ class SidecarPosterTests(unittest.TestCase):
         RecordingEvent.query.delete()
         db.session.commit()
         write_sidecar(self.rec.id, self.video, self.cfg)
-        self.assertEqual(sorted(os.listdir(self.dvr)), ['Race-poster.png', 'Race.mp4', 'Race.nfo'])
+        # The frame is the background (dev/changelog/1507), so it is the one -fanart beside them.
+        self.assertEqual(sorted(os.listdir(self.dvr)),
+                         ['Race-fanart.jpg', 'Race-poster.png', 'Race.mp4', 'Race.nfo'])
 
     def test_a_pinned_file_gone_from_disk_falls_back_to_the_frame_and_says_so(self):
         self._thumbnail()
@@ -455,6 +552,86 @@ class SidecarPosterTests(unittest.TestCase):
         self.assertIn(os.path.join(self.dvr, 'Race-poster.png'), paths)
         self.assertNotIn(pinned, paths)
         self.assertNotIn(pinned, recording_image_paths(self.rec.id, cfg))
+
+
+class SidecarBackgroundTests(_SidecarBase):
+    """dev/changelog/1508: a pinned background is the -fanart, ahead of the captured frame."""
+
+    def _pin_bg(self, data, kind):
+        info = sniff_image(data)
+        self.assertEqual(info.kind, kind)
+        self.profile.background_file = store_poster(self.cfg, self.profile.id, data, info)
+        self.profile.background_width, self.profile.background_height = info.width, info.height
+        db.session.commit()
+
+    def _fanart_text(self):
+        with open(os.path.join(self.dvr, 'Race' + NFO_SUFFIX)) as fh:
+            return ET.fromstring(fh.read()).findtext('fanart/thumb')
+
+    def test_the_pinned_background_wins_over_the_frame_and_keeps_its_format(self):
+        self._thumbnail()
+        self._pin_bg(png_bytes(16, 9), 'png')
+        self.assertTrue(write_sidecar(self.rec.id, self.video, self.cfg))
+        with open(os.path.join(self.dvr, 'Race-fanart.png'), 'rb') as fh:
+            self.assertEqual(fh.read(), png_bytes(16, 9))
+        self.assertFalse(os.path.exists(os.path.join(self.dvr, 'Race-fanart.jpg')))
+        self.assertEqual(self._fanart_text(), 'Race-fanart.png')
+        # The poster is still the frame: a pinned background never stands in for it.
+        self.assertEqual(self._thumb_text(), 'Race' + POSTER_SUFFIX)
+        event = self._event()
+        self.assertIn('Race-fanart.png as its background (the image pinned to its profile)', event.detail)
+        self.assertEqual(json.loads(event.extra_data)['fanart_source'], POSTER_FROM_PROFILE)
+
+    def test_a_pinned_background_gone_from_disk_falls_back_to_the_frame_and_says_so(self):
+        self._thumbnail()
+        self._pin_bg(png_bytes(16, 9), 'png')
+        shutil.rmtree(os.path.join(self.images, 'posters'))
+        self.assertTrue(write_sidecar(self.rec.id, self.video, self.cfg))
+        self.assertEqual(self._fanart_text(), 'Race-fanart.jpg')
+        event = self._event()
+        self.assertIn('The background pinned to profile "NASCAR" was missing from disk', event.detail)
+        self.assertEqual(json.loads(event.extra_data)['fanart_source'], POSTER_FROM_THUMBNAIL)
+
+
+class Migration123Tests(unittest.TestCase):
+    """dev/changelog/1508: the switch is renamed with every profile's answer kept, the background
+    columns are added, and running it again, or 122 after it, changes nothing."""
+
+    def test_rename_keeps_the_answer_and_is_re_runnable(self):
+        import sqlite3
+        from app.migrations import _m122_prefer_sports_poster, _m123_profile_background
+        conn = sqlite3.connect(':memory:')
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE recording_profiles (id INTEGER PRIMARY KEY, name TEXT, '
+                    'prefer_sports_poster BOOLEAN NOT NULL DEFAULT 0)')
+        cur.execute("INSERT INTO recording_profiles VALUES (1, 'NHL', 1), (2, 'Nascar', 0)")
+        conn.commit()
+        for _ in range(2):
+            _m123_profile_background(conn, cur)
+            _m122_prefer_sports_poster(conn, cur)
+        cols = {r[1] for r in cur.execute('PRAGMA table_info(recording_profiles)')}
+        self.assertNotIn('prefer_sports_poster', cols)
+        self.assertTrue({'prefer_sports_art', 'background_file', 'background_width',
+                         'background_height'} <= cols)
+        self.assertEqual(cur.execute('SELECT id, prefer_sports_art FROM recording_profiles ORDER BY id')
+                         .fetchall(), [(1, 1), (2, 0)])
+        conn.close()
+
+    def test_a_database_at_121_goes_through_122_then_123(self):
+        import sqlite3
+        from app.migrations import _m122_prefer_sports_poster, _m123_profile_background
+        conn = sqlite3.connect(':memory:')
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE recording_profiles (id INTEGER PRIMARY KEY, name TEXT)')
+        cur.execute("INSERT INTO recording_profiles VALUES (1, 'NHL')")
+        conn.commit()
+        _m122_prefer_sports_poster(conn, cur)
+        _m123_profile_background(conn, cur)
+        cols = {r[1] for r in cur.execute('PRAGMA table_info(recording_profiles)')}
+        self.assertIn('prefer_sports_art', cols)
+        self.assertNotIn('prefer_sports_poster', cols)
+        self.assertEqual(cur.execute('SELECT prefer_sports_art FROM recording_profiles').fetchone(), (0,))
+        conn.close()
 
 
 class WriteDirsTests(unittest.TestCase):
@@ -514,7 +691,7 @@ console.log(JSON.stringify(eval(process.argv[2])));
         self.assertIn('nothing is resized', html)
         self.assertIn('type="file"', html)
         self.assertIn('accept="image/jpeg,image/png"', html)
-        self.assertNotIn('data-poster-remove', html)
+        self.assertNotIn('data-image-remove', html)
 
     def test_a_pinned_poster_is_shown_with_its_advice_and_a_remove_button(self):
         poster = "{url:'/api/profiles/3/poster?v=abc',width:800,height:600,kind:'PNG',advice:'This image is 800 x 600.'}"
@@ -522,21 +699,41 @@ console.log(JSON.stringify(eval(process.argv[2])));
         self.assertIn('/api/profiles/3/poster?v=abc', html)
         self.assertIn('PNG, 800 x 600', html)
         self.assertIn('This image is 800 x 600.', html)
-        self.assertIn('data-poster-remove', html)
+        self.assertIn('data-image-remove="poster"', html)
 
     def test_the_sports_poster_switch_shows_its_stored_state(self):
         """dev/changelog/1505."""
         on = self.evaluate(f'pmPosterSectionHtml(null, {self.SPEC}, true)')
         off = self.evaluate(f'pmPosterSectionHtml(null, {self.SPEC}, false)')
-        self.assertIn("Use TheSportsDB's poster when the game has one", on)
-        self.assertIn('id="pm-prefer-sports-poster" checked', on)
-        self.assertIn('id="pm-prefer-sports-poster">', off)
+        self.assertIn("Use TheSportsDB's images when the game has them", on)
+        self.assertIn('id="pm-prefer-sports-art" checked', on)
+        self.assertIn('id="pm-prefer-sports-art">', off)
+
+    def test_the_background_row_states_its_own_size_and_shape(self):
+        """dev/changelog/1508."""
+        bg_spec = "{width:1920,height:1080,ratio:'16:9',expected:'a landscape background',maxMb:10}"
+        html = self.evaluate(f'pmPosterSectionHtml(null, {self.SPEC}, false, null, {bg_spec})')
+        self.assertIn('Pinned background', html)
+        self.assertIn('1920 x 1080 pixels (landscape, 16:9)', html)
+        self.assertIn('id="pm-background-file"', html)
+        self.assertIn('No background is pinned.', html)
+        bg = "{url:'/api/profiles/3/background?v=abc',width:1920,height:1080,kind:'JPG',advice:null}"
+        html = self.evaluate(f'pmPosterSectionHtml(null, {self.SPEC}, false, {bg}, {bg_spec})')
+        self.assertIn('class="pm-poster-img is-wide" src="/api/profiles/3/background?v=abc"', html)
+        self.assertIn('data-image-remove="background">Remove background', html)
+        self.assertEqual(self.evaluate(f'pmSizeAdvice(1000, 1500, {bg_spec})'),
+                         size_advice(1000, 1500, BACKGROUND))
+        self.assertEqual(self.evaluate(f'pmSizeAdvice(1280, 720, {bg_spec})'),
+                         size_advice(1280, 720, BACKGROUND))
+
+    def test_without_a_background_spec_there_is_no_background_row(self):
+        self.assertNotIn('Pinned background', self.evaluate(f'pmPosterSectionHtml(null, {self.SPEC})'))
 
     def test_the_switch_is_sent_on_every_save(self):
         for checked in (True, False):
             section = '{querySelector: () => ({checked: %s})}' % str(checked).lower()
             self.assertEqual(self.evaluate(f'pmPosterPayload({section})'),
-                             {'prefer_sports_poster': checked})
+                             {'prefer_sports_art': checked})
 
 
 if __name__ == '__main__':

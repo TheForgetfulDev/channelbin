@@ -167,13 +167,63 @@ class ReadingTests(NameCase):
         self.run_match()
         self.assertEqual([m.channel_id for m in self.named(event)], [listed.id])
 
-    def test_a_channel_with_guide_rows_is_not_read_by_its_name(self):
+    def test_a_channel_with_a_listing_at_the_games_time_is_not_read_by_its_name(self):
+        event = self.game(11, 12)
+        ch = self.channel('NEXT | PHL HARBORVIEW - IRONVALE | Sun 08 Nov 13:00 EST (US)')
+        make_epg_entry(ch, title='Pretend Hockey Tonight', start_time=FACEOFF - timedelta(minutes=30),
+                       duration_minutes=60)
+        db.session.commit()
+        self.run_match()
+        self.assertEqual(self.named(event), [])
+
+    def test_a_listing_at_another_time_does_not_stop_a_name_being_read(self):
+        """A listing says what is on while it runs, nothing about the game the name names a day later."""
         event = self.game(11, 12)
         ch = self.channel('NEXT | PHL HARBORVIEW - IRONVALE | Sun 08 Nov 13:00 EST (US)')
         make_epg_entry(ch, title='Pretend Hockey Tonight', start_time=NOW, duration_minutes=60)
         db.session.commit()
         self.run_match()
+        self.assertEqual([m.channel_id for m in self.named(event)], [ch.id])
+
+    def test_an_event_channel_renamed_for_its_game_is_read_by_its_name(self):
+        """dev/docs/BUGS.md 2026-11-15 06:58: `NCAAF 27: 1pm Arkansas State at Coastal Carolina` kept
+        its earlier blocks under its former name `NCAAF 27:`, which are not filler once the name
+        changed, while every block at the game is filler. Read by neither its listings nor its name,
+        10 of 2026-11-14's college football games were matched to no channel at all."""
+        event = self.game(11, 12)
+        ch = self.channel('PHL 27: 1pm Blackhawks at Lightning', category='Pretend Package')
+        for i in range(6):
+            make_epg_entry(ch, title='PHL 27:', start_time=FACEOFF - timedelta(hours=24 - 2 * i),
+                           duration_minutes=120)
+        self.filler(ch, start=FACEOFF - timedelta(hours=12), blocks=12)
+        self.run_match()
+        (m,) = self.named(event)
+        self.assertEqual((m.channel_id, m.strength), (ch.id, SPORTS_MATCH_STRONG))
+        self.assertEqual(SportsMatch.query.filter_by(event_id=event.id, kind=SPORTS_MATCH_KIND_GUIDE).count(), 0)
+
+    def test_a_listing_at_the_guides_own_start_stops_the_name_being_read(self):
+        """The guide lists the game 3 hours after TheSportsDB's time; that listing still matches as a
+        listing (6.5), so its channel is not read by its name beside it."""
+        event = self.game(11, 12)
+        event.guide_start = FACEOFF + timedelta(hours=3)
+        db.session.commit()
+        ch = self.channel('PHL 01: 4pm Blackhawks at Lightning')
+        make_epg_entry(ch, title='Pretend Hockey Tonight', start_time=FACEOFF + timedelta(hours=3),
+                       duration_minutes=180)
+        db.session.commit()
+        self.run_match()
         self.assertEqual(self.named(event), [])
+
+    def test_a_channel_whose_listing_of_the_game_has_aired_is_not_read_by_its_name_too(self):
+        """Its listing of the game is the match; reading its name as well would show the channel twice."""
+        event = self.game(11, 12, start=NOW - timedelta(hours=4))
+        ch = self.channel('PHL 01: Blackhawks at Lightning')
+        make_epg_entry(ch, title='PHL Hockey', sub_title='Blackhawks at Lightning', start_time=NOW - timedelta(hours=4),
+                       duration_minutes=180)
+        db.session.commit()
+        self.run_match()
+        self.assertEqual(self.named(event), [])
+        self.assertEqual(SportsMatch.query.filter_by(event_id=event.id, kind=SPORTS_MATCH_KIND_GUIDE).count(), 1)
 
     def filler(self, ch, start=FACEOFF - timedelta(hours=6), blocks=6, **kw):
         """A guide source's filler: the channel's own name in 2-hour blocks, as on two of prod's three
@@ -241,6 +291,14 @@ class ReadingTests(NameCase):
         self.run_match()
         self.assertEqual(self.named(a) + self.named(b), [])
 
+    def test_a_ranking_after_the_joiner_still_faces_the_teams_off(self):
+        """ESPN+ `NCAA Football: Duke vs. #7 Miami` (dev/changelog/1562): the ranking stood between the
+        joiner and the second team."""
+        event = self.game(11, 12)
+        ch = self.channel('US (ESPN+ 044) | PHL: Ironvale Blackhawks vs. #7 Harborview Lightning (SkyCast)')
+        self.run_match()
+        self.assertEqual([m.channel_id for m in self.named(event)], [ch.id])
+
     def test_a_highlights_name_is_not_a_game(self):
         event = self.game(11, 12)
         self.channel('PHL Highlights: Lightning @ Blackhawks Nov 8')
@@ -283,6 +341,84 @@ class FalseMatchTests(NameCase):
         ch = self.channel('PHL: Harborview Lightning-Ironvale Blackhawks @ 2099-11-08 18:00:00 :Tv2Play DK  12')
         self.run_match()
         self.assertEqual([m.channel_id for m in self.named(event)], [ch.id])
+
+
+class SportWordTests(NameCase):
+    """ESPN+ names a college football game `Football: Duke vs. #7 Miami`, in a category that carries
+    every sport, with no league in the name (dev/changelog/1562)."""
+
+    def setUp(self):
+        super().setUp()
+        self.hockey.sport = 'Ice Hockey'
+        db.session.commit()
+
+    def test_a_name_naming_the_leagues_sport_and_a_game_is_read(self):
+        event = self.game(11, 12)
+        ch = self.channel('US (ESPN+ 040) | Hockey: Ironvale Blackhawks vs. #7 Harborview Lightning '
+                          '(2099-11-08 12:01:15)', category='ESPN+')
+        self.run_match()
+        (m,) = self.named(event)
+        self.assertEqual((m.channel_id, m.strength), (ch.id, SPORTS_MATCH_STRONG))
+        self.assertIn('matched on the sport named in it, both teams by name', m.reason)
+
+    def test_the_sport_with_the_teams_by_city_only_is_not_read(self):
+        """Every league of a sport shares its word: `Football: Pittsburgh vs. Miami` is a college game,
+        never the Steelers and Dolphins by their cities."""
+        event = self.game(11, 12)
+        self.channel('Hockey: Ironvale vs Harborview Nov 8 1:00PM ET', category='ESPN+')
+        self.run_match()
+        self.assertEqual(self.named(event), [])
+
+    def test_a_soccer_league_does_not_read_football(self):
+        """`Football: Duke vs. #7 Miami` is American football; only a soccer league's own word counts."""
+        soccer = self.league(9005, ['Pretend Soccer League'], sport='Soccer')
+        event = self.game(13, 14, league=soccer)
+        self.channel('Football: Northgate Owls vs. Saint-Rémy Comets', category='ESPN+')
+        self.run_match()
+        self.assertEqual(self.named(event), [])
+        ch = self.channel('Soccer: Northgate Owls vs. Saint-Rémy Comets', category='ESPN+')
+        self.run_match()
+        self.assertEqual([m.channel_id for m in self.named(event)], [ch.id])
+
+    def test_another_leagues_category_is_not_read_by_a_sport_word(self):
+        event = self.game(11, 12)
+        self.tie(self.football, 'US| PFL PPV')
+        self.channel('Hockey: Ironvale Blackhawks vs. Harborview Lightning', category='US| PFL PPV')
+        self.run_match()
+        self.assertEqual(self.named(event), [])
+
+    def test_another_sport_or_another_league_in_the_name_is_not_read(self):
+        event = self.game(11, 12)
+        football = self.game(1, 2, league=self.football)
+        for name in ('Basketball: Ironvale Blackhawks vs. Harborview Lightning',
+                     'Hockey and Soccer: Ironvale Blackhawks vs. Harborview Lightning',
+                     'PFL Hockey: Ironvale Blackhawks vs. Harborview Lightning',
+                     'Hockey: Ironvale Bears vs. Harborview Gulls'):
+            self.channel(name, category='ESPN+')
+        self.run_match()
+        self.assertEqual(self.named(event) + self.named(football), [])
+
+    def test_a_league_whose_sport_is_not_known_reads_no_sport_word(self):
+        self.hockey.sport = None
+        db.session.commit()
+        event = self.game(11, 12)
+        self.channel('Hockey: Ironvale Blackhawks vs. Harborview Lightning', category='ESPN+')
+        self.run_match()
+        self.assertEqual(self.named(event), [])
+
+    def test_a_sport_word_never_names_a_race(self):
+        """A tour's `Golf: ...` names would all read as the one tournament of its day."""
+        golf = self.league(9004, ['Pretend Golf Tour'], sport='Golf')
+        race = self.race('Harborview Open', FACEOFF, golf)
+        self.channel('Golf: Harborview Open Nov 8', category='ESPN+')
+        self.run_match()
+        self.assertEqual(self.named(race), [])
+
+    def test_ncaaf_is_suggested_for_college_football(self):
+        """`NCAAF 27: 1pm Arkansas State at Coastal Carolina`: the providers' word for TheSportsDB's
+        league 4479, offered on its page while the league lacks it."""
+        league = self.league(4479, ['NCAA Division 1 Football', 'College Football'])
+        self.assertEqual(sports_match.suggested_terms(league), ['NCAAF'])
 
 
 class TimeTests(NameCase):
@@ -368,7 +504,7 @@ class RenameTests(NameCase):
         event = self.game(11, 12)
         ch = self.channel('PHL 01: 1pm Blackhawks @ Lightning')
         self.run_match()
-        make_epg_entry(ch, title='Pretend Hockey Tonight', start_time=NOW, duration_minutes=60)
+        make_epg_entry(ch, title='Pretend Hockey Tonight', start_time=FACEOFF, duration_minutes=180)
         db.session.commit()
         self.run_match()
         (m,) = self.named(event)

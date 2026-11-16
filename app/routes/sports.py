@@ -1,4 +1,5 @@
 """The Sports Schedules pages and their actions (app/sports_data.py, DESIGN-sports-data.md 5, 11)."""
+import logging
 import threading
 import time
 
@@ -8,6 +9,7 @@ from .. import sports_data, sports_match, sports_view
 from ..fmt_utils import join_labels
 
 sports_bp = Blueprint('sports', __name__)
+log = logging.getLogger(__name__)
 
 #: A follow must name something a lookup just checked (design 5), so a request cannot invent a
 #: league's name or number. Kept in memory: a restart only means looking it up again.
@@ -41,12 +43,18 @@ def sports_page():
 
 @sports_bp.route('/sports/<int:league_id>')
 def league_page(league_id):
+    from ..database import RecordingProfile
     from .recordings import read_section_pref
-    ctx = sports_view.page_context(league_id, scope=request.args.get('scope', sports_view.SCOPE_FOLLOWED))
+    args = request.args
+    ctx = sports_view.page_context(league_id, scope=args.get('scope', sports_view.SCOPE_FOLLOWED),
+                                   page=args.get('page', 1, type=int), feed_page=args.get('feed_page', 1, type=int),
+                                   feed_q=args.get('feed_q', ''))
     if ctx is None:
         abort(404)
     return render_template(
         'sports_league.html', add_config=sports_view.add_dialog_config(),
+        # The shared record dialog's profile picker (_record_modal.html, dev/changelog/1539).
+        profiles=RecordingProfile.query.order_by(RecordingProfile.name).all(),
         sections=list(sports_view.SECTIONS), section_pref=read_section_pref(sports_view.SECTIONS_PREF_KEY),
         sections_pref_key=sports_view.SECTIONS_PREF_KEY, **ctx)
 
@@ -131,10 +139,12 @@ def set_following(league_id):
     raw = data.get('team_ids') or []
     if not isinstance(raw, list):
         return jsonify({'error': 'team_ids must be a list.'}), 400
-    try:
-        team_ids = [int(t) for t in raw]
-    except (TypeError, ValueError):
-        return jsonify({'error': 'team_ids must be numbers.'}), 400
+    # Whole team numbers only, each once. 0 is how the whole league is stored, so a 0 beside a team
+    # would store both, and a repeat breaks the follow's unique key (dev/docs/BUGS.md 2026-11-15
+    # @ 12:58:58 PM). A bool is an int to Python and is refused with the rest.
+    if not all(isinstance(t, int) and not isinstance(t, bool) and t > 0 for t in raw):
+        return jsonify({'error': 'team_ids must be team numbers. Send none to follow the whole league.'}), 400
+    team_ids = sorted(set(raw))
     if not sports_data.set_following(league_id, team_ids):
         return jsonify({'error': 'That league no longer exists.'}), 404
     sports_data.ensure_worker()
@@ -147,6 +157,68 @@ def stop_following(league_id):
         return jsonify({'error': 'That league no longer exists.'}), 404
     sports_data.ensure_worker()
     return jsonify({'success': True})
+
+
+@sports_bp.route('/api/sports/leagues/<int:league_id>/feed-channels', methods=['PUT'])
+def set_feed_channel(league_id):
+    """Turn one of this league's sports channels on the output feed on or off: a team's channel
+    (`team_id`), or the league's numbered channels with none (app/sports_feed.py)."""
+    from .. import sports_feed
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get('enabled'), bool):
+        return jsonify({'error': 'enabled must be true or false.'}), 400
+    try:
+        team_id = int(data.get('team_id') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'team_id must be a number.'}), 400
+    if team_id < 0:
+        return jsonify({'error': 'team_id must be a number.'}), 400
+    try:
+        if team_id:
+            done = sports_feed.set_team_channel(league_id, team_id, data['enabled'])
+        else:
+            done = sports_feed.set_league_channels(league_id, data['enabled'])
+    except sports_feed.NotFollowed as exc:
+        return jsonify({'error': str(exc)}), 409
+    if done is None:
+        return jsonify({'error': 'That league no longer exists.'}), 404
+    return jsonify({'success': True})
+
+
+@sports_bp.route('/api/sports/events/<int:event_id>/live-now', methods=['PUT'])
+def set_live_now(event_id):
+    """Go live now for one game, on or off (app/sports_feed.py::set_live_now, dev/changelog/1530).
+    The page names the game and nothing else: which channels play it and until when are worked
+    out here, from what is stored now."""
+    from datetime import datetime
+    from .. import output_feed, sports_feed
+    from ..channel_groups import blocked_account_ids_now
+    from ..tz_utils import get_display_tz, is_24h
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get('on'), bool):
+        return jsonify({'error': 'Say whether Go live now is on.'}), 400
+    fcfg = output_feed.feed_config()
+    _before, after = output_feed.sports_window(fcfg)
+    now = datetime.utcnow()
+    try:
+        done = sports_feed.set_live_now(event_id, data['on'], after, now=now, blocked=blocked_account_ids_now(),
+                                        allowed=output_feed.allowed_account_ids(fcfg))
+    except sports_feed.LiveNowRefused as exc:
+        return jsonify({'error': str(exc)}), 409
+    if done is None:
+        return jsonify({'error': 'That game is no longer in the schedule.'}), 404
+    if done['on']:
+        log.info('Sports channels: Go live now turned on for %s (event %d) on %s, until %s UTC',
+                 done['game'], event_id, join_labels(done['channels']), done['until'])
+        # A play on a waiting screen moves to the game now, not at its next re-check.
+        output_feed.recheck_waiting()
+        message = (f'Go live now is on for {done["game"]} until '
+                   f'{sports_feed.at_clause(done["until"], now, get_display_tz(), is_24h())}.')
+    else:
+        if done['was_on']:
+            log.info('Sports channels: Go live now turned off for %s (event %d)', done['game'], event_id)
+        message = f'Go live now is off for {done["game"]}.'
+    return jsonify({'success': True, 'on': done['on'], 'message': message})
 
 
 @sports_bp.route('/api/sports/leagues/<int:league_id>', methods=['DELETE'])
@@ -190,6 +262,15 @@ def event_listings(event_id):
                     'tsdb_url': f'https://www.thesportsdb.com/event/{event.tsdb_id}'})
 
 
+@sports_bp.route('/api/sports/events/<int:event_id>/record')
+def event_record(event_id):
+    """What a league page's Record opens the record dialog on for this game (dev/changelog/1539):
+    the listing a rule for the league would pick, a replay, or an event channel, each with the
+    dialog's notice saying which and why. Reads only; the save is the ordinary create path."""
+    payload, status = sports_view.record_offer(event_id)
+    return jsonify(payload), status
+
+
 @sports_bp.route('/api/sports/events/<int:event_id>/wrong', methods=['POST'])
 def mark_wrong(event_id):
     """Mark listings a wrong match for this event (`wrong: true`), or undo it."""
@@ -200,7 +281,11 @@ def mark_wrong(event_id):
         return jsonify({'error': 'match_ids must be a list of numbers.'}), 400
     if not ids:
         return jsonify({'error': 'No listings were named.'}), 400
-    changed = sports_match.mark_wrong(event_id, ids, bool(data.get('wrong', True)))
+    wrong = data.get('wrong', True)
+    if not isinstance(wrong, bool):
+        # A string "false" is truthy, and would mark the listings wrong when the caller meant to undo.
+        return jsonify({'error': 'wrong must be true or false.'}), 400
+    changed = sports_match.mark_wrong(event_id, ids, wrong)
     if changed is None:
         return jsonify({'error': 'That event is no longer stored.'}), 404
     return jsonify({'success': True, 'changed': changed})

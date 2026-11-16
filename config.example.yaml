@@ -16,7 +16,7 @@
 # logging.file, which appear below as commented-out examples because their defaults
 # are paths derived from wherever the app is installed.
 
-config_version: 8
+config_version: 9
 
 recording:
   # Where segments, the in-progress file and the finished recording are written.
@@ -234,6 +234,7 @@ flask:
   debug: false
   secret_key: change-me-in-production   # left as-is → a generated key in instance/secret_key is used
   behind_proxy: false                   # true ONLY when a reverse proxy fronts the app (trusts X-Forwarded-*); restart required
+  public_url: ''                        # ChannelBin's own address, whole: https://channelbin.example.com or http://192.168.1.1:5000 - links in push notifications, and the server address the IPTV Output page shows
 
 # An optional password gate over the whole app: every page and API endpoint requires
 # signing in. One shared password, no usernames or roles - a door on something that was
@@ -257,25 +258,31 @@ integrations:
   home_assistant:
     enabled: false
     api_key_hash: ''
-  # The output feed: ChannelBin as an Xtream Codes source an IPTV app (TiviMate and the like)
-  # adds as an account. The app then sees exactly the TV Guide - every channel and group in
-  # it, with the guide's listings - and a group plays as one channel with failover. Off by
-  # default; turn it on from Settings > Integrations, where every key below is explained.
+  # The output feed: ChannelBin as an Xtream Codes source an IPTV player (TiviMate and the like)
+  # adds as an account. The player then sees the TV Guide - every channel and group in it
+  # that was not taken off the output, with the guide's listings - and a group plays as one
+  # channel with failover. Off by default; set its login and turn it on from the IPTV Output
+  # page, which explains every key below.
   # No restart needed for any of these.
   output_feed:
     enabled: false
     username: ''
-    password: ''            # stored as typed, not hashed: the IPTV app sends it on every request
-    mode: proxy             # proxy (relayed through ChannelBin, with failover and a held seat)
-                            # or redirect (the IPTV app plays straight from the provider)
+    password: ''            # stored as typed, not hashed: the IPTV player sends it on every request
+    mode: proxy             # proxy (relayed through ChannelBin, with failover and a held seat),
+                            # mixed (groups and sports channels relayed, the rest redirected)
+                            # or redirect (the IPTV player plays straight from the provider)
     accounts: []            # account ids the feed may play from; empty = all
-    held_seats: {}          # redirect mode: account id -> seats kept free for the IPTV app
-    buffer_mb: 16           # proxy mode: the in-memory ring per IPTV app
-    reserve_seconds: 3      # proxy mode: how far behind live the IPTV app plays; 0 = pass-through
-    max_viewers: 3          # proxy mode: streams relayed at once
-    idle_seconds: 30        # proxy mode: an IPTV app that read nothing for this long is gone
-    max_session_hours: 12   # proxy mode: the hard cap on one play
+    held_seats: {}          # redirect and mixed modes: account id -> seats kept free for the IPTV
+                            # player; a play relayed in mixed mode uses one of them first
+    buffer_mb: 64           # proxy and mixed: the most memory one IPTV player's stream may wait in; it has to hold the
+                            # 13 to 29 seconds a provider sends at once when a play starts
+    reserve_seconds: 3      # proxy and mixed: how far behind live the IPTV player plays; 0 = pass-through
+    max_viewers: 3          # proxy and mixed: streams relayed at once
+    idle_seconds: 30        # proxy and mixed: an IPTV player that read nothing for this long is gone
+    max_session_hours: 12   # proxy and mixed: the hard cap on one play
     xmltv_days: 3           # listings depth in xmltv.php
+    sports_before_minutes: 60   # a sports channel plays the channel listing its game from this long
+    sports_after_minutes: 120   # before the listing starts to this long after it ends (pregame, overtime)
 
 database:
   # path and logging.file default to repo-relative locations (dvr.db beside the app,
@@ -527,8 +534,8 @@ alerts:
   keep_days: 90                          # daily sweep deletes dismissed alerts older than this; 0 = keep forever
 
 sports_data:                             # the schedules on the Sports Schedules page, from TheSportsDB
-  call_spacing_seconds: 60               # between calls; with the jitter, the shortest wait must be 12 or more
-  call_jitter_seconds: 20                # each wait is the spacing plus or minus up to this
+  call_spacing_seconds: 10               # between calls; with the jitter, the shortest wait must be 8 or more
+  call_jitter_seconds: 2                 # each wait is the spacing plus or minus up to this
   horizon_days: 21                       # how far ahead a schedule is kept
   history_keep_days: 30                  # how long a past game is kept
   download_images: true                  # a matched recording's poster and background, for media servers
@@ -547,7 +554,6 @@ config_backup:
 
 notifications:
   push_rate_limit_seconds: 60
-  base_url: ''                          # e.g. http://192.168.1.50:5000 - used to build links in push notifications
   services:
     # Each url is an Apprise-style service URL. Fill one in and flip enabled: true.
     discord:

@@ -28,7 +28,7 @@ def _handle_shutdown(signum, frame):
     #
     # A live preview is killed on the same terms: its ffmpeg holds a provider connection
     # open for a viewer this process can no longer serve (dev/changelog/1018). The output
-    # feed's relays are the same thing for an IPTV app.
+    # feed's relays are the same thing for an IPTV player.
     kill_all_active()
     kill_active_conversions()
     kill_active_joins()

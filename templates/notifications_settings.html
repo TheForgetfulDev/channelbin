@@ -68,11 +68,11 @@
 .rt-filter .chips { flex: 1 1 auto; }
 .rt-shown { font-size: var(--fs-sm); color: var(--text-faint); white-space: nowrap; }
 
-/* App URL is the one field whose control column stacks: the example link is a
+/* ChannelBin's address is the one field whose control column stacks: the example link is a
    readout of what was typed, so it belongs under the input rather than beside it.
    Keyed off the path, the same way settings.html keys its filename-template row -
    one row wanting a different arrangement is not worth a macro parameter. */
-.frow[data-path="notifications.base_url"] .fr-ctl { flex-direction: column; align-items: stretch; gap: 6px; }
+.frow[data-path="flask.public_url"] .fr-ctl { flex-direction: column; align-items: stretch; gap: 6px; }
 .url-preview { font-size: var(--fs-sm); color: var(--text-faint); word-break: break-all; text-align: right; }
 
 @media (max-width: 960px) {
@@ -109,9 +109,9 @@
        'Seconds between push flushes. Alerts raised inside one window are aggregated into a single notification.', tier='advanced') %}
     <input type="number" id="rate-limit-input" min="1" max="3600" value="{{ boot.rate_limit }}">
     {% endcall %}
-    {% call field_shell('notifications.base_url', 'App URL',
-       'Used to build clickable links in push notifications, e.g. a failed-recording alert links back to its detail page. In-app alerts always link correctly regardless of this setting. Leave blank to omit links from push notifications.', tier='basic') %}
-    <input type="text" id="base-url-input" placeholder="http://192.168.1.50:5000" value="{{ boot.base_url }}">
+    {% call field_shell('flask.public_url', 'ChannelBin\'s address',
+       'The address other devices reach ChannelBin at. Type the whole address, starting with http:// or https://, like https://channelbin.example.com or http://192.168.1.1:5000. Used to build clickable links in push notifications, e.g. a failed-recording alert links back to its detail page, and shown as the server address on the IPTV Output page. In-app alerts always link correctly regardless of this setting. Leave blank to omit links from push notifications. The same setting as on the Settings page.', tier='basic') %}
+    <input type="text" id="base-url-input" placeholder="https://channelbin.example.com" value="{{ boot.base_url }}">
     <div class="url-preview" id="base-url-preview"></div>
     {% endcall %}
   </div>

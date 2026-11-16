@@ -139,8 +139,12 @@ if (live) {
   GET_PLAN.push({ mark: 'timed', gate: new Promise((r) => { release = r; }) }, { mark: 'action' });
   live.fn();
   await wait(5);
+  // The confirm takes the league's own noun from the row, so a race is never a game.
+  const stopRow = d.querySelector('#sp-rows .row');
+  stopRow.dataset.dialog = JSON.stringify({ ...JSON.parse(stopRow.dataset.dialog), one: 'race', many: 'races' });
   await click(d.querySelector('#sp-rows .row .c-actions button'));
   await click(d.querySelector('#sp-rows .menu.open [data-act="stop"]'));
+  out.stop_confirm = d.querySelector('.modal-panel').textContent;
   await click(Array.from(d.querySelectorAll('.modal-foot button')).find((b) => b.textContent.trim() === 'Stop following'));
   const until = async (ok) => { for (let i = 0; i < 200 && !ok(); i++) await wait(10); };
   await wait(30);

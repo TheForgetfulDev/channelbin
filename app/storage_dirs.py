@@ -76,13 +76,19 @@ CONFIG_BACKUP_ROLE = StorageRole(
 
 PROFILE_POSTER_ROLE = StorageRole(
     'Profile poster directory',
-    'A poster image cannot be uploaded to a recording profile, and recordings made under '
-    'a profile that has one get a captured frame as their poster instead.')
+    'A poster or background image cannot be uploaded to a recording profile, and recordings '
+    'made under a profile that has one get a captured frame in its place instead.')
 
 SPORTS_IMAGE_ROLE = StorageRole(
     'TheSportsDB image directory',
-    'Posters and backgrounds cannot be downloaded from TheSportsDB, so a recording matched to '
-    'one of its events gets a frame from the program as its poster instead.')
+    'Posters, backgrounds and team badges cannot be downloaded from TheSportsDB, so a recording '
+    'matched to one of its events gets a frame from the program as its poster instead, and a '
+    "sports channel's waiting screen shows each team's short code in place of its badge.")
+
+SPORTS_SCREEN_ROLE = StorageRole(
+    'Sports waiting screen directory',
+    "A sports channel's waiting screen cannot be made, so an IPTV player tuning in to a sports "
+    'channel with no game on is turned away instead of shown what is next.')
 
 #: The folders the Readiness check's "Take screenshots and live thumbnails" answers for: the
 #: frames ChannelBin captures itself. Uploaded profile posters and cached logos are not
@@ -107,6 +113,9 @@ POSTER_FRAMES = 'poster-frames'
 #: events (app/sports_images.py, dev/changelog/1465). One file per image, shared by every
 #: recording of that event.
 SPORTS_IMAGES = 'sports-images'
+#: The clips a sports channel plays while it has no game on, its waiting screen
+#: (app/sports_screen.py, dev/changelog/1533): made once per thing they show and looped.
+SPORTS_SCREENS = 'sports-screens'
 
 
 def images_root(cfg: dict) -> str:
@@ -118,8 +127,7 @@ def images_root(cfg: dict) -> str:
 
 
 def image_dir(cfg: dict, kind: str) -> str:
-    """The folder one kind of image is saved in: `kind` is THUMBNAILS, SCREENSHOTS, LOGOS
-    or POSTERS."""
+    """The folder one kind of image is saved in: `kind` is one of the subfolder names above."""
     return os.path.join(images_root(cfg), kind)
 
 
@@ -183,11 +191,17 @@ def configured_write_dirs(cfg: dict, capture_log_dir: str = None) -> list:
     # Gated on the global sidecar switch: the poster only ever reaches a library through
     # the sidecar, and a profile can turn that on by itself, but the standing alert is for
     # an install that has opted in rather than one that never asked for the feature.
-    if (rec.get('metadata_sidecar', {}) or {}).get('enabled'):
+    sidecar_on = bool((rec.get('metadata_sidecar', {}) or {}).get('enabled'))
+    if sidecar_on:
         candidates.append((image_dir(cfg, POSTERS), PROFILE_POSTER_ROLE))
-        # Same gate, and the download switch: these too reach a library only through the sidecar.
-        if (cfg.get('sports_data', {}) or {}).get('download_images', True):
-            candidates.append((image_dir(cfg, SPORTS_IMAGES), SPORTS_IMAGE_ROLE))
+    # The download switch, and a use for what it downloads: a recording's poster reaches a library
+    # only through the sidecar, and a team's badge only the output feed's waiting screen.
+    from .output_feed import feed_config, is_enabled
+    feed_on = is_enabled(feed_config(cfg))
+    if (sidecar_on or feed_on) and (cfg.get('sports_data', {}) or {}).get('download_images', True):
+        candidates.append((image_dir(cfg, SPORTS_IMAGES), SPORTS_IMAGE_ROLE))
+    if feed_on:
+        candidates.append((image_dir(cfg, SPORTS_SCREENS), SPORTS_SCREEN_ROLE))
     candidates.append((db_backup_dir(cfg), DB_BACKUP_ROLE))
     candidates.append((get_backup_dir(cfg), CONFIG_BACKUP_ROLE))
 

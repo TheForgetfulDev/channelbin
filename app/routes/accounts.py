@@ -29,7 +29,7 @@ from ..database import (Account, AccountBlock, AccountStatDay, Channel, AccountS
                         ChannelGroupMember, ChannelTest, EpgSource, EpgSourceSubscription, SportsMatch,
                         EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, ACCOUNT_STATUS_SYNCING,
                         ACCOUNT_STATUS_UNSYNCED, SYNC_LOG_SUCCESS, SYNC_LOG_CANCELLED,
-                        SYNC_LOG_IMPORTED)
+                        SYNC_LOG_IMPORTED, detach_channel_references)
 from ..db_utils import chunked, retry_on_locked
 from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, directory_row_summary,
                            case_sensitive_matching,
@@ -861,9 +861,11 @@ def _delete_account_and_jobs(account_id):
         delete_sources_for_account(account_id)
         # A group pinned to one of these channels goes back to automatic, and says why.
         clear_guide_listings_pins_on(channel_ids)
-        # Not cascaded either, and channel ids are re-issued (DESIGN-sports-data.md 9).
+        # Not cascaded either, and channel ids are re-issued (DESIGN-sports-data.md 9): a
+        # match goes, and a finished recording, its segments and a group's events lose the id.
         for chunk in chunked(channel_ids, _DELETE_CHUNK_SIZE):
             SportsMatch.query.filter(SportsMatch.channel_id.in_(chunk)).delete(synchronize_session=False)
+            detach_channel_references(chunk)
         # hidden-recompute-ok: the cascade takes memberships only of channels it deletes
         # too, so no surviving channel loses a protection.
         db.session.delete(account)

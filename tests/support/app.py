@@ -326,17 +326,21 @@ def stop_preview_sessions():
 
 def stop_viewer_sessions():
     """Stop every output-feed relay and wait for its reaper to exit - the preview's
-    contract above, for the IPTV app's session: a relay's ffmpeg holds a seat and reads its
+    contract above, for the IPTV player's session: a relay's ffmpeg holds a seat and reads its
     source until stopped."""
     import app.output_feed as output_feed
 
     live = output_feed.live_sessions()
     if not live:
         output_feed.wait_for_reaper(_TEARDOWN_DRAIN_SECONDS)
+        # The Recent plays writer is not a leak the test made: a refused play queues a line
+        # by design. It still must not outlive the test's database.
+        output_feed.discard_play_log(_TEARDOWN_DRAIN_SECONDS)
         return None
     found = (f'{len(live)} live output-feed relay(s) (first: session={live[0].id}, '
              f'{live[0].label}, state={live[0].state})')
     output_feed.stop_all(output_feed.REASON_SHUTDOWN)
+    output_feed.discard_play_log(_TEARDOWN_DRAIN_SECONDS)
     if not output_feed.wait_for_reaper(_TEARDOWN_DRAIN_SECONDS):
         return f'{found} still going when the test ended and the reaper did not exit'
     return f'{found} still going when the test ended; teardown stopped it'
@@ -398,6 +402,7 @@ def reset_module_globals():
     import app.routes.system as system_routes
     import app.search_index as search_index
     import app.routes.sports as routes_sports
+    import app.sports_screen as sports_screen
     import app.setup_steps as setup_steps
     import app.examples as examples
     import app.toolchain as toolchain
@@ -418,6 +423,8 @@ def reset_module_globals():
     channel_tester._state = channel_tester.RunState()
     routes_sports._checked_leagues.clear()
     routes_sports._checked_teams.clear()
+    sports_screen._making.clear()
+    sports_screen._procs.clear()
     # Paired with the RunState above: the smoother carries the previous run's rate and its
     # +/-20% clamp, so leaving it would drag the next module's first estimate toward a
     # number measured over different channels.

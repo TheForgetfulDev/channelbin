@@ -12,6 +12,16 @@ for arg in "$@"; do
     esac
 done
 
+# The dev box's Test Bench (dev/tools/testbench.py) is brought up here so nobody has to
+# remember to start it after a reboot. It runs before the busy guard because it does not
+# depend on the app: a restart refused for work in flight still leaves it running. A Bench
+# already up is left alone, and one that cannot start prints why and never fails the restart.
+# A checkout without dev/ skips this (dev/changelog/1514).
+if [ -f "$SCRIPT_DIR/dev/tools/testbench.py" ]; then
+    (cd "$SCRIPT_DIR" && python3 dev/tools/testbench.py start --lan --if-stopped 2>&1) \
+        || echo "Test Bench did not start (reason above); restarting ChannelBin without it."
+fi
+
 DVR_OUTPUT_DIR="$(cd "$SCRIPT_DIR" && python3 -c 'from app.config import load_config; print(load_config()["recording"]["dvr_output_dir"])' 2>/dev/null)"
 
 # Busy guard. A restart kills capture, concatenation AND conversion: run.py's SIGTERM

@@ -22,7 +22,7 @@ are in the [README](../README.md).
 - [Readiness, Maintenance, Jobs and Logs](#readiness-maintenance-jobs-and-logs)
 - [Settings](#settings)
 - [Home Assistant](#home-assistant)
-- [Watching your channels in an IPTV app](#watching-your-channels-in-an-iptv-app)
+- [Watching your channels in an IPTV player](#watching-your-channels-in-an-iptv-player)
 
 ## Reading a recording's page
 
@@ -272,7 +272,7 @@ and looking. Turn one on:
 1. Open **Settings** and click **Notification settings**.
 2. Add a service: Discord, Home Assistant, Pushover, SMTP2Go (email) or WhatsApp. Paste its URL,
    click **Save**, then **Send test** to make sure a message actually arrives.
-3. Set **App URL** to the address you open ChannelBin at, so a notification links straight to
+3. Set **ChannelBin's address** to the address you open ChannelBin at, so a notification links straight to
    the recording or page it is about.
 4. **Alert routing**, further down, says which kinds of alert go to which service, and which stay
    in the app only.
@@ -356,24 +356,31 @@ including turning on the API it uses under **Settings → Integrations**, is in 
 [README](../README.md#home-assistant-integration). Home Assistant can also be a notification
 service, under [Getting told when something breaks](#getting-told-when-something-breaks).
 
-## Watching your channels in an IPTV app
+## Watching your channels in an IPTV player
 
-ChannelBin can be an Xtream Codes source itself, so an IPTV app such as TiviMate adds it as an
-account and sees exactly your TV Guide - every channel and group in it, in the guide's order,
-with the guide's own listings - instead of the provider's whole list. A group is one channel in
-the app, played from the member ChannelBin would record from right now, and if that member dies
-the picture moves to another one without the app noticing.
+ChannelBin can be an Xtream Codes source itself, so an IPTV player such as TiviMate adds it as an
+account and sees your TV Guide - every channel and group in it, in the guide's order, with the
+guide's own listings - instead of the provider's whole list. A group is one channel in the
+player, played from the member ChannelBin would record from right now, and if that member dies
+the picture moves to another one without the player noticing.
 
-Turn it on under **Settings → Integrations**: give the feed a short username and password, turn
-the **Output feed for an IPTV app** switch on, then add ChannelBin to the IPTV app as an Xtream Codes
-account using the address shown beside the switch. Put a channel in the TV Guide and it is in
-the app; take it out and it is gone at the app's next refresh.
+Set it up on the **IPTV Output** page, under Channels & guide: choose a short username and
+password with **Set login**, then **Turn on**. The page's **Connect an IPTV player** card has
+what to type into the player, each with a Copy button: the server address, username and
+password for an Xtream Codes account, or the M3U playlist and XMLTV guide addresses for a
+player that takes those. Put a channel in the TV Guide and it is in the player at its next
+refresh. To keep a channel in your TV Guide but off the player, turn its switch off in the
+page's channel list; turn it back on and the player gets the same channel it had before.
 
 A recording always wins. In the default **Proxy** mode ChannelBin holds the provider connection
-for the IPTV app, and when a recording needs it the app is cut and the Alerts page names the recording
-that took it; the app tunes in again on its own once a connection is free. **Redirect** mode sends
-the IPTV app straight to the provider instead - no failover, and ChannelBin cannot see when it
-stops, so tell it how many connections to leave alone with **Seats kept free for the IPTV app**.
-The Dashboard's **Watching now** section shows who is playing what, and why the last sessions
-ended. The setup steps and the two modes in more detail are in the
-[README](../README.md#output-feed-for-an-iptv-app).
+for the IPTV player, and when a recording needs it the player is cut and the Alerts page names the recording
+that took it; the player tunes in again on its own once a connection is free. **Redirect** mode sends
+the IPTV player straight to the provider instead - no failover, and ChannelBin cannot see when it
+stops, so tell it how many connections recordings should leave alone, per account, on the
+IPTV Output page. **Mixed** mode plays channel groups and sports channels through ChannelBin and
+sends every other channel straight to the provider. The page's **Watching now** card shows who is playing what, with a way to
+stop a play, and **Recent plays** keeps 30 days of plays that ended or were refused, each with
+its reason.
+
+The Dashboard's **Watching now** section shows the same plays at a glance. The setup steps and the three modes in more detail are in the
+[README](../README.md#output-feed-for-an-iptv-player).

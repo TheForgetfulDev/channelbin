@@ -51,6 +51,10 @@ REFLOWING_PAGES = {
     '/epg-manager': 1,
     # Add Account's table of what each URL normalization mode does (dev/changelog/1392).
     '/accounts/new': 1,
+    # The IPTV Output page as this fixture leaves it, with no login set (dev/changelog/1526):
+    # one table. Every table it draws once the output is on is held to the same rule by
+    # tests/test_iptv_output_page_conformance.py.
+    '/iptv-output': 1,
 }
 
 # Tables built in JavaScript, so no server render contains them. The source file is what
@@ -305,6 +309,7 @@ class OptInTests(unittest.TestCase):
                         found.add(os.path.relpath(path, REPO))
         registered = {'templates/tags.html', 'templates/jobs.html', 'templates/rule_detail.html',
                       'templates/sports_league.html',
+                      'templates/iptv_output.html',
                       'templates/recording_detail.html',
                       'templates/channels/detail.html', 'templates/_account_stats.html',
                       'templates/account_detail.html', 'templates/account_form.html',

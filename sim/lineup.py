@@ -103,12 +103,14 @@ class GuideChannel:
     """A channel element in a guide: its id, the name it is listed under, and whether the
     guide carries programs for it (a real guide's directory often lists more than it fills).
     `filler` is a title the guide repeats in place of programs, as some guide sources do for
-    an event channel: its own name, block after block (the filler_guide fault)."""
-    __slots__ = ('guide_id', 'display_name', 'station', 'has_programs', 'icon', 'filler')
+    an event channel: its own name, block after block (the filler_guide fault). `former` is
+    (title, hours): the blocks that started more than `hours` before now repeat that title, the
+    name the slot had before it was renamed for its game (the renamed_slot_guide fault)."""
+    __slots__ = ('guide_id', 'display_name', 'station', 'has_programs', 'icon', 'filler', 'former')
 
-    def __init__(self, guide_id, display_name, station, has_programs, icon, filler=None):
+    def __init__(self, guide_id, display_name, station, has_programs, icon, filler=None, former=None):
         self.guide_id, self.display_name, self.station = guide_id, display_name, station
-        self.has_programs, self.icon, self.filler = has_programs, icon, filler
+        self.has_programs, self.icon, self.filler, self.former = has_programs, icon, filler, former
 
 
 class PanelLineup:

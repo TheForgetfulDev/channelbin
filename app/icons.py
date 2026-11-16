@@ -89,6 +89,7 @@ ICONS = {
     'nav-channel-search': 'text-search',
     'nav-epg-manager': 'calendar-multiple-check',
     'nav-sports': 'scoreboard-outline',
+    'nav-iptv-output': 'cast',
     'nav-get-started': 'rocket-launch-outline',
     'nav-accounts': 'account-key-outline',
     'nav-rec-profiles': 'movie-cog-outline',

@@ -5,11 +5,11 @@ Gated per request on `integrations.output_feed.enabled` and the credential pair 
 sends on every call - in the query for the three `.php` endpoints, in the path for a stream.
 "Disabled", "no credential set" and "wrong credential" all answer the same 401 body, the
 precedent app/routes/ha.py sets; app/auth.py::SELF_GATED_BLUEPRINTS names this blueprint so
-the interactive login gate does not also demand a browser login from an IPTV app. Registered
+the interactive login gate does not also demand a browser login from an IPTV player. Registered
 always, so turning the feed on needs no restart.
 
 The answers are bare Xtream shapes, not the app's `{'success': True}` envelope, for the same
-reason ha.py's are: the consumer is an IPTV app that reads the Xtream protocol, not this app's
+reason ha.py's are: the consumer is an IPTV player that reads the Xtream protocol, not this app's
 own JavaScript. The measured client (TiviMate 5.3.3, dev/docs/evidence/) issues the bare auth
 call and six catalog actions at add time, accepts `[]` for the VOD and series ones, never
 calls get.php, and builds `/live/<user>/<pass>/<id>.ts` against the address it was given.
@@ -95,17 +95,23 @@ def xmltv():
 @output_feed_bp.route('/live/<username>/<password>/<int:feed_id>.ts')
 @output_feed_bp.route('/live/<username>/<password>/<int:feed_id>')
 def live(username, password, feed_id):
-    """Play one feed id: a 302 to the member's provider URL in redirect mode, a relayed
-    MPEG-TS body in proxy mode. Every refusal names its reason in the body."""
+    """Play one feed id: a relayed MPEG-TS body when the mode relays it (proxy mode, and a
+    group or sports channel in mixed mode), a 302 to the member's provider URL otherwise, and
+    a sports channel's waiting screen in every mode when it has nothing to play. Every refusal
+    names its reason in the body."""
     client = request.remote_addr or ''
     try:
-        if output_feed.mode_of(g.feed_cfg) == output_feed.MODE_REDIRECT:
-            return redirect(output_feed.redirect_target(feed_id, client, g.cfg), code=302)
-        session = output_feed.start_session(feed_id, client, g.cfg)
+        if output_feed.relays(g.feed_cfg, feed_id):
+            session = output_feed.start_session(feed_id, client, g.cfg)
+        else:
+            # A sports channel with nothing on is streamed its waiting screen in this mode too.
+            target, session = output_feed.redirect_play(feed_id, client, g.cfg)
+            if target is not None:
+                return redirect(target, code=302)
     except output_feed.FeedRefused as exc:
         return jsonify({'error': exc.message}), exc.status
     # The body runs after this request has ended, outside any request or app context, so
-    # the stream holds no database session and no pool connection for as long as the IPTV app
+    # the stream holds no database session and no pool connection for as long as the IPTV player
     # watches. Everything it needs is on the session object.
     return Response(output_feed.stream(session), mimetype='video/mp2t',
                     headers={'Cache-Control': 'no-cache'}, direct_passthrough=True)

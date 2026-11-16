@@ -1,9 +1,13 @@
-"""The poster image a Recording Profile can pin, and the one upload surface this app has.
+"""The poster and background images a Recording Profile can pin, and the one upload surface
+this app has.
 
 A finished recording's poster is otherwise a frame captured from the recording itself, and
 for a ball game that is whatever graphic the capture ended on. A profile that carries its
 own image gives every recording made under it the same cover - the series logo, the league
-badge - which is what a library of sports recordings actually wants (dev/changelog/1059).
+badge - which is what a library of sports recordings actually wants (dev/changelog/1059). A
+landscape background can be pinned the same way, for the `-fanart` a media server shows in its
+widescreen spots (dev/changelog/1508). The two are `SLOTS`: everything below takes one, and
+they differ only in their size and the profile columns they are written to.
 
 This is the first place the app accepts a file from the browser, so the rules that keep an
 upload from becoming an attack surface are all here and all enforced on the server:
@@ -26,7 +30,7 @@ upload from becoming an attack surface are all here and all enforced on the serv
 
 The profile's file is shared by every recording made under it, so a recording's teardown
 never touches it (recorder.recording_disk_paths lists the COPY beside the video, not the
-source). Only deleting the profile, replacing its poster or removing it discards the file.
+source). Only deleting the profile, replacing its image or removing it discards the file.
 """
 import logging
 import os
@@ -45,6 +49,10 @@ log = logging.getLogger(__name__)
 #: worth refusing when the file is used as-is either way.
 POSTER_WIDTH = 1000
 POSTER_HEIGHT = 1500
+#: The background slot is drawn 16:9 by the same servers, at 1920 x 1080 in Plex's and Kodi's
+#: own artwork guidance. Advisory in the same way.
+BACKGROUND_WIDTH = 1920
+BACKGROUND_HEIGHT = 1080
 
 #: A 1000 x 1500 PNG is under 3 MB; this leaves room for a generous one without letting
 #: the upload endpoint become a way to fill the images folder.
@@ -68,6 +76,27 @@ _JPEG_SOF_MARKERS = frozenset(
     [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF])
 #: Markers with no length field after them.
 _JPEG_BARE_MARKERS = frozenset([0x01, 0xD8] + list(range(0xD0, 0xD8)))
+
+
+class Slot(NamedTuple):
+    """One kind of image a profile can pin. `role` names the profile's columns
+    (`<role>_file`, `_width`, `_height`) and the route (`/api/profiles/<id>/<role>`)."""
+    role: str
+    width: int
+    height: int
+    ratio: str
+    expected: str     # how the advice names what a server wants
+
+
+POSTER = Slot('poster', POSTER_WIDTH, POSTER_HEIGHT, '2:3', 'a portrait poster')
+BACKGROUND = Slot('background', BACKGROUND_WIDTH, BACKGROUND_HEIGHT, '16:9', 'a landscape background')
+SLOTS = {slot.role: slot for slot in (POSTER, BACKGROUND)}
+
+
+def slot_spec(slot: Slot) -> dict:
+    """What the modal is told about a slot, so its copy and the server's checks are one number."""
+    return {'width': slot.width, 'height': slot.height, 'ratio': slot.ratio,
+            'expected': slot.expected, 'maxMb': MAX_BYTES // (1024 * 1024)}
 
 
 class ImageInfo(NamedTuple):
@@ -131,23 +160,23 @@ def sniff_image(data: bytes) -> Optional[ImageInfo]:
     return _png_info(data) or _jpeg_info(data)
 
 
-def size_advice(width: int, height: int) -> Optional[str]:
-    """One sentence saying how an image differs from what a media server expects, or None
-    when it is exactly that. Mirrored by pmSizeAdvice in static/js/profile-modal.js so the
-    modal can say it before the upload and the response can say it after."""
-    if width == POSTER_WIDTH and height == POSTER_HEIGHT:
+def size_advice(width: int, height: int, slot: Slot = POSTER) -> Optional[str]:
+    """One sentence saying how an image differs from what a media server expects in `slot`,
+    or None when it is exactly that. Mirrored by pmSizeAdvice in static/js/profile-modal.js
+    so the modal can say it before the upload and the response can say it after."""
+    if width == slot.width and height == slot.height:
         return None
-    expected = f'{POSTER_WIDTH} x {POSTER_HEIGHT}'
-    if width * POSTER_HEIGHT == height * POSTER_WIDTH:
-        return (f'This image is {width} x {height}. It has the right 2:3 shape but is '
-                f'{"smaller" if width < POSTER_WIDTH else "larger"} than the {expected} '
+    expected = f'{slot.width} x {slot.height}'
+    if width * slot.height == height * slot.width:
+        return (f'This image is {width} x {height}. It has the right {slot.ratio} shape but is '
+                f'{"smaller" if width < slot.width else "larger"} than the {expected} '
                 f'media servers expect, so it will be scaled by the server.')
-    return (f'This image is {width} x {height}. Media servers expect a portrait poster of '
-            f'{expected} (2:3), so this one will be cropped or letterboxed to fit.')
+    return (f'This image is {width} x {height}. Media servers expect {slot.expected} of '
+            f'{expected} ({slot.ratio}), so this one will be cropped or letterboxed to fit.')
 
 
 def posters_dir(cfg: dict) -> str:
-    """The folder pinned posters live in: images_dir's posters subfolder."""
+    """The folder pinned images live in, backgrounds included: images_dir's posters subfolder."""
     return image_dir(cfg, POSTERS)
 
 
@@ -159,19 +188,26 @@ def poster_path(cfg: dict, filename: str) -> str:
     return os.path.join(posters_dir(cfg), filename)
 
 
-def poster_payload(profile) -> Optional[dict]:
-    """What the profiles page and the modal show for a profile's poster, or None."""
-    if not profile.poster_file:
+def pinned(profile, slot: Slot):
+    """`(file, width, height)` of the image pinned to `profile` in `slot`; file None when none is."""
+    return (getattr(profile, f'{slot.role}_file'), getattr(profile, f'{slot.role}_width'),
+            getattr(profile, f'{slot.role}_height'))
+
+
+def image_payload(profile, slot: Slot = POSTER) -> Optional[dict]:
+    """What the profiles page and the modal show for a profile's image in `slot`, or None."""
+    filename, width, height = pinned(profile, slot)
+    if not filename:
         return None
-    match = FILENAME_RE.match(profile.poster_file)
+    match = FILENAME_RE.match(filename)
     return {
         # The token is part of the name and changes on every upload, so the browser
         # cannot keep showing the previous image after a replace.
-        'url': f'/api/profiles/{profile.id}/poster?v={match.group(2) if match else ""}',
-        'width': profile.poster_width,
-        'height': profile.poster_height,
-        'kind': 'PNG' if profile.poster_file.endswith('.png') else 'JPG',
-        'advice': size_advice(profile.poster_width or 0, profile.poster_height or 0),
+        'url': f'/api/profiles/{profile.id}/{slot.role}?v={match.group(2) if match else ""}',
+        'width': width,
+        'height': height,
+        'kind': 'PNG' if filename.endswith('.png') else 'JPG',
+        'advice': size_advice(width or 0, height or 0, slot),
     }
 
 
