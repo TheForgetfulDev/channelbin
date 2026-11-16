@@ -231,6 +231,7 @@ def recording_disk_paths(recording_id: int, cfg: dict = None) -> list:
             from_path = None
         if from_path:
             stems.append(os.path.splitext(from_path)[0])
+    scratch_dirs = set()
     for stem in dict.fromkeys(stems):
         for ext in family:
             sibling = stem + ext
@@ -252,6 +253,7 @@ def recording_disk_paths(recording_id: int, cfg: dict = None) -> list:
         # (SCRATCH_PREFIXES, scratch_file_paths), so a new supervised caller is reaped here
         # the moment it exists.
         scratch_dir = os.path.dirname(stem) or '.'
+        scratch_dirs.add(scratch_dir)
         for prefix in SCRATCH_PREFIXES:
             paths.extend(scratch_file_paths(scratch_dir, prefix, recording_id))
         # The partly-encoded parts a resumable conversion checkpoints into
@@ -270,6 +272,13 @@ def recording_disk_paths(recording_id: int, cfg: dict = None) -> list:
             # the join deletes its own (concatenator._remux_for_join, hole_repair).
             paths.append(f'{seg.file_path}{LAYOUT_REMUX_SUFFIX}')
             paths.append(f'{seg.file_path}{HOLE_REMUX_SUFFIX}')
+            # A join killed before it committed an output has no stem above, and its scratch
+            # (the join's own, a layout rewrite's, a hole repair's) sits beside the segments.
+            scratch_dir = os.path.dirname(seg.file_path) or '.'
+            if scratch_dir not in scratch_dirs:
+                scratch_dirs.add(scratch_dir)
+                for prefix in SCRATCH_PREFIXES:
+                    paths.extend(scratch_file_paths(scratch_dir, prefix, recording_id))
     paths.extend(recording_image_paths(recording_id, cfg))
     return list(dict.fromkeys(paths))
 
@@ -2848,7 +2857,7 @@ def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int,
     given up in the same step the new one is taken (dev/changelog/1242).
 
     Recordings still always win over the actors that do not hold a stream open on the
-    user's behalf: an in-flight sync on this account is canceled, and an IPTV app on
+    user's behalf: an in-flight sync on this account is canceled, and an IPTV player on
     the output feed, then a live preview, then a running channel test are preempted so
     the recording can take the slot, in that order. What this will NOT do
     is exceed the account's limit. When every slot is held by another *recording*, it
@@ -2869,7 +2878,7 @@ def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int,
             return connlim.try_acquire(account_id, 'recording', recording_id)
     if acquire():
         return True
-    # An IPTV app on the output feed yields first of all: it is entertainment that resumes
+    # An IPTV player on the output feed yields first of all: it is entertainment that resumes
     # on its own, below the operator's own look and the measurement feeding the health
     # score (DESIGN-output-feed.md 4.4). The viewer is told why - the session ends by name
     # and an alert names this recording.
@@ -2878,7 +2887,7 @@ def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int,
         from . import output_feed
         for holder_account_id in dict.fromkeys(a for _, a in viewers):
             output_feed.preempt_for_account(app, holder_account_id, recording_id)
-            log.warning('Recording %d: preempted an IPTV app on account %d%s',
+            log.warning('Recording %d: preempted an IPTV player on account %d%s',
                         recording_id, holder_account_id,
                         '' if holder_account_id == account_id
                         else f' (sharing a login with account {account_id})')
@@ -2964,6 +2973,14 @@ def _slot_wait_reason(account_id: int, waiting_on=None) -> str:
     if waiting_on is not None:
         return (f'recording "{waiting_on.name}" (#{waiting_on.id}) has been waiting longer '
                 f'for a connection slot on account "{account_name}"')
+    # Connections the IPTV output keeps for players are never a recording's, so a wait they
+    # cause says so rather than blaming another recording (DESIGN-output-feed.md 5.3, 5.5).
+    from .output_feed import held_seats_now
+    held = held_seats_now([account_id]).get(account_id, 0)
+    if held:
+        return (f'every connection on account "{account_name}" that recordings may use is taken: '
+                f'{counted(held, "connection")} {"is" if held == 1 else "are"} left alone for IPTV '
+                f'players ("Recordings leave alone" on the IPTV Output page)')
     return (f'every connection slot on account "{account_name}" is in use by another '
             f'recording')
 

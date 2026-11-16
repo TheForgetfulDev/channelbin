@@ -153,7 +153,7 @@ const RECORDING_PROFILE_SECTIONS = [
           'caught while there is still time to do something about it.' },
       { key: 'metadata_sidecar_enabled', label: 'Metadata file for media servers',
         type: 'tristate', inheritable: true, trueLabel: 'Enabled', falseLabel: 'Disabled',
-        meta: 'Saves a .nfo file and a poster (and for a matched game, a background) beside each finished recording made with ' +
+        meta: 'Saves a .nfo file, a poster and a background beside each finished recording made with ' +
           'this profile, so Plex, Jellyfin, Emby and Kodi show its real title, synopsis ' +
           'and genre instead of guessing from the filename.' },
     ],
@@ -164,11 +164,12 @@ function pmFlatFields(sections) {
   return sections.reduce((acc, s) => acc.concat(s.fields), []);
 }
 
-/* The poster a recording profile pins (app/profile_posters.py). Deliberately NOT an entry
-   in RECORDING_PROFILE_SECTIONS: it travels as a file through /api/profiles/<id>/poster,
-   never inside the JSON body, and the row's poster columns are written by that route
-   alone. `spec` is RP_CONFIG.posterSpec - the size and the cap are stated by the server
-   so the form's copy and the upload's own check cannot name two different numbers.
+/* The poster and background a recording profile pins (app/profile_posters.py). Deliberately
+   NOT entries in RECORDING_PROFILE_SECTIONS: each travels as a file through
+   /api/profiles/<id>/<role>, never inside the JSON body, and the row's image columns are
+   written by that route alone. `spec` is RP_CONFIG.posterSpec or .backgroundSpec - the size,
+   the shape and the cap are stated by the server so the form's copy and the upload's own
+   check cannot name two different numbers.
 
    pmSizeAdvice mirrors profile_posters.size_advice(): the modal says it BEFORE the upload,
    from the picked file's own pixel size, which is the moment the user can still choose a
@@ -176,71 +177,95 @@ function pmFlatFields(sections) {
 function pmSizeAdvice(width, height, spec) {
   if (width === spec.width && height === spec.height) return null;
   const expected = `${spec.width} x ${spec.height}`;
+  const ratio = spec.ratio || '2:3';
   if (width * spec.height === height * spec.width) {
-    return `This image is ${width} x ${height}. It has the right 2:3 shape but is ` +
+    return `This image is ${width} x ${height}. It has the right ${ratio} shape but is ` +
       `${width < spec.width ? 'smaller' : 'larger'} than the ${expected} media servers ` +
       'expect, so it will be scaled by the server.';
   }
-  return `This image is ${width} x ${height}. Media servers expect a portrait poster of ` +
-    `${expected} (2:3), so this one will be cropped or letterboxed to fit.`;
+  return `This image is ${width} x ${height}. Media servers expect ${spec.expected || 'a portrait poster'} of ` +
+    `${expected} (${ratio}), so this one will be cropped or letterboxed to fit.`;
 }
 
-function pmPosterCardHtml(src, line, advice, removable) {
-  return `<img class="pm-poster-img" src="${escHtml(src)}" alt="">` +
+const PM_IMAGE_ROLES = {
+  poster: {
+    label: 'Pinned poster', shape: 'portrait', wide: false,
+    none: 'No poster is pinned. Recordings made with this profile get a frame captured from the recording.',
+    use: 'Used as the cover of every recording made with this profile, in place of a frame from ' +
+      'the recording, whenever a metadata file is written for it.',
+  },
+  background: {
+    label: 'Pinned background', shape: 'landscape', wide: true,
+    none: 'No background is pinned. Recordings made with this profile get a frame captured from the recording.',
+    use: 'Used as the background of every recording made with this profile - the widescreen ' +
+      'image a media server shows behind its details and in spots like Continue Watching - in ' +
+      'place of a frame from the recording, whenever a metadata file is written for it.',
+  },
+};
+
+function pmPosterCardHtml(src, line, advice, removable, role = 'poster') {
+  return `<img class="pm-poster-img${PM_IMAGE_ROLES[role].wide ? ' is-wide' : ''}" src="${escHtml(src)}" alt="">` +
     `<div class="pm-poster-meta"><div>${escHtml(line)}</div>` +
     (advice ? `<div class="pm-poster-advice">${escHtml(advice)}</div>`
       : '<div>Matches what media servers expect.</div>') +
-    (removable ? '<button type="button" class="btn btn-sm" data-poster-remove>Remove poster</button>' : '') +
+    (removable ? `<button type="button" class="btn btn-sm" data-image-remove="${role}">Remove ${role}</button>` : '') +
     '</div>';
 }
 
-function pmPosterSectionHtml(poster, spec, preferSports) {
-  const current = poster
-    ? `<div class="pm-poster">${pmPosterCardHtml(poster.url,
-      `${poster.kind}, ${poster.width} x ${poster.height}`, poster.advice, true)}</div>`
-    : '<div class="pm-poster-none">No poster is pinned. Recordings made with this profile ' +
-      'get a frame captured from the recording.</div>';
-  const meta = 'Used as the cover of every recording made with this profile, in place of a ' +
-    'frame from the recording, whenever a metadata file is written for it. Needs to be ' +
-    `${spec.width} x ${spec.height} pixels (portrait, 2:3), JPG or PNG, up to ${spec.maxMb} MB. ` +
+function pmImageRowHtml(role, image, spec) {
+  const r = PM_IMAGE_ROLES[role];
+  const current = image
+    ? `<div class="pm-poster">${pmPosterCardHtml(image.url,
+      `${image.kind}, ${image.width} x ${image.height}`, image.advice, true, role)}</div>`
+    : `<div class="pm-poster-none">${escHtml(r.none)}</div>`;
+  const meta = `${r.use} Needs to be ${spec.width} x ${spec.height} pixels ` +
+    `(${r.shape}, ${spec.ratio || '2:3'}), JPG or PNG, up to ${spec.maxMb} MB. ` +
     'It is used exactly as uploaded - nothing is resized, cropped or converted.';
-  return '<fieldset class="gd-fset"><div class="gd-fset-head">Poster image</div>' +
+  return fieldRow({
+    label: r.label, meta: escHtml(meta), stack: true,
+    control: `<div id="pm-${role}-current">${current}</div>` +
+      `<input type="file" id="pm-${role}-file" accept="image/jpeg,image/png">` +
+      `<div id="pm-${role}-preview" class="pm-poster" hidden></div>`,
+  });
+}
+
+/* `background`/`backgroundSpec` are optional so a caller with only a poster still renders. */
+function pmPosterSectionHtml(poster, spec, preferSports, background, backgroundSpec) {
+  return '<fieldset class="gd-fset"><div class="gd-fset-head">Poster and background</div>' +
+    pmImageRowHtml('poster', poster, spec) +
+    (backgroundSpec ? pmImageRowHtml('background', background, backgroundSpec) : '') +
+    // Saved with the profile's JSON body, not the images' file routes (pmPosterPayload).
     fieldRow({
-      label: 'Pinned poster', meta: escHtml(meta), stack: true,
-      control: `<div id="pm-poster-current">${current}</div>` +
-        '<input type="file" id="pm-poster-file" accept="image/jpeg,image/png">' +
-        '<div id="pm-poster-preview" class="pm-poster" hidden></div>',
-    }) +
-    // Saved with the profile's JSON body, not the poster's file route (pmPosterPayload).
-    fieldRow({
-      label: "Use TheSportsDB's poster when the game has one",
-      meta: "For a recording matched to a TheSportsDB event that has its own poster, use that " +
-        'poster instead of the pinned one. The pinned poster is still used for every other ' +
-        "recording. TheSportsDB's background images never replace it.",
-      control: '<label class="switch"><input type="checkbox" id="pm-prefer-sports-poster"' +
+      label: "Use TheSportsDB's images when the game has them",
+      meta: "For a recording matched to a TheSportsDB event, use the event's own poster and " +
+        'background instead of the pinned ones. The pinned images are still used for every ' +
+        "other recording, and for an event missing one. TheSportsDB's background never " +
+        'replaces a pinned poster.',
+      control: '<label class="switch"><input type="checkbox" id="pm-prefer-sports-art"' +
         `${preferSports ? ' checked' : ''}><span class="knob"></span></label>`,
     }) +
     '</fieldset>';
 }
 
-/* The poster section's one setting that travels in the JSON body. Every save sends it, like
-   every other field (pmPayload), so turning it off is a save like any other. */
+/* The section's one setting that travels in the JSON body. Every save sends it, like every
+   other field (pmPayload), so turning it off is a save like any other. */
 function pmPosterPayload(section) {
-  const box = section.querySelector('#pm-prefer-sports-poster');
-  return { prefer_sports_poster: !!(box && box.checked) };
+  const box = section.querySelector('#pm-prefer-sports-art');
+  return { prefer_sports_art: !!(box && box.checked) };
 }
 
-/* Wires the section: a picked file is previewed with its size and the advice line, an
+/* Wires one image row: a picked file is previewed with its size and the advice line, an
    oversize pick is refused here as a courtesy (the route refuses it again), and Remove
    is deferred to Save so Cancel still cancels everything. `state` is {file, remove}. */
-function pmWirePosterSection(section, spec, state) {
-  const input = section.querySelector('#pm-poster-file');
-  const preview = section.querySelector('#pm-poster-preview');
-  const current = section.querySelector('#pm-poster-current');
+function pmWireImageRow(section, role, spec, state) {
+  const input = section.querySelector(`#pm-${role}-file`);
+  const preview = section.querySelector(`#pm-${role}-preview`);
+  const current = section.querySelector(`#pm-${role}-current`);
+  if (!input) return;
   section.addEventListener('click', (e) => {
-    if (!e.target.closest('[data-poster-remove]')) return;
+    if (!e.target.closest(`[data-image-remove="${role}"]`)) return;
     state.remove = true;
-    current.innerHTML = '<div class="pm-poster-none">The poster will be removed when you save.</div>';
+    current.innerHTML = `<div class="pm-poster-none">The ${role} will be removed when you save.</div>`;
   });
   input.addEventListener('change', () => {
     const file = input.files && input.files[0];
@@ -259,7 +284,7 @@ function pmWirePosterSection(section, spec, state) {
       state.file = file;
       preview.innerHTML = pmPosterCardHtml(url,
         `Ready to upload: ${img.naturalWidth} x ${img.naturalHeight}`,
-        pmSizeAdvice(img.naturalWidth, img.naturalHeight, spec), false);
+        pmSizeAdvice(img.naturalWidth, img.naturalHeight, spec), false, role);
       preview.hidden = false;
     };
     img.onerror = () => {
@@ -268,6 +293,17 @@ function pmWirePosterSection(section, spec, state) {
     };
     img.src = url;
   });
+}
+
+/* The request that carries one row's change after the JSON save, or null when it has none. */
+function pmImageRequest(id, role, state) {
+  if (state.file) {
+    const form = new FormData();
+    form.append(role, state.file);
+    return () => jsonFetch(`/api/profiles/${id}/${role}`, { method: 'POST', body: form });
+  }
+  if (state.remove) return () => jsonFetch(`/api/profiles/${id}/${role}`, { method: 'DELETE' });
+  return null;
 }
 
 /* The "blank = inherit" sentence appended to an inheritable field's meta. Kept pure and
@@ -422,7 +458,7 @@ function pmSectionsHtml(sections, values, defaults, cleanup) {
                     with no template field
      extraPayload() - optional; keys from `extra` merged into the request body
      afterSave(res) - optional; a promise for follow-up requests that need the saved
-                    row's id (the poster upload). Its failure is reported but never leaves
+                    row's id (the image uploads). Its failure is reported but never leaves
                     the modal open over a profile that IS saved - a second Save on the
                     create path would make a duplicate.
      onDone()     - called after a successful save; call sites reload */
@@ -471,7 +507,7 @@ function openProfileModal(opts) {
       if (!opts.afterSave) return true;
       return opts.afterSave(res).then(() => true, (err) => {
         // The page reloads a moment later, so the message gets its time on screen first.
-        showToast(`Profile "${name}" saved, but its poster was not: ${err.message}`,
+        showToast(`Profile "${name}" saved, but its image was not: ${err.message}`,
           { type: 'error', durationMs: 10000 });
         close();
         setTimeout(onDone, 5000);
@@ -568,34 +604,30 @@ function openHealthCheckProfileModal(opts) {
 }
 
 /* Recording Profiles list page (templates/profiles.html).
-   opts: { profile, defaults, posterSpec, onDone } - profile omitted for the create flow.
-   The poster section rides along as `extra`, and its upload or removal runs after the
+   opts: { profile, defaults, posterSpec, backgroundSpec, onDone } - profile omitted for the
+   create flow. The image section rides along as `extra`, and its uploads or removals run after the
    JSON save because a new profile has no id to attach a file to until then. */
 function openRecordingProfileModal(opts) {
   const p = opts.profile || null;
   const spec = opts.posterSpec;
-  const posterState = { file: null, remove: false };
+  const bgSpec = opts.backgroundSpec || null;
+  const states = { poster: { file: null, remove: false }, background: { file: null, remove: false } };
   let extra = null;
   let afterSave;
   let extraPayload;
   if (spec) {
     extra = document.createElement('div');
-    extra.innerHTML = pmPosterSectionHtml(p ? p.poster : null, spec, !!(p && p.prefer_sports_poster));
-    pmWirePosterSection(extra, spec, posterState);
+    extra.innerHTML = pmPosterSectionHtml(p ? p.poster : null, spec, !!(p && p.prefer_sports_art),
+      p ? p.background : null, bgSpec);
+    pmWireImageRow(extra, 'poster', spec, states.poster);
+    if (bgSpec) pmWireImageRow(extra, 'background', bgSpec, states.background);
     const section = extra;
     extraPayload = () => pmPosterPayload(section);
-    afterSave = (res) => {
-      const id = res.profile.id;
-      if (posterState.file) {
-        const form = new FormData();
-        form.append('poster', posterState.file);
-        return jsonFetch(`/api/profiles/${id}/poster`, { method: 'POST', body: form });
-      }
-      if (posterState.remove) {
-        return jsonFetch(`/api/profiles/${id}/poster`, { method: 'DELETE' });
-      }
-      return Promise.resolve();
-    };
+    // One after the other: each answer rewrites the same profile row.
+    afterSave = (res) => ['poster', 'background']
+      .map((role) => pmImageRequest(res.profile.id, role, states[role]))
+      .filter(Boolean)
+      .reduce((chain, send) => chain.then(send), Promise.resolve());
   }
   return openProfileModal({
     extra,

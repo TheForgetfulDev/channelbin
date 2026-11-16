@@ -5,12 +5,16 @@ The client runs over real HTTP against tests/support/fake_sportsdb.py: TheSports
 odd shapes, with made-up data. Throwaway temp SQLite DB - never the live dvr.db.
   python3 -m unittest tests.test_sports_schedule
 """
+import html as html_lib
 import json
 import os
+import re
 import sys
 import unittest
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -108,6 +112,21 @@ class AnswerShapeTests(SportsCase):
         answer = sports_data._call('eventsround', {'id': 1}, 'events')
         self.assertEqual(answer.outcome, SPORTS_FETCH_RATE_LIMITED)
 
+    def test_a_429_carries_the_pause_it_asked_for(self):
+        self.fake.fault, self.fake.retry_after = 'rate_limited', '180'
+        answer = sports_data._call('eventsround', {'id': 1}, 'events')
+        self.assertEqual(answer.retry_after, 180)
+        self.assertIn('180 seconds', answer.reason)
+
+    def test_a_retry_after_is_read_as_seconds_between_a_minute_and_an_hour(self):
+        """The docs say a minute; the measured header said 120 (dev/changelog/1551)."""
+        self.assertEqual(sports_data.retry_after_seconds('120'), 120)
+        self.assertEqual(sports_data.retry_after_seconds(' 90 '), 90)
+        self.assertEqual(sports_data.retry_after_seconds('5'), 60)
+        self.assertEqual(sports_data.retry_after_seconds('99999'), sports_data.MAX_BACKOFF_SECONDS)
+        self.assertEqual(sports_data.retry_after_seconds(None), 120)
+        self.assertEqual(sports_data.retry_after_seconds('Wed, 21 Oct 2099 07:28:00 GMT'), 120)
+
     def test_a_503_is_a_refusal_and_names_the_status(self):
         self.fake.fault = 'refused'
         answer = sports_data._call('eventsround', {'id': 1, 's': '2099', 'r': 1}, 'events')
@@ -164,8 +183,8 @@ class FirstFillTests(SportsCase):
         self.assertEqual(len(self.fake.calls), 1)
         state = db.session.get(SportsState, 1)
         wait = (state.next_call_at - self.now).total_seconds()
-        self.assertGreaterEqual(wait, 40)
-        self.assertLessEqual(wait, 80)
+        self.assertGreaterEqual(wait, 8)
+        self.assertLessEqual(wait, 12)
 
     def test_the_floor_holds_whatever_the_config_says(self):
         self.t.sandbox_config({'sports_data': {'call_spacing_seconds': 1, 'call_jitter_seconds': 0}})
@@ -252,7 +271,7 @@ class FailureTests(SportsCase):
         self.add_league()
         return self.drain()
 
-    def test_a_429_doubles_the_wait_changes_nothing_stored_and_asks_again(self):
+    def test_a_429_doubles_the_spacing_changes_nothing_stored_and_asks_again(self):
         self.seeded()
         row = self.fetch(f'round:{LEAGUE_ID}:2099:9')
         later = self.now + timedelta(hours=6)
@@ -260,10 +279,39 @@ class FailureTests(SportsCase):
         self.assertEqual(self.ask_now(row.target, later), SPORTS_FETCH_RATE_LIMITED)
         db.session.expire_all()
         state = db.session.get(SportsState, 1)
-        self.assertEqual(state.backoff_seconds, 120)
-        self.assertGreaterEqual((state.next_call_at - later).total_seconds(), 100)
+        self.assertEqual(state.backoff_seconds, 20)
         self.assertEqual(SportsEvent.query.count(), 2)
         self.assertLessEqual(self.fetch(row.target).next_due_at, later)
+
+    def limited_wait(self):
+        self.seeded()
+        row = self.fetch(f'round:{LEAGUE_ID}:2099:9')
+        later = self.now + timedelta(hours=6)
+        self.fake.fault = 'rate_limited'
+        self.ask_now(row.target, later)
+        db.session.expire_all()
+        return (db.session.get(SportsState, 1).next_call_at - later).total_seconds()
+
+    def test_the_first_call_after_a_429_waits_out_the_pause_it_asked_for(self):
+        """dev/docs/BUGS.md 2026-11-14: the next call came after the doubled spacing, inside the pause,
+        where every call is refused again."""
+        self.fake.retry_after = '300'
+        self.assertGreaterEqual(self.limited_wait(), 300)
+
+    def test_a_429_with_no_retry_after_waits_the_measured_two_minutes(self):
+        """dev/docs/BUGS.md 2026-11-14."""
+        self.fake.retry_after = None
+        self.assertGreaterEqual(self.limited_wait(), 120)
+
+    def test_after_the_pause_calls_come_at_the_doubled_spacing_not_the_pause(self):
+        self.seeded()
+        settings = sports_data._settings()
+        state = db.session.get(SportsState, 1)
+        sports_data._note_call(state, settings, sports_data.Answer(SPORTS_FETCH_RATE_LIMITED, retry_after=120), self.now)
+        self.assertGreaterEqual((state.next_call_at - self.now).total_seconds(), 120)
+        after = state.next_call_at
+        sports_data._note_call(state, settings, sports_data.Answer(SPORTS_FETCH_OK), after)
+        self.assertLessEqual((state.next_call_at - after).total_seconds(), 20 + settings['call_jitter_seconds'])
 
     def test_clean_calls_bring_a_backoff_back_down(self):
         self.seeded()
@@ -272,12 +320,13 @@ class FailureTests(SportsCase):
         db.session.commit()
         settings = sports_data._settings()
         state = db.session.get(SportsState, 1)
-        for _ in range(sports_data.CLEAN_CALLS_TO_EASE):
-            sports_data._note_call(state, settings, sports_data.Answer(SPORTS_FETCH_OK), self.now)
-        self.assertEqual(state.backoff_seconds, 120)
-        for _ in range(sports_data.CLEAN_CALLS_TO_EASE):
-            sports_data._note_call(state, settings, sports_data.Answer(SPORTS_FETCH_OK), self.now)
-        self.assertEqual(state.backoff_seconds, 0)
+        seen = []
+        while state.backoff_seconds and len(seen) < 10:
+            for _ in range(sports_data.CLEAN_CALLS_TO_EASE):
+                sports_data._note_call(state, settings, sports_data.Answer(SPORTS_FETCH_OK), self.now)
+            seen.append(state.backoff_seconds)
+        # Halved each time until half would be no slower than the spacing (10), then gone.
+        self.assertEqual(seen, [120, 60, 30, 15, 0])
 
     def test_a_refusal_keeps_what_is_stored_and_says_when_it_started(self):
         self.seeded()
@@ -356,7 +405,7 @@ class ReviewedFailureTests(SportsCase):
         state = db.session.get(SportsState, 1)
         self.assertEqual(state.last_call_at, at, 'the pace survives the rollback')
         calls = len(self.fake.calls)
-        self.assertEqual(sports_data.tick(now=at + timedelta(seconds=15)), 'waiting')
+        self.assertEqual(sports_data.tick(now=at + timedelta(seconds=5)), 'waiting')
         self.assertEqual(len(self.fake.calls), calls)
 
     def test_a_repeated_event_id_in_one_answer_is_dropped_not_fatal(self):
@@ -385,7 +434,8 @@ class ReviewedFailureTests(SportsCase):
         self.assertIsNotNone(self.fetch(f'round:{LEAGUE_ID}:2099:9').next_due_at)
 
     def test_a_next_event_with_no_round_is_named_not_healthy(self):
-        self.fake.next_event[LEAGUE_ID] = [game(1, 'Reds', 'Blues', iso(self.now + timedelta(days=1)), intRound='0')]
+        # Round 0 is a real round (the NBA's regular season, dev/changelog/1550); no round is an empty one.
+        self.fake.next_event[LEAGUE_ID] = [game(1, 'Reds', 'Blues', iso(self.now + timedelta(days=1)), intRound='')]
         self.add_league()
         self.drain()
         row = self.fetch(f'next:{LEAGUE_ID}')
@@ -454,6 +504,33 @@ class CadenceTests(unittest.TestCase):
 
     def test_once_more_six_hours_before_the_start(self):
         self.assertEqual(self.due(timedelta(hours=10)), self.NOW + timedelta(hours=4))
+
+
+class LeaguePageMidnightTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-14 12:14 AM: a league page kept a game only from the start of
+    today, so a game that started at 11:42 PM and was still on, or recording, left the page at
+    midnight."""
+    TZ = ZoneInfo('America/New_York')
+    NOW = datetime(2099, 11, 14, 5, 12)          # 12:12 AM Eastern
+
+    def game(self, start):
+        return SimpleNamespace(start_at=start, home_team_id=1, away_team_id=2, local_date=None)
+
+    def test_a_game_that_started_before_midnight_stays_after_it(self):
+        since = sports_view._league_page_since(self.NOW, self.TZ)
+        late = self.game(self.NOW - timedelta(minutes=30))       # 11:42 PM the day before
+        self.assertTrue(sports_view._on_league_page(late, since, self.NOW, self.TZ))
+
+    def test_a_game_from_the_day_before_that_is_long_over_goes(self):
+        since = sports_view._league_page_since(self.NOW, self.TZ)
+        early = self.game(self.NOW - timedelta(hours=7))
+        self.assertFalse(sports_view._on_league_page(early, since, self.NOW, self.TZ))
+
+    def test_in_the_evening_a_morning_game_still_stays_for_the_day(self):
+        evening = datetime(2099, 11, 14, 23, 0)                  # 6 PM Eastern
+        since = sports_view._league_page_since(evening, self.TZ)
+        morning = self.game(datetime(2099, 11, 14, 14, 0))       # 9 AM Eastern
+        self.assertTrue(sports_view._on_league_page(morning, since, evening, self.TZ))
 
 
 class TimeDisplayTests(SportsCase):
@@ -688,7 +765,20 @@ class AddingALeagueTests(SportsCase):
     def test_a_lookup_counts_toward_the_workers_pace(self):
         self.post(text=str(LEAGUE_ID))
         state = db.session.get(SportsState, 1)
-        self.assertGreater(state.next_call_at, datetime.utcnow() + timedelta(seconds=20))
+        self.assertGreater(state.next_call_at, datetime.utcnow() + timedelta(seconds=sports_data.MIN_WAIT_SECONDS - 1))
+
+    def test_a_lookup_inside_a_429s_pause_says_when_and_makes_no_call(self):
+        """dev/docs/BUGS.md 2026-11-14: a person's lookup checked only the floor, so one made inside
+        the pause drew another 429 and doubled the backoff again."""
+        now = datetime.utcnow()
+        db.session.add(SportsState(id=1, backoff_seconds=20, clean_calls=0, daily_offset_seconds=0,
+                                   last_call_at=now - timedelta(seconds=30),
+                                   next_call_at=now + timedelta(seconds=90)))
+        db.session.commit()
+        r = self.post(text=str(LEAGUE_ID))
+        self.assertEqual(r.status_code, 409)
+        self.assertGreaterEqual(r.get_json()['retry_after'], 85)
+        self.assertEqual(self.fake.calls, [])
 
     def test_thesportsdb_being_down_saves_nothing_and_says_so(self):
         self.fake.fault = 'refused'
@@ -745,6 +835,25 @@ class AddingALeagueTests(SportsCase):
         db.session.expire_all()
         self.assertEqual([f.team_tsdb_id for f in SportsFollow.query.all()], [0])
 
+    def test_a_repeated_team_is_stored_once(self):
+        """dev/docs/BUGS.md 2026-11-15 @ 12:58:58 PM: a repeated id broke the follow's unique key
+        and answered 500 with nothing saved."""
+        league_id = self.add_league()
+        r = self.client.put(f'/api/sports/leagues/{league_id}/following', json={'team_ids': [11, 11, 12]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(sorted(f.team_tsdb_id for f in SportsFollow.query.all()), [11, 12])
+
+    def test_anything_but_a_team_number_is_refused_and_the_follow_stands(self):
+        """dev/docs/BUGS.md 2026-11-15 @ 12:58:58 PM: a 0 beside a team stored the whole league and
+        that team together, and a negative id, a fraction or a number too big to hold was stored
+        or answered 500."""
+        league_id = self.add_league()
+        for bad in ([0, 11], [-4], [11.7], ['11'], [True], [1e400], [None]):
+            r = self.client.put(f'/api/sports/leagues/{league_id}/following', json={'team_ids': bad})
+            self.assertEqual(r.status_code, 400, bad)
+            db.session.expire_all()
+            self.assertEqual([f.team_tsdb_id for f in SportsFollow.query.all()], [0], bad)
+
     def test_the_dialog_offers_the_six_default_leagues_alphabetically_and_follows_none(self):
         """The shipped picks (dev/changelog/1446): offered, never followed until a click."""
         shipped = sports_view.add_dialog_config()['shipped']
@@ -759,19 +868,48 @@ class AddingALeagueTests(SportsCase):
         self.assertEqual(self.client.delete('/api/sports/leagues/999').status_code, 404)
 
 
+class WorkerWakeTests(unittest.TestCase):
+    """The worker's interval is how often an idle worker looks; a pace under it holds because the job
+    wakes itself at the stored next call (dev/changelog/1551)."""
+
+    def wake(self, due, next_run, job=True):
+        from app import scheduler
+        stub = SimpleNamespace(get_job=lambda job_id: SimpleNamespace(next_run_time=next_run) if job else None)
+        with patch.object(scheduler, '_scheduler', stub), patch.object(scheduler, '_modify_job') as modify:
+            scheduler._wake_sports_worker_at(due)
+        return modify
+
+    def test_a_next_call_sooner_than_the_interval_brings_the_tick_forward(self):
+        due = datetime.utcnow() + timedelta(seconds=9)
+        modify = self.wake(due, datetime.now(ZoneInfo('UTC')) + timedelta(seconds=15))
+        modify.assert_called_once()
+        self.assertEqual(modify.call_args.kwargs['next_run_time'], due)
+
+    def test_a_next_call_after_the_next_tick_leaves_it(self):
+        self.wake(datetime.utcnow() + timedelta(seconds=40),
+                  datetime.now(ZoneInfo('UTC')) + timedelta(seconds=15)).assert_not_called()
+
+    def test_a_next_call_already_past_leaves_it_so_an_idle_worker_never_spins(self):
+        self.wake(datetime.utcnow() - timedelta(seconds=5),
+                  datetime.now(ZoneInfo('UTC')) + timedelta(seconds=15)).assert_not_called()
+
+    def test_no_job_no_change(self):
+        self.wake(datetime.utcnow() + timedelta(seconds=9), None, job=False).assert_not_called()
+
+
 class PaceSettingTests(SportsCase):
     def save(self, path, value):
         return self.client.post('/api/settings/field', json={'path': path, 'value': value})
 
     def test_pace_error_is_about_the_shortest_wait(self):
         self.assertEqual(sports_data.pace_error(60, 20), '')
-        self.assertEqual(sports_data.pace_error(32, 20), '')
-        self.assertIn('12', sports_data.pace_error(31, 20))
+        self.assertEqual(sports_data.pace_error(10, 2), '')
+        self.assertIn('8', sports_data.pace_error(9, 2))
 
     def test_a_spacing_too_fast_for_the_jitter_is_refused(self):
-        r = self.save('sports_data.call_spacing_seconds', 25)
+        r = self.save('sports_data.call_spacing_seconds', 9)
         self.assertEqual(r.status_code, 400)
-        self.assertIn('at least 12', r.get_json()['error'])
+        self.assertIn('at least 8', r.get_json()['error'])
 
     def test_a_jitter_too_wide_for_the_spacing_is_refused(self):
         r = self.save('sports_data.call_jitter_seconds', 50)
@@ -1014,6 +1152,18 @@ class PageTests(SportsCase):
         self.assertIn('Time not listed', text)
         self.assertIn('Upcoming races', text)
         self.assertIn('Pretend Speedway, Pretendville', text)
+
+    def test_a_racing_league_is_never_called_games_in_its_dialogs(self):
+        """Stop following and Delete league read the league's own noun from the row
+        (dev/changelog/1568): they said "games" of a race."""
+        when = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=3)
+        self.fake.next_event[FIELD_LEAGUE_ID] = [race(7, 'Pretend 500', iso(when))]
+        self.fake.rounds[(FIELD_LEAGUE_ID, '2099', 30)] = [race(7, 'Pretend 500', iso(when))]
+        league_id = self.add_league(FIELD_LEAGUE_ID, name='Pretend Racing', sport='Motorsport')
+        self.drain(start=datetime.utcnow())
+        for text in (self.league_html(league_id), self.list_html()):
+            dialog = json.loads(html_lib.unescape(re.search(r'data-dialog="([^"]*)"', text).group(1)))
+            self.assertEqual((dialog['one'], dialog['many']), ('race', 'races'))
 
     def test_a_league_gone_is_a_404(self):
         self.assertEqual(self.client.get('/sports/999').status_code, 404)

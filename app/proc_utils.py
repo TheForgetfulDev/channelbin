@@ -240,13 +240,13 @@ def build_relay_cmd(cfg: dict, url: str, *, pace_realtime: bool = False) -> list
     """ffmpeg "connect + stream-copy to MPEG-TS on stdout" command for the output feed's
     relay (app/output_feed.py, dev/docs/DESIGN-output-feed.md section 4.1). The input half is
     input_args(), the same connect behavior every capture and preview gets, so a provider
-    sees an IPTV app exactly as it sees a recording.
+    sees an IPTV player exactly as it sees a recording.
 
     The output is a stream copy for the reason build_preview_cmd's is: a re-encode measured
     347% of this box's CPU, and a viewer must never be able to starve the capture it sits
-    beside. Video and audio are copied as they are - the IPTV app decodes whatever the provider
+    beside. Video and audio are copied as they are - the IPTV player decodes whatever the provider
     sends, unlike a browser - and subtitle and data tracks are dropped so a teletext PID
-    cannot upset the IPTV app's demuxer. One continuous TS on pipe:1 gives one shape for every
+    cannot upset the IPTV player's demuxer. One continuous TS on pipe:1 gives one shape for every
     provider (an HLS source and a TS source both come out as TS), which is what an Xtream
     client expects from `/live/<u>/<p>/<id>.ts` anyway. The caller's reader thread is the
     one drain of that pipe (CLAUDE.md, subprocess discipline)."""
@@ -254,6 +254,57 @@ def build_relay_cmd(cfg: dict, url: str, *, pace_realtime: bool = False) -> list
     cmd += input_args(cfg, url, pace_realtime=pace_realtime)
     cmd += ['-map', '0:v:0?', '-map', '0:a:0?', '-sn', '-dn', '-c', 'copy',
             '-f', 'mpegts', 'pipe:1']
+    return cmd
+
+
+def build_screen_clip_cmd(cfg: dict, pictures: list, graph: str, frames: int, fps: int,
+                          output_path: str) -> list:
+    """ffmpeg command that makes a sports channel's waiting-screen clip (app/sports_screen.py,
+    dev/changelog/1533) from its still layers: `pictures` in the input order `graph` (a
+    filter_complex ending in [v]) reads them, `frames` frames long, H.264 and a silent AAC track
+    in MPEG-TS. Made once and then looped with -c copy, so every flag here is about the loop:
+
+    - No B-frames: with them, -stream_loop dropped a frame at every seam, measured. Without
+      them a seam is one frame plus the AAC encoder's 21 ms of priming, video DTS monotonic and
+      the audio continuous across it.
+    - The audio is exactly the video's length (`frames` is a whole number of
+      sports_screen_draw.LOOP_UNIT), so neither track runs out first.
+    - A keyframe every second, so an IPTV player tuning in starts within one.
+    veryfast: 9.5 s for a 30 s clip on this box, against 4.7 s for ultrafast at three times the
+    size (17.7 MB, 4.7 Mbit/s)."""
+    seconds = frames / fps
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path']), '-hide_banner', '-nostdin', '-y']
+    for path in pictures:
+        cmd += ['-i', path]
+    cmd += ['-f', 'lavfi', '-t', f'{seconds:.6f}', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+            '-filter_complex', graph, '-map', '[v]', '-map', f'{len(pictures)}:a',
+            '-frames:v', str(frames), '-r', str(fps),
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-bf', '0', '-pix_fmt', 'yuv420p',
+            '-g', str(fps), '-keyint_min', str(fps), '-sc_threshold', '0',
+            '-c:a', 'aac', '-b:a', '64k', '-f', 'mpegts', output_path]
+    return cmd
+
+
+#: How much of a waiting-screen clip build_screen_play_cmd sends at once before pacing to real
+#: time, so an IPTV player fills its buffer and starts without waiting that long.
+SCREEN_PLAY_BURST_SECONDS = 3
+
+
+def build_screen_play_cmd(cfg: dict, clip_path: str) -> list:
+    """ffmpeg command that plays a sports channel's waiting-screen clip to an IPTV player: the
+    clip looped forever and stream-copied to MPEG-TS on stdout, the output feed relay's shape
+    (build_relay_cmd) with a file for its input (app/output_feed.py, dev/changelog/1534).
+
+    Paced to real time, which is not optional: unpaced, ffmpeg pushes the loop as fast as the
+    pipe takes it and the relay's ring overflows. -readrate 1 with a short initial burst is -re
+    with the player's first seconds sent at once. Measured on this box with ffmpeg 7.1 over 75 s
+    and two seams: the bytes grow at the clip's own rate past each seam, video DTS stays
+    monotonic (a 54.7 ms step at a seam, as the clip was made) and the audio is continuous;
+    about 1% of one core."""
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path']), '-hide_banner', '-nostdin', '-loglevel', 'error',
+           '-readrate', '1', '-readrate_initial_burst', str(SCREEN_PLAY_BURST_SECONDS),
+           '-stream_loop', '-1', '-i', f'file:{clip_path}']
+    cmd += ['-map', '0:v:0?', '-map', '0:a:0?', '-sn', '-dn', '-c', 'copy', '-f', 'mpegts', 'pipe:1']
     return cmd
 
 

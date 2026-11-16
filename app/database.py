@@ -448,7 +448,13 @@ GROUP_DEFAULT_PROFILE_SET       = 'GROUP_DEFAULT_PROFILE_SET'
 # (dev/changelog/1281) or by Keep the examples (dev/changelog/1288). The detail says
 # which. Written only by app/examples.py. Group-wide, so channel_id is NULL.
 GROUP_EXAMPLE_KEPT              = 'GROUP_EXAMPLE_KEPT'
-# An IPTV app watching this group through the output feed was moved to another member because
+# A person took this channel (ChannelEvent) or this group (ChannelGroupEvent, channel_id NULL)
+# off the IPTV output, or put it back: the `on_output` switch. Written only by
+# app/output_feed.py::set_on_output, with the column, and the detail says which way and how
+# many plays it cut (dev/changelog/1525). The same word on both tables on purpose: it is
+# one switch on two kinds of guide row.
+OUTPUT_FEED_SWITCHED            = 'OUTPUT_FEED_SWITCHED'
+# An IPTV player watching this group through the output feed was moved to another member because
 # the one it was on died (app/output_feed.py, dev/docs/DESIGN-output-feed.md section 4.5).
 # A fact about the group, not a recording: no Recording row exists for a viewer. The
 # detail names the member that failed and the one that took over; channel_id is the new
@@ -573,7 +579,8 @@ EVENT_LABELS = {
     GROUP_GUIDE_LISTINGS_SET: 'Guide listings changed',
     GROUP_DEFAULT_PROFILE_SET: 'Default profile changed',
     GROUP_EXAMPLE_KEPT: 'No longer an example',
-    GROUP_VIEWER_FAILOVER: 'An IPTV app was moved to another channel',
+    OUTPUT_FEED_SWITCHED: 'IPTV output switch changed',
+    GROUP_VIEWER_FAILOVER: 'An IPTV player was moved to another channel',
 }
 
 
@@ -649,11 +656,17 @@ class RecordingProfile(db.Model):
     poster_file               = db.Column(db.String(255))
     poster_width              = db.Column(db.Integer)
     poster_height             = db.Column(db.Integer)
-    # True = TheSportsDB's portrait poster for a recording's event goes ahead of the pinned
-    # one, which is then the poster only for a recording with no event poster. Its landscape
-    # thumb never does (app/metadata_sidecar.py::_copy_poster, dev/changelog/1505). No global
-    # to inherit: a pinned poster exists only on a profile.
-    prefer_sports_poster      = db.Column(db.Boolean, nullable=False, default=False,
+    # A landscape background pinned the same way, in the same folder under the same name
+    # shape, for the `-fanart` a media server shows in its widescreen spots. None = none
+    # pinned (dev/changelog/1508).
+    background_file           = db.Column(db.String(255))
+    background_width          = db.Column(db.Integer)
+    background_height         = db.Column(db.Integer)
+    # True = TheSportsDB's images for a recording's event go ahead of the pinned ones: its
+    # portrait poster ahead of the pinned poster, its landscape thumb ahead of the pinned
+    # background. The thumb never stands in for a pinned POSTER (app/metadata_sidecar.py,
+    # dev/changelog/1505, 1508). No global to inherit: pinned images exist only on a profile.
+    prefer_sports_art         = db.Column(db.Boolean, nullable=False, default=False,
                                           server_default=db.text('0'))
     created_at                = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at                = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -1613,6 +1626,51 @@ def detach_recording_references(recording_id: int):
         forget_unreferenced()
 
 
+#: A recording in one of these still needs its channel row: it has yet to capture, is capturing,
+#: or is being joined and read back. The missing-channel delete refuses a channel one of them
+#: names, and detach_channel_references() leaves their link alone.
+CHANNEL_NEEDING_STATUSES = (REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED,
+                            REC_STATUS_RETRYING, REC_STATUS_CONCATENATING,
+                            REC_STATUS_ANALYZING)
+
+
+def detach_channel_references(channel_ids) -> int:
+    """Unlink the history rows that name a channels.id and outlive the channel: a recording
+    whose capture is over, that recording's segments, and a group's event. Returns how many
+    recordings were unlinked.
+
+    Mutates without committing, like detach_recording_references above: both channel delete
+    paths call it inside the closure that deletes the rows. `channel_ids` is one chunk, sized
+    by the caller.
+
+    channels.id is not AUTOINCREMENT, so SQLite hands the id of a row deleted from the top of
+    the table to the next channel a sync creates. A row still holding that id then reads as
+    the new channel's: a finished recording links to it, a segment is attributed to its
+    account, and a group's member history inherits the gone member's participation events
+    (dev/docs/BUGS.md 2026-11-15, dev/changelog/1569). Each row keeps its own text, which is
+    what names the channel once the link is gone.
+
+    A recording in CHANNEL_NEEDING_STATUSES and its segments are left as they are. A NULL
+    channel_id on a scheduled or running recording means "recorded from a typed URL" to the
+    conflict check and the recorder, which a deleted channel is not. An account's delete does
+    not refuse over such a recording, so it can still leave one naming a gone channel."""
+    ids = list(channel_ids)
+    if not ids:
+        return 0
+    live = db.session.query(Recording.id).filter(
+        Recording.status.in_(CHANNEL_NEEDING_STATUSES))
+    unlinked = Recording.query.filter(
+        Recording.channel_id.in_(ids),
+        Recording.status.notin_(CHANNEL_NEEDING_STATUSES),
+    ).update({'channel_id': None}, synchronize_session=False)
+    RecordingSegment.query.filter(
+        RecordingSegment.channel_id.in_(ids), RecordingSegment.recording_id.notin_(live),
+    ).update({'channel_id': None}, synchronize_session=False)
+    ChannelGroupEvent.query.filter(ChannelGroupEvent.channel_id.in_(ids)).update(
+        {'channel_id': None}, synchronize_session=False)
+    return unlinked
+
+
 def group_event_channel_links(events) -> dict:
     """{event.id: [{'role': 'selected'|'to'|'from', 'channel': Channel, 'account': Account}]}
     for every GROUP_MEMBER_SELECTED/GROUP_FAILOVER event in `events` - lets a rendered event
@@ -2111,6 +2169,10 @@ class ChannelGroup(db.Model):
     is_example       = db.Column(db.Boolean, nullable=False, default=False,
                                  server_default=db.text('0'))
     in_guide         = db.Column(db.Boolean, nullable=False, default=False)
+    # A person's switch: False keeps this guide row off the IPTV output while it stays in the
+    # TV Guide. Nothing but app/output_feed.py::set_on_output writes it, and it is never
+    # derived from in_guide or read as it (dev/changelog/1525). The feed id does not move.
+    on_output        = db.Column(db.Boolean, nullable=False, default=True, server_default=db.text('1'))
     # Shares the same numeric ordering space as Channel.guide_sort_order
     guide_sort_order = db.Column(db.Integer, default=0)
     created_at       = db.Column(db.DateTime, default=datetime.utcnow)
@@ -2259,6 +2321,10 @@ class Channel(db.Model):
     raw_stream_url   = db.Column(db.String(2048))                   # original URL from M3U/API
     epg_channel_id   = db.Column(db.String(255), index=True)
     in_guide         = db.Column(db.Boolean, nullable=False, default=False)
+    # A person's switch: False keeps this guide row off the IPTV output while it stays in the
+    # TV Guide. Nothing but app/output_feed.py::set_on_output writes it, and it is never
+    # derived from in_guide or read as it (dev/changelog/1525). The feed id does not move.
+    on_output        = db.Column(db.Boolean, nullable=False, default=True, server_default=db.text('1'))
     guide_sort_order = db.Column(db.Integer, default=0)
     test_enabled     = db.Column(db.Boolean, nullable=False, default=True,
                                  server_default=db.text('1'))
@@ -3150,12 +3216,25 @@ SPORTS_FETCH_EMPTY = 'empty'
 SPORTS_FETCH_RATE_LIMITED = 'rate_limited'
 SPORTS_FETCH_REFUSED = 'refused'
 SPORTS_FETCH_SHRUNK = 'shrunk'
+# A round answer as long as the free key ever sends (50 rows): the round may hold more games, and a
+# game left out of it is not evidence of anything (dev/changelog/1549).
+SPORTS_FETCH_CAPPED = 'capped'
+# A cut round answer whose every game had already started: the round runs on past the cut with no
+# end anyone can see, as the NBA's season-long round 0 does, so every game the guide lists from then
+# on is looked up by name (dev/changelog/1550).
+SPORTS_FETCH_CAPPED_PAST = 'capped_past'
 
 # What a row in the queue asks for. Every one is one call.
 SPORTS_KIND_LEAGUE = 'league'
 SPORTS_KIND_NEXT = 'next'
 SPORTS_KIND_ROUND = 'round'
 SPORTS_KIND_TEAM = 'team'
+# One stored game re-read by its number, after a cut round answer left it out (lookupevent).
+SPORTS_KIND_EVENT = 'event'
+# One game the guide names, looked up by name and day where a round answer was cut (searchevents).
+SPORTS_KIND_SEARCH = 'search'
+# One team's next game, home or away, where a round answer was cut (eventsnext, dev/changelog/1553).
+SPORTS_KIND_TEAM_NEXT = 'team_next'
 
 
 class SportsLeague(db.Model):
@@ -3176,6 +3255,9 @@ class SportsLeague(db.Model):
     trust_sample      = db.Column(db.Integer)
     trust_agreed      = db.Column(db.Integer)
     trust_measured_at = db.Column(db.DateTime)
+    # A person's switch: serve this league's games as numbered channels on the output feed
+    # (app/sports_feed.py, dev/changelog/1518). Read only while the league is followed whole.
+    feed_league_channels = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
 
 
 class SportsLeagueCategory(db.Model):
@@ -3207,6 +3289,65 @@ class SportsFollow(db.Model):
     created_at   = db.Column(db.DateTime, default=datetime.utcnow)
 
 
+class SportsFeedChannel(db.Model):
+    """One of ChannelBin's own sports channels on the output feed (app/sports_feed.py,
+    dev/changelog/1517): a team's channel (`team_tsdb_id` set, `number` 0) or one of a league's
+    numbered channels (`team_tsdb_id` 0, `number` 1 and up). Its id is its feed id, less
+    output_feed.SPORTS_FEED_BASE, so a row is kept when its switch goes off and its id is never
+    issued again: an IPTV player holds the id in a cached catalog. Deleted only with its league.
+
+    `enabled` is a person's switch for a team's channel and is written by nothing else. A numbered
+    channel follows SportsLeague.feed_league_channels and never reads it."""
+    __tablename__ = 'sports_feed_channels'
+    __table_args__ = (db.UniqueConstraint('league_id', 'team_tsdb_id', 'number',
+                                          name='uq_sports_feed_channel'),
+                      {'sqlite_autoincrement': True})
+    id           = db.Column(db.Integer, primary_key=True)
+    league_id    = db.Column(db.Integer, db.ForeignKey('sports_leagues.id'), nullable=False)
+    team_tsdb_id = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    number       = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    enabled      = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
+    created_at   = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+# What one row of the IPTV output's play log is (OutputFeedPlay.kind).
+FEED_PLAY_ENDED      = 'ended'        # a relayed play that ran and stopped; `reason` says why
+FEED_PLAY_REFUSED    = 'refused'      # a play that never started; `message` says why
+FEED_PLAY_REDIRECTED = 'redirected'   # redirect and mixed modes: the player was sent to the provider
+FEED_PLAY_KINDS = (FEED_PLAY_ENDED, FEED_PLAY_REFUSED, FEED_PLAY_REDIRECTED)
+
+
+class OutputFeedPlay(db.Model):
+    """One line of the IPTV output's Recent plays (app/output_feed.py, dev/changelog/1525): a
+    play that ended, one that was refused, or a redirect-mode tune-in. Written by the feed's
+    one log writer and by nothing else, and pruned by age. Not an observation: nothing here
+    feeds a health score.
+
+    An IPTV player asks again for a refused play about every half minute, so a run of the same
+    refusal (feed id and message, with no gap longer than output_feed.REFUSAL_RUN_GAP) is one
+    row, counted in `count` with `at` the last time and `first_at` the first. `label`, `channel_name` and `message` are text as it was shown at
+    the time, kept so the line still reads after the channel or group is renamed or deleted;
+    the ids are for linking and carry no foreign key for the same reason."""
+    __tablename__ = 'output_feed_plays'
+    __table_args__ = (db.Index('ix_output_feed_plays_at', 'at'),)
+    id           = db.Column(db.Integer, primary_key=True)
+    kind         = db.Column(db.String(16), nullable=False)
+    at           = db.Column(db.DateTime, nullable=False)
+    first_at     = db.Column(db.DateTime, nullable=False)
+    feed_id      = db.Column(db.Integer, nullable=False)
+    label        = db.Column(db.String(255), nullable=False, default='', server_default=db.text("''"))
+    client       = db.Column(db.String(64), nullable=False, default='', server_default=db.text("''"))
+    channel_id   = db.Column(db.Integer)
+    channel_name = db.Column(db.String(255))
+    account_id   = db.Column(db.Integer)
+    reason       = db.Column(db.String(32))
+    message      = db.Column(db.Text, nullable=False, default='', server_default=db.text("''"))
+    seconds      = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    bytes_sent   = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    moves        = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    count        = db.Column(db.Integer, nullable=False, default=1, server_default=db.text('1'))
+
+
 class SportsTeam(db.Model):
     """A team's names, read once a season (6.2). No league column: a team can be in more than one
     competition, and which league it plays in is read from its events."""
@@ -3217,6 +3358,15 @@ class SportsTeam(db.Model):
     names          = db.Column(db.Text, nullable=False, default='[]', server_default=db.text("'[]'"))
     city           = db.Column(db.String(255))
     last_looked_up = db.Column(db.DateTime)
+    # strColour1-3 as lowercase `#rrggbb`, each NULL when TheSportsDB has none ('' as measured) or
+    # sends something that is not a color. Drawn by app/sports_screen.py::side_colors().
+    color1         = db.Column(db.String(7))
+    color2         = db.Column(db.String(7))
+    color3         = db.Column(db.String(7))
+    # strTeamShort, NULL when '' (measured 2026-11-13: Forfar Athletic has none).
+    short_name     = db.Column(db.String(32))
+    # strBadge. The download is the sports_images row for this address, as a recording's poster's is.
+    badge_url      = db.Column(db.Text)
 
 
 class SportsFetch(db.Model):
@@ -3295,6 +3445,16 @@ class SportsEvent(db.Model):
     # Shown beside start_at when the two disagree, and never written into it.
     guide_start      = db.Column(db.DateTime)
     guide_channels   = db.Column(db.Integer)
+    # Which of the league's numbered feed channels carries this event, NULL until it is placed.
+    # Written once by app/sports_feed.py::place_league_events() and never moved: an IPTV player caches
+    # the guide it was given.
+    feed_number      = db.Column(db.Integer)
+    # Go live now (app/sports_feed.py::set_live_now(), dev/changelog/1530): a person said this game
+    # is on early, so every sports channel carrying it plays it ahead of its window until
+    # `live_now_until`, fixed when the button is pressed so a game moved to next week cannot bring it
+    # back. Written by that person's button and nothing else; the schedule update never touches it.
+    live_now_at      = db.Column(db.DateTime)
+    live_now_until   = db.Column(db.DateTime)
 
 
 # A match's strength, kind and airing (DESIGN-sports-data.md 6, 9).
@@ -3386,9 +3546,10 @@ class RecordingSports(db.Model):
 
 
 class SportsImage(db.Model):
-    """One image downloaded from TheSportsDB for the recordings that point at it, by address
-    (app/sports_images.py, dev/changelog/1465). Written only by that module's worker step, and
-    deleted once no recording_sports row names its address."""
+    """One image downloaded from TheSportsDB, by address: a recording's poster or background
+    (dev/changelog/1465), or a team's badge for a sports channel's waiting screen
+    (app/sports_images.py). Written only by that module's worker step, and deleted once no
+    recording_sports row and no sports_teams row names its address."""
     __tablename__ = 'sports_images'
     id          = db.Column(db.Integer, primary_key=True)
     url         = db.Column(db.Text, nullable=False, unique=True)

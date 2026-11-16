@@ -354,9 +354,12 @@ class WatchdogVideoArrivalTests(unittest.TestCase):
     def _restart_run(self):
         """Video stops for good on segment 0; the restart's segment 1 carries video."""
         if WatchdogVideoArrivalTests._restart is None:
-            seg = self._run(video_s=0.5, freeze_s=-1, grow=1, relaunch=(99, 0), seconds=6)
+            with mock.patch('app.watchdog.provider_stalls.note_stall',
+                            return_value=False) as noted:
+                seg = self._run(video_s=0.5, freeze_s=-1, grow=1, relaunch=(99, 0), seconds=6)
             rec = db.session.get(Recording, self.rid)
             WatchdogVideoArrivalTests._restart = {
+                'provider_stall_notes': noted.call_count,
                 'exit_reason': seg.exit_reason,
                 'stall_count': seg.stall_count,
                 'launched': list(self.launched),
@@ -391,6 +394,12 @@ class WatchdogVideoArrivalTests(unittest.TestCase):
         self.assertEqual(run['total_stall_count'], 0)
         self.assertEqual(run['consecutive_failures_peak'], 0)
         self.assertFalse(run['stall_count'])
+
+    def test_a_video_stop_restart_is_not_counted_toward_a_provider_outage(self):
+        """dev/docs/BUGS.md 2026-11-15 @ 02:44:35 PM: the restart was handed to
+        provider_stalls as a stall, so two of them on two accounts of one provider raised
+        "stalled together" over recordings that had not stalled."""
+        self.assertEqual(self._restart_run()['provider_stall_notes'], 0)
 
     def test_the_restart_that_brings_the_picture_back_says_so(self):
         run = self._restart_run()

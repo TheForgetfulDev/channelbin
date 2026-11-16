@@ -49,7 +49,7 @@ HOLDER_LABELS = {
     'recording': 'a recording',
     'test': 'a channel test',
     'preview': 'a live preview',
-    'viewer': 'an IPTV app',
+    'viewer': 'an IPTV player',
 }
 
 
@@ -76,34 +76,76 @@ def limits_for_accounts(accounts, default_max_connections: int) -> dict:
     return {a.id: limit_for_account(a, default_max_connections, seats.get(a.id)) for a in rows}
 
 
-def _pool_taken_now(account_ids, seats: dict, cfg=None) -> dict:
-    """{pool: slots a block takes right now} for the pools of `account_ids` (`seats`, their
-    login rows) - read BEFORE _lock is taken, since it is a query and the lock guards only
-    the in-memory holder list. A block on an account sharing one of their logins counts on
-    that login's pool too (dev/changelog/1170); the sibling lookup runs only when one of
-    them lists a login, so an account with none asks exactly what it always did."""
+def seated_holder_ids(holder_kind: str) -> set:
+    """The ids of every `holder_kind` holder with a seat right now. Advisory, like at_limit()."""
+    with _lock:
+        return {holder_id for kind, holder_id in _seat_of if kind == holder_kind}
+
+
+def _viewer_seats_locked() -> dict:
+    """{account_id: seats 'viewer' holders have on it} - the IPTV output's relayed plays.
+    The caller holds _lock."""
+    counts: dict = defaultdict(int)
+    for (kind, _holder_id), (account_id, _pool) in _seat_of.items():
+        if kind == 'viewer':
+            counts[account_id] += 1
+    return dict(counts)
+
+
+def _nothing_taken() -> dict:
+    return {}
+
+
+def _pool_taken_plan(account_ids, seats: dict, cfg=None, holder_kind: Optional[str] = None):
+    """A function of no arguments answering {pool: slots taken} for the pools of
+    `account_ids` (`seats`, their login rows), to be called with _lock held. The queries run
+    here, BEFORE the lock: a block and the login rows are database reads, and the lock guards
+    only the in-memory holder list. A block on an account sharing one of their logins counts on
+    that login's pool too (dev/changelog/1170); the sibling lookup runs only when one of them
+    lists a login, so an account with none asks exactly what it always did.
+
+    The output feed's held seats are the IPTV players' own (dev/changelog/1536): `holder_kind`
+    'viewer' (a relayed play) is never kept off them, and for every other kind a relayed play
+    already on the account fills one, so only the held seats no viewer holds are taken. That
+    count is the holder list itself, so the function reads it under the lock, in the same
+    critical section as the decision it feeds."""
     from .account_blocks import blocked_slots, blocks_at, pool_taken
     from .account_links import login_seats_for_accounts, login_siblings
     ids = set(account_ids)
     wider = set(ids)
     if any(seats.get(a) for a in ids):
         wider |= {other for found in login_siblings(ids).values() for other in found}
-    merged = blocked_slots(blocks_at(account_ids=wider))
-    # Seats the output feed keeps free for an IPTV app in redirect mode are subtracted exactly
-    # where a block's are: ChannelBin cannot see the IPTV app's connection in that mode, so the
-    # recorder must never plan on a seat the IPTV app may be using (DESIGN-output-feed.md 5.3).
+    blocked = blocked_slots(blocks_at(account_ids=wider))
+    # Seats the output feed keeps free for an IPTV player are subtracted exactly where a block's
+    # are: ChannelBin cannot see a redirected play's connection, so the recorder must never plan
+    # on a seat the IPTV player may be using (DESIGN-output-feed.md 5.3, 5.5).
     from .output_feed import held_seats_now
-    for account_id, held in held_seats_now(wider, cfg).items():
-        if merged.get(account_id, 0) is None:
-            continue
-        merged[account_id] = merged.get(account_id, 0) + held
-    if not merged:
-        return {}
-    missing = set(merged) - set(seats)
+    held_now = held_seats_now(wider, cfg) if holder_kind != 'viewer' else {}
+    if not blocked and not held_now:
+        return _nothing_taken
+    missing = (set(blocked) | set(held_now)) - set(seats)
     all_seats = dict(seats)
     if missing:
         all_seats.update(login_seats_for_accounts(missing))
-    return pool_taken(merged, all_seats)
+
+    def taken_locked() -> dict:
+        merged = dict(blocked)
+        viewers = _viewer_seats_locked() if held_now else {}
+        for account_id, held in held_now.items():
+            held = max(0, held - viewers.get(account_id, 0))
+            if not held or merged.get(account_id, 0) is None:
+                continue
+            merged[account_id] = merged.get(account_id, 0) + held
+        return pool_taken(merged, all_seats) if merged else {}
+    return taken_locked
+
+
+def _pool_taken_now(account_ids, seats: dict, cfg=None, holder_kind: Optional[str] = None) -> dict:
+    """_pool_taken_plan()'s answer now, for an advisory reader that decides nothing under the
+    lock (at_limit(), accounts_without_free_recording_slot(), must_yield_to_block())."""
+    taken = _pool_taken_plan(account_ids, seats, cfg, holder_kind)
+    with _lock:
+        return taken()
 
 
 def _usable_limits(account, default_max_connections: int, taken: dict,
@@ -164,12 +206,12 @@ def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
     cooldown = refusal_cooldown(cfg)
     all_seats = _seats_now([account_id])
     seats = all_seats.get(account_id, [])
-    taken = _pool_taken_now([account_id], all_seats, cfg)
+    taken = _pool_taken_plan([account_id], all_seats, cfg, holder_kind)
     with _lock:
         account = db.session.get(Account, account_id)
         if account is None:
             return False
-        pools = _usable_limits(account, default_max_connections, taken, seats)
+        pools = _usable_limits(account, default_max_connections, taken(), seats)
         key = (holder_kind, holder_id)
         if any(key in _held_in(pool) for pool, _, _ in pools):
             return True
@@ -215,13 +257,13 @@ def move_seat(holder_kind: str, holder_id, from_account_id: int, to_account_id: 
     cooldown = refusal_cooldown(cfg)
     all_seats = _seats_now([to_account_id])
     seats = all_seats.get(to_account_id, [])
-    taken = _pool_taken_now([to_account_id], all_seats, cfg)
+    taken = _pool_taken_plan([to_account_id], all_seats, cfg, holder_kind)
     key = (holder_kind, holder_id)
     with _lock:
         account = db.session.get(Account, to_account_id)
         if account is None:
             return False
-        pools = _usable_limits(account, default_max_connections, taken, seats)
+        pools = _usable_limits(account, default_max_connections, taken(), seats)
         seated = _seat_of.get(key)
         current = seated[1] if seated is not None else from_account_id
         if key in _held_in(current) and any(pool == current for pool, _, _ in pools):
@@ -262,7 +304,7 @@ def reseat_if_refused(account_id: int, holder_kind: str, holder_id) -> Optional[
     cooldown = refusal_cooldown(cfg)
     all_seats = _seats_now([account_id])
     seats = all_seats.get(account_id, [])
-    taken = _pool_taken_now([account_id], all_seats, cfg)
+    taken = _pool_taken_plan([account_id], all_seats, cfg, holder_kind)
     with _lock:
         seated = _seat_of.get(key)
         if seated is None or not isinstance(seated[1], tuple):
@@ -271,7 +313,7 @@ def reseat_if_refused(account_id: int, holder_kind: str, holder_id) -> Optional[
         account = db.session.get(Account, account_id)
         if account is None:
             return current[1]
-        pools = _usable_limits(account, default_max_connections, taken, seats)
+        pools = _usable_limits(account, default_max_connections, taken(), seats)
         now = datetime.utcnow()
         mine = next(((pool, refused) for pool, _, refused in pools if pool == current), None)
         if mine is None or not _refused(mine[1], now, cooldown):
@@ -498,7 +540,7 @@ def release(account_id: int, holder_kind: str, holder_id):
             _holders.pop(pool, None)
 
 
-def _strip_kind(account_id: int, holder_kind: str) -> List[tuple]:
+def _strip_kind(account_id: int, holder_kind: str, keep: Optional[dict] = None) -> List[tuple]:
     """Release every holder of one kind that a recording on account_id would need the seat
     of, and return (holder_id, account the holder came through) pairs.
 
@@ -506,15 +548,34 @@ def _strip_kind(account_id: int, holder_kind: str) -> List[tuple]:
     came through, since a login shared across accounts is one seat set and a preview on the
     sibling holds the very seat the recording needs (dev/changelog/1243) - plus any holder
     counted to this account in a pool its list no longer names (a login removed while the
-    seat was held), which is still this account's connection on the provider."""
+    seat was held), which is still this account's connection on the provider.
+
+    `keep` ({account the holder came through: how many}) leaves that many of them seated,
+    the earliest first: the ones whose release would free nothing a recording may use."""
     seats = _seats_now([account_id]).get(account_id, [])
     pools = {login_pool(lid) for lid, _, _ in seats} if seats else {account_id}
+    left = dict(keep or {})
     stripped = []
+
+    def kept(owner) -> bool:
+        if left.get(owner, 0) > 0:
+            left[owner] -= 1
+            return True
+        return False
+
     with _lock:
+        # A kept holder that is not in the way (another pool of its own account) uses up its
+        # account's keep first, so the ones in the way are the ones released.
+        for pool, holders in _holders.items():
+            for h in holders:
+                owner = _account_of(pool, h)
+                if h[0] == holder_kind and not (pool in pools or owner == account_id):
+                    kept(owner)
         for pool in list(_holders):
             holders = _holders[pool]
             mine = [(h, _account_of(pool, h)) for h in holders if h[0] == holder_kind
                     and (pool in pools or _account_of(pool, h) == account_id)]
+            mine = [(h, owner) for h, owner in mine if not kept(owner)]
             for h, _ in mine:
                 holders.remove(h)
                 _seat_of.pop(h, None)
@@ -540,10 +601,14 @@ def preempt_tests_for_slot(account_id: int) -> List[tuple]:
 def preempt_viewers_for_slot(account_id: int) -> List[tuple]:
     """Release every 'viewer'-kind holder a recording on account_id needs the seat of and
     return (relay session id, account the viewer came through) pairs, so recorder.py can
-    end the session through app/output_feed.py. An IPTV app is lowest in the order: the
+    end the session through app/output_feed.py. An IPTV player is lowest in the order: the
     recorder asks this before the preview strip, since a viewer can resume on its own and
-    a recording is what the app is for (DESIGN-output-feed.md 4.4)."""
-    return _strip_kind(account_id, 'viewer')
+    a recording is what the app is for (DESIGN-output-feed.md 4.4).
+
+    A viewer sitting on one of its account's held seats is left alone: recordings never get
+    those seats, so ending the play would free nothing they may use (dev/changelog/1536)."""
+    from .output_feed import held_seats_now
+    return _strip_kind(account_id, 'viewer', held_seats_now(None))
 
 
 def preempt_previews_for_slot(account_id: int) -> List[tuple]:

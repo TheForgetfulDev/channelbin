@@ -132,7 +132,7 @@ class DashboardPageConformanceTests(unittest.TestCase):
         (DESIGN-output-feed.md 12): the section and its definition both leave the page."""
         from app.routes.dashboard import DASHBOARD_FEED_SECTION
         self.assertIn(f'data-sec="{DASHBOARD_FEED_SECTION}"', self.html)
-        self.assertIn('No IPTV app is watching', self.html)
+        self.assertIn('No IPTV player is watching', self.html)
         self.t.sandbox_config({})
         try:
             html = self.client.get('/').get_data(as_text=True)

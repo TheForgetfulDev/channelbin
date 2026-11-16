@@ -14,7 +14,7 @@ from flask import (Blueprint, render_template, request, redirect, url_for, flash
                    jsonify, send_file, current_app, session)
 
 from .. import health_bands, output_feed
-from ..config import (load_config, save_config, config_default, is_restart_needed,
+from ..config import (load_config, save_config, config_default, is_restart_needed, public_url, public_url_problem,
                       RESTART_REQUIRED_KEYS, set_nested, mask_config, redact_sensitive_diff_lines, _is_sensitive_path,
                       _load_config_file, config_write_lock, load_for_edit, changed_from_default,
                       check_config_text)
@@ -276,9 +276,6 @@ def _render_settings(yaml_text=None, yaml_problems=None):
         page_size_options=[(n, str(n)) for n in PAGE_SIZE_OPTIONS],
         page_size_value=configured_page_size(unmasked_cfg),
         timezone_options=timezone_options,
-        # The address the IPTV app types in is whatever this request arrived on - the feed's
-        # stream endpoint is ChannelBin itself, never an account's base_url.
-        feed_url=request.host_url.rstrip('/'),
         feed_credentials_set=output_feed.credentials_set(
             (unmasked_cfg.get('integrations') or {}).get('output_feed') or {}),
         feed_held_seats_lines=[f'{a}: {n}' for a, n in sorted(
@@ -337,7 +334,7 @@ def api_settings_field():
         # Per stereo pair since dev/changelog/1184: a 5.1 source gets three times this.
         'recording.post_process.audio_bitrate_kbps': (32, 320),
         'channel_testing.window.dispatch_interval_minutes': (1, None),
-        'sports_data.call_spacing_seconds': (12, None),
+        'sports_data.call_spacing_seconds': (8, None),  # sports_data.MIN_WAIT_SECONDS
         'sports_data.call_jitter_seconds': (0, None),
         'sports_data.horizon_days': (1, 90),
         'sports_data.history_keep_days': (1, None),
@@ -385,7 +382,7 @@ def api_settings_field():
         if path in ('sports_data.call_spacing_seconds', 'sports_data.call_jitter_seconds'):
             from ..sports_data import pace_error
             pace = dict(cfg.get('sports_data') or {}, **{path.split('.')[1]: value})
-            refused = pace_error(pace.get('call_spacing_seconds', 60), pace.get('call_jitter_seconds', 20))
+            refused = pace_error(pace.get('call_spacing_seconds', 10), pace.get('call_jitter_seconds', 2))
             if refused:
                 return jsonify({'error': refused}), 400
 
@@ -459,6 +456,12 @@ def api_settings_field():
                 return jsonify({'error': 'Pick one of '
                                          + ', '.join(map(str, MAX_HEIGHT_CHOICES))}), 400
 
+        if path == 'flask.public_url':
+            value = str(value or '').strip()
+            problem = public_url_problem(value)
+            if problem:
+                return jsonify({'error': problem}), 400
+
         if path == 'search.page_size':
             value = _page_size_choice(value)
             if value is None:
@@ -492,14 +495,25 @@ def api_settings_field():
                                              'output feed on'}), 400
             if leaf == 'mode' and value not in output_feed.MODES:
                 return jsonify({'error': 'Pick one of ' + ', '.join(output_feed.MODES)}), 400
-            if leaf in ('buffer_mb', 'reserve_seconds', 'max_viewers', 'idle_seconds',
-                        'max_session_hours', 'xmltv_days'):
+            if leaf in ('username', 'password'):
+                # The IPTV Output page saves the login whole; a save of one half is held to
+                # the same check, and a login cannot be emptied under an output that is on.
+                value = '' if value is None else str(value)
+                if leaf == 'username':
+                    value = value.strip()
+                problem = output_feed.login_problem(leaf, value)
+                if problem:
+                    return jsonify({'error': problem}), 400
+                if not value and output_feed.is_enabled(feed_cfg):
+                    return jsonify({'error': 'Turn the IPTV output off before clearing its '
+                                             'login'}), 400
+            if leaf in output_feed.SETTING_BOUNDS:
                 try:
                     value = int(value)
                 except (TypeError, ValueError):
                     return jsonify({'error': 'Value must be a whole number'}), 400
-                floor = 0 if leaf == 'reserve_seconds' else 1
-                value = max(floor, value)
+                low, high = output_feed.SETTING_BOUNDS[leaf]
+                value = min(high, max(low, value))
             if leaf in ('buffer_mb', 'reserve_seconds'):
                 trial = dict(feed_cfg, **{leaf: value})
                 if not output_feed.reserve_fits(trial):
@@ -529,6 +543,9 @@ def api_settings_field():
                     except ValueError:
                         return jsonify({'error': f'"{raw}" is not "account id: seats" - one '
                                                  f'pair per line, like 2: 1'}), 400
+                problem = output_feed.held_seats_problem(held, cfg)
+                if problem:
+                    return jsonify({'error': problem}), 400
                 value = held
 
         # Enforcement lives server-side (CLAUDE.md): the Security card disables this toggle
@@ -622,7 +639,7 @@ def api_settings_field():
         from ..scheduler import apply_logo_cache_schedule
         apply_logo_cache_schedule()
 
-    # Turning the feed off ends every IPTV app watching through it, by name: a relay left running
+    # Turning the feed off ends every IPTV player watching through it, by name: a relay left running
     # would go on holding a provider seat for a feature the user just switched off.
     if path == 'integrations.output_feed.enabled' and not value:
         from .. import output_feed
@@ -1467,7 +1484,7 @@ def notifications_settings():
             'services': boot_services,
             'routing': full_routing,
             'rate_limit': notif_cfg.get('push_rate_limit_seconds', 60),
-            'base_url': notif_cfg.get('base_url', ''),
+            'base_url': public_url(cfg),
         },
     )
 

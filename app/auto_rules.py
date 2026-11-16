@@ -122,7 +122,7 @@ def clean_search(raw_params: str):
     - it would match nothing or stop the rule, which is the one outcome a rule running with
     nobody watching must never be allowed."""
     from .channel_search import (
-        DEFAULT_PAGE_SIZE, DEFAULT_SORT_BY_GRAIN, DOW_LABELS, DUR_PREFIX, GRAIN_AIRINGS,
+        DEFAULT_PAGE_SIZE, DEFAULT_SORT_BY_GRAIN, DOW_LABELS, DUR_PREFIX, GRAIN_AIRINGS, DimensionFilter,
         MARK_LABELS,
         SearchStateError, TOD_PREFIX, WHEN_CUSTOM_PREFIX, WHEN_NEXT_PREFIX, WHEN_NOW,
         WHEN_STATIC_VALUES, parse_duration, parse_time_of_day, parse_when_custom,
@@ -135,6 +135,10 @@ def clean_search(raw_params: str):
     if state.grain != GRAIN_AIRINGS:
         raise RuleError('A rule records showings, so it needs a Programs search - '
                         'a channel has no start time.')
+    if (state.filter_for('event') or DimensionFilter('event')).values:
+        raise RuleError('A rule cannot be about one game - it would end with it. Use Record on the '
+                        'league\'s page in Sports Schedules to record one game, or make the rule about '
+                        'the league or a team.')
     when = state.filter_for('when')
     if when is not None and WHEN_NOW in when.values:
         raise RuleError('A rule cannot use "On now" - it never joins a program that has '
@@ -1072,9 +1076,7 @@ class _Prepared:
 def _prepare_rule(rule_id, run):
     """§4.3 steps 1-3 for one rule: a _Prepared, or the RuleOutcome of a rule that stops here
     (paused, broken, too broad, or changed under a write)."""
-    from .channel_groups import effective_score, member_eager_options
     from .channel_search import SearchStateError
-    from .channel_search_rows import label_group_id
 
     now = datetime.utcnow()
     # 1. Prepare (§4.3). populate_existing: get() would otherwise answer from the identity
@@ -1119,27 +1121,7 @@ def _prepare_rule(rule_id, run):
             f'Its search matches more than {MAX_SHOWINGS:,} upcoming showings, which is too '
             'broad to be what anyone meant. Use Edit search on the rule\'s page to narrow it '
             '(a channel, a group or a tag), then save it to the rule.', now)
-    entries = [e for e in entries if e.start is not None and e.start > now]
-
-    won_ids = sorted({gid for e in entries for gid in wins.get(e.id, ())})
-    groups = ({g.id: g for g in ChannelGroup.query.options(*member_eager_options())
-               .filter(ChannelGroup.id.in_(won_ids))} if won_ids else {})
-    group_names = {gid: g.name for gid, g in groups.items()}
-    channel_rows = {c.id: c for c in db.session.query(
-        Channel.id, Channel.name, Channel.health_score, Channel.manual_health_adjustment
-    ).filter(Channel.id.in_(sorted({e.channel_id for e in entries})))} if entries else {}
-
-    showings = []
-    for e in entries:
-        ch = channel_rows.get(e.channel_id)
-        if ch is None:
-            continue
-        gid = label_group_id(wins[e.id], groups) if wins.get(e.id) else None
-        showings.append(_Showing(
-            entry_id=e.id, channel_id=e.channel_id, channel_name=ch.name, group_id=gid,
-            group_name=group_names.get(gid), title=e.title, sub_title=e.sub_title,
-            title_key=title_key(e.title), episode_raw=title_key(e.sub_title),
-            start=e.start, stop=e.stop, score=effective_score(ch)))
+    showings = _showings([e for e in entries if e.start is not None and e.start > now], wins)
 
     rows = [_row_snapshot(m) for m in
             RuleMatch.query.filter_by(rule_id=rule_id).populate_existing()]
@@ -1170,6 +1152,32 @@ def _prepare_rule(rule_id, run):
     return _Prepared(rule_id=rule_id, revision=revision, settings=settings, now=now, rows=rows,
                      showings=showings, slots=slots, outcome=outcome, problems=problems,
                      moved=moved, state=state)
+
+
+def _showings(entries, wins) -> list:
+    """The search's entries as _Showings: each on its channel, or on the group the search
+    collapsed it into, with the channel's effective score. Two queries."""
+    from .channel_groups import effective_score, member_eager_options
+    from .channel_search_rows import label_group_id
+    won_ids = sorted({gid for e in entries for gid in wins.get(e.id, ())})
+    groups = ({g.id: g for g in ChannelGroup.query.options(*member_eager_options())
+               .filter(ChannelGroup.id.in_(won_ids))} if won_ids else {})
+    group_names = {gid: g.name for gid, g in groups.items()}
+    channel_rows = {c.id: c for c in db.session.query(
+        Channel.id, Channel.name, Channel.health_score, Channel.manual_health_adjustment
+    ).filter(Channel.id.in_(sorted({e.channel_id for e in entries})))} if entries else {}
+    showings = []
+    for e in entries:
+        ch = channel_rows.get(e.channel_id)
+        if ch is None:
+            continue
+        gid = label_group_id(wins[e.id], groups) if wins.get(e.id) else None
+        showings.append(_Showing(
+            entry_id=e.id, channel_id=e.channel_id, channel_name=ch.name, group_id=gid,
+            group_name=group_names.get(gid), title=e.title, sub_title=e.sub_title,
+            title_key=title_key(e.title), episode_raw=title_key(e.sub_title),
+            start=e.start, stop=e.stop, score=effective_score(ch)))
+    return showings
 
 
 def _episode_fills(rows, slots) -> list:
@@ -1724,6 +1732,96 @@ def recordable_pick(games, game, state, ctx):
     if pick is None or not account_passes(state, pick.named.account_id) or not start_passes(state, pick.start, ctx):
         return None
     return pick
+
+
+# ---------------------------------------------------------------------------
+# A league page's Record (DESIGN-sports-data.md 11, dev/changelog/1539)
+# ---------------------------------------------------------------------------
+
+#: What Record on a league page records for one game. Every value is named where it is read.
+PICK_LIVE = 'live'          # the live listing a rule for the league would pick
+PICK_REPLAY = 'replay'      # no live listing left, so the replay in the same order
+PICK_EVENT = 'event'        # no listing at all: the event channel a rule would record from
+PICK_NONE = 'none'          # nothing to record; `why` says which of the WHY_* it is
+
+WHY_ENDED = 'ended'         # every listing has ended
+WHY_UNSURE = 'unsure'       # listings ahead, none a strong enough match to pick for a person
+WHY_NO_START = 'no_start'   # only an event channel names it, with no start to stand behind
+WHY_UNLISTED = 'unlisted'   # nothing in the guide or any channel's name
+WHY_UNKNOWN = 'unknown'     # the game is not in the window a pick reads
+WHY_TOO_MANY = 'too_many'   # more listings than MAX_SHOWINGS
+
+
+@dataclass
+class GamePick:
+    """What a league page's Record records for one game: a showing (live or replay), an event
+    channel's pick, or nothing and why. `channels` is how many showings the picked listing has,
+    the number its order ranked on."""
+    kind: str
+    game: object = None
+    showing: '_Showing' = None
+    channels: int = 0
+    airing: str = ''
+    event: object = None
+    why: str = ''
+
+
+#: A league page keeps a game all its day (sports_view), so its pick reads back that far.
+PICK_LOOKBACK = timedelta(days=1)
+
+
+def game_pick(event_id, now=None, cfg=None):
+    """The GamePick for one stored event, or None when it is not stored. The same order a rule for
+    its league would use, over the same search: the Programs search narrowed to the event
+    (`f.event`), grouped into programs, and of the game's listings not yet over, the keeper
+    (auto_rules_sports.keepers()) - the live airing most channels carry, then the earliest. With
+    no live one left, the same order over its replays, which a rule never records; with no listing
+    at all, event_pick(). Reads only; the route that records it re-asks this, never the page."""
+    from .auto_rules_sports import GameIndex, Scope, event_pick, keepers
+    from .channel_search import GRAIN_AIRINGS, DimensionFilter, SearchContext, SearchState
+    from .config import load_config
+    from .database import SportsEvent
+    now = now or datetime.utcnow()
+    event = db.session.get(SportsEvent, event_id)
+    if event is None:
+        return None
+    games = GameIndex.load([event.league_id], now, lookback=PICK_LOOKBACK)
+    game = games.games.get(event.id)
+    if game is None:
+        return GamePick(PICK_NONE, why=WHY_UNKNOWN)
+    state = SearchState(grain=GRAIN_AIRINGS,
+                        filters=(DimensionFilter('event', (str(event.tsdb_id),)),))
+    entries, wins = _search_rule(state, SimpleNamespace(ctx=SearchContext.build(cfg or load_config())))
+    if entries is None:
+        # More listings of one game than a rule may act on, which a rule's search is refused for
+        # too. Not seen on any real guide.
+        log.warning('Record: %s has more than %d listings, too many to pick from', game.title, MAX_SHOWINGS)
+        return GamePick(PICK_NONE, game=game, why=WHY_TOO_MANY)
+    showings = _showings([e for e in entries if e.stop is not None and e.stop > now], wins)
+    slots = _Slots()
+    for s in showings:
+        slots.add(s.title_key, s.start, s.episode_raw)
+    scope = Scope(league_id=event.league_id)
+    games_of, mine = {}, []
+    for p in _programs(showings, slots):
+        found = games.program_game(p, scope)
+        if found[0] is not None and found[0].id == game.id:
+            games_of[p.identity] = found
+            mine.append(p)
+    for kind, replays in ((PICK_LIVE, False), (PICK_REPLAY, True)):
+        keep = keepers(mine, games_of, replays=replays)
+        if keep:
+            program = next(p for p in mine if p.identity in keep)
+            return GamePick(kind, game=game, showing=program.lead, channels=len(program.showings),
+                            airing=games_of[program.identity][1])
+    if game.id in games.listed:
+        return GamePick(PICK_NONE, game=game, why=WHY_UNSURE if showings else WHY_ENDED)
+    pick, _why = event_pick(games, game)
+    if pick is not None:
+        if pick.stop <= now:
+            return GamePick(PICK_NONE, game=game, why=WHY_ENDED)
+        return GamePick(PICK_EVENT, game=game, event=pick)
+    return GamePick(PICK_NONE, game=game, why=WHY_NO_START if games.named_by.get(game.id) else WHY_UNLISTED)
 
 
 #: How far an event pick's start may now read from where its recording sits before the rule says

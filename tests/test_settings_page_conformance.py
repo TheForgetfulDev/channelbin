@@ -532,7 +532,7 @@ class TierTests(unittest.TestCase):
     def test_notifications_rows_declare_a_tier_and_the_page_has_no_switch(self):
         self.assertEqual(self._tiers(self.notif_html),
                          {'notifications.push_rate_limit_seconds': 'advanced',
-                          'notifications.base_url': 'basic'})
+                          'flask.public_url': 'basic'})
         self.assertNotIn('data-view-set', self.notif_html)
 
 
@@ -705,6 +705,9 @@ class GatingAndOverrideTests(unittest.TestCase):
         f'{OF}.idle_seconds': [f'{OF}.enabled', f'{OF}.mode!=redirect'],
         f'{OF}.max_session_hours': [f'{OF}.enabled', f'{OF}.mode!=redirect'],
         f'{OF}.xmltv_days': [f'{OF}.enabled'],
+        # The sports window applies in both modes (dev/changelog/1529).
+        f'{OF}.sports_before_minutes': [f'{OF}.enabled'],
+        f'{OF}.sports_after_minutes': [f'{OF}.enabled'],
     }
 
     # Each is read with its apparent gate off, so dimming it would be a false claim.

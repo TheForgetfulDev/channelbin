@@ -343,7 +343,7 @@ class SidecarTests(_Case):
 
     def pinned_profile(self, prefer):
         cfg = load_config()
-        profile = RecordingProfile(name='Football', prefer_sports_poster=prefer)
+        profile = RecordingProfile(name='Football', prefer_sports_art=prefer)
         db.session.add(profile)
         db.session.commit()
         info = sniff_image(png_bytes(1000, 1500))
@@ -352,7 +352,7 @@ class SidecarTests(_Case):
         return profile
 
     def test_a_profile_can_put_their_poster_ahead_of_its_pinned_one(self):
-        """dev/changelog/1505: prefer_sports_poster moves TheSportsDB's own poster above the pin,
+        """dev/changelog/1505: prefer_sports_art moves TheSportsDB's own poster above the pin,
         and the event says the pinned one was passed over."""
         profile = self.pinned_profile(prefer=True)
         rec = self.recording(profile_id=profile.id)
@@ -412,6 +412,66 @@ class SidecarTests(_Case):
         self.assertEqual(json.loads(ev.extra_data)['poster_source'], POSTER_FROM_PROFILE)
         self.assertNotIn('ahead of', ev.detail)
         self.assertNotIn('no poster for this event', ev.detail)
+
+    def pinned_background(self, prefer):
+        cfg = load_config()
+        profile = RecordingProfile(name='Football', prefer_sports_art=prefer)
+        db.session.add(profile)
+        db.session.commit()
+        info = sniff_image(png_bytes(1920, 1080))
+        profile.background_file = store_poster(cfg, profile.id, png_bytes(1920, 1080), info)
+        db.session.commit()
+        return profile
+
+    def test_a_pinned_background_goes_ahead_of_their_thumb(self):
+        """dev/changelog/1508: with the switch off the pinned background wins, as the pinned poster
+        does, and their poster is still the poster since only a background is pinned."""
+        profile = self.pinned_background(prefer=False)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        root, ev = self.write(rec)
+        self.assertEqual(root.find('fanart/thumb').text, 'game-fanart.png')
+        with open(os.path.join(self.dvr, 'game-fanart.png'), 'rb') as fh:
+            self.assertEqual(fh.read(), png_bytes(1920, 1080))
+        self.assertFalse(os.path.exists(os.path.join(self.dvr, 'game-fanart.jpg')))
+        self.assertEqual(json.loads(ev.extra_data)['fanart_source'], POSTER_FROM_PROFILE)
+        self.assertEqual(json.loads(ev.extra_data)['poster_source'], POSTER_FROM_SPORTS)
+        self.assertNotIn('background ahead of', ev.detail)
+
+    def test_the_switch_puts_their_background_ahead_of_the_pinned_one(self):
+        profile = self.pinned_background(prefer=True)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        root, ev = self.write(rec)
+        self.assertEqual(root.find('fanart/thumb').text, 'game-fanart.jpg')
+        self.assertEqual(json.loads(ev.extra_data)['fanart_source'], POSTER_FROM_SPORTS_THUMB)
+        self.assertIn('Profile "Football" puts TheSportsDB\'s background ahead of its pinned one', ev.detail)
+
+    def test_with_the_switch_on_an_event_with_no_thumb_uses_the_pin_and_says_why(self):
+        e = db.session.get(SportsEvent, self.event.id)
+        e.thumb_url = None
+        db.session.commit()
+        profile = self.pinned_background(prefer=True)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        root, ev = self.write(rec)
+        self.assertEqual(root.find('fanart/thumb').text, 'game-fanart.png')
+        self.assertIn('TheSportsDB has no background for this event, so the one pinned to profile '
+                      '"Football" was used', ev.detail)
+
+    def test_their_background_not_downloaded_is_news_only_when_the_profile_wanted_it(self):
+        del self.fake.images['/images/media/event/thumb/bbb.jpg']
+        profile = self.pinned_background(prefer=False)
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        _, ev = self.write(rec)
+        self.assertNotIn("TheSportsDB's background for its event had not been downloaded", ev.detail)
+        profile = db.session.get(RecordingProfile, profile.id)
+        profile.prefer_sports_art = True
+        db.session.commit()
+        _, ev = self.write(rec)
+        self.assertIn("TheSportsDB's background for its event had not been downloaded", ev.detail)
+        self.assertEqual(json.loads(ev.extra_data)['fanart_source'], POSTER_FROM_PROFILE)
 
     def test_not_downloaded_yet_falls_back_and_says_why(self):
         del self.fake.images['/images/media/event/poster/aaa.png']
@@ -539,7 +599,7 @@ class PageTests(_Case):
         self.assertEqual(self.t.client.get(f'/recordings/{rec.id}/sports-image/poster').status_code, 404)
 
     def pinned(self, prefer):
-        profile = RecordingProfile(name='Football', prefer_sports_poster=prefer)
+        profile = RecordingProfile(name='Football', prefer_sports_art=prefer)
         db.session.add(profile)
         db.session.commit()
         profile.poster_file = store_poster(load_config(), profile.id, png_bytes(1000, 1500),
@@ -554,7 +614,7 @@ class PageTests(_Case):
         self.drain()
         self.assertIn('The image pinned to profile &#34;Football&#34; is the poster.', self.page(rec.id))
         off = db.session.get(RecordingProfile, off.id)
-        off.prefer_sports_poster = True
+        off.prefer_sports_art = True
         db.session.commit()
         self.assertIn('Profile &#34;Football&#34; puts this poster ahead of its pinned one.', self.page(rec.id))
 
@@ -584,11 +644,29 @@ class PageTests(_Case):
         self.assertIn('Background from TheSportsDB.', html)
         self.assertIn('The image pinned to profile &#34;Football&#34; is the poster.', html)
         profile = db.session.get(RecordingProfile, profile.id)
-        profile.prefer_sports_poster = True
+        profile.prefer_sports_art = True
         db.session.commit()
         html = self.page(rec.id)
         self.assertNotIn('also used as the poster', html)
         self.assertIn('is the poster, since the event has none.', html)
+
+    def test_the_row_names_which_background_a_pinned_profile_uses(self):
+        """dev/changelog/1508: the same sentences for a pinned background as for a pinned poster."""
+        profile = RecordingProfile(name='Football', prefer_sports_art=False)
+        db.session.add(profile)
+        db.session.commit()
+        profile.background_file = store_poster(load_config(), profile.id, png_bytes(1920, 1080),
+                                               sniff_image(png_bytes(1920, 1080)))
+        db.session.commit()
+        rec = self.recording(profile_id=profile.id)
+        self.drain()
+        html = self.page(rec.id)
+        self.assertIn('The image pinned to profile &#34;Football&#34; is the background.', html)
+        self.assertNotIn('is the poster', html)
+        profile = db.session.get(RecordingProfile, profile.id)
+        profile.prefer_sports_art = True
+        db.session.commit()
+        self.assertIn('Profile &#34;Football&#34; puts this background ahead of its pinned one.', self.page(rec.id))
 
     def test_an_event_with_no_artwork_says_so(self):
         e = db.session.get(SportsEvent, self.event.id)

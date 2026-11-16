@@ -414,7 +414,7 @@
         {{ field_text('recording.move_on_complete.destination', 'Move destination',
            'Absolute path to move the final file to. Directory is created if it does not exist.', mc.get('destination', ''), gated_by=['recording.move_on_complete.enabled'], tier='basic') }}
         {{ field_bool('recording.metadata_sidecar.enabled', 'Write a metadata file for media servers',
-           'Save a Kodi-format .nfo file and a poster image beside every finished recording, so Plex, Jellyfin, Emby and Kodi show its real title, synopsis, air date and genre instead of guessing from the filename. A game matched to TheSportsDB also carries its league, season, round and venue, its poster from TheSportsDB, and a background image as a third file. Nothing is sent anywhere - the files are written to local disk. In Plex this needs a Movie or TV Show library with the matching NFO agent selected; an Other Videos library ignores them. Turning this off later stops new files being written and leaves existing ones alone.', ms.get('enabled', False), tier='basic') }}
+           'Save a Kodi-format .nfo file, a poster and a background image beside every finished recording, so Plex, Jellyfin, Emby and Kodi show its real title, synopsis, air date and genre instead of guessing from the filename. A game matched to TheSportsDB also carries its league, season, round and venue, and its poster and background from TheSportsDB. Nothing is sent anywhere - the files are written to local disk. In Plex this needs a Movie or TV Show library with the matching NFO agent selected; an Other Videos library ignores them. Turning this off later stops new files being written and leaves existing ones alone.', ms.get('enabled', False), tier='basic') }}
         {{ field_bool('recording.post_script.enabled', 'Run post-completion script',
            'Execute a shell script after the recording finishes all post-processing. Non-fatal: recording is marked COMPLETED regardless of script outcome.', ps.get('enabled', False), tier='advanced') }}
         {{ field_text('recording.post_script.path', 'Post-completion script path',
@@ -771,53 +771,49 @@
       {#- The output feed (app/output_feed.py, DESIGN-output-feed.md 9): one switch, and the
           rest only reads while it is on. The switch is disabled until a credential exists -
           the route refuses it too. The help text says what is served and that a recording
-          always wins a seat; in redirect mode it says ChannelBin cannot see the IPTV app. -#}
+          always wins a seat; in redirect and mixed modes it says what ChannelBin cannot see. -#}
       {% set feedcfg = cfg.get('integrations', {}).get('output_feed', {}) %}
-      {% call field_shell('integrations.output_feed.enabled', 'Output feed for an IPTV app',
-         'When enabled, an IPTV app such as TiviMate can connect to ChannelBin via an Xtream account and gets exactly the TV Guide: every channel and group in it, in the guide\'s order, with the guide\'s own listings. A group plays as one channel from the member ChannelBin would record from, and moves to another member if that one dies. A recording always wins: an IPTV app holding the connection a recording needs is cut, and told why on the Alerts page. Needs the username and password below.', false, false, 'output feed tivimate xtream m3u xmltv iptv app client', tier='basic') %}
-      <label class="switch{{ ' tip-plain' if not feed_credentials_set else '' }}"{% if not feed_credentials_set %} data-tip="Set a username and password below first"{% endif %}>
+      {% call field_shell('integrations.output_feed.enabled', 'Output feed for an IPTV player',
+         'When enabled, an IPTV player such as TiviMate can connect to ChannelBin as if it were an IPTV provider and gets the TV Guide: every channel and group in it that has not been taken off the output, in the guide\'s order, with the guide\'s own listings. A group plays as one channel from the member ChannelBin would record from, and moves to another member if that one dies. A recording always wins: an IPTV player holding the connection a recording needs is cut, and told why on the Alerts page. The login a player uses, the details to type into it, which channels it gets and who is watching are on the IPTV Output page, which has these same settings.', false, false, 'output feed tivimate xtream m3u xmltv iptv player app client username password login', tier='basic') %}
+      <label class="switch{{ ' tip-plain' if not feed_credentials_set else '' }}"{% if not feed_credentials_set %} data-tip="Set the IPTV player's login on the IPTV Output page first"{% endif %}>
         <input type="checkbox" data-setting-path="integrations.output_feed.enabled"{{ ' checked' if feedcfg.get('enabled') else '' }}{{ ' disabled' if not feed_credentials_set else '' }}>
         <span class="knob"></span>
       </label>
+      <a class="btn btn-sm" href="{{ url_for('iptv_output.page') }}">IPTV Output {{ icon('forward') }}</a>
       {% endcall %}
-      {% call field_shell('', 'Address for the IPTV app', 'What to type as the server when adding the account - the address this page was opened on. Behind a reverse proxy, turn on flask.behind_proxy so it is the outside address. The feed\'s username and password are the ones below, and the login gate is not asked of the IPTV app.', false, false, 'output feed url server address', tier='basic') %}
-      <input type="text" value="{{ feed_url }}" readonly>
-      {% endcall %}
-      {{ field_text('integrations.output_feed.username', 'Feed username',
-         'The username the IPTV app sends on every request. Short is fine - it is typed on a remote, and the feed is only as reachable as this server is.', feedcfg.get('username', ''), tier='basic') }}
-      {% call field_shell('integrations.output_feed.password', 'Feed password',
-         'Sent on every request, including the one that starts each play, so it is stored as typed rather than hashed - the eye shows it back, which is what retyping it into an IPTV app needs.', false, false, 'output feed password secret', tier='basic') %}
-      <div class="secret-field">
-        <input type="text" data-setting-path="integrations.output_feed.password" value="{{ feedcfg.get('password', '') }}" autocomplete="off">
-        {% if feedcfg.get('password') %}{{ secret_reveal_btn('integrations.output_feed.password') }}{% endif %}
-      </div>
-      {% endcall %}
-      {{ field_select('integrations.output_feed.mode', 'How the IPTV app gets the stream',
-         'Proxy: ChannelBin plays the channel through itself, so it can hold a seat for the IPTV app, move a group to another member mid-stream and say why a play stopped. Redirect: the IPTV app is sent straight to the provider\'s stream for the member chosen at that moment - no failover, the provider\'s credentials reach the IPTV app, and ChannelBin never sees when the play ends, so a recording that then needs the connection is refused by the provider rather than warned about here.',
-         feedcfg.get('mode', 'proxy'), [('proxy', 'Proxy - relayed through ChannelBin'), ('redirect', 'Redirect - played straight from the provider')], tier='basic', gated_by=['integrations.output_feed.enabled']) }}
+      {#- The same three modes as app/output_feed_view.py MODE_LABELS, written as literals because the gates below are checked against them (SettingsGateDeclarationTests), and as "Name - explanation" because a gate badge names an option by the part before " - " (settings.js optionName). -#}
+      {{ field_select('integrations.output_feed.mode', 'How the IPTV player gets the stream',
+         'Proxy: ChannelBin plays every channel through itself, so it can hold a connection for the IPTV player, move a group to another member mid-stream and say why a play stopped. Redirect: the IPTV player is sent straight to the provider\'s stream for the member chosen at that moment - no failover, the provider\'s credentials reach the IPTV player, and ChannelBin never sees when the play ends, so a recording that then needs the connection is refused by the provider rather than warned about here. Mixed: channel groups and sports channels play through ChannelBin, which is what moving to another member mid-stream and a sports channel\'s waiting screen turning into the game need, and every other channel is sent straight to the provider.',
+         feedcfg.get('mode', 'proxy'), [('proxy', 'Proxy - relayed through ChannelBin'), ('mixed', 'Mixed - groups and sports channels relayed, the rest straight from the provider'), ('redirect', 'Redirect - played straight from the provider')], tier='basic', gated_by=['integrations.output_feed.enabled']) }}
       {{ field_list('integrations.output_feed.accounts', 'Accounts the feed may play from',
-         'Account ids, one per line (the number in an account page\'s address). Empty means every account. A group member on any other account is skipped before the format lock, and a channel on one is not served at all.',
+         'The IPTV Output page has a switch per account that writes this list. Account ids, one per line (the number in an account page\'s address). Empty means every account. A group member on any other account is skipped before the format lock, and a channel on one is not served at all.',
          feedcfg.get('accounts', []), tier='advanced', gated_by=['integrations.output_feed.enabled']) }}
-      {{ field_list('integrations.output_feed.held_seats', 'Seats kept free for the IPTV app',
-         'Redirect mode only. One "account id: seats" pair per line, like "2: 1". ChannelBin subtracts that many from its own connection limit on the account, so a recording never plans on a seat the IPTV app may be holding; a recording that then waits says so. Ignored in proxy mode, where the IPTV app holds a visible seat and yields it.',
+      {{ field_list('integrations.output_feed.held_seats', 'Connections recordings leave alone',
+         'Redirect and mixed modes. One "account id: connections" pair per line, like "2: 1". ChannelBin subtracts that many from its own connection limit on the account, so a recording never plans on a connection the IPTV player may be holding; a recording that then waits says so. In mixed mode a group or sports channel playing through ChannelBin uses one of these first, so it never counts twice. Ignored in proxy mode, where ChannelBin can see the connection an IPTV player holds and takes it back for a recording.',
          feed_held_seats_lines, tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=proxy']) }}
       {{ field_number('integrations.output_feed.reserve_seconds', 'Seconds behind live',
-         'Proxy mode. How much of the stream ChannelBin holds in memory before the IPTV app gets it. A dropout, a reconnect or a group failover shorter than this plays through without the picture freezing - but the seconds the provider never sent are still missing, so the picture skips forward by that much instead. 0 passes bytes straight through. About 1 MB of memory per second per IPTV app.',
+         'Proxy and mixed modes. How much of the stream ChannelBin holds in memory before the IPTV player gets it. A dropout, a reconnect or a group failover shorter than this plays through without the picture freezing - but the seconds the provider never sent are still missing, so the picture skips forward by that much instead. 0 passes bytes straight through. About 1 MB of memory per second per IPTV player.',
          feedcfg.get('reserve_seconds', 3), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
-      {{ field_number('integrations.output_feed.buffer_mb', 'Buffer per IPTV app (MB)',
-         'Proxy mode. The fixed-size memory ring each IPTV app plays from; it never grows with watch time. Must hold the seconds behind live with room to spare - the save refuses a pair that does not fit. An IPTV app that falls further behind than this is cut and told so.',
-         feedcfg.get('buffer_mb', 16), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
-      {{ field_number('integrations.output_feed.max_viewers', 'IPTV apps at once',
-         'Proxy mode. The most streams ChannelBin relays at the same time; one more is refused with a message naming the cap. Each one is an ffmpeg process, a provider connection and a buffer.',
+      {{ field_number('integrations.output_feed.buffer_mb', 'Memory held for each player (MB)',
+         'Proxy and mixed modes. The most of the stream ChannelBin keeps in memory for each IPTV player; it is a limit, used only as far as the stream needs. An IPTV provider sends 13 to 29 seconds of a channel at once when a play starts, and this has to hold that on top of the seconds behind live: about 32 MB for an HD channel, and 64 leaves room for a higher bitrate. When it fills, the stream goes out sooner than the seconds behind live, and the play says so. An IPTV player that falls further behind than this is cut and told so.',
+         feedcfg.get('buffer_mb', 64), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
+      {{ field_number('integrations.output_feed.max_viewers', 'IPTV players at once',
+         'Proxy and mixed modes. The most streams ChannelBin relays at the same time; one more is refused with a message naming the cap. Each one is an ffmpeg process, a provider connection and a buffer. A player on a sports channel\'s waiting screen is not counted until its game comes on.',
          feedcfg.get('max_viewers', 3), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
-      {{ field_number('integrations.output_feed.idle_seconds', 'Idle cut (seconds)',
-         'Proxy mode. An IPTV app that has read nothing for this long is treated as gone and its stream ended, so a device switched off at the wall does not hold a provider connection.',
+      {{ field_number('integrations.output_feed.sports_before_minutes', 'Sports channels: start early by (minutes)',
+         'How long before a game\'s guide listing starts its sports channel already plays the channel that lists it, so an IPTV player tuning in early gets the pregame show instead of nothing. 0 starts at the listing. Every mode.',
+         feedcfg.get('sports_before_minutes', 60), tier='advanced', gated_by=['integrations.output_feed.enabled']) }}
+      {{ field_number('integrations.output_feed.sports_after_minutes', 'Sports channels: keep playing after (minutes)',
+         'How long after a game\'s guide listing ends its sports channel still plays the channel that carried it, because games run long. Counted from the end of the listing, not the start of the game. When this runs into the next game\'s early start, the game that just ended keeps the channel until the next one\'s listing begins. A play already running is never cut either way. 0 stops at the listing\'s end. Every mode.',
+         feedcfg.get('sports_after_minutes', 120), tier='advanced', gated_by=['integrations.output_feed.enabled']) }}
+      {{ field_number('integrations.output_feed.idle_seconds', 'Cut when the player reads nothing for (seconds)',
+         'Proxy and mixed modes. An IPTV player that has read nothing for this long is treated as gone and its stream ended, so a device switched off at the wall does not hold a provider connection.',
          feedcfg.get('idle_seconds', 30), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
-      {{ field_number('integrations.output_feed.max_session_hours', 'Longest session (hours)',
-         'Proxy mode. The hard cap on one play, so an IPTV app left on a channel for a week does not hold a provider connection for a week. The app tunes in again and gets a fresh session.',
+      {{ field_number('integrations.output_feed.max_session_hours', 'Longest single play (hours)',
+         'Proxy and mixed modes. The hard cap on one play, so an IPTV player left on a channel for a week does not hold a provider connection for a week. The player tunes in again and gets a fresh session.',
          feedcfg.get('max_session_hours', 12), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
-      {{ field_number('integrations.output_feed.xmltv_days', 'Guide depth (days)',
-         'How many days of listings xmltv.php carries. The TV Guide\'s own depth is 3.',
+      {{ field_number('integrations.output_feed.xmltv_days', 'Days of guide it sends',
+         'How far ahead the guide an IPTV player downloads reaches. A channel\'s listings end where ChannelBin\'s own guide does, which is set to ' ~ sync_cfg.get('epg_days_ahead', 3) ~ (' day' if sync_cfg.get('epg_days_ahead', 3) == 1 else ' days') ~ ' ("EPG days ahead"). A sports channel\'s games come from TheSportsDB and can reach further.',
          feedcfg.get('xmltv_days', 3), tier='advanced', gated_by=['integrations.output_feed.enabled']) }}
 
       {#- How the Sports Schedules page's worker paces itself (app/sports_data.py). What to follow
@@ -826,11 +822,11 @@
       <div data-sub>
       <div class="sec-sub"><strong>TheSportsDB</strong>How the <a href="{{ url_for('sports.sports_page') }}">Sports Schedules</a> page keeps its schedules current. With nothing followed, no calls are made.</div>
       {{ field_number('sports_data.call_spacing_seconds', 'Seconds between calls',
-         'How long to wait between one call to TheSportsDB and the next. With the variation below, the shortest possible wait has to be at least 12 seconds, the fastest pace measured without being told to slow down. Checked about every 15 seconds, so a shorter wait than that has no further effect.',
-         sportscfg.get('call_spacing_seconds', 60), tier='advanced') }}
+         'How long to wait between one call to TheSportsDB and the next. With the variation below, the shortest possible wait has to be at least 8 seconds: TheSportsDB answers about 10 calls a minute from one address, then refuses every call for two minutes.',
+         sportscfg.get('call_spacing_seconds', 10), tier='advanced') }}
       {{ field_number('sports_data.call_jitter_seconds', 'Variation (seconds)',
          'Each wait is the seconds above, plus or minus a random amount up to this.',
-         sportscfg.get('call_jitter_seconds', 20), tier='advanced') }}
+         sportscfg.get('call_jitter_seconds', 2), tier='advanced') }}
       {{ field_number('sports_data.horizon_days', 'Days ahead',
          'How far ahead a schedule reaches. Further ahead means more calls.',
          sportscfg.get('horizon_days', 21), tier='advanced') }}
@@ -838,7 +834,7 @@
          'A past game is deleted this long after it happened.',
          sportscfg.get('history_keep_days', 30), tier='advanced') }}
       {{ field_bool('sports_data.download_images', 'Download posters and backgrounds',
-         'For a recording matched to a TheSportsDB event, download the event\'s poster and background once and use them in the files written beside the recording for Plex, Jellyfin and Kodi. An image pinned to the recording\'s profile still comes first, unless the profile is set to use TheSportsDB\'s poster when the game has one. Off, nothing is downloaded, none already downloaded is used, and the poster is a frame from the program.',
+         'For a recording matched to a TheSportsDB event, download the event\'s poster and background once and use them in the files written beside the recording for Plex, Jellyfin and Kodi. An image pinned to the recording\'s profile still comes first, unless the profile is set to use TheSportsDB\'s images when the game has them. It also downloads the badges of the teams playing next on the IPTV output\'s sports channels. Off, nothing is downloaded, none already downloaded is used, and the poster and background are a frame from the program.',
          sportscfg.get('download_images', true), tier='advanced') }}
       </div>
     {% endcall %}
@@ -857,8 +853,10 @@
           else 'and it has no authentication (see the Security section above to turn on the password gate).') ~
          ' If your reverse proxy runs on this same machine, you can set flask.host: 127.0.0.1 in the config.yaml tab to make the raw port unreachable except from the proxy. Do not do this if the proxy (or the devices you browse from) run on a different host - it will break access.', false, false, 'network exposure bind reachable lan security host', true, 'warn', tier='advanced') %}{% endcall %}
       {% endif %}
+      {{ field_text('flask.public_url', 'ChannelBin\'s address',
+         'The address other devices reach ChannelBin at. Type the whole address, starting with http:// or https://, like https://channelbin.example.com or http://192.168.1.1:5000. It is the server address the IPTV Output page tells you to type into an IPTV player, and the start of every link in a push notification. Leave it blank and the IPTV Output page shows the address it was opened on, and push notifications carry no link. An IPTV player is always answered on the address it connected on, whatever is set here.', fsk.get('public_url', ''), tier='basic') }}
       {{ field_readonly('flask.behind_proxy', 'Behind a reverse proxy',
-         'Trust the X-Forwarded-* headers, so the app sees the real client IP and the real scheme (https) instead of the proxy\'s. Turn this on only when a reverse proxy actually fronts the app - with it off, an HTTPS visitor still looks like plain HTTP to the app, and the login page warns that the connection is unencrypted when it is not. Your proxy must append to X-Forwarded-For rather than pass the client\'s own copy through (nginx: $proxy_add_x_forwarded_for), or a caller can present a fresh IP per attempt and never trip the login lockout. Edit in the config.yaml tab; restart required.',
+         'Trust the X-Forwarded-* headers, so the app sees the real client IP and the real scheme (https) instead of the proxy\'s. Turn this on only when a reverse proxy actually fronts the app - with it off, an HTTPS visitor still looks like plain HTTP to the app, and the login page warns that the connection is unencrypted when it is not, and the IPTV Output page lists every IPTV player under the proxy\'s address. Your proxy must append to X-Forwarded-For rather than pass the client\'s own copy through (nginx: $proxy_add_x_forwarded_for), or a caller can present a fresh IP per attempt and never trip the login lockout. Edit in the config.yaml tab; restart required.',
          fsk.get('behind_proxy', False)|string|lower, tier='advanced') }}
       {{ field_readonly('flask.debug', 'Debug mode',
          'Flask debug mode. Edit in the config.yaml tab; restart required.',

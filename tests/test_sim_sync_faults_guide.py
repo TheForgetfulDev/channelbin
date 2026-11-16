@@ -27,6 +27,7 @@ from app.database import (SPORTS_MATCH_KIND_CHANNEL_NAME, Channel, EPGEntry,  # 
                           SportsMatch, SportsTeam, XtreamAccount)
 from app.epg_sources import add_url_source  # noqa: E402
 from app.logo_cache import _fetch_one_logo  # noqa: E402
+from sim.faults import _GAME_SLOT  # noqa: E402
 from tests.support.sim_sync import FAULT_WORLD, SimSyncCase, names_a_cut_chunk  # noqa: E402
 
 
@@ -468,6 +469,43 @@ class FillerGuideTests(_GuideCase):
         start = self.now + timedelta(hours=6)
         event = SportsEvent(tsdb_id=7001, league_id=league.id, name=f'{home} vs {away}', home_team_id=901,
                             away_team_id=902, home_name=home, away_name=away, start_at=start, local_date=start.date())
+        db.session.add(event)
+        db.session.commit()
+        sports_match.run(pause=0)
+        db.session.expire_all()
+        mine = SportsMatch.query.filter_by(event_id=event.id, channel_id=ch.id)
+        self.assertEqual({x.kind for x in mine}, {SPORTS_MATCH_KIND_CHANNEL_NAME})
+
+
+class RenamedSlotGuideTests(_GuideCase):
+    def test_a_slot_renamed_for_its_game_is_still_read_by_its_name(self):
+        """Guards dev/docs/BUGS.md 2026-11-15 06:58 through the simulator's renamed_slot_guide fault: a
+        real sync stores blocks titled with the slot's former name before its current ones, and the
+        slot is still matched to its game by its name."""
+        aid = self.add_xtream()
+        self.sim.inject('renamed_slot_guide', 'north-tv')
+        log = self.sync(aid)
+        self.assertEqual(log.status, 'SUCCESS', log.error_message)
+        found = None
+        for ch in Channel.query.filter_by(account_id=aid).all():
+            m = _GAME_SLOT.search(ch.name)
+            titles = {e.title for e in EPGEntry.query.filter_by(channel_id=ch.id)} if m else set()
+            if m and ch.name in titles and len(titles) == 2:
+                found = ch, m, titles
+                break
+        self.assertIsNotNone(found, 'the fault world carries no renamed event slot')
+        ch, m, titles = found
+        self.assertEqual(titles - {ch.name}, {ch.name[:m.start(2)].rstrip()})
+        sport, away, home = m.groups()
+        league = SportsLeague(tsdb_id=9102, name=sport, match_terms=json.dumps([sport]))
+        db.session.add(league)
+        for tid, team in ((921, home), (922, away)):
+            db.session.add(SportsTeam(tsdb_id=tid, full_name=team, names=json.dumps([team]), city='',
+                                      last_looked_up=self.now))
+        db.session.flush()
+        start = self.now + timedelta(hours=6)
+        event = SportsEvent(tsdb_id=7003, league_id=league.id, name=f'{home} vs {away}', home_team_id=921,
+                            away_team_id=922, home_name=home, away_name=away, start_at=start, local_date=start.date())
         db.session.add(event)
         db.session.commit()
         sports_match.run(pause=0)

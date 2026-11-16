@@ -573,16 +573,17 @@ def _check_auth_gate(ctx):
 def _check_output_feed(ctx):
     """Evaluated only while the feed is on: a credential is stored, the ring holds the
     reserve, something is served, and every held-seats account still exists. The detail
-    carries the URL to type into the IPTV app (DESIGN-output-feed.md section 8)."""
-    from .output_feed import MODE_REDIRECT, max_reserve_seconds
+    carries the URL to type into the IPTV player (DESIGN-output-feed.md section 8)."""
+    from .output_feed import MODE_MIXED, MODE_PROXY, MODE_REDIRECT, max_reserve_seconds
     feed = ctx.feed
     tested = 'Read the output feed settings and counted what the TV Guide would serve'
     if not feed['enabled']:
         return Result(NOTHING, tested, 'The output feed is off')
     fcfg = (ctx.cfg.get('integrations') or {}).get('output_feed') or {}
-    url = (ctx.cfg.get('notifications', {}).get('base_url') or '').strip()
-    detail = (f'In an IPTV app, add an Xtream Codes account with the server set to '
-              f'{url or "this ChannelBin address"} and the feed\'s username and password.')
+    from .config import public_url
+    url = public_url(ctx.cfg)
+    detail = (f'In an IPTV player, add an Xtream Codes account with the server set to '
+              f'{url or "this ChannelBin address"} and the login set on the IPTV Output page.')
     if not feed['credentials_set']:
         return Result(PROBLEM, tested,
                       'The feed is on but has no username or password, so every request '
@@ -600,8 +601,15 @@ def _check_output_feed(ctx):
                       detail=detail)
     if not feed['served']:
         return Result(ATTENTION, tested,
-                      'The TV Guide is empty, so the IPTV app sees no channels', detail=detail)
-    mode = 'relayed through ChannelBin' if feed['mode'] != MODE_REDIRECT else 'played straight from the provider'
+                      'The TV Guide is empty, so the IPTV player sees no channels', detail=detail)
+    if feed['mode'] == MODE_PROXY:
+        mode = 'relayed through ChannelBin'
+    elif feed['mode'] == MODE_MIXED:
+        mode = 'groups and sports channels relayed through ChannelBin, the rest played straight from the provider'
+    elif feed['mode'] == MODE_REDIRECT:
+        mode = 'played straight from the provider'
+    else:
+        raise ValueError(f'Unknown feed mode "{feed["mode"]}"')
     return Result(READY, tested,
                   f'{feed["served"]} {plural(feed["served"], "channel")} served, {mode}',
                   detail=detail)
@@ -922,16 +930,17 @@ CHECKS = (
     Check('auth_gate', 'machine', 'The login gate does what you asked', 'the login gate', CHEAP,
           'Login is on but no password is stored, so every page is open to anyone.',
           Link('Settings', 'settings.settings', 'auth.enabled'), False, _check_auth_gate),
-    Check('output_feed', 'machine', 'The output feed can serve an IPTV app', 'the output feed',
+    Check('output_feed', 'machine', 'The output feed can serve an IPTV player', 'the output feed',
           CHEAP,
-          'An IPTV app that added ChannelBin as an account sees no channels, or is refused on '
+          'An IPTV player that added ChannelBin as an account sees no channels, or is refused on '
           'every request.',
-          Link('Settings', 'settings.settings', 'integrations.output_feed'), True,
+          Link('IPTV Output', 'iptv_output.page'), True,
           _check_output_feed,
-          setup=('Turn on the output feed in Settings > Integrations, give it a username '
-                 'and password, and add ChannelBin to an IPTV app as an Xtream Codes account. '
-                 'The app then lists the TV Guide\'s channels and groups, with the guide\'s '
-                 'listings, and a group plays as one channel with failover.')),
+          setup=('On the IPTV Output page, set the login an IPTV player uses and turn the '
+                 'output on, then add ChannelBin to the player as an Xtream Codes account with '
+                 'the details that page shows. The player then lists the TV Guide\'s channels '
+                 'and groups, with the guide\'s listings, and a group plays as one channel '
+                 'with failover.')),
 
     # ── Your provider ─────────────────────────────────────────────────────
     Check('accounts_any', 'provider', 'You have at least one account', 'your provider accounts',
@@ -1039,7 +1048,7 @@ CAPABILITIES = (
     Capability('safe', 'Keep the database safe and the login working',
                _cap('db_local', 'db_write', 'secret_key', 'auth_gate')),
     Capability('clear', 'See every error', _cap('alerts_unread')),
-    Capability('tv', 'Watch your channels and groups from a third-party IPTV app', _cap('output_feed')),
+    Capability('tv', 'Watch your channels and groups from a third-party IPTV player', _cap('output_feed')),
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

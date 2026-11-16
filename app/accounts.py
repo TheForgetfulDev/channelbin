@@ -4030,7 +4030,7 @@ def _delete_ended_listings(model, cutoff: datetime) -> int:
 
 def cleanup_old_epg_entries(app):
     """Delete EPG entries, active and alternate, older than sync.epg_keep_days (0 = keep
-    forever), then rebuild the program index in full."""
+    forever), then bring the program index up to date and compact it."""
     with app.app_context():
         cfg = load_config()
         keep_days = cfg.get('sync', {}).get('epg_keep_days', 1)

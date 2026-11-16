@@ -25,9 +25,9 @@ def _cfg(services=None, routing=None):
     make what the page renders deterministic.
     """
     return {
+        'flask': {'public_url': 'http://dvr.local:5000'},
         'notifications': {
             'push_rate_limit_seconds': 90,
-            'base_url': 'http://dvr.local:5000',
             'services': services if services is not None else {},
             'routing': routing or {},
         },

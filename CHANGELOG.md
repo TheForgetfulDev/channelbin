@@ -5,6 +5,41 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.42.0 - 2026-11-16
+
+The IPTV Output page, and sports channels for your IPTV player.
+
+**Added**
+
+- An IPTV Output page, last under Channels & guide, gives the details to type into an IPTV
+  player, each with a Copy button. It lists every channel the player gets, with a switch that
+  takes a channel off the output while it stays in the TV Guide, shows who is watching, and
+  keeps 30 days of plays with the reason each one ended, moved or was refused.
+- Mixed mode plays channel groups and sports channels through ChannelBin and sends every other
+  channel straight to the IPTV provider.
+- A followed team, or a whole league as numbered channels, can be its own channel in an IPTV
+  player, with a guide of its games from TheSportsDB. Tuning in plays whichever of your
+  channels lists the game right now, and moves to another one carrying it if that one dies.
+- A sports channel plays from an hour before a game's listing to two hours after it ends, Go
+  live now opens a game that starts early, and with no game on it shows a waiting screen with
+  the next game in its teams' colors.
+- Record and Search programs on a game on its league's page.
+- Leagues too big for one TheSportsDB answer, like college football and the NBA, get their
+  whole schedule, and schedules fill about six times faster.
+- Every recording gets a widescreen background, and a recording profile can pin one.
+
+**Fixed**
+
+- Recordings waiting on conversions no longer hold every background database connection,
+  which could keep new recordings from starting.
+- A capture restarted because its video stopped is no longer counted as a provider outage.
+- A play leaving the waiting screen can no longer start on a connection a recording just took.
+- Changing channel at the limit of players at once waits for the old play to end instead of
+  refusing, and an HD play is no longer cut by the provider's opening burst.
+- Deleting a channel or an account no longer leaves its id on recordings and group events.
+- A league page keeps a late game past midnight.
+- Sports lookups no longer chase other sports, replays or look-alike team names.
+
 ## 0.41.0 - 2026-11-11
 
 Record a league or a team, and name sports recordings from TheSportsDB.

@@ -748,6 +748,25 @@ def _model_team_channels(view, f):
     view.guide = list(view.guide) + extra
 
 
+def _model_renamed_slot_guide(view, f):
+    """Event slots naming a game get a filler guide whose blocks from before `hours` ago repeat the
+    slot's former name, the part before its game (`Hockey EVENT 3:`), and its current name after.
+    ChannelBin's import keeps what stops after an hour ago and leaves earlier rows in place, so in
+    prod the former blocks came from the syncs before the rename; an hour lets one sync store one."""
+    share, hours, seed = f.params['share'], f.params['hours'], view.world.seed
+    rows, extra = [], []
+    for row in view.rows:
+        m = _GAME_SLOT.search(row.name) if row.channel.kind == KIND_EVENT else None
+        if m and frac(seed, 'fault-renamed', view.name, row.channel.stream_id) < share:
+            tvg = row.tvg_id or f'renamed{row.channel.stream_id}.slot'
+            row = _row(row, tvg_id=tvg)
+            former = row.name[:m.start(2)].rstrip()
+            extra.append(GuideChannel(tvg, row.name, None, True, None, filler=row.name, former=(former, hours)))
+        rows.append(row)
+    view.rows = rows
+    view.guide = list(view.guide) + extra
+
+
 def _model_shared_guide_id(view, f):
     target = next((g.guide_id for g in view.guide if g.has_programs), None)
     if target is None:
@@ -1092,6 +1111,13 @@ _KINDS = (
           'accounts, each with only filler in its guide, two naming more than one team',
           'event slots renamed as team channels naming a market\'s teams with nothing between them, '
           'each with a guide that only repeats its name', {'share': (1.0, _share)}, apply=_model_team_channels),
+    _kind('renamed_slot_guide', SCOPE_PANEL, LAYER_MODEL, _ROWS + (EP_GUIDE,), MEASURED,
+          'dev/changelog/1562, BUGS.md 2026-11-15 06:58 AM; 2026-11-14\'s `NCAAF 27: 1pm Arkansas State '
+          'at Coastal Carolina` kept 9 blocks titled `NCAAF 27:`; all six College Football Package and '
+          'ESPN+ slots checked kept their earlier blocks under the former name',
+          'event slots naming a game get a filler guide whose blocks from before `hours` ago repeat the '
+          'name the slot had before its game', {'share': (1.0, _share), 'hours': (1, _count(1))},
+          apply=_model_renamed_slot_guide),
     _kind('guide_id_twins', SCOPE_PANEL, LAYER_MODEL, (EP_GUIDE,), MEASURED,
           'dev/changelog/1139 (2,297 channels), BUGS.md 2026-09-26 06:15 PM',
           'the guide lists a channel under a second id differing only in case, carrying '

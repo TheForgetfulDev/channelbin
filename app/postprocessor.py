@@ -10,7 +10,9 @@ from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 
-from .db_utils import retry_on_locked
+from flask import has_app_context
+
+from .db_utils import release_idle_connection, retry_on_locked
 from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration
 from .fs_utils import ensure_dir
 from .proc_utils import (TIMELINE_GAP_KEEP_SECONDS, iter_stderr_error_lines, supervise_ffmpeg,
@@ -380,6 +382,7 @@ def _wait_for_conversion_clear(recording_id, within_seconds, poll_seconds=5, log
             log.info('Recording %d conversion waiting on recording "%s" (status %s, '
                      'starts %s) - recording.post_process.collision_policy',
                      recording_id, conflict.name, conflict.status, conflict.start_time)
+        release_idle_connection()
         time.sleep(poll_seconds)
         i += 1
 
@@ -1329,13 +1332,18 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
         window = _collision_window_seconds(remaining, collision_multiplier)
         conflict = _conversion_collision_conflict(window, recording_id)
         if conflict is None:
+            # Polled for the length of the encode, paused or not: nothing between polls
+            # needs the connection (dev/docs/BUGS.md 2026-11-14 @ 06:14:41 pm ET).
+            release_idle_connection()
             return None
         # Handed to _on_suspend through here rather than re-queried there: the answer is
         # already in hand, and a second query could name a different recording than the one
         # the pause is actually for.
         suspending_for = conflict
-        return (f'yielding local resources to recording "{conflict.name}" '
-                f'({_conflict_phrase(conflict)})')
+        reason = (f'yielding local resources to recording "{conflict.name}" '
+                  f'({_conflict_phrase(conflict)})')
+        release_idle_connection()
+        return reason
 
     def _on_suspend(reason):
         # The row is stamped BEFORE the event is written, so the window in which a restart
@@ -2021,6 +2029,13 @@ def do_postprocess(app, recording_id: int, ts_path: str):
         log.warning('Postprocessor: recording %d already has a live conversion - refusing duplicate run',
                     recording_id)
         return
+
+    # The context pushed below has a session of its own, so the caller's (the concat chain
+    # that called this) would otherwise keep its connection for the whole of post-processing:
+    # two of the background pool's connections per chain (dev/docs/BUGS.md 2026-11-14 @
+    # 06:14:41 pm ET).
+    if has_app_context():
+        release_idle_connection()
 
     with app.app_context():
         cfg = load_config()

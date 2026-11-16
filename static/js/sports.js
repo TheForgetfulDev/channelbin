@@ -22,9 +22,9 @@
   // it and put back what the action just changed.
   let swapQueue = Promise.resolve();
   let swapsPending = 0;
-  const swap = () => {
+  const swap = (regions = REGIONS) => {
     swapsPending += 1;
-    const run = swapQueue.then(() => swapFromServer(REGIONS)).then(applySort);
+    const run = swapQueue.then(() => swapFromServer(regions)).then(applySort);
     swapQueue = run.catch(() => {}).finally(() => { swapsPending -= 1; });
     return run;
   };
@@ -274,13 +274,14 @@
   }
 
   /* ---- Stop following, follow again, delete ---------------------------------------------- */
-  const gamesWord = (n) => `${n} upcoming ${n === 1 ? 'game' : 'games'}`;
+  // d.one and d.many are the league's own noun (sports_view._dialog), so a race is never a game.
+  const gamesWord = (d) => `${d.stored} upcoming ${d.stored === 1 ? d.one : d.many}`;
 
   async function stop(d) {
     const ok = await confirmModal({
       title: `Stop following ${d.name}?`,
-      message: `ChannelBin stops checking TheSportsDB for ${d.name}'s games.`,
-      consequence: `${d.stored ? `It keeps the ${gamesWord(d.stored)} it already has, and deletes each one ${d.keep_days} days after it's over. ` : ''}The league stays in this list so you can follow it again.`,
+      message: `ChannelBin stops checking TheSportsDB for ${d.name} ${d.many}.`,
+      consequence: `${d.stored ? `It keeps the ${gamesWord(d)} it already has, and deletes each one ${d.keep_days} days after it's over. ` : ''}The league stays in this list so you can follow it again.`,
       confirmLabel: 'Stop following',
     });
     if (!ok) return;
@@ -306,7 +307,7 @@
     }
     const ok = await confirmModal({
       title: `Delete ${d.name}?`,
-      message: `This deletes ${d.name} from ChannelBin, with its stored games and its team names.`,
+      message: `This deletes ${d.name} from ChannelBin, with its stored ${d.many} and its team names.`,
       consequence: 'You can add the league again later, and its schedule will be fetched again.',
       confirmLabel: 'Delete league', danger: true,
     });
@@ -354,7 +355,7 @@
       return `<div class="sp-chan sp-ename${n.wrong ? ' rejected' : ''}"><span class="sp-cname">${escHtml(n.name)}${badge}<span class="sp-cat">${escHtml(n.category)}</span><span class="sp-why">${escHtml(n.why)}</span></span><span class="sp-cact">${act}</span></div>`;
     }).join('');
     return `<h3 class="sp-h3">Event channels <span class="cnt">${names.length}</span></h3>
-      <p class="sp-intro">These channels have no real listings in your guide: none at all, or only their own name repeated. Each one's name says it carries this ${one}, and the name is all ChannelBin has to go on. Providers rename these channels as the day goes on, so the names are read again after every sync, and a channel whose name moves on to another ${one} drops off this list.</p>
+      <p class="sp-intro">These channels have no real listing in your guide at this ${one}'s time: nothing at all then, or only their own name repeated. Each one's name says it carries this ${one}, and the name is all ChannelBin has to go on. Providers rename these channels as the day goes on, so the names are read again after every sync, and a channel whose name moves on to another ${one} drops off this list.</p>
       <div class="sp-enames">${rows}</div>`;
   }
 
@@ -457,10 +458,162 @@
     saveTerms([...termsNow(), value]);
   });
 
+  /* A sports channel on the output feed: a team's (data-team is its id) or the league's numbered
+     ones (0). The page is swapped from the server either way, so a refused switch goes back. */
+  function saveFeedChannel(teamId, enabled) {
+    return jsonFetch(`/api/sports/leagues/${leagueId()}/feed-channels`,
+      { method: 'PUT', body: JSON.stringify({ team_id: teamId, enabled }) })
+      .then(refresh)
+      .catch((err) => { showToast(err.message, { type: 'error' }); return refresh(); });
+  }
+
   document.addEventListener('change', (e) => {
     const sw = e.target.closest('input[data-act="replay"]');
-    if (sw) saveCategories({ replay: { [sw.dataset.name]: sw.checked } });
+    if (sw) { saveCategories({ replay: { [sw.dataset.name]: sw.checked } }); return; }
+    const feed = e.target.closest('input[data-act="feed-channel"]');
+    if (feed) saveFeedChannel(Number(feed.dataset.team), feed.checked);
   });
+
+  /* ---- A page at a time (mockup 57) --------------------------------------------------------
+     Upcoming games and On your IPTV output are paged on the server (?page=, ?feed_page=), and the
+     channels filtered by team first (?feed_q=). Prev and Next are links, so a new tab opens that
+     page. A plain click, or the filter, puts the address in the bar and swaps only that card's
+     list through the one queue: the timed swap fetches the address, so it keeps the page. */
+  const PAGED = { games: '#sp-upcoming', feed: '#sp-feed-list' };
+  const PAGE_PARAM = { games: 'page', feed: 'feed_page' };
+  const FILTER_MS = 250;
+  let filterTimer = null;
+
+  // After a page change, bring the card's heading back when it has scrolled off the top, below the
+  // phone's top bar.
+  function toCardTop(sel) {
+    const region = document.querySelector(sel);
+    const head = region && region.closest('.card').querySelector('.card-head');
+    if (!head) return;
+    const bar = isPhone() ? parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--topnav-h')) || 0 : 0;
+    const top = head.getBoundingClientRect().top;
+    if (top < bar) window.scrollTo({ top: window.scrollY + top - bar - 8 });
+  }
+
+  document.addEventListener('click', (e) => {
+    const link = e.target.closest('a[data-pager]');
+    if (!link || wantsNewTab(e)) return;
+    e.preventDefault();
+    const kind = link.dataset.pager;
+    const sel = PAGED[kind];
+    // Only this card's page moves. The link was drawn with the other card as it was then, and
+    // that card may have paged or filtered since without this one being redrawn.
+    const url = new URL(window.location.href);
+    const to = new URL(link.href).searchParams.get(PAGE_PARAM[kind]);
+    if (to) url.searchParams.set(PAGE_PARAM[kind], to); else url.searchParams.delete(PAGE_PARAM[kind]);
+    window.history.replaceState(null, '', url);
+    swap([sel]).then(() => toCardTop(sel)).catch(() => window.location.reload());
+  });
+
+  function filterFeed() {
+    clearTimeout(filterTimer);
+    const input = document.getElementById('sp-feed-q');
+    if (!input) return;
+    const url = new URL(window.location.href);
+    const q = input.value.trim();
+    if (q) url.searchParams.set('feed_q', q); else url.searchParams.delete('feed_q');
+    url.searchParams.delete('feed_page');
+    window.history.replaceState(null, '', url);
+    // The field now says what the address says, so it no longer holds the timed swap off (inUse).
+    input.defaultValue = input.value;
+    swap([PAGED.feed]).catch(() => window.location.reload());
+  }
+
+  const markFilter = (input) => {
+    const wrap = document.getElementById('sp-feed-wrap');
+    if (wrap) wrap.classList.toggle('has-text', input.value.length > 0);
+  };
+
+  document.addEventListener('input', (e) => {
+    if (e.target.id !== 'sp-feed-q') return;
+    markFilter(e.target);
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(filterFeed, FILTER_MS);
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#sp-feed-clear')) return;
+    const input = document.getElementById('sp-feed-q');
+    input.value = '';
+    markFilter(input);
+    filterFeed();
+    input.focus();
+  });
+
+  /* ---- Record, and a game's recording (mockup 54, dev/changelog/1539) ----------------------
+     Record asks the server what to record: it works the pick out from the game alone, the way an
+     auto-record rule for the league would, and the shared record dialog (guide.js::openModal)
+     opens on it with one notice saying which listing and why. A greyed Record keeps its click to
+     say why. Manage recording's entries are the Recordings list's, with its confirm words; every
+     change ends in the page's own swap from the server. */
+  window.onScheduleSaved = () => { refresh(); };
+
+  async function record(btn) {
+    if (btn.dataset.why) { showToast(btn.dataset.why, { type: 'warning' }); return; }
+    if (btn.dataset.busy) return;
+    btn.dataset.busy = '1';
+    try {
+      const pick = await jsonFetch(`/api/sports/events/${btn.dataset.event}/record`);
+      const notice = { ...pick.notice, searchUrl: pick.search_url || '' };
+      if (pick.kind === 'event') {
+        openModal(pick.program, pick.channel, { notice, sportsEventId: pick.sports_event_id });
+        return;
+      }
+      const group = pick.group_id ? `?group=${pick.group_id}` : '';
+      const ctx = await jsonFetch(`/api/channels/airings/${pick.epg_id}/record-context${group}`);
+      openModal(ctx.program, ctx.channel, { notice });
+    } catch (err) {
+      // A 409 is the page being out of date: a recording made elsewhere, or nothing left.
+      showToast(err.message, { type: 'error' });
+      if (err.status === 409) refresh();
+    } finally {
+      delete btn.dataset.busy;
+    }
+  }
+
+  function editRecording(btn) {
+    const d = JSON.parse(btn.dataset.edit);
+    const name = btn.dataset.recName;
+    openModal({
+      has_recording: true, recording_id: Number(btn.dataset.rec), recording_status: statusVocab('REC_STATUS').SCHEDULED,
+      recording_start_time: d.start_iso, recording_stop_time: d.stop_iso, recording_profile_id: d.profile_id,
+      suggested_name: name, title: name, stream_url: d.url, channel_id: d.channel_id, group_id: d.group_id,
+      id: null, description: null,
+    }, null);
+  }
+
+  async function cancelRecording(btn) {
+    const ok = await confirmModal({
+      title: 'Cancel scheduled recording',
+      message: `"${btn.dataset.recName}" will be removed.`,
+      consequence: btn.dataset.consequence || '',
+      confirmLabel: 'Cancel recording',
+      danger: true,
+    });
+    if (!ok) return;
+    jsonFetch(`/recordings/${btn.dataset.rec}/cancel-json`, { method: 'POST' })
+      .catch((err) => showToast(err.message, { type: 'error' }))
+      .finally(refresh);
+  }
+
+  async function stopRecording(btn) {
+    const ok = await confirmModal({
+      title: 'Stop recording',
+      message: `Capture of "${btn.dataset.recName}" will end now and its segments will be joined into the final file.`,
+      consequence: "It can't be resumed.",
+      confirmLabel: 'Stop recording',
+      danger: true,
+    });
+    if (!ok) return;
+    jsonFetch(`/recordings/${btn.dataset.rec}/stop-json`, { method: 'POST' })
+      .catch((err) => showToast(err.message, { type: 'error' }))
+      .finally(refresh);
+  }
 
   /* ---- Wiring ---------------------------------------------------------------------------- */
   const sectionLayout = PAGE ? initSectionLayout({
@@ -487,6 +640,7 @@
     const name = act.dataset.act;
     if (name === 'sections') { if (sectionLayout) sectionLayout.open(); return; }
     if (name === 'listings') { e.preventDefault(); openListings(Number(act.dataset.event), act.dataset.name, act.dataset.namesOnly === '1'); return; }
+    if (name === 'live-now') { goLiveNow(act).then((changed) => { if (changed) refresh(); }); return; }
     if (name === 'remove-term') {
       const left = termsNow().filter((t) => t !== act.dataset.term);
       if (!left.length) { showToast('A league needs at least one name, or no listing could ever match it.', { type: 'error' }); return; }
@@ -496,7 +650,12 @@
     if (name === 'accept-term') { saveTerms([...termsNow(), act.dataset.term]); return; }
     if (name === 'tie') { openTie(); return; }
     if (name === 'untie') { saveCategories({ remove: [act.dataset.name] }); return; }
-    if (name === 'add-term' || name === 'replay') return;
+    if (name === 'add-term' || name === 'replay' || name === 'feed-channel') return;
+    if (name === 'record') { record(act); return; }
+    if (name === 'search-why') { showToast(act.dataset.why, { type: 'warning' }); return; }
+    if (name === 'edit-rec') { editRecording(act); return; }
+    if (name === 'cancel-rec') { cancelRecording(act); return; }
+    if (name === 'stop-rec') { stopRecording(act); return; }
     const d = dialogOf(act);
     if (!d) return;
     if (name === 'teams') openTeams(d);

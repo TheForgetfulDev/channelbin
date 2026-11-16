@@ -10,6 +10,7 @@ import time
 from collections import namedtuple
 from datetime import datetime
 
+from .db_utils import release_idle_connection
 from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration
 from .join_layout import (LAYOUT_REMUX_SUFFIX, concat_stream_lines, describe as describe_layout,
                           join_input_args, plan_layouts, remux_args)
@@ -238,6 +239,7 @@ def _wait_for_no_active_recording(recording_id: int, poll_seconds: float = 5, lo
         if i % log_every == 0:
             log.info('Concat for recording %d waiting on %d active recording(s) to finish '
                       '(recording.serialize_concat enabled)', recording_id, active)
+        release_idle_connection()
         time.sleep(poll_seconds)
         i += 1
 
@@ -591,7 +593,7 @@ def _close_segment_holes(recording_id, seg, holes, cfg, ffmpeg_path):
                 pre_output_timeout=cfg['ffmpeg']['concat_pre_output_timeout_seconds'],
                 stall_seconds=cfg['ffmpeg']['concat_stall_seconds'],
                 on_spawn=lambda proc: _track_join_child(recording_id, proc, dest),
-                label=label)
+                label=label, scratch_key=recording_id)
             error = repair.error
         except Exception as exc:
             repair, error = None, str(exc)

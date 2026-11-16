@@ -1046,8 +1046,9 @@ class WatchdogThread(threading.Thread):
                         # the restart below goes ahead. What the guard does not cover is
                         # time - a locked database can hold this for its retries, the same
                         # exposure the stall's own commit and the two hooks above carry on
-                        # this path. A fast-delivery segment is not a stall.
-                        if fast_delivery is None:
+                        # this path. A fast-delivery segment is not a stall, and neither
+                        # is a video-stop restart: the file never stopped growing.
+                        if fast_delivery is None and not video_restart:
                             try:
                                 provider_stalls.note_stall(self.recording_id, seg_channel_id)
                             except Exception:

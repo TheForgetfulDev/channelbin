@@ -6,7 +6,9 @@ program's real title, synopsis, air date and genre. The gate is global with a tr
 per-profile override, both files are enumerated for teardown, and a write that fails says
 so on the recording's own timeline rather than failing the recording.
 """
+import json
 import os
+import shutil
 import unittest
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -197,8 +199,8 @@ class RenderTests(unittest.TestCase):
         self.assertIn('&amp;', render_nfo(self.rec, self.tz))
 
 
-class WriteTests(unittest.TestCase):
-    """Writing the pair beside a real file, and saying so."""
+class _WriteCase(unittest.TestCase):
+    """A completed recording with a video file in a temp tree."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -239,6 +241,11 @@ class WriteTests(unittest.TestCase):
     def _events(self, event_type):
         return RecordingEvent.query.filter_by(
             recording_id=self.rec.id, event_type=event_type).all()
+
+
+
+class WriteTests(_WriteCase):
+    """Writing the pair beside a real file, and saying so."""
 
     def test_nothing_is_written_when_the_feature_is_off(self):
         self.assertFalse(write_sidecar(self.rec.id, self.video, self._cfg(False)))
@@ -303,6 +310,81 @@ class WriteTests(unittest.TestCase):
         db.session.commit()
         self.assertFalse(write_sidecar(self.rec.id, self.video, self._cfg(True)))
         self.assertEqual(os.listdir(self.dvr), ['Race.mp4'])
+
+
+class BackgroundTests(_WriteCase):
+    """dev/changelog/1507: a recording with no TheSportsDB background gets its captured frame as
+    `-fanart`, so a media server's widescreen tiles show the program instead of their fallback."""
+
+    FANART = 'Race-fanart.jpg'
+
+    def _poster_frame(self):
+        from app.recorder import poster_frame_path
+        path = poster_frame_path(self.rec.id, self._cfg())
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as fh:
+            fh.write(b'framebytes')
+
+    def _written(self):
+        with open(os.path.join(self.dvr, 'Race' + NFO_SUFFIX)) as fh:
+            root = ET.fromstring(fh.read())
+        ev = self._events(METADATA_SIDECAR_WRITTEN)[-1]
+        return root, ev
+
+    def _fanart_bytes(self):
+        with open(os.path.join(self.dvr, self.FANART), 'rb') as fh:
+            return fh.read()
+
+    def test_the_captured_frame_is_the_background(self):
+        self._poster_frame()
+        self._thumbnail()
+        write_sidecar(self.rec.id, self.video, self._cfg())
+        root, ev = self._written()
+        self.assertEqual(self._fanart_bytes(), b'framebytes')
+        self.assertEqual(root.findtext('fanart/thumb'), self.FANART)
+        self.assertIn('Race-fanart.jpg as its background (a frame from inside the program)', ev.detail)
+        self.assertEqual(json.loads(ev.extra_data)['fanart_source'], 'frame')
+
+    def test_the_final_frame_is_the_background_when_there_is_no_poster_frame(self):
+        self._thumbnail()
+        write_sidecar(self.rec.id, self.video, self._cfg())
+        root, ev = self._written()
+        self.assertEqual(self._fanart_bytes(), b'jpegbytes')
+        self.assertIn('(the final frame of the recording)', ev.detail)
+        self.assertEqual(json.loads(ev.extra_data)['fanart_source'], 'thumbnail')
+
+    def test_the_poster_stays_the_frame_too(self):
+        self._poster_frame()
+        write_sidecar(self.rec.id, self.video, self._cfg())
+        root, _ = self._written()
+        self.assertEqual(root.findtext('thumb'), 'Race' + POSTER_SUFFIX)
+        with open(os.path.join(self.dvr, 'Race' + POSTER_SUFFIX), 'rb') as fh:
+            self.assertEqual(fh.read(), b'framebytes')
+
+    def test_with_no_image_there_is_no_background_and_an_old_one_is_removed(self):
+        with open(os.path.join(self.dvr, self.FANART), 'wb') as fh:
+            fh.write(b'stale')
+        write_sidecar(self.rec.id, self.video, self._cfg())
+        root, ev = self._written()
+        self.assertIsNone(root.find('fanart'))
+        self.assertFalse(os.path.exists(os.path.join(self.dvr, self.FANART)))
+        self.assertIsNone(json.loads(ev.extra_data)['fanart_source'])
+
+    def test_a_frame_that_cannot_be_copied_falls_to_the_next_and_says_so(self):
+        self._poster_frame()
+        self._thumbnail()
+        real = shutil.copyfile
+
+        def copy(src, dst):
+            if dst.endswith('-fanart.jpg') and 'poster' in os.path.dirname(src):
+                raise PermissionError(13, 'Permission denied')
+            return real(src, dst)
+        with patch('app.metadata_sidecar.shutil.copyfile', side_effect=copy):
+            write_sidecar(self.rec.id, self.video, self._cfg())
+        _, ev = self._written()
+        self.assertEqual(self._fanart_bytes(), b'jpegbytes')
+        self.assertIn('The frame from inside the program could not be copied as the background '
+                      '(Permission denied)', ev.detail)
 
 
 class TeardownTests(unittest.TestCase):

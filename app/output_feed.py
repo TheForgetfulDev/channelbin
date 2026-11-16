@@ -1,6 +1,6 @@
-"""The output feed: ChannelBin as an Xtream/M3U/XMLTV source an IPTV app adds as an account.
+"""The output feed: ChannelBin as an Xtream/M3U/XMLTV source an IPTV player adds as an account.
 
-What the IPTV app sees is the TV Guide - every in-guide channel, and every in-guide group as ONE
+What the IPTV player sees is the TV Guide - every in-guide channel, and every in-guide group as ONE
 channel - with the guide's own listings, and nothing else (dev/docs/DESIGN-output-feed.md).
 This module is the model: the served set and its feed ids, the catalog the Xtream actions
 answer with, the XMLTV writer, and the relay session that plays a channel through
@@ -21,7 +21,7 @@ tests/test_output_feed.py:
   timeline gets a diagnostics event saying what it displaced (section 4.4).
 * The relay is one ffmpeg stream-copying into a fixed-size in-memory ring - no disk, no
   per-client queue, memory a function of config and never of watch time. The reader thread
-  is the one drain of ffmpeg's stdout, so a slow IPTV app can never stall the process; an IPTV app that
+  is the one drain of ffmpeg's stdout, so a slow IPTV player can never stall the process; an IPTV player that
   falls behind by more than the ring is cut REASON_CLIENT_TOO_SLOW (section 4.2).
 * The viewer plays `reserve_seconds` behind live: each chunk is released that long after it
   arrived, so a stall or a failover shorter than the reserve plays through. What the
@@ -37,12 +37,37 @@ tests/test_output_feed.py:
 * In `redirect` mode nothing flows through ChannelBin: a play is a 302 to the member's
   provider URL, re-picked on every tune-in, and ChannelBin never learns the play ended. The
   seats `held_seats` names are subtracted from the recorder's limit where a connection is
-  taken (connection_limits._pool_taken_now), so it never plans on a seat the IPTV app may hold.
+  taken (connection_limits._pool_taken_now), so it never plans on a seat the IPTV player may hold.
+* `mixed` mode relays what needs ChannelBin during a play - a group (failover) and a sports
+  channel (its waiting screen handing over) - and redirects a plain channel; relays() is the
+  one answer. A relayed play sits on one of its account's held seats before the recorder
+  loses another (dev/changelog/1536).
 
-Nothing here feeds a health score or writes a row for a session: a viewer is not an
-observation.
+* A third kind of feed channel is ChannelBin's own: a followed team, or one of a followed
+  league's numbered channels (app/sports_feed.py, dev/changelog/1517). It is not in the TV
+  Guide, its guide is TheSportsDB's schedule, and it plays whichever channel's guide lists
+  the game within the sports window of now (sports_window(), dev/changelog/1529), ranked like
+  a group's members. Its ids start at SPORTS_FEED_BASE.
+  A play with no game on, or a game no guide lists, is shown the channel's waiting screen
+  (start_waiting(), dev/changelog/1534): ChannelBin's own looped clip of what is next, with no
+  provider seat and not counted against max_viewers. A relayed play (proxy mode, and mixed
+  mode for a sports channel) has the game put on in its place when it comes on; a game that is on with no slot or seat free waits on the screen too.
+  A screen that cannot be made is refused by name, with no alert: neither is a fault.
+
+* A channel or a group a person took off the output (`on_output`, written only by
+  set_on_output with its event) is in the TV Guide and not in the feed: gone from every
+  catalog answer, the numbers after it one lower, its feed id unchanged, and a play of it
+  refused by name (dev/changelog/1525).
+* Every play that ended, was refused or was redirected is a line in output_feed_plays, the
+  page's Recent plays. The line is queued in memory and written by one thread of this
+  module's own, never inline: a play ends on threads that may sit inside another writer's
+  transaction, and in the shutdown signal handler, where a database write has no place. A
+  play cut by a restart is therefore in the app log and not in the table.
+
+Nothing here feeds a health score: a viewer is not an observation.
 """
 import hmac
+import json
 import logging
 import os
 import secrets
@@ -57,20 +82,26 @@ from typing import Optional
 from xml.sax.saxutils import escape as xml_escape
 
 from . import connection_limits as connlim
-from .fmt_utils import fmt_bytes, iso_or_none
-from .proc_utils import build_relay_cmd, read_stderr_tail, terminate_or_kill
+from .database import FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED
+from .fmt_utils import counted, fmt_bytes, fmt_duration, iso_or_none
+from .proc_utils import build_relay_cmd, build_screen_play_cmd, read_stderr_tail, terminate_or_kill
 from .url_utils import mask_creds_in_text
 
 log = logging.getLogger(__name__)
 
 MODE_PROXY = 'proxy'
+#: Groups and sports channels through ChannelBin, plain channels redirected (dev/changelog/1536).
+MODE_MIXED = 'mixed'
 MODE_REDIRECT = 'redirect'
-MODES = (MODE_PROXY, MODE_REDIRECT)
+MODES = (MODE_PROXY, MODE_MIXED, MODE_REDIRECT)
 
 STATE_STARTING = 'STARTING'     # ffmpeg launched, nothing relayed yet
 STATE_STREAMING = 'STREAMING'   # bytes have reached the ring
 STATE_STOPPED = 'STOPPED'       # ended; `reason` says why
-STATES = (STATE_STARTING, STATE_STREAMING, STATE_STOPPED)
+#: On a sports channel's waiting screen, ChannelBin's own looped clip: no game to play yet,
+#: no provider seat, and not counted against max_viewers (dev/changelog/1534).
+STATE_WAITING = 'WAITING'
+STATES = (STATE_STARTING, STATE_STREAMING, STATE_WAITING, STATE_STOPPED)
 
 # Why a session ended. Every terminal path names one, and REASON_TEXT is what the dashboard
 # shows for it - a stream that stops says why, or it is a number nobody can explain
@@ -89,14 +120,26 @@ REASON_FAILED_OVER = 'failed_over'
 REASON_NO_MEMBER = 'no_member'
 REASON_SHUTDOWN = 'shutdown'
 REASON_DISABLED = 'disabled'
+REASON_TAKEN_OFF = 'taken_off'
+REASON_STOPPED = 'stopped'
+REASON_ACCOUNT_OFF = 'account_off'
+REASON_SCREEN_FAILED = 'screen_failed'
+REASON_SCREEN_GONE = 'screen_gone'
+REASON_WINDOW_OPENED = 'window_opened'
+
+#: What two of the reasons read as on a sports channel, which has no group.
+SPORTS_REASON_TEXT = {
+    REASON_FAILED_OVER: 'Moved to another channel carrying the game.',
+    REASON_NO_MEMBER: 'Nothing left to play - every channel carrying the game failed or is unavailable.',
+}
 
 REASON_TEXT = {
-    REASON_CLIENT_GONE: 'The IPTV app stopped watching.',
-    REASON_CLIENT_TOO_SLOW: 'Cut - the IPTV app fell further behind than the buffer holds.',
-    REASON_BUFFER_TOO_SMALL: ('Cut - the stream arrived faster than the buffer can hold for this '
-                              'reserve. Lower reserve_seconds or raise buffer_mb in Settings.'),
-    REASON_IDLE: 'Cut - the IPTV app read nothing for a while.',
-    REASON_MAX_DURATION: 'Cut - a session runs for a limited time. The IPTV app can tune in again.',
+    REASON_CLIENT_GONE: 'The IPTV player stopped watching.',
+    REASON_CLIENT_TOO_SLOW: 'Cut - the IPTV player fell further behind than the buffer holds.',
+    REASON_BUFFER_TOO_SMALL: ('Cut - more of the stream arrived at once than the buffer holds. Raise '
+                              '"Memory held for each player" in the IPTV output\'s settings.'),
+    REASON_IDLE: 'Cut - the IPTV player read nothing for a while.',
+    REASON_MAX_DURATION: 'Cut - a session runs for a limited time. The IPTV player can tune in again.',
     REASON_PREEMPTED: 'Cut - a recording needed this connection.',
     REASON_FFMPEG_EXITED: 'The stream ended or dropped.',
     REASON_CONNECT_TIMEOUT: 'Could not connect - the stream sent nothing in time.',
@@ -104,7 +147,14 @@ REASON_TEXT = {
     REASON_FAILED_OVER: 'Moved to another channel in the group.',
     REASON_NO_MEMBER: 'Nothing left to play - every channel in the group failed or is unavailable.',
     REASON_SHUTDOWN: 'Cut - the app is restarting.',
-    REASON_DISABLED: 'Cut - the output feed was turned off.',
+    REASON_DISABLED: 'Cut - the IPTV output was turned off.',
+    REASON_TAKEN_OFF: 'Cut - the channel was taken off the IPTV output.',
+    REASON_STOPPED: 'Stopped from the IPTV Output page.',
+    REASON_ACCOUNT_OFF: 'Cut - its account was switched off for the IPTV output.',
+    REASON_SCREEN_FAILED: 'Cut - the waiting screen stopped playing.',
+    REASON_SCREEN_GONE: 'Cut - the sports channel is no longer on the IPTV output.',
+    REASON_WINDOW_OPENED: ('Ended - the game came on. In redirect mode ChannelBin cannot tune a player in, '
+                           'so the waiting screen stops and the next tune-in gets the game.'),
 }
 
 #: Reads from ffmpeg's stdout are this big; the ring holds whole chunks.
@@ -115,11 +165,33 @@ CONNECT_TIMEOUT_SECONDS = 20.0
 #: Bytes per second of reserve the settings validation assumes, a typical HD stream at
 #: 8 Mbps (design doc section 4.3). The ring must hold the reserve with room to spare.
 RESERVE_BYTES_PER_SECOND = 1_000_000
-#: How much of the ring the reserve may fill before the validation refuses it.
+#: How much of the ring the reserve may fill before the validation refuses it, and how full
+#: the ring gets before a chunk is released ahead of its reserve (Ring.take).
 RESERVE_RING_SHARE = 0.75
+#: How long a tune-in at the viewer cap, or at a seat another play of the output holds, waits
+#: for that play to end before it is refused. An IPTV player changing channel asks for the new
+#: channel before ChannelBin has seen the old connection close: prod measured the old play
+#: ending 2.0 to 3.1 s after the first request for the new one, and every change of channel
+#: was refused three or four times first (dev/docs/BUGS.md 2026-11-12). A play that is really
+#: still being watched is still there after the wait, and the refusal is the same one, this
+#: much later. Waited for, never cut: two players behind one address look like one player
+#: changing channel, and each would end the other's play in turn.
+SWITCH_GRACE_SECONDS = 5.0
+_SWITCH_POLL = 0.05
 #: How many ended sessions and redirects are kept for the dashboard and the bundle.
 _KEEP_ENDED = 20
+#: How long a line of Recent plays is kept, and how often the writer looks for older ones.
+PLAY_LOG_DAYS = 30
+_PRUNE_EVERY_SECONDS = 3600.0
+_LOG_INTERVAL = 0.5
+#: A refusal asked again within this long of the last time is the same line, counted.
+REFUSAL_RUN_GAP = timedelta(hours=1)
 _REAP_INTERVAL = 0.5
+#: How often a play on a sports channel's waiting screen asks again whether its game is on,
+#: and whether what the screen says has changed. Go live now asks at once (recheck_waiting).
+SCREEN_RECHECK_SECONDS = 30.0
+#: What a play's history calls the waiting screen, as the channel it moved from.
+SCREEN_NAME = 'the waiting screen'
 
 #: The one-line body every refused credential gets, whatever the cause (section 6.1).
 AUTH_FAILED_MESSAGE = 'Invalid or missing credentials'
@@ -172,9 +244,81 @@ def credentials_ok(fcfg: dict, username, password) -> bool:
     return hmac.compare_digest(want, got)
 
 
+#: A stream address is built by the player as /live/<username>/<password>/<id>.ts, so neither
+#: half of the login may hold what ends or splits a path.
+LOGIN_BREAKERS = '/?#%\\'
+LOGIN_MAX = 60
+
+
+def login_problem(label: str, value: str) -> str:
+    """Why `value` cannot be the feed's username or password (`label` says which), or ''.
+    The one check, for every route that saves either half."""
+    if len(value) > LOGIN_MAX:
+        return f'The {label} can be at most {LOGIN_MAX} characters.'
+    if any(c.isspace() for c in value) or any(c in LOGIN_BREAKERS for c in value):
+        return (f'The {label} cannot hold a space or any of {" ".join(LOGIN_BREAKERS)} - an IPTV '
+                f'player puts it inside the address of every stream it plays.')
+    return ''
+
+
+#: The lowest and highest value each numeric setting takes. A number outside is moved to the
+#: nearest end by the save, and the page's fields carry the same pair.
+SETTING_BOUNDS = {
+    'xmltv_days': (1, 14),
+    'max_viewers': (1, 99),
+    'reserve_seconds': (0, 120),
+    'idle_seconds': (1, 3600),
+    'max_session_hours': (1, 168),
+    'buffer_mb': (1, 1024),
+    'sports_before_minutes': (0, 720),
+    'sports_after_minutes': (0, 720),
+}
+
+
+def sports_window(fcfg: dict) -> tuple:
+    """(before, after): how far ahead of a game's listing and past its end a sports channel plays
+    the channel that lists it (sports_feed.playing_now, dev/changelog/1529). A missing key is 0,
+    which is the listing's own time; a hand-edited value is held to SETTING_BOUNDS."""
+    out = []
+    for key in ('sports_before_minutes', 'sports_after_minutes'):
+        low, high = SETTING_BOUNDS[key]
+        try:
+            minutes = int(fcfg.get(key) or 0)
+        except (TypeError, ValueError):
+            log.warning('integrations.output_feed.%s is not a whole number (%r); using 0', key, fcfg.get(key))
+            minutes = 0
+        out.append(timedelta(minutes=min(high, max(low, minutes))))
+    return tuple(out)
+
+
 def mode_of(fcfg: dict) -> str:
     mode = fcfg.get('mode') or MODE_PROXY
     return mode if mode in MODES else MODE_PROXY
+
+
+def relays(fcfg: dict, feed_id: int) -> bool:
+    """Whether a play of `feed_id` goes through ChannelBin (a relay session) rather than a 302
+    to the provider. Decided by the feed id's kind alone, so it costs no query: in mixed mode
+    a group and a sports channel are relayed, because failover and a waiting screen handing
+    over happen during a play, where a redirected TV is out of ChannelBin's reach."""
+    mode = mode_of(fcfg)
+    if mode == MODE_PROXY:
+        return True
+    if mode == MODE_REDIRECT:
+        return False
+    if mode == MODE_MIXED:
+        return decode_feed_id(feed_id)[0] != KIND_CHANNEL
+    raise ValueError(f'Unknown feed mode "{mode}"')
+
+
+def relays_some(fcfg: dict) -> bool:
+    """Whether any play goes through ChannelBin in this mode (proxy, mixed)."""
+    return mode_of(fcfg) != MODE_REDIRECT
+
+
+def redirects_some(fcfg: dict) -> bool:
+    """Whether any play is sent straight to the provider in this mode (redirect, mixed)."""
+    return mode_of(fcfg) != MODE_PROXY
 
 
 def allowed_account_ids(fcfg: dict) -> Optional[frozenset]:
@@ -204,15 +348,44 @@ def held_seats_map(fcfg: dict) -> dict:
 
 
 def held_seats_now(account_ids, cfg=None) -> dict:
-    """{account_id: seats the IPTV app may be using} for `account_ids`, non-empty only while the
-    feed is on in redirect mode - the one reader connection_limits subtracts from. `cfg` is
-    the caller's already-loaded config; a caller in a loop hands it in."""
+    """{account_id: seats the IPTV player may be using} for `account_ids` (None: every account),
+    non-empty only while the feed is on in a mode that redirects (redirect, mixed) - the one
+    reader connection_limits subtracts from, which nets out the seats relayed plays already
+    hold. `cfg` is the caller's already-loaded config; a caller in a loop hands it in."""
     fcfg = feed_config(cfg)
-    if not is_enabled(fcfg) or mode_of(fcfg) != MODE_REDIRECT:
+    if not is_enabled(fcfg) or not redirects_some(fcfg):
         return {}
     held = held_seats_map(fcfg)
+    if account_ids is None:
+        return held
     wanted = {a for a in account_ids if a is not None}
     return {a: n for a, n in held.items() if a in wanted}
+
+
+def held_seats_problem(held: dict, cfg: dict) -> str:
+    """Why `held` ({account id: connections recordings leave alone}) cannot be saved, or ''.
+    A number above what the account allows would leave recordings nothing and still not
+    give the IPTV player more than the provider does; an id that names no account is a typo.
+    The one check, for the Settings page and the IPTV Output page alike."""
+    from .database import Account
+    wanted = {}
+    for raw_id, raw_n in (held or {}).items():
+        account_id, n = int(raw_id), int(raw_n)
+        if n > 0:
+            wanted[account_id] = n
+    if not wanted:
+        return ''
+    accounts = Account.query.filter(Account.id.in_(list(wanted))).all()
+    limits = connlim.limits_for_accounts(
+        accounts, (cfg.get('accounts') or {}).get('default_max_connections', 1))
+    names = {a.id: a.name for a in accounts}
+    for account_id, n in sorted(wanted.items()):
+        if account_id not in names:
+            return f'There is no account with id {account_id}.'
+        if n > limits[account_id]:
+            return (f'{names[account_id]} allows {counted(limits[account_id], "connection")} at once, '
+                    f'so recordings cannot leave {n} alone.')
+    return ''
 
 
 def reserve_fits(fcfg: dict) -> bool:
@@ -240,6 +413,13 @@ def max_reserve_seconds(buffer_mb) -> int:
 
 KIND_CHANNEL = 'channel'
 KIND_GROUP = 'group'
+KIND_SPORTS = 'sports'
+
+#: Where sports channels' feed ids start. Channels and groups between them use every integer
+#: from 0 up and may never be renumbered (an IPTV player caches them), so the third kind takes a
+#: range they cannot reach in practice: the first channel id that would land here is
+#: 500,000,000. Below 2**31, since an Xtream client reads a stream id as a 32-bit integer.
+SPORTS_FEED_BASE = 1_000_000_000
 
 
 def feed_id_for_channel(channel_id: int) -> int:
@@ -250,8 +430,14 @@ def feed_id_for_group(group_id: int) -> int:
     return 2 * group_id + 1
 
 
+def feed_id_for_sports(row_id: int) -> int:
+    return SPORTS_FEED_BASE + row_id
+
+
 def decode_feed_id(feed_id: int):
     """(kind, row id) for a feed id - no table needed, which is the point (section 3.3)."""
+    if feed_id >= SPORTS_FEED_BASE:
+        return KIND_SPORTS, feed_id - SPORTS_FEED_BASE
     if feed_id % 2:
         return KIND_GROUP, (feed_id - 1) // 2
     return KIND_CHANNEL, feed_id // 2
@@ -261,8 +447,9 @@ def decode_feed_id(feed_id: int):
 
 @dataclass
 class FeedRow:
-    """One channel as the IPTV app sees it. `row` is the Channel or ChannelGroup behind it,
-    `listings_channel_id` the channel whose EPG rows fill it, `logo_path` the app's own
+    """One channel as the IPTV player sees it. `row` is the Channel, ChannelGroup or
+    sports_feed.Served behind it, `listings_channel_id` the channel whose EPG rows fill it
+    (None for a sports channel, whose guide is its schedule), `logo_path` the app's own
     logo route or '' (never a provider URL, which may carry credentials)."""
     feed_id: int
     kind: str
@@ -273,6 +460,26 @@ class FeedRow:
     row: object = field(repr=False)
     listings_channel_id: Optional[int]
     members: list = field(default_factory=list, repr=False)
+    # False when a person took the row off the output (set_on_output).
+    on_output: bool = True
+    # Why the row is not offered at all though its switch is on, '' when it is: its account
+    # is one the output may not play from.
+    left_out: str = ''
+    # Why a play of it would be refused right now, '' when one would start.
+    why_none: str = ''
+    # The channel a play would start from right now, for the page's view only (`everything`):
+    # the channel itself, or the member a group would pick. None when nothing would play.
+    plays: object = field(default=None, repr=False)
+
+    @property
+    def offered(self) -> bool:
+        return self.on_output and not self.left_out
+
+
+#: Why a channel whose switch is on is still not offered (FeedRow.left_out).
+LEFT_OUT_ACCOUNT = 'its account is one the IPTV output is not allowed to play from'
+#: Why a play of a row a person took off the output is refused (Play.why_none).
+WHY_TAKEN_OFF = 'it was taken off the IPTV output'
 
 
 def _members_for_feed(group, blocked, allowed):
@@ -316,18 +523,23 @@ def _group_lead(group, members, latest_by_channel, blocked):
     return next((m.channel for m in group.memberships), None)
 
 
-def catalog(cfg=None) -> list:
+def catalog(cfg=None, everything: bool = False) -> list:
     """Every feed row in the guide's order: the in-guide channels and the in-guide groups,
-    interleaved by their shared guide_sort_order (channel_groups.guide_row_sort_key). A
-    fixed number of queries whatever the guide holds: the channels, the groups with their
-    members and accounts, the members' latest health checks, the blocked accounts.
+    interleaved by their shared guide_sort_order (channel_groups.guide_row_sort_key), then
+    ChannelBin's own sports channels by league (sports_feed.served_channels). A fixed number
+    of queries whatever the guide holds: the channels, the groups with their members and
+    accounts, the members' latest health checks, the blocked accounts, the sports channels.
 
     A channel on an account the allowlist excludes is not served; a group is served even
     when nothing in it is playable right now - the play is what refuses, by name
-    (FEED_NO_MEMBER), so the IPTV app's list does not silently shrink. A group's members are
-    never listed individually: they are its failover set."""
+    (FEED_NO_MEMBER), so the IPTV player's list does not silently shrink. A group's members are
+    never listed individually: they are its failover set. A row a person took off the output
+    is not served either, and takes no number, so the rows after it move up.
+
+    `everything` is the IPTV Output page's view: the rows that are not offered come back too,
+    with `num` 0 and the reason on the row (`on_output`, `left_out`), from the same queries."""
     from .channel_groups import (blocked_account_ids_now, guide_listings_member,
-                                 guide_row_sort_key, member_eager_options)
+                                 guide_row_sort_key, member_eager_options, serving_member)
     from .database import Channel, ChannelGroup
     from .routes.channel_tests import _latest_tests_by_channel
 
@@ -342,26 +554,38 @@ def catalog(cfg=None) -> list:
 
     entries = []
     for ch in channels:
-        if allowed is not None and ch.account_id not in allowed:
-            continue
+        left_out = (LEFT_OUT_ACCOUNT if allowed is not None and ch.account_id not in allowed
+                    else '')
         entries.append((guide_row_sort_key(ch), FeedRow(
             feed_id=feed_id_for_channel(ch.id), kind=KIND_CHANNEL, num=0, name=ch.name,
             category=(ch.category_name or '').strip() or UNCATEGORIZED,
-            logo_path=_logo_path(ch), row=ch, listings_channel_id=ch.id)))
+            logo_path=_logo_path(ch), row=ch, listings_channel_id=ch.id,
+            on_output=bool(ch.on_output), left_out=left_out,
+            plays=None if left_out else ch)))
     for g in groups:
-        members, _why = _members_for_feed(g, blocked, allowed)
+        members, why = _members_for_feed(g, blocked, allowed)
         lead = _group_lead(g, members, latest, blocked)
         listings = guide_listings_member(g) or lead
+        plays = None
+        if everything and members:
+            plays = serving_member(g, latest, blocked_account_ids=blocked, members=members).member
         entries.append((guide_row_sort_key(g), FeedRow(
             feed_id=feed_id_for_group(g.id), kind=KIND_GROUP, num=0, name=g.name,
             category=((lead.category_name or '').strip() if lead else '') or UNCATEGORIZED,
             logo_path=_logo_path(lead), row=g,
-            listings_channel_id=listings.id if listings else None, members=members)))
+            listings_channel_id=listings.id if listings else None, members=members,
+            on_output=bool(g.on_output), why_none=why, plays=plays)))
     entries.sort(key=lambda e: e[0])
     rows = [e[1] for e in entries]
-    for n, row in enumerate(rows, start=1):
+    from . import sports_feed
+    for served in sports_feed.served_channels():
+        rows.append(FeedRow(
+            feed_id=feed_id_for_sports(served.row.id), kind=KIND_SPORTS, num=0, name=served.name,
+            category=served.league.name, logo_path='', row=served, listings_channel_id=None))
+    offered = [row for row in rows if row.offered]
+    for n, row in enumerate(offered, start=1):
         row.num = n
-    return rows
+    return rows if everything else offered
 
 
 def categories(rows) -> list:
@@ -425,7 +649,7 @@ def stream_url(base_url: str, fcfg: dict, feed_id: int) -> str:
 
 def m3u_text(rows, base_url: str, fcfg: dict) -> str:
     """get.php as m3u_plus: tvg-id is the feed id string, the URL is the feed's own stream
-    URL in both modes - a redirect happens on play, so no provider URL is ever listed."""
+    URL in every mode - a redirect happens on play, so no provider URL is ever listed."""
     lines = ['#EXTM3U']
     for row in rows:
         logo = f'{base_url}{row.logo_path}' if row.logo_path else ''
@@ -485,6 +709,18 @@ def xmltv_lines(rows, cfg=None, now: Optional[datetime] = None):
             for feed_id in feed_ids_by_channel[channel_id]:
                 yield (f'  <programme start="{_xmltv_time(start)}" stop="{_xmltv_time(stop)}" '
                        f'channel="{feed_id}">{body}</programme>\n')
+    sports = [row.row for row in rows if row.kind == KIND_SPORTS]
+    if sports:
+        from . import sports_feed
+        from .channel_groups import blocked_account_ids_now
+        for program in sports_feed.guide_programs(sports, now, days, blocked=blocked_account_ids_now(),
+                                                  allowed=allowed_account_ids(fcfg)):
+            yield (f'  <programme start="{_xmltv_time(program.start)}" '
+                   f'stop="{_xmltv_time(program.stop)}" '
+                   f'channel="{feed_id_for_sports(program.row_id)}">'
+                   f'<title>{xml_escape(program.title)}</title>'
+                   f'<desc>{xml_escape(program.description)}</desc>'
+                   f'<category>{xml_escape(program.category)}</category></programme>\n')
     yield '</tv>\n'
 
 
@@ -502,19 +738,78 @@ class FeedRefused(Exception):
 @dataclass
 class Play:
     """What one feed id resolves to right now: the member to play, and the group it came
-    from when it is one. `why_none` names the reason when `member` is None."""
+    from when it is one. `why_none` names the reason when `member` is None. A sports
+    channel's play carries the game it is (`event_id`), and `fault` is False when having
+    nothing to play is an ordinary state - no game on, or one no guide lists - that is
+    refused by name and raises no alert."""
     feed_id: int
     label: str
     member: object = field(default=None, repr=False)
     group: object = field(default=None, repr=False)
     why_none: str = ''
+    sports: bool = False
+    event_id: Optional[int] = None
+    fault: bool = True
+    #: A sports play taken from outside its listing's own time says so here (sports window,
+    #: dev/changelog/1529). Kept off `label`, which a proxy session keeps for its whole life.
+    note: str = ''
+    #: A sports play's channel (sports_feed.Served) and what it has on (sports_feed.NowPlaying),
+    #: which its waiting screen is drawn from.
+    served: object = field(default=None, repr=False)
+    found: object = field(default=None, repr=False)
 
 
-def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset()) -> Optional[Play]:
+def _resolve_sports_play(feed_id: int, row_id: int, allowed, exclude_ids, event_id, now,
+                         window: tuple) -> Optional[Play]:
+    """A sports channel's play: the game on now and the best channel whose guide lists it,
+    with the same drops in the same order as a group's members - blocked accounts, the
+    allowlist, what already failed - and the same ranking (channel_groups.rank_members)."""
+    from . import sports_feed
+    from .account_blocks import split_blocked
+    from .channel_groups import blocked_account_ids_now, pick_best_member
+    from .routes.channel_tests import _latest_tests_by_channel
+    from .sports_data import event_game_name
+
+    served = sports_feed.served_channels(row_id)
+    if not served:
+        return None
+    play = Play(feed_id, f'sports channel {row_id} ({served[0].name})', sports=True)
+    before, after = window
+    found = sports_feed.playing_now(served[0], now or datetime.utcnow(), event_id=event_id,
+                                    before=before, after=after)
+    play.served, play.found = served[0], found
+    if not found.channels:
+        play.why_none = found.why_none
+        play.fault = False
+        return play
+    game = event_game_name(found.event)
+    play.event_id = found.event.id
+    play.label = f'{play.label}: {game}'
+    play.note = found.note
+    kept, _skipped = split_blocked(found.channels, blocked_account_ids_now())
+    if not kept:
+        play.why_none = f'every channel whose guide lists {game} is on a blocked account'
+        return play
+    if allowed is not None:
+        kept = [m for m in kept if m.account_id in allowed]
+        if not kept:
+            play.why_none = (f'every channel whose guide lists {game} is on an account the output '
+                             f'feed is not allowed to serve from')
+            return play
+    play.member = pick_best_member(kept, _latest_tests_by_channel([m.id for m in kept]),
+                                   exclude_ids=exclude_ids)
+    if play.member is None:
+        play.why_none = f'every channel whose guide lists {game} already failed this play'
+    return play
+
+
+def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int = None,
+                 now: Optional[datetime] = None) -> Optional[Play]:
     """The member `feed_id` plays right now, or None when the id names nothing served.
     A group is re-asked here on every tune-in and every failover (`exclude_ids` drops the
-    members that already failed this play), so the IPTV app always gets the member a recording
-    would start from (channel_groups.serving_member, the one spelling)."""
+    members that already failed this play), so the IPTV player always gets the member a recording
+    would start from (channel_groups.serving_member, the one spelling). `event_id` holds a
+    sports channel's failover to the game its play started on."""
     from .channel_groups import blocked_account_ids_now, serving_member
     from .database import Channel, ChannelGroup
     from .routes.channel_tests import _latest_tests_by_channel
@@ -523,11 +818,17 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset()) -> Optional[Pl
     fcfg = feed_config(cfg)
     allowed = allowed_account_ids(fcfg)
     kind, row_id = decode_feed_id(feed_id)
+    if kind == KIND_SPORTS:
+        return _resolve_sports_play(feed_id, row_id, allowed, exclude_ids, event_id, now,
+                                    sports_window(fcfg))
     if kind == KIND_CHANNEL:
         ch = db.session.get(Channel, row_id)
         if ch is None or not ch.in_guide:  # guide-flag-read-ok: a feed id for a channel is its own guide row and nothing else
             return None
         play = Play(feed_id, f'channel {ch.id} ({ch.name})')
+        if not ch.on_output:
+            play.why_none, play.fault = WHY_TAKEN_OFF, False
+            return play
         if allowed is not None and ch.account_id not in allowed:
             play.why_none = 'its account is one the output feed is not allowed to serve from'
             return play
@@ -540,6 +841,9 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset()) -> Optional[Pl
     if group is None or not group.in_guide:
         return None
     play = Play(feed_id, f'group {group.id} ({group.name})', group=group)
+    if not group.on_output:
+        play.why_none, play.fault = WHY_TAKEN_OFF, False
+        return play
     blocked = blocked_account_ids_now()
     members, why = _members_for_feed(group, blocked, allowed)
     if not members:
@@ -560,24 +864,33 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset()) -> Optional[Pl
 class Ring:
     """A fixed-size queue of arrival-stamped chunks between the reader thread and the one
     HTTP response. The reader appends; when the total passes `capacity` the oldest chunks
-    are dropped and `dropped` counts the bytes, which is how an IPTV app that stopped reading is
+    are dropped and `dropped` counts the bytes, which is how an IPTV player that stopped reading is
     noticed (REASON_CLIENT_TOO_SLOW) rather than queued for. `take()` hands the consumer
     the oldest chunk once it has aged `reserve` seconds, so the viewer plays that far behind
     live and a gap shorter than it plays through (section 4.3).
 
+    The reserve gives way to the ring, never the other way round: once the ring is fuller
+    than `pressure`, the oldest chunk is released whatever its age, and `released_early`
+    counts those bytes. A provider opens a connection with 13 to 29 seconds of the channel at
+    once (dev/changelog/942, 997), and holding all of that for the reserve in a ring it does
+    not fit lost the head of the stream before the viewer could be given any of it - every
+    play of an HD channel ended at nothing sent (dev/docs/BUGS.md 2026-11-12). A viewer on
+    less reserve than was asked for is still watching.
+
     `dropped_unripe` is the part of `dropped` that was evicted before it had aged the
-    reserve - bytes the viewer could not have taken yet. Those say the ring is too small for
-    the reserve at the stream's real bitrate (REASON_BUFFER_TOO_SMALL), not that the viewer
-    is slow: the settings validation assumes RESERVE_BYTES_PER_SECOND, and a stream above it
-    fills the ring before its head is ever releasable, so the viewer gets nothing at all."""
+    reserve: more arrived inside the reserve than the ring holds, faster than the viewer took
+    what the pressure released (REASON_BUFFER_TOO_SMALL). The rest of `dropped` had been the
+    viewer's to take for a while (REASON_CLIENT_TOO_SLOW)."""
 
     def __init__(self, capacity: int, reserve: float):
         self.capacity = max(int(capacity), READ_CHUNK)
         self.reserve = max(float(reserve), 0.0)
+        self.pressure = int(self.capacity * RESERVE_RING_SHARE)
         self._chunks: deque = deque()
         self.size = 0
         self.dropped = 0
         self.dropped_unripe = 0
+        self.released_early = 0
         self.total_in = 0
         self._cv = threading.Condition()
 
@@ -596,17 +909,20 @@ class Ring:
             self._cv.notify_all()
 
     def take(self, timeout: float, now: Optional[float] = None) -> Optional[bytes]:
-        """The oldest chunk once it is `reserve` old, or None after `timeout` with
-        nothing releasable."""
+        """The oldest chunk once it is `reserve` old, or sooner while the ring is fuller
+        than `pressure`; None after `timeout` with nothing releasable."""
         deadline = (time.monotonic() if now is None else now) + timeout
         with self._cv:
             while True:
                 now = time.monotonic()
                 if self._chunks:
                     arrived, data = self._chunks[0]
-                    if arrived + self.reserve <= now:
+                    ripe = arrived + self.reserve <= now
+                    if ripe or self.size > self.pressure:
                         self._chunks.popleft()
                         self.size -= len(data)
+                        if not ripe:
+                            self.released_early += len(data)
                         return data
                     wait = min(arrived + self.reserve - now, deadline - now)
                 else:
@@ -617,8 +933,8 @@ class Ring:
 
     def untaken_age(self, now: Optional[float] = None) -> float:
         """How long the oldest chunk has been releasable and still not taken - the one
-        measure of an IPTV app that has stopped reading. Zero while nothing is releasable, so a
-        provider that stopped sending never reads as an idle IPTV app."""
+        measure of an IPTV player that has stopped reading. Zero while nothing is releasable, so a
+        provider that stopped sending never reads as an idle IPTV player."""
         now = time.monotonic() if now is None else now
         with self._cv:
             if not self._chunks:
@@ -627,6 +943,13 @@ class Ring:
 
     def wake(self) -> None:
         with self._cv:
+            self._cv.notify_all()
+
+    def set_reserve(self, reserve: float) -> None:
+        """A new reserve from the next chunk on: a waiting screen plays on none, and the game
+        it moves to on the configured one."""
+        with self._cv:
+            self.reserve = max(float(reserve), 0.0)
             self._cv.notify_all()
 
     def clear(self) -> None:
@@ -640,8 +963,8 @@ class Ring:
 class RelaySession:
     id: str
     feed_id: int
-    label: str                       # what the IPTV app asked for: 'channel 5 (CNN)' or 'group 2 (...)'
-    client: str                      # the IPTV app's address
+    label: str                       # what the IPTV player asked for: 'channel 5 (CNN)' or 'group 2 (...)'
+    client: str                      # the IPTV player's address
     group_id: Optional[int]
     channel_id: int
     channel_name: str
@@ -672,17 +995,58 @@ class RelaySession:
     preempted: bool = False
     preempted_by: Optional[int] = None
     login_id: Optional[int] = None
+    # The game a sports channel's play is, which a failover is held to; None for anything else.
+    event_id: Optional[int] = None
+    # Whether another channel can take over when the one playing dies: a group, a sports channel.
+    fails_over: bool = False
     app: Optional[object] = field(default=None, repr=False)
+    # A sports channel's waiting screen (dev/changelog/1534). The row it is drawn for, the clip
+    # playing and its cache key, whether that clip is the quick still, what it shows
+    # (sports_screen.STATE_*, and HELD_* when a game that is on cannot start), the game it waits
+    # for, and when the play went to the game.
+    sports_row_id: Optional[int] = None
+    reserve_seconds: float = 0.0
+    screen_path: str = ''
+    screen_key: str = ''
+    screen_still: bool = False
+    screen_state: str = ''
+    screen_held: Optional[str] = None
+    waiting_for: str = ''
+    left_screen_at: Optional[datetime] = None
+    screen_seconds: float = 0.0
+    # Counted against max_viewers while the play takes a slot to leave the screen for the game.
+    slot_claimed: bool = False
+    # Ask again now, not at the next SCREEN_RECHECK_SECONDS (recheck_waiting, Go live now).
+    recheck_due: bool = False
+    last_recheck_mono: float = 0.0
+    _reserve_short_logged: bool = False
     _finishing: bool = False
     _teardown_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _failing_over: bool = False
+    # Held by whatever swaps what the play is playing: one swap at a time.
+    _swap_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _rechecking: bool = False
 
     @property
     def live(self) -> bool:
         return self.state != STATE_STOPPED
 
+    @property
+    def waiting(self) -> bool:
+        return self.state == STATE_WAITING
+
+    @property
+    def counted(self) -> bool:
+        """Whether the play counts against max_viewers: every live one but a play on the
+        waiting screen that is not taking a slot to leave it."""
+        return self.live and (self.state != STATE_WAITING or self.slot_claimed)
+
     def reason_text(self) -> str:
-        return REASON_TEXT.get(self.reason, '') if self.reason else ''
+        if not self.reason:
+            return ''
+        if self.event_id is not None and self.reason in SPORTS_REASON_TEXT:
+            return SPORTS_REASON_TEXT[self.reason]
+        return REASON_TEXT.get(self.reason, '')
 
     def to_dict(self) -> dict:
         now = time.monotonic()
@@ -695,13 +1059,28 @@ class RelaySession:
             'elapsed_seconds': round(now - self.started_mono, 1) if self.started_mono else 0,
             'started_at': self.started_at, 'ended_at': self.ended_at,
             'failovers': list(self.failovers),
+            'waiting': self.waiting, 'waiting_for': self.waiting_for,
+            'screen_state': self.screen_state, 'screen_held': self.screen_held,
+            'left_screen_at': self.left_screen_at,
+            'screen_seconds': round(self._screen_seconds(now), 1),
         }
+
+    def _screen_seconds(self, now: float) -> float:
+        """How long the play has been on the waiting screen, up to `now`."""
+        if self.state == STATE_WAITING and self.started_mono:
+            return max(0.0, now - self.started_mono)
+        return self.screen_seconds
 
 
 _lock = threading.Lock()
 _sessions: dict = {}          # session id -> RelaySession, live ones and the last few ended
 _redirects: list = []         # the last _KEEP_ENDED redirect-mode plays, oldest first
+_refused: dict = {}           # (feed id, message) -> the last _KEEP_ENDED refused plays
 _reaper: Optional[threading.Thread] = None
+_play_queue: list = []        # lines of Recent plays waiting for the writer thread
+_log_writer: Optional[threading.Thread] = None
+_log_kick = threading.Event()   # ends the writer's wait early (discard_play_log)
+_last_prune_mono: Optional[float] = None
 
 
 def live_sessions() -> list:
@@ -720,6 +1099,38 @@ def recent_redirects() -> list:
         return list(reversed(_redirects))
 
 
+def recent_refused() -> list:
+    """The refused plays, newest first: what was asked for, why it was refused, when it last
+    was and how many times. An IPTV player retries a refused play every half minute, so a
+    standing reason is one row that counts, not a row per try."""
+    with _lock:
+        return sorted(_refused.values(), key=lambda r: r['at'], reverse=True)
+
+
+def _note_refused(feed_id: int, label: str, client: str, message: str) -> None:
+    with _lock:
+        row = _refused.get((feed_id, message))
+        if row is None:
+            row = _refused[(feed_id, message)] = {
+                'feed_id': feed_id, 'label': label, 'message': message, 'count': 0,
+                'first_at': datetime.utcnow()}
+        row.update(at=datetime.utcnow(), client=client, count=row['count'] + 1)
+        for key in sorted(_refused, key=lambda k: _refused[k]['at'])[:-_KEEP_ENDED]:
+            del _refused[key]
+    _queue_play(None, {'kind': FEED_PLAY_REFUSED, 'at': datetime.utcnow(), 'feed_id': feed_id,
+                       'label': label, 'client': client, 'message': message})
+
+
+def _refuse_nothing_on(play: Play, client: str):
+    """Refuse a play that has nothing to start and is not a fault - a sports channel between
+    games, a row a person took off the output: named in the refused plays and the log, and
+    no alert."""
+    message = f'Nothing to play for {play.label}: {play.why_none}.'
+    _note_refused(play.feed_id, play.label, client, message)
+    log.info('Viewer from %s refused: %s', client, message)
+    raise FeedRefused(message, 409)
+
+
 def get_session(session_id: str) -> Optional[RelaySession]:
     with _lock:
         return _sessions.get(session_id)
@@ -733,94 +1144,145 @@ def _prune_ended_locked():
             _sessions.pop(s.id, None)
 
 
-def _refuse(feed_id: int, label: str, message: str, status: int, source_tail: str):
+def _refuse(feed_id: int, label: str, message: str, status: int, source_tail: str,
+            client: str = ''):
     """Raise FeedRefused after an INFO alert, once per standing condition: the measured
-    client reconnects every 27 s, so one open alert per feed id and cause, not one per try."""
+    client reconnects every 27 s, so one open alert per feed id and cause, not one per try.
+    The refusal is also kept in the refused plays."""
     from .alerts import create_alert, has_open_alert
+    _note_refused(feed_id, label, client, message)
     source = f'feed:{feed_id}:{source_tail}'
     alert_type = 'FEED_NO_MEMBER' if source_tail == 'no-member' else 'VIEWER_REFUSED'
     if not has_open_alert(alert_type, source):
         title = (f'Output feed: nothing to play for {label}' if alert_type == 'FEED_NO_MEMBER'
-                 else f'Output feed: an IPTV app was refused {label}')
+                 else f'Output feed: an IPTV player was refused {label}')
         create_alert(alert_type, title, body=message, source=source)
     raise FeedRefused(message, status)
 
 
 def start_session(feed_id: int, client: str, cfg=None) -> RelaySession:
-    """Start relaying `feed_id` to one IPTV app. Raises FeedRefused with a user-facing message:
+    """Start relaying `feed_id` to one IPTV player. Raises FeedRefused with a user-facing message:
     404 for an id the feed does not serve, 503 at the viewer cap, 409 when nothing is
     playable (a blocked account, the allowlist, the connection limit) and 500 when ffmpeg
     could not start. Requires an app context; the returned session is registered and reaped.
     """
     from flask import current_app
     from .config import load_config
-    from .recorder import resolve_capture_pacing
 
     cfg = cfg or load_config()
     fcfg = feed_config(cfg)
     play = resolve_play(feed_id, cfg)
     if play is None:
         raise FeedRefused('No such channel on this feed', 404)
+    if play.sports and play.member is None and not play.fault:
+        return start_waiting(play, client, cfg)
+    if play.member is None and not play.fault:
+        _refuse_nothing_on(play, client)
     if play.member is None:
         _refuse(feed_id, play.label, f'Nothing to play for {play.label}: {play.why_none}.',
-                409, 'no-member')
+                409, 'no-member', client)
 
     member = play.member
     cap = int(fcfg.get('max_viewers') or 1)
-    pace, _source = resolve_capture_pacing(cfg, member.pace_realtime, 0)
     session = RelaySession(
         id=secrets.token_urlsafe(12), feed_id=feed_id, label=play.label, client=client,
         group_id=play.group.id if play.group is not None else None,
         channel_id=member.id, channel_name=member.name, account_id=member.account_id,
-        ring=Ring(int(fcfg.get('buffer_mb') or 16) * 1024 * 1024,
+        ring=Ring(int(fcfg.get('buffer_mb') or 64) * 1024 * 1024,
                   float(fcfg.get('reserve_seconds') or 0)),
-        idle_timeout=float(fcfg.get('idle_seconds') or 30),
-        max_seconds=float(fcfg.get('max_session_hours') or 12) * 3600,
-        stall_timeout=float((cfg.get('watchdog') or {}).get('stall_timeout_seconds') or 30),
-        pace_realtime=pace, started_mono=time.monotonic(),
+        **_session_limits(cfg, fcfg),
+        started_mono=time.monotonic(),
+        event_id=play.event_id, fails_over=play.group is not None or play.sports,
         app=current_app._get_current_object(),
     )
     # The cap is counted and the session registered under the ONE lock, so two tune-ins in
     # the same instant cannot both pass the count (the check-then-act shape
     # .claude/rules/background-jobs.md names). Registered BEFORE the seat is taken, so a
     # recording preempting in the window between acquire and Popen finds something to flag.
-    with _lock:
-        live = sum(1 for s in _sessions.values() if s.live)
-        if live < cap:
-            _sessions[session.id] = session
-            _prune_ended_locked()
+    # A play on a waiting screen is not counted: it holds no seat and plays ChannelBin's own
+    # clip (dev/changelog/1534).
+    deadline = time.monotonic() + SWITCH_GRACE_SECONDS
+    while True:
+        with _lock:
+            live = sum(1 for s in _sessions.values() if s.counted)
+            if live < cap:
+                _sessions[session.id] = session
+                _prune_ended_locked()
+        if live < cap or time.monotonic() >= deadline:
+            break
+        time.sleep(_SWITCH_POLL)
     if live >= cap:
+        if play.sports:
+            # A game that is on and cannot start here yet waits on the screen, which says
+            # why and starts the game by itself when a slot is free.
+            return start_waiting(play, client, cfg, held=_screen_mod().HELD_NO_SLOT)
         _refuse(feed_id, play.label,
-                f'The output feed is at its viewer cap ({cap} at once). Stop another IPTV app '
-                f'or raise the cap in Settings.', 503, 'cap')
-    _launch(session, member, cfg, first=True)
+                f'The IPTV output is already playing to as many IPTV players as it allows at once '
+                f'({cap}). Stop one, or raise "IPTV players at once" in the IPTV output\'s settings.',
+                503, 'cap', client)
+    try:
+        _launch(session, member, cfg, first=True, seat_deadline=deadline, hold=play.sports)
+    except _SeatHeld:
+        with _lock:
+            _sessions.pop(session.id, None)
+        return start_waiting(play, client, cfg, held=_screen_mod().HELD_NO_CONNECTION)
     _ensure_reaper()
-    log.info('Viewer %s from %s: %s playing channel %d (%s) on account %d', session.id,
-             client, session.label, member.id, member.name, member.account_id)
+    log.info('Viewer %s from %s: %s playing channel %d (%s) on account %d%s', session.id,
+             client, session.label, member.id, member.name, member.account_id,
+             f' ({play.note})' if play.note else '')
     return session
 
 
-def _take_seat(session: RelaySession, member, first: bool) -> bool:
+def _session_limits(cfg: dict, fcfg: dict) -> dict:
+    """The RelaySession fields every play takes from the settings."""
+    return {'idle_timeout': float(fcfg.get('idle_seconds') or 30),
+            'max_seconds': float(fcfg.get('max_session_hours') or 12) * 3600,
+            'stall_timeout': float((cfg.get('watchdog') or {}).get('stall_timeout_seconds') or 30),
+            'reserve_seconds': float(fcfg.get('reserve_seconds') or 0)}
+
+
+class _SeatHeld(Exception):
+    """A sports play's first seat was refused: the play waits on the screen instead of being
+    refused. Raised by _launch(hold=True) with nothing to tear down."""
+
+
+def _take_seat(session: RelaySession, member, first: bool, deadline: float = 0.0) -> bool:
     """A seat for `member`'s account: a fresh one on the first play, the seat already held
     on a failover within the account, or that seat moved across accounts in one step
     (connection_limits.move_seat - never release-then-acquire, which can leave the session
-    holding nothing)."""
+    holding nothing). A first play refused the seat asks again until `deadline` while another
+    play of the output is live: that is the channel an IPTV player is changing from, about
+    to let its seat go (SWITCH_GRACE_SECONDS). With no other play the refusal is at once."""
     if first:
-        return connlim.try_acquire(member.account_id, 'viewer', session.id)
+        while True:
+            if connlim.try_acquire(member.account_id, 'viewer', session.id):
+                return True
+            # Any other play, not only one on this account: two accounts can be one login
+            # and so one seat (app/account_links.py).
+            with _lock:
+                leaving = any(s.counted and s is not session for s in _sessions.values())
+            if not leaving or time.monotonic() >= deadline:
+                return False
+            time.sleep(_SWITCH_POLL)
     if member.account_id == session.account_id:
         return True
     return connlim.move_seat('viewer', session.id, session.account_id, member.account_id)
 
 
-def _launch(session: RelaySession, member, cfg, first: bool = True) -> None:
+def _launch(session: RelaySession, member, cfg, first: bool = True,
+            seat_deadline: float = 0.0, hold: bool = False) -> None:
     """Take the seat and start ffmpeg on `member`, wiring its stdout to the ring through a
     reader thread. Raises FeedRefused; on the first play the session is finished first and
-    the refusal alert raised, on a failover the caller decides what the refusal means."""
+    the refusal alert raised, on a failover the caller decides what the refusal means. With
+    `hold`, a first play refused its seat raises _SeatHeld and touches nothing."""
     from .account_blocks import blocked_reason
     from .account_links import render_held_login
     from .config import load_config
+    from .recorder import resolve_capture_pacing
 
-    if not _take_seat(session, member, first):
+    if not _take_seat(session, member, first, seat_deadline):
+        if first and hold:
+            raise _SeatHeld()
         account_name = member.account.name if member.account else f'account {member.account_id}'
         blocked = blocked_reason(member.account_id, account_name, capital=True)
         if blocked:
@@ -831,15 +1293,29 @@ def _launch(session: RelaySession, member, cfg, first: bool = True) -> None:
                       + (f' ({who} is using it)' if who else '') + '.')
         if first:
             _finish(session, REASON_LAUNCH_FAILED, detail=detail)
-            _refuse(session.feed_id, session.label, detail, 409, 'seat')
+            _refuse(session.feed_id, session.label, detail, 409, 'seat', session.client)
         raise FeedRefused(detail, 409)
 
-    session.channel_id = member.id
-    session.channel_name = member.name
-    session.account_id = member.account_id
+    # The account is named and the seat confirmed in one hold of the lock: a recording finds
+    # the plays it preempts by account (preempt_for_account), so a seat it stripped before the
+    # account was named here would otherwise go unnoticed and the play would relay on a
+    # connection it does not hold (dev/docs/BUGS.md 2026-11-15 01:36 PM). A first play is
+    # registered under its account before its seat is asked for and needs no second look.
+    with _lock:
+        session.channel_id = member.id
+        session.channel_name = member.name
+        session.account_id = member.account_id
+        seated = first or session.id in connlim.seated_holder_ids('viewer')
+    if not seated:
+        _finish(session, REASON_PREEMPTED,
+                detail=f'a recording took the connection as the play was moving to "{member.name}"')
+        raise FeedRefused(REASON_TEXT[REASON_PREEMPTED], 409)
     launch_url, session.login_id = render_held_login(member.stream_url, member.account_id,
                                                      'viewer', session.id)
     cfg = cfg or load_config()
+    # Asked of the member being launched, never carried over from the play's first one: a
+    # failover and a game put on from the waiting screen get that channel's own answer.
+    session.pace_realtime, _source = resolve_capture_pacing(cfg, member.pace_realtime, 0)
     cmd = build_relay_cmd(cfg, launch_url, pace_realtime=session.pace_realtime)
     log.info('Viewer %s: launching %s', session.id, mask_creds_in_text(' '.join(cmd)))
     try:
@@ -858,32 +1334,42 @@ def _launch(session: RelaySession, member, cfg, first: bool = True) -> None:
             _finish(session, REASON_LAUNCH_FAILED, detail=detail)
         raise FeedRefused(f'Could not start ffmpeg: {detail}', 500)
 
+    reader = _adopt(session, proc)
+    if reader is None:
+        # The seat taken above is this play's whatever _finish() released before it.
+        connlim.release(member.account_id, 'viewer', session.id)
+        if session.preempted:
+            _finish(session, REASON_PREEMPTED)
+            raise FeedRefused(REASON_TEXT[REASON_PREEMPTED], 409)
+        raise FeedRefused(REASON_TEXT[REASON_CLIENT_GONE], 409)
+
+
+def _adopt(session: RelaySession, proc: subprocess.Popen) -> Optional[threading.Thread]:
+    """Make a just-started ffmpeg the session's and start its reader, or kill it and return
+    None. The session may have ended while ffmpeg was launching: a recording took the seat, or
+    the IPTV player closed the response and _finish() is tearing down or has torn down. A
+    session _finish() has claimed is still live until its teardown is done, so the claim is
+    what is tested: an ffmpeg adopted after _finish() read the session's process would be one
+    nothing ever kills (dev/docs/BUGS.md 2026-11-13)."""
     reader = threading.Thread(target=_read_loop, args=(session, proc), daemon=True,
                               name=f'relay-{session.id}')
     with _lock:
-        # The session may have ended while ffmpeg was launching: a recording took the seat,
-        # or (on a failover) the IPTV app closed the response and _finish() already released
-        # everything. Either way the new ffmpeg is never adopted - a process nothing tracks
-        # is the one shape the teardown rule forbids.
-        adopt = session.live and not session.preempted
+        adopt = session.live and not session._finishing and not session.preempted
         if adopt:
             session.proc = proc
             session.reader = reader
             session.launched_mono = time.monotonic()
-        preempted = session.preempted
     if not adopt:
-        terminate_or_kill(proc)
+        terminate_or_kill(proc, hard=True)
         _remove_stderr(session)
-        if preempted:
-            _finish(session, REASON_PREEMPTED)
-            raise FeedRefused(REASON_TEXT[REASON_PREEMPTED], 409)
-        raise FeedRefused(REASON_TEXT[REASON_CLIENT_GONE], 409)
+        return None
     reader.start()
+    return reader
 
 
 def _read_loop(session: RelaySession, proc: subprocess.Popen) -> None:
     """Drain ffmpeg's stdout into the ring until it ends. The drain is unconditional: the
-    IPTV app's speed never reaches this loop, so a frozen client cannot stall ffmpeg."""
+    IPTV player's speed never reaches this loop, so a frozen client cannot stall ffmpeg."""
     out = proc.stdout
     try:
         while True:
@@ -909,7 +1395,7 @@ def _read_loop(session: RelaySession, proc: subprocess.Popen) -> None:
 def stream(session: RelaySession):
     """The HTTP body: chunks from the ring on the reserve's pacing until the session ends.
     Runs outside any request or app context - everything it needs is on the session - and
-    its close (the IPTV app disconnected, changed channel, was turned off) ends the session
+    its close (the IPTV player disconnected, changed channel, was turned off) ends the session
     REASON_CLIENT_GONE. A session the reaper ended stops the body on its next turn."""
     try:
         while session.live:
@@ -935,13 +1421,18 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
             session._finishing = True
             session._teardown_lock.acquire()
         proc, reader = session.proc, session.reader
+        was_waiting = session.state == STATE_WAITING
     if not claimed:
         with session._teardown_lock:
             return False
     try:
         try:
             if proc is not None:
-                terminate_or_kill(proc)
+                # Killed outright, here and wherever a relay's ffmpeg is stopped: it writes
+                # to a pipe, so there is no trailer or file a graceful stop would finish,
+                # and the wait for one is time the next channel cannot start in at the
+                # viewer cap (measured 0.52 s graceful, 0.01 s killed - dev/changelog/1527).
+                terminate_or_kill(proc, hard=True)
             # The reader ends on the pipe's EOF, which the kill produces; joined before the
             # ring is cleared so ffmpeg's drained tail cannot land in a cleared ring.
             if reader is not None and reader is not threading.current_thread():
@@ -953,16 +1444,57 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
                 _remove_stderr(session)
                 session.ring.clear()
         with _lock:
+            if was_waiting:
+                session.screen_seconds = session._screen_seconds(time.monotonic())
             session.state = STATE_STOPPED
+            session.slot_claimed = False
             session.reason = reason
             session.detail = detail
             session.ended_at = datetime.utcnow()
     finally:
         session._teardown_lock.release()
+    if not was_waiting and reason != REASON_SHUTDOWN:
+        # A slot or a seat may have come free for a game waiting on the screen for one.
+        recheck_waiting(held_only=True)
     level = logging.INFO if reason in (REASON_CLIENT_GONE, REASON_SHUTDOWN) else logging.WARNING
     log.log(level, 'Viewer %s: %s stopped after %s - %s%s', session.id, session.label,
             fmt_bytes(session.bytes_sent), reason, f' ({detail})' if detail else '')
+    # Not on shutdown: this runs in the signal handler then, where starting a thread that
+    # writes the database has no place. The log line above is that play's record.
+    if reason != REASON_SHUTDOWN:
+        _queue_play(session.app, {
+            'kind': FEED_PLAY_ENDED, 'at': session.ended_at, 'first_at': session.started_at,
+            'feed_id': session.feed_id, 'label': session.label, 'client': session.client,
+            # A play that only ever watched a sports channel's waiting screen played that.
+            'channel_id': session.channel_id, 'channel_name': session.channel_name or (
+                SCREEN_NAME if session.sports_row_id else ''),
+            'account_id': session.account_id, 'reason': reason,
+            'message': ' '.join(x for x in (session.reason_text(), detail, _screen_note(session),
+                                            _moves_note(session), reserve_short_note(session.ring)) if x),
+            'seconds': int(max(0.0, time.monotonic() - session.started_mono)) if session.started_mono else 0,
+            'bytes_sent': session.bytes_sent, 'moves': len(session.failovers)})
     return True
+
+
+def _screen_note(session: RelaySession) -> str:
+    """What a play's line in Recent plays says about the waiting screen, or '' for a play
+    that never saw it."""
+    if not session.sports_row_id:
+        return ''
+    waited = fmt_duration(session.screen_seconds)
+    if session.left_screen_at is None:
+        what = f', waiting for {session.waiting_for}' if session.waiting_for else ''
+        return f'Watched only the waiting screen, for {waited}{what}.'
+    return f'Was on the waiting screen for {waited} before the game came on.'
+
+
+def reserve_short_note(ring: Ring) -> str:
+    """What Watching now and a play's line in Recent plays say when the ring gave part of the
+    stream out ahead of its reserve, or ''."""
+    if not ring.released_early:
+        return ''
+    return (f'{fmt_bytes(ring.released_early)} went out sooner than {ring.reserve:g}s behind live, '
+            f'because the {fmt_bytes(ring.capacity)} buffer was nearly full.')
 
 
 def _remove_stderr(session: RelaySession) -> None:
@@ -974,29 +1506,225 @@ def _remove_stderr(session: RelaySession) -> None:
 
 
 def stop_all(reason: str = REASON_SHUTDOWN) -> int:
+    """End every live play by name, and stop any waiting-screen clip being made for one: a
+    make outlives the play that asked for it otherwise. No database, signal-handler safe."""
     with _lock:
         live = [s for s in _sessions.values() if s.live]
     for s in live:
         _finish(s, reason)
+    _screen_mod().stop_makes()
     return len(live)
+
+
+def stop_feed_id(feed_id: int, reason: str) -> int:
+    """End every live play of `feed_id`, by name. How many it ended."""
+    with _lock:
+        live = [s for s in _sessions.values() if s.live and s.feed_id == feed_id]
+    return sum(1 for s in live if _finish(s, reason))
+
+
+def stop_account(account_id: int, reason: str = REASON_ACCOUNT_OFF) -> int:
+    """End every live play coming from `account_id`, by name. How many it ended."""
+    with _lock:
+        live = [s for s in _sessions.values() if s.live and s.account_id == account_id]
+    return sum(1 for s in live if _finish(s, reason))
+
+
+def stop_session(session_id: str, reason: str = REASON_STOPPED) -> bool:
+    """End one live play. False when it is unknown or already over."""
+    session = get_session(session_id)
+    return bool(session is not None and session.live and _finish(session, reason))
+
+
+def live_count_for(feed_id: int) -> int:
+    with _lock:
+        return sum(1 for s in _sessions.values() if s.live and s.feed_id == feed_id)
+
+
+# ── The switch ─────────────────────────────────────────────────────────────────────────────
+
+def set_on_output(kind: str, row_id: int, on: bool):
+    """Take a channel or a group off the IPTV output, or put it back: THE only writer of
+    `on_output`, column and event together (the shape of channel_groups.set_participation).
+    Mutates and adds the event without committing, so the caller owns the commit and keeps
+    the read-modify-write in one retry_on_locked unit; ending the plays of a row that went
+    off is the caller's too, after the commit (stop_feed_id), never inside it.
+
+    Returns (row, moved), or (None, False) for an id that is not a guide row of that kind. A
+    switch that did not move logs nothing. The feed id is the row's own and does not move,
+    so an IPTV player that cached it finds the same channel when it comes back. A sports
+    channel has its own switch (app/sports_feed.py) and is not handled here."""
+    from . import db
+    from .database import (Channel, ChannelEvent, ChannelGroup, ChannelGroupEvent,
+                           OUTPUT_FEED_SWITCHED)
+    if kind == KIND_CHANNEL:
+        row = db.session.get(Channel, row_id)
+    elif kind == KIND_GROUP:
+        row = db.session.get(ChannelGroup, row_id)
+    else:
+        raise ValueError(f'No output switch for a row of kind "{kind}"')
+    if row is None or not row.in_guide:  # guide-flag-read-ok: only a guide row is on the feed, so only one has the switch
+        return None, False
+    on = bool(on)
+    if bool(row.on_output) == on:
+        return row, False
+    row.on_output = on
+    detail = ('Put back on the IPTV output by hand' if on
+              else 'Taken off the IPTV output by hand. It stays in the TV Guide')
+    extra = json.dumps({'on_output': on, 'source': 'user'})
+    if kind == KIND_CHANNEL:
+        db.session.add(ChannelEvent(channel_id=row.id, event_type=OUTPUT_FEED_SWITCHED,
+                                    detail=detail, extra_data=extra))
+    else:
+        db.session.add(ChannelGroupEvent(group_id=row.id, event_type=OUTPUT_FEED_SWITCHED,
+                                         detail=detail, extra_data=extra))
+    return row, True
+
+
+# ── The play log ───────────────────────────────────────────────────────────────────────────
+
+def _queue_play(app, entry: dict) -> None:
+    """Hand one line of Recent plays to the writer thread. `app` is the Flask app when the
+    caller has one in hand (a session carries its own); None means the caller is inside a
+    request, and with neither the line is dropped with a log line saying so."""
+    global _log_writer
+    if app is None:
+        from flask import current_app, has_app_context
+        if not has_app_context():
+            log.warning('Output feed: a %s play of feed id %s was not written to Recent plays '
+                        '(no app to write it with)', entry.get('kind'), entry.get('feed_id'))
+            return
+        app = current_app._get_current_object()
+    with _lock:
+        _play_queue.append(entry)
+        if _log_writer is None:
+            _log_writer = threading.Thread(target=_log_loop, args=(app,), name='relay-play-log',
+                                           daemon=True)
+            _log_writer.start()
+
+
+def _log_loop(app) -> None:
+    global _log_writer
+    while True:
+        _log_kick.wait(_LOG_INTERVAL)
+        _log_kick.clear()
+        with _lock:
+            batch = list(_play_queue)
+            _play_queue.clear()
+            if not batch:
+                _log_writer = None
+                return
+        try:
+            with app.app_context():
+                _write_plays(batch)
+        except Exception:                               # noqa: BLE001 - the log must never take the feed down
+            log.exception('Output feed: %d line(s) of Recent plays could not be written and '
+                          'are lost', len(batch))
+
+
+def flush_play_log() -> int:
+    """Write what is queued now, in the caller's app context. For a caller that needs the
+    lines in the table before it reads them (the page after its own action, the tests)."""
+    with _lock:
+        batch = list(_play_queue)
+        _play_queue.clear()
+    if batch:
+        _write_plays(batch)
+    return len(batch)
+
+
+def discard_play_log(timeout: float = 5.0) -> bool:
+    """Forget what is queued and wait for the writer thread to exit. tests/support/app.py:
+    a writer left running would write one test's lines into the next test's database."""
+    with _lock:
+        del _play_queue[:]
+        thread = _log_writer
+    if thread is None:
+        return True
+    _log_kick.set()
+    thread.join(timeout)
+    return not thread.is_alive()
+
+
+def _write_plays(batch: list) -> None:
+    from . import db
+    from .database import OutputFeedPlay
+    from .db_utils import retry_on_locked
+
+    @retry_on_locked()
+    def _write():
+        for entry in batch:
+            at = entry['at'] or datetime.utcnow()
+            if entry['kind'] == FEED_PLAY_REFUSED:
+                # Re-read inside the retried unit: a rolled-back session forgets the bump.
+                last = (OutputFeedPlay.query
+                        .filter_by(kind=FEED_PLAY_REFUSED, feed_id=entry['feed_id'],
+                                   message=entry['message'])
+                        .filter(OutputFeedPlay.at >= at - REFUSAL_RUN_GAP)
+                        .order_by(OutputFeedPlay.at.desc()).first())
+                if last is not None:
+                    last.at = max(last.at, at)
+                    last.count += 1
+                    last.client = entry.get('client') or last.client
+                    db.session.flush()
+                    continue
+            fields = {k: v for k, v in entry.items() if v is not None}
+            fields.setdefault('first_at', at)
+            fields['at'] = at
+            db.session.add(OutputFeedPlay(**fields))
+            db.session.flush()
+        db.session.commit()
+
+    _write()
+    _prune_plays()
+
+
+def _prune_plays() -> None:
+    """Drop lines older than PLAY_LOG_DAYS, at most once an hour and only on the back of a
+    write, so an output nobody uses runs nothing."""
+    global _last_prune_mono
+    from . import db
+    from .database import OutputFeedPlay
+    from .db_utils import retry_on_locked
+    now = time.monotonic()
+    if _last_prune_mono is not None and now - _last_prune_mono < _PRUNE_EVERY_SECONDS:
+        return
+    _last_prune_mono = now
+
+    @retry_on_locked()
+    def _prune():
+        gone = OutputFeedPlay.query.filter(
+            OutputFeedPlay.at < datetime.utcnow() - timedelta(days=PLAY_LOG_DAYS)).delete(
+                synchronize_session=False)
+        db.session.commit()
+        return gone
+
+    gone = _prune()
+    if gone:
+        log.info('Output feed: %d line(s) of Recent plays older than %d days removed', gone,
+                 PLAY_LOG_DAYS)
 
 
 def kill_all_viewers():
     """Shutdown hook (run.py): end every relay so a restarted process never leaves an
-    orphaned ffmpeg pulling a provider stream for an IPTV app it cannot serve. No DB, signal-handler
+    orphaned ffmpeg pulling a provider stream for an IPTV player it cannot serve. No DB, signal-handler
     safe."""
     stop_all(REASON_SHUTDOWN)
 
 
 def preempt_for_account(app, account_id: int, recording_id: int) -> bool:
     """A recording on `account_id` needs the seat: end every live session on that account
-    REASON_PREEMPTED, and tell the user twice - a VIEWER_PREEMPTED alert naming the
-    recording, and a diagnostics event on the recording's own timeline saying what it
-    displaced (section 4.4). Called by recorder._try_acquire_slot_with_preemption after
-    connection_limits.preempt_viewers_for_slot stripped the seats; a session with proc=None
-    is inside its launch window and is flagged so it never runs on the stripped seat."""
+    that no longer holds one REASON_PREEMPTED, and tell the user twice - a VIEWER_PREEMPTED
+    alert naming the recording, and a diagnostics event on the recording's own timeline
+    saying what it displaced (section 4.4). Called by
+    recorder._try_acquire_slot_with_preemption after connection_limits.preempt_viewers_for_slot
+    stripped the seats; a play it left seated (one on a held seat, dev/changelog/1536) plays on.
+    A session with proc=None is inside its launch window and is flagged so it never runs on
+    the stripped seat."""
+    seated = connlim.seated_holder_ids('viewer')
     with _lock:
-        matched = [s for s in _sessions.values() if s.live and s.account_id == account_id]
+        matched = [s for s in _sessions.values()
+                   if s.live and s.account_id == account_id and s.id not in seated]
         for s in matched:
             s.preempted = True
             s.preempted_by = recording_id
@@ -1028,11 +1756,11 @@ def _announce_preemption(app, sessions, recording_id: int, account_id: int) -> N
         for s in sessions:
             create_alert(
                 'VIEWER_PREEMPTED',
-                f'IPTV app cut for recording "{rec_name}"',
-                body=(f'An IPTV app watching {s.label} through the output feed (channel '
+                f'IPTV player cut for recording "{rec_name}"',
+                body=(f'An IPTV player watching {s.label} on the IPTV output (channel '
                       f'"{s.channel_name}" on {account_name}) was cut because recording '
-                      f'"{rec_name}" needed the connection. A recording always wins the '
-                      f'seat; the IPTV app reconnects on its own if another connection is free.'),
+                      f'"{rec_name}" needed the connection. A recording always wins; the '
+                      f'IPTV player reconnects on its own if another connection is free.'),
                 source=f'feed:{s.feed_id}:preempted', recording_id=recording_id)
 
         @retry_on_locked()
@@ -1042,7 +1770,7 @@ def _announce_preemption(app, sessions, recording_id: int, account_id: int) -> N
             for s in sessions:
                 add_recording_event(
                     recording_id, DIAGNOSTICS,
-                    detail=(f'Took the connection from an IPTV app watching {s.label} '
+                    detail=(f'Took the connection from an IPTV player watching {s.label} '
                             f'(channel "{s.channel_name}") on {account_name}.'),
                     extra={'kind': 'viewer_preempted', 'feed_id': s.feed_id,
                            'channel_id': s.channel_id, 'account_id': account_id,
@@ -1073,15 +1801,22 @@ def _check(session: RelaySession) -> None:
         return
     if session.ring.dropped_unripe:
         _finish(session, REASON_BUFFER_TOO_SMALL,
-                detail=f'{fmt_bytes(session.ring.dropped_unripe)} arrived faster than the '
-                       f'buffer holds for a {session.ring.reserve:g}s reserve')
+                detail=f'{fmt_bytes(session.ring.dropped_unripe)} of the stream was lost: more '
+                       f'than the {fmt_bytes(session.ring.capacity)} buffer holds arrived '
+                       f'inside {session.ring.reserve:g}s.')
         return
+    if session.ring.released_early and not session._reserve_short_logged:
+        session._reserve_short_logged = True
+        log.warning('Viewer %s: %s is playing on less than its %gs reserve - the %s buffer '
+                    'filled, so the stream is going out early instead of being lost',
+                    session.id, session.label, session.ring.reserve,
+                    fmt_bytes(session.ring.capacity))
     if session.ring.dropped:
         _finish(session, REASON_CLIENT_TOO_SLOW,
                 detail=f'{fmt_bytes(session.ring.dropped)} dropped unread')
         return
-    # Idle is a fact about the IPTV app, so it is measured on the IPTV app's side of the ring: a chunk
-    # the IPTV app could have taken and has not. A provider that stopped sending leaves nothing
+    # Idle is a fact about the IPTV player, so it is measured on the IPTV player's side of the ring: a chunk
+    # the IPTV player could have taken and has not. A provider that stopped sending leaves nothing
     # releasable and is the stall branch's business below, never this one.
     untaken = session.ring.untaken_age(now)
     if untaken > session.idle_timeout:
@@ -1089,6 +1824,9 @@ def _check(session: RelaySession) -> None:
         return
     if now - session.started_mono > session.max_seconds:
         _finish(session, REASON_MAX_DURATION)
+        return
+    if state == STATE_WAITING:
+        _check_waiting(session, proc, now)
         return
     rc = proc.poll() if proc is not None else None
     if rc is not None:
@@ -1108,8 +1846,9 @@ def _check(session: RelaySession) -> None:
 
 def _member_died(session: RelaySession, reason: str, detail: str) -> None:
     """The member being relayed stopped delivering: fail over inside the same response when
-    the play is a group with somebody left, else end the session by the member's reason."""
-    if session.group_id is None or session.app is None:
+    the play is a group or a sports channel with somebody left, else end the session by the
+    member's reason."""
+    if not session.fails_over or session.app is None:
         _finish(session, reason, detail=detail)
         return
     with _lock:
@@ -1139,23 +1878,25 @@ def _failover(session: RelaySession, reason: str, detail: str) -> None:
     with session.app.app_context():
         cfg = load_config()
         if old_proc is not None:
-            terminate_or_kill(old_proc)
+            terminate_or_kill(old_proc, hard=True)
         # The old reader drains the dead member's tail before the new one starts, so the two
         # members' bytes never interleave in the ring at the switch.
         if old_reader is not None:
             old_reader.join(timeout=5.0)
         _remove_stderr(session)
         while True:
-            play = resolve_play(session.feed_id, cfg, exclude_ids=frozenset(session.failed_ids))
+            play = resolve_play(session.feed_id, cfg, exclude_ids=frozenset(session.failed_ids),
+                                event_id=session.event_id)
             if play is None or play.member is None:
-                why = play.why_none if play is not None else 'the group is no longer served'
+                gone = 'the group' if session.group_id is not None else 'the channel'
+                why = play.why_none if play is not None else f'{gone} is no longer served'
                 detail = f'"{failed_name}" {_died_phrase(reason)}; {why}'
-                if _finish(session, REASON_NO_MEMBER, detail=detail):
+                if _finish(session, REASON_NO_MEMBER, detail=detail) and (play is None or play.fault):
                     source = f'feed:{session.feed_id}:no-member'
                     if not has_open_alert('FEED_NO_MEMBER', source):
                         create_alert('FEED_NO_MEMBER',
                                      f'Output feed: nothing left to play for {session.label}',
-                                     body=f'An IPTV app watching {session.label} was cut: {detail}.',
+                                     body=f'An IPTV player watching {session.label} was cut: {detail}.',
                                      source=source)
                 return
             member = play.member
@@ -1179,12 +1920,17 @@ def _failover(session: RelaySession, reason: str, detail: str) -> None:
         log.warning('Viewer %s: "%s" %s - moved to "%s"', session.id, failed_name, why,
                     member.name)
 
+        if session.group_id is None:
+            # A sports channel has no group whose timeline could carry this. The move is in
+            # the session's own history, which the dashboard shows, and in the log above.
+            return
+
         @retry_on_locked()
         def _log_group_event_and_commit():
             db.session.add(ChannelGroupEvent(
                 group_id=session.group_id, channel_id=member.id,
                 event_type=GROUP_VIEWER_FAILOVER,
-                detail=(f'An IPTV app watching through the output feed was moved from "{failed_name}" '
+                detail=(f'An IPTV player watching through the output feed was moved from "{failed_name}" '
                         f'to "{member.name}": "{failed_name}" {why}.')))
             db.session.commit()
 
@@ -1195,6 +1941,18 @@ def _died_phrase(reason: str) -> str:
     if reason == REASON_CONNECT_TIMEOUT:
         return 'sent nothing in time'
     return 'stopped delivering'
+
+
+def move_text(from_name: str, to_name: str, reason: str) -> str:
+    """One of a play's moves as a sentence. RelaySession.failovers keeps each move's reason as a
+    REASON_* code, which is never shown as it is (dev/docs/BUGS.md 2026-11-15 @ 03:51:40 PM)."""
+    return f'Moved from "{from_name}" to "{to_name}": "{from_name}" {_died_phrase(reason)}.'
+
+
+def _moves_note(session: 'RelaySession') -> str:
+    """What a play's line in Recent plays says about its moves, or ''. A sports channel has no
+    group timeline to keep them in, so the line is where each move's reason outlives the play."""
+    return ' '.join(move_text(a, b, why) for a, b, why in session.failovers)
 
 
 def _reap_loop():
@@ -1231,26 +1989,432 @@ def wait_for_reaper(timeout: float = 5.0) -> bool:
     return not thread.is_alive()
 
 
+# ── The waiting screen ─────────────────────────────────────────────────────────────────────
+#
+# A sports channel with no game to play shows its waiting screen instead of refusing the play
+# (dev/changelog/1534, the picture app/sports_screen.py): ChannelBin's own clip, looped by an
+# ffmpeg that writes into the same ring through the same reader, so idle, max duration, the
+# IPTV player leaving and every other end work as they do for a relay. It takes no provider
+# seat and is not counted against max_viewers (the play still shows on Watching now). Every
+# SCREEN_RECHECK_SECONDS it asks again: in proxy mode a game that has come on takes a slot and a
+# seat and is put on in place of the clip, as a failover puts on a member; a game that cannot
+# get one, or words that changed, swap the clip in place. One swap at a time per play
+# (`_swap_lock`), never under `_lock`, never inside a database unit.
+
+def _screen_mod():
+    from . import sports_screen
+    return sports_screen
+
+
+def _screen_of(play: Play, cfg: dict, held: str = None):
+    """The waiting screen `play` shows now. A few queries (sports_screen.screen_for)."""
+    fcfg = feed_config(cfg)
+    before, _after = sports_window(fcfg)
+    # The screen's words follow how this play is delivered, so mixed mode's sports channel,
+    # which is relayed, says the game starts by itself.
+    mode = MODE_PROXY if relays(fcfg, play.feed_id) else MODE_REDIRECT
+    return _screen_mod().screen_for(play.served, play.found, datetime.utcnow(), cfg, mode=mode,
+                                    before_minutes=int(before.total_seconds() // 60), held=held,
+                                    slots=int(fcfg.get('max_viewers') or 1))
+
+
+def _prune_clips(cfg: dict) -> None:
+    """Prune the clip folder before a make, the one thing that adds to it, keeping every clip a
+    live play is on. So the folder needs no job of its own."""
+    with _lock:
+        keep = {s.screen_path for s in _sessions.values() if s.live and s.screen_path}
+    try:
+        _screen_mod().prune_clips(cfg, keep=keep)
+    except OSError as exc:
+        log.warning('Could not prune the waiting-screen clips: %s', exc)
+
+
+def _clip_for(cfg: dict, row_id: int, screen) -> tuple:
+    """(path, still) for `screen`: its moving clip when it is made, else the quick still, made
+    now (under a second, dev/changelog/1533) for the play to start on while the moving one is
+    made behind it. Raises sports_screen.ClipFailed."""
+    ss = _screen_mod()
+    path = ss.ready_clip(cfg, row_id, screen)
+    if path:
+        return path, False
+    _prune_clips(cfg)
+    return ss.make_clip(cfg, row_id, screen, still=True), True
+
+
+def _set_screen(session: RelaySession, screen, path: str, still: bool, held: str = None) -> None:
+    key = _screen_mod().clip_key(screen)
+    with _lock:
+        session.screen_path, session.screen_key, session.screen_still = path, key, still
+        session.screen_state, session.screen_held = screen.state, held
+        session.waiting_for = screen.game.name if screen.game is not None else ''
+
+
+def start_waiting(play: Play, client: str, cfg: dict, held: str = None) -> RelaySession:
+    """Start `play`, a sports play, on its channel's waiting screen. `held` (a
+    sports_screen.HELD_* reason) is a game that is on and cannot start here yet. Requires an app
+    context. Raises FeedRefused, naming why, when the screen cannot be made or played: the play
+    is then refused as it was before the screen existed (storage_dirs.SPORTS_SCREEN_ROLE)."""
+    from flask import current_app
+    ss = _screen_mod()
+    fcfg = feed_config(cfg)
+    row_id = play.served.row.id
+    try:
+        screen = _screen_of(play, cfg, held)
+        path, still = _clip_for(cfg, row_id, screen)
+    except ss.ClipFailed as exc:
+        why = play.why_none or 'the game cannot start here yet'
+        message = f'Nothing to play for {play.label}: {why}. Its waiting screen could not be shown: {exc}.'
+        _note_refused(play.feed_id, play.label, client, message)
+        log.warning('Viewer from %s refused: %s', client, message)
+        raise FeedRefused(message, 409)
+    session = RelaySession(
+        id=secrets.token_urlsafe(12), feed_id=play.feed_id, label=play.label, client=client,
+        group_id=None, channel_id=None, channel_name='', account_id=None,
+        ring=Ring(int(fcfg.get('buffer_mb') or 64) * 1024 * 1024, 0.0),
+        **_session_limits(cfg, fcfg), started_mono=time.monotonic(), state=STATE_WAITING,
+        fails_over=True, app=current_app._get_current_object(), sports_row_id=row_id)
+    session.last_recheck_mono = session.started_mono
+    _set_screen(session, screen, path, still, held)
+    with _lock:
+        _sessions[session.id] = session
+        _prune_ended_locked()
+    try:
+        _launch_clip(session, path, cfg)
+    except FeedRefused as exc:
+        _finish(session, REASON_LAUNCH_FAILED, detail=exc.message)
+        raise
+    if still:
+        _make_moving_later(session, cfg, screen, held)
+    _ensure_reaper()
+    log.info('Viewer %s from %s: %s on the waiting screen (%s%s)%s', session.id, client, session.label,
+             screen.state, f', {held}' if held else '', f', waiting for {session.waiting_for}'
+             if session.waiting_for else '')
+    return session
+
+
+def _launch_clip(session: RelaySession, path: str, cfg: dict) -> None:
+    """Start the ffmpeg that loops `path` into the session's ring. Raises FeedRefused."""
+    cmd = build_screen_play_cmd(cfg, path)
+    try:
+        fd, session.stderr_path = tempfile.mkstemp(prefix='channelbin-relay-', suffix='.stderr')
+        os.close(fd)
+        # stderr to a file, never a pipe (dev/changelog/430).
+        with open(session.stderr_path, 'wb') as err:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err)
+    except OSError as exc:
+        _remove_stderr(session)
+        log.error('Viewer %s: could not start the waiting screen: %s', session.id, exc)
+        raise FeedRefused(f'Could not start the waiting screen: {exc}', 500)
+    if _adopt(session, proc) is None:
+        raise FeedRefused(REASON_TEXT[REASON_CLIENT_GONE], 409)
+
+
+def _stop_current(session: RelaySession) -> None:
+    """Kill what the session is playing and drain its tail into the ring, so two sources' bytes
+    never interleave at a swap (the failover's order)."""
+    with _lock:
+        old_proc, old_reader = session.proc, session.reader
+        session.proc = session.reader = None
+        session.last_data_mono = None
+    if old_proc is not None:
+        terminate_or_kill(old_proc, hard=True)
+    if old_reader is not None and old_reader is not threading.current_thread():
+        old_reader.join(timeout=5.0)
+    _remove_stderr(session)
+
+
+def _discard_unplayed(path: str) -> None:
+    """Delete a clip the play just left because something newer replaced it, unless another live
+    play is on it. A clip that is still a channel's current screen is never passed here."""
+    if not path:
+        return
+    with _lock:
+        playing = any(s.live and s.screen_path == path for s in _sessions.values())
+    if not playing:
+        _screen_mod().discard_clip(path)
+
+
+def _swap_clip(session: RelaySession, screen, path: str, still: bool, cfg: dict, held: str = None) -> bool:
+    """Put `path` on in place of the clip playing. The caller holds `_swap_lock`. False when the
+    play ended instead."""
+    old = session.screen_path
+    _stop_current(session)
+    _set_screen(session, screen, path, still, held)
+    try:
+        _launch_clip(session, path, cfg)
+    except FeedRefused as exc:
+        if session.live:
+            _finish(session, REASON_SCREEN_FAILED, detail=exc.message)
+        return False
+    if old != path:
+        _discard_unplayed(old)
+    log.info('Viewer %s: the waiting screen for %s now shows %s%s%s', session.id, session.label,
+             screen.state, f' ({held})' if held else '', ', the quick still' if still else '')
+    return True
+
+
+def _make_moving_later(session: RelaySession, cfg: dict, screen, held: str = None) -> None:
+    """Make the moving clip of `screen` behind the quick still the play is on, at a low priority,
+    and swap it in when it is made, if the play still shows that screen. The maker's ffmpeg is
+    sports_screen's to stop (stop_makes(), from stop_all())."""
+    def _make():
+        ss = _screen_mod()
+        try:
+            path = ss.make_clip(cfg, session.sports_row_id, screen, background=True)
+        except ss.ClipFailed as exc:
+            log.warning('Viewer %s: the moving waiting screen for %s could not be made, so the still '
+                        'one stays on: %s', session.id, session.label, exc)
+            return
+        key = ss.clip_key(screen)
+        with session._swap_lock:
+            with _lock:
+                current = session.waiting and session.screen_still and session.screen_key == key
+            if current:
+                _swap_clip(session, screen, path, False, cfg, held)
+    threading.Thread(target=_make, daemon=True, name=f'relay-screen-{session.id}').start()
+
+
+def recheck_waiting(held_only: bool = False) -> int:
+    """Ask every play on a waiting screen again now rather than at its next turn: Go live now
+    opened a game (app/routes/sports.py), or a play that held a slot ended (`held_only`, the
+    plays whose game is on and waiting for one). No database; the reaper asks within
+    _REAP_INTERVAL. How many plays were asked."""
+    with _lock:
+        waiting = [s for s in _sessions.values() if s.live and s.waiting
+                   and (s.screen_held or not held_only)]
+        for s in waiting:
+            s.recheck_due = True
+    return len(waiting)
+
+
+def _check_waiting(session: RelaySession, proc: subprocess.Popen, now: float) -> None:
+    """The reaper's turn for a play on the waiting screen: the clip's ffmpeg is alive and
+    sending, and every SCREEN_RECHECK_SECONDS (or when asked) the play asks again on a thread of
+    its own, so a clip made on the way never holds up the reaper."""
+    rc = proc.poll()
+    if rc is not None:
+        tail = read_stderr_tail(session.stderr_path)
+        _finish(session, REASON_SCREEN_FAILED,
+                detail=f'ffmpeg exited with code {rc}' + (f': {tail}' if tail else ''))
+        return
+    if session.last_data_mono is None:
+        if now - session.launched_mono > CONNECT_TIMEOUT_SECONDS:
+            _finish(session, REASON_SCREEN_FAILED, detail='the clip sent nothing in time')
+            return
+    elif now - session.last_data_mono > session.stall_timeout:
+        _finish(session, REASON_SCREEN_FAILED, detail=f'no data for {session.stall_timeout:.0f}s')
+        return
+    if session.app is None:
+        return
+    with _lock:
+        due = session.recheck_due or now - session.last_recheck_mono >= SCREEN_RECHECK_SECONDS
+        if not due or session._rechecking or not session.live:
+            return
+        session._rechecking = True
+        session.recheck_due = False
+        session.last_recheck_mono = now
+    threading.Thread(target=_recheck, args=(session,), daemon=True,
+                     name=f'relay-recheck-{session.id}').start()
+
+
+def _recheck(session: RelaySession) -> None:
+    try:
+        with session.app.app_context():
+            with session._swap_lock:
+                if session.waiting:
+                    _recheck_locked(session)
+    except Exception:                                   # noqa: BLE001 - one play's re-check, never the feed
+        log.exception('Viewer %s: the waiting screen could not ask again whether its game is on',
+                      session.id)
+    finally:
+        with _lock:
+            session._rechecking = False
+
+
+def _recheck_locked(session: RelaySession) -> None:
+    from .alerts import create_alert, has_open_alert
+    from .config import load_config
+    ss = _screen_mod()
+    cfg = load_config()
+    fcfg = feed_config(cfg)
+    play = resolve_play(session.feed_id, cfg)
+    if play is None or not play.sports:
+        _finish(session, REASON_SCREEN_GONE)
+        return
+    held = None
+    if play.member is not None and not relays(fcfg, session.feed_id):
+        # A redirected play cannot put the game on in place: ChannelBin never sends a provider
+        # stream through itself for it. The stream ends, and the player's next tune-in is the
+        # 302 to the game (section 5.1).
+        _finish(session, REASON_WINDOW_OPENED, detail=play.note)
+        return
+    if play.member is not None:
+        held = _to_game(session, play, cfg, fcfg)
+        if held is None:
+            return
+    elif play.fault:
+        # The game is on, and listed only where the feed may not play from: what a tune-in
+        # is refused for with FEED_NO_MEMBER, so the play ends the same way.
+        detail = f'{play.why_none}'
+        if _finish(session, REASON_NO_MEMBER, detail=detail):
+            source = f'feed:{session.feed_id}:no-member'
+            if not has_open_alert('FEED_NO_MEMBER', source):
+                create_alert('FEED_NO_MEMBER', f'Output feed: nothing to play for {play.label}',
+                             body=f'An IPTV player on the waiting screen of {play.label} was cut: {detail}.',
+                             source=source)
+        return
+    screen = _screen_of(play, cfg, held)
+    if ss.clip_key(screen) == session.screen_key:
+        return
+    try:
+        path, still = _clip_for(cfg, play.served.row.id, screen)
+    except ss.ClipFailed as exc:
+        log.warning('Viewer %s: the waiting screen for %s stays as it is, its new one could not be '
+                    'made: %s', session.id, session.label, exc)
+        return
+    if _swap_clip(session, screen, path, still, cfg, held) and still:
+        _make_moving_later(session, cfg, screen, held)
+
+
+def _to_game(session: RelaySession, play: Play, cfg: dict, fcfg: dict) -> Optional[str]:
+    """The game is on: take a slot under the one lock (start_session()'s count), then a seat,
+    then put the game on in place of the clip. None when the play moved to the game, or ended on
+    the way; else the sports_screen.HELD_* reason it stays on the screen for."""
+    ss = _screen_mod()
+    cap = int(fcfg.get('max_viewers') or 1)
+    with _lock:
+        if not session.live:
+            return None
+        if sum(1 for s in _sessions.values() if s.counted and s is not session) >= cap:
+            return ss.HELD_NO_SLOT
+        session.slot_claimed = True
+    try:
+        member = _seat_for(session, play, cfg)
+        if member is None:
+            return ss.HELD_NO_CONNECTION
+        if not _own_seat(session, member):
+            return ss.HELD_NO_CONNECTION if session.live else None
+        _put_on_game(session, play, member, cfg)
+        return None
+    finally:
+        with _lock:
+            session.slot_claimed = False
+
+
+def _own_seat(session: RelaySession, member) -> bool:
+    """Name the account on a waiting play if the seat _seat_for() took is still its, in one hold
+    of the lock. A play on the screen has no account, so a recording that takes the seat between
+    the acquire and here finds no play to end (preempt_for_account() matches on the account) and
+    the play would go on to start the game on a connection the recording holds, counted nowhere
+    (dev/docs/BUGS.md 2026-11-15 01:36 PM). Named and seated together, a recording from here on
+    finds the play; a seat already gone leaves the play unnamed, on its screen. Nothing in
+    connection_limits calls back into this module under its own lock, so taking its lock inside
+    this one cannot deadlock."""
+    with _lock:
+        ending = not session.live or session._finishing
+        seated = not ending and session.id in connlim.seated_holder_ids('viewer')
+        if seated:
+            session.account_id = member.account_id
+    if ending:
+        connlim.release(member.account_id, 'viewer', session.id)
+    elif not seated:
+        log.warning('Viewer %s: a recording took the connection on account %d as %s was coming on, so '
+                    'the play stays on the waiting screen', session.id, member.account_id, session.label)
+    return seated
+
+
+def _seat_for(session: RelaySession, play: Play, cfg: dict):
+    """The best member playing the game whose account has a seat free, with the seat taken; None
+    when every one is out of connections."""
+    tried = set()
+    member = play.member
+    while member is not None:
+        if connlim.try_acquire(member.account_id, 'viewer', session.id):
+            return member
+        tried.add(member.id)
+        more = resolve_play(session.feed_id, cfg, exclude_ids=frozenset(tried), event_id=play.event_id)
+        member = more.member if more is not None else None
+    return None
+
+
+def _put_on_game(session: RelaySession, play: Play, member, cfg: dict) -> None:
+    """Swap the clip for `member`, whose seat is already taken, in place - the TV sees an MPEG-TS
+    discontinuity, as at a failover (section 4.5)."""
+    old = session.screen_path
+    _stop_current(session)
+    now = time.monotonic()
+    with _lock:
+        if not session.live or session._finishing:
+            alive = False
+        else:
+            alive = True
+            session.screen_seconds = session._screen_seconds(now)
+            session.state = STATE_STARTING
+            session.slot_claimed = False
+            session.left_screen_at = datetime.utcnow()
+            session.account_id = member.account_id   # the seat is held: _launch keeps it
+            session.event_id = play.event_id
+            session.label = play.label
+            session.screen_path = ''
+    if not alive:
+        connlim.release(member.account_id, 'viewer', session.id)
+        return
+    session.ring.set_reserve(session.reserve_seconds)
+    try:
+        _launch(session, member, cfg, first=False)
+    except FeedRefused as exc:
+        if session.live:
+            _finish(session, REASON_LAUNCH_FAILED, detail=exc.message)
+        return
+    _discard_unplayed(old)
+    log.info('Viewer %s: %s came on - moved from the waiting screen to channel %d (%s) on account '
+             '%d after %s%s', session.id, session.label, member.id, member.name, member.account_id,
+             fmt_duration(session.screen_seconds), f' ({play.note})' if play.note else '')
+
+
 # ── Redirect mode ──────────────────────────────────────────────────────────────────────────
 
-def redirect_target(feed_id: int, client: str, cfg=None) -> str:
-    """The provider URL an IPTV app is sent to for `feed_id` right now (section 5.1), recorded as
-    a redirect for the dashboard. Raises FeedRefused on an id the feed does not serve (404)
-    or a group with nothing playable (409, with the FEED_NO_MEMBER alert)."""
+def redirect_play(feed_id: int, client: str, cfg=None) -> tuple:
+    """Redirect mode's answer to a tune-in: (provider URL, None) to send the player to, or
+    (None, session) for a sports channel with nothing to play, whose waiting screen is
+    ChannelBin's own bytes and so is streamed in this mode too: it never takes a seat and never
+    sends a provider login to the player (dev/changelog/1534). It ends when its game's window
+    opens (REASON_WINDOW_OPENED), and the next tune-in is the 302. Requires an app context.
+    Raises FeedRefused as redirect_target() does."""
+    from .config import load_config
+    cfg = cfg or load_config()
     play = resolve_play(feed_id, cfg)
+    if play is not None and play.sports and play.member is None and not play.fault:
+        return None, start_waiting(play, client, cfg)
+    return redirect_target(feed_id, client, cfg, play=play), None
+
+
+def redirect_target(feed_id: int, client: str, cfg=None, play: Play = None) -> str:
+    """The provider URL an IPTV player is sent to for `feed_id` right now (section 5.1), recorded as
+    a redirect for the dashboard. Raises FeedRefused on an id the feed does not serve (404)
+    or a group with nothing playable (409, with the FEED_NO_MEMBER alert). `play` is the
+    caller's resolve_play() answer when it already has one."""
+    play = play or resolve_play(feed_id, cfg)
     if play is None:
         raise FeedRefused('No such channel on this feed', 404)
+    if play.member is None and not play.fault:
+        _refuse_nothing_on(play, client)
     if play.member is None:
         _refuse(feed_id, play.label, f'Nothing to play for {play.label}: {play.why_none}.',
-                409, 'no-member')
+                409, 'no-member', client)
     member = play.member
+    # A redirect is one moment, so its record may say where that moment fell (play.note).
+    label = f'{play.label} ({play.note})' if play.note else play.label
     with _lock:
-        _redirects.append({'at': datetime.utcnow(), 'feed_id': feed_id, 'label': play.label,
+        _redirects.append({'at': datetime.utcnow(), 'feed_id': feed_id, 'label': label,
                            'client': client, 'channel_id': member.id,
                            'channel_name': member.name, 'account_id': member.account_id})
         del _redirects[:-_KEEP_ENDED]
+    _queue_play(None, {'kind': FEED_PLAY_REDIRECTED, 'at': datetime.utcnow(), 'feed_id': feed_id,
+                       'label': label, 'client': client, 'channel_id': member.id,
+                       'channel_name': member.name, 'account_id': member.account_id})
     log.info('Viewer from %s: %s redirected to channel %d (%s) on account %d', client,
-             play.label, member.id, member.name, member.account_id)
+             label, member.id, member.name, member.account_id)
     return member.stream_url
 
 
@@ -1267,7 +2431,7 @@ def readiness_facts(cfg=None) -> dict:
         return facts
     facts['served'] = len(catalog(cfg))
     held = held_seats_map(fcfg)
-    if held and facts['mode'] == MODE_REDIRECT:
+    if held and redirects_some(fcfg):
         present = {a.id for a in Account.query.filter(Account.id.in_(list(held))).all()}
         facts['missing_held_accounts'] = sorted(a for a in held if a not in present)
     return facts
@@ -1287,6 +2451,9 @@ def bundle_facts(cfg=None) -> dict:
         'failovers': len(s.failovers),
         'started_at': iso_or_none(s.started_at), 'ended_at': iso_or_none(s.ended_at),
     } for s in recent_ended()]
+    out['recent_refused'] = [{
+        'feed_id': r['feed_id'], 'count': r['count'], 'at': iso_or_none(r['at'])}
+        for r in recent_refused()]
     out['recent_redirects'] = [{
         'feed_id': r['feed_id'], 'channel_id': r['channel_id'], 'account_id': r['account_id'],
         'at': iso_or_none(r['at'])} for r in recent_redirects()]
@@ -1295,8 +2462,12 @@ def bundle_facts(cfg=None) -> dict:
 
 def reset_for_tests():
     """Stop everything and forget every session. tests/support/app.py only."""
+    global _last_prune_mono
     stop_all(REASON_SHUTDOWN)
     wait_for_reaper()
     with _lock:
         _sessions.clear()
+        _refused.clear()
         del _redirects[:]
+    discard_play_log()
+    _last_prune_mono = None

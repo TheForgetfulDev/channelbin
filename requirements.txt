@@ -8,3 +8,4 @@ psutil>=5.9
 apprise>=1.7
 Flask-WTF>=1.2
 defusedxml>=0.7
+Pillow>=12.0,<13

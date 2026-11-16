@@ -140,14 +140,15 @@ class GameIndex:
     longest: dict = field(default_factory=dict)        # {league id: its longest strong listing}
 
     @classmethod
-    def load(cls, league_ids, now, horizon_days=21):
-        """The games of `league_ids` from LOOKBACK ago to `horizon_days` ahead, their live guide and
-        channel-name matches, and the recordings linked to them. A fixed handful of queries."""
+    def load(cls, league_ids, now, horizon_days=21, lookback=LOOKBACK):
+        """The games of `league_ids` from `lookback` ago to `horizon_days` ahead, their live guide
+        and channel-name matches, and the recordings linked to them. A fixed handful of queries.
+        A league page's Record reads back a day, since that page keeps a game all its day."""
         out = cls()
         league_ids = sorted({i for i in league_ids if i})
         if not league_ids:
             return out
-        lo, hi = now - LOOKBACK, now + timedelta(days=horizon_days)
+        lo, hi = now - lookback, now + timedelta(days=horizon_days)
         events = SportsEvent.query.filter(
             SportsEvent.league_id.in_(league_ids),
             or_(SportsEvent.start_at.between(lo, hi),
@@ -341,14 +342,16 @@ def covers(window_start, window_stop, start, stop) -> bool:
     return window_start <= start + PREGAME_SLACK and window_stop >= stop
 
 
-def keepers(programs, games_of) -> set:
+def keepers(programs, games_of, replays=False) -> set:
     """The identity of each game's keeper among `programs`: of the listings that are not a known
     replay, the one carried on the most channels, then the earliest. `games_of` is
-    {identity: (Game, airing)}."""
+    {identity: (Game, airing)}. With `replays`, the same order over the known replays only: what
+    a league page's Record picks for a game whose live airing is not in the guide or is over
+    (dev/changelog/1539). A rule never asks for that."""
     best = {}
     for p in programs:
         game, airing = games_of.get(p.identity, (None, None))
-        if game is None or airing == SPORTS_AIRING_REPLAY:
+        if game is None or (airing == SPORTS_AIRING_REPLAY) != replays:
             continue
         rank = (-len(p.showings), p.lead.start, p.identity)
         if game.id not in best or rank < best[game.id][0]:

@@ -82,7 +82,7 @@ class RegistryTests(unittest.TestCase):
     def test_nothing_that_means_the_install_is_broken_can_be_silenced(self):
         """Which checks may be silenced is the one judgment call in the feature, so it is
         pinned here rather than left to whoever edits the registry next."""
-        # output_feed is ignorable on purpose: an IPTV app that cannot play is a feature not
+        # output_feed is ignorable on purpose: an IPTV player that cannot play is a feature not
         # working, not an install that is broken (DESIGN-output-feed.md 12).
         self.assertEqual(
             sorted(c.id for c in readiness.CHECKS if not c.ignorable),

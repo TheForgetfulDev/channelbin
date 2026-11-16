@@ -13,7 +13,7 @@ import math
 import re
 import statistics
 
-from .fmt_utils import iso_or_none
+from .fmt_utils import iso_or_none, plural
 
 # Ranking-only neutral score for members that have never been observed. Display
 # code deliberately shows "untested" instead (e.g. routes/channels.py channel
@@ -564,7 +564,7 @@ def _format_strategy_entry(strategy, buckets):
     # "healthy" and stopping there is what let a bucket whose every channel is warning read
     # as a clean win (dev/changelog/890).
     n = winner['rank_count']
-    channels_txt = f'{n} recordable channel{"" if n == 1 else "s"}'
+    channels_txt = f'{n} {plural(n, "recordable channel")}'
     if winner['pass_count'] == 0:
         channels_txt += ' (every one of them warning)'
     if strategy == 'highest_bitrate':
@@ -603,14 +603,13 @@ def _measurement_clause(bucket) -> str:
     61 health checks spanning 21 days" - relative rather than dated so it needs no timezone
     and reads the same in an event written months ago."""
     n = bucket['rank_measurement_count']
-    checks = f'{n} health check{"" if n == 1 else "s"}'
+    checks = f'{n} {plural(n, "health check")}'
     span = bucket['rank_measured_span_days']
     if span is None:
         return f'the bitrate is the median of {checks}'
     if span < 1:
         return f'the bitrate is the median of {checks}, all within one day'
-    return (f'the bitrate is the median of {checks} spanning {span} '
-            f'day{"" if span == 1 else "s"}')
+    return f'the bitrate is the median of {checks} spanning {span} {plural(span, "day")}'
 
 
 def plan_format_selection(channels, latest_by_channel, rank_ids=None,
@@ -1665,7 +1664,7 @@ def guide_row_targets(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
 def guide_row_sort_key(row):
     """Where a channel or a group sits in the guide's one ordering space: its
     guide_sort_order, then its name. The one spelling, read by the guide's rows above and
-    by the output feed's channel numbers, so an IPTV app lists the channels in the guide's order."""
+    by the output feed's channel numbers, so an IPTV player lists the channels in the guide's order."""
     return (row.guide_sort_order or 0, row.name.lower())
 
 

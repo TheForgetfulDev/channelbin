@@ -24,6 +24,18 @@ _LOCAL_COPIES = ('def _plural(', 'def _iso(', 'def _first_line(', 'def _lower_fi
 _MARKED_VARIANTS = {('app/health_score.py', 'def _iso(')}
 
 
+#: An inline plural: `{"" if n == 1 else "s"}` or `'' if n == 1 else 's'`. plural() and counted()
+#: are the one spelling. The files below still carried one when the check was written
+#: (dev/changelog/1569); the set only shrinks, and a file not in it may not grow one.
+_INLINE_PLURAL = re.compile(r"""if [^{}\n]+ == 1 else ["']s["']""")
+_INLINE_PLURAL_GRANDFATHERED = {
+    'app/accounts.py', 'app/check_window.py', 'app/postprocessor.py', 'app/probe.py',
+    'app/recording_story.py', 'app/routes/accounts.py', 'app/routes/channel_groups.py',
+    'app/routes/providers.py',
+    'app/scheduler.py', 'app/tz_utils.py',
+}
+
+
 def _app_files():
     for dirpath, _dirs, files in os.walk(os.path.join(ROOT, 'app')):
         for name in files:
@@ -78,6 +90,14 @@ class PluralTests(unittest.TestCase):
         bad = [f'{rel}: {needle}' for rel in _app_files() for needle in _LOCAL_COPIES
                if needle in _read(rel) and (rel, needle) not in _MARKED_VARIANTS]
         self.assertEqual(bad, [], 'use the fmt_utils helper')
+
+
+    def test_no_new_inline_plural(self):
+        with_one = {rel for rel in _app_files() if _INLINE_PLURAL.search(_read(rel))}
+        self.assertEqual(sorted(with_one - _INLINE_PLURAL_GRANDFATHERED), [],
+                         'use fmt_utils.plural() or counted()')
+        self.assertEqual(sorted(_INLINE_PLURAL_GRANDFATHERED - with_one), [],
+                         'swept clean: drop it from _INLINE_PLURAL_GRANDFATHERED')
 
 
 class FirstLineTests(unittest.TestCase):

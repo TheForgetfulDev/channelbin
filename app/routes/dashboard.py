@@ -84,7 +84,7 @@ DASHBOARD_SECTIONS = {
     # offers in Customize otherwise, so a module that is off has no card and no toggle
     # (DESIGN-output-feed.md 12).
     'viewers': {'label': 'Watching now',
-                'hint': 'IPTV apps playing through the output feed, and how the last sessions ended.',
+                'hint': 'IPTV players playing through the output feed, and how the last sessions ended.',
                 'to': 'Settings', 'endpoint': 'settings.settings'},
 }
 DASHBOARD_FEED_SECTION = 'viewers'
@@ -614,10 +614,16 @@ def dashboard():
     feed_cfg = output_feed.feed_config(cfg)
     section_defs = dict(DASHBOARD_SECTIONS)
     if output_feed.is_enabled(feed_cfg):
+        redirect = output_feed.mode_of(feed_cfg) == output_feed.MODE_REDIRECT
         feed = {'mode': output_feed.mode_of(feed_cfg),
-                'live': [s.to_dict() for s in output_feed.live_sessions()],
+                # In redirect mode the one play ChannelBin sees is a waiting screen.
+                'live': [s.to_dict() for s in output_feed.live_sessions() if not redirect or s.waiting],
                 'ended': [s.to_dict() for s in output_feed.recent_ended()][:5],
-                'redirects': output_feed.recent_redirects()[:5]}
+                # Proxy mode redirects nothing; a tune-in kept from before a change of mode is
+                # still on the IPTV Output page's Recent plays.
+                'redirects': (output_feed.recent_redirects()[:5]
+                              if output_feed.redirects_some(feed_cfg) else []),
+                'refused': output_feed.recent_refused()[:5]}
     else:
         feed = None
         section_defs.pop(DASHBOARD_FEED_SECTION, None)

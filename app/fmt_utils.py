@@ -244,7 +244,7 @@ def fmt_job_duration_line(avg_seconds, runs: int) -> str:
     number) when the job has no completed run yet."""
     if avg_seconds is None:
         return 'How long it takes is not known yet - it has not finished a run here.'
-    basis = f'average of the last {runs} run{"" if runs == 1 else "s"}'
+    basis = f'average of the last {runs} {plural(runs, "run")}'
     return f'Usually takes {fmt_duration_phrase(avg_seconds)} ({basis}).'
 
 

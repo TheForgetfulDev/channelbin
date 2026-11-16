@@ -1,4 +1,6 @@
 {% extends "base.html" %}
+{# _record_modal.html calls csrf_field() unqualified, so it has to be in this template's namespace. #}
+{% from '_macros.html' import csrf_field %}
 {% block title %}{{ league.name }} - Sports Schedules - ChannelBin{% endblock %}
 
 {#  One league (dev/docs/DESIGN-sports-data.md 11, mockup 50): the rule page's shell. Everything in
@@ -7,6 +9,15 @@
     .gd-statezone and .gd-sections after an action, so the template stays the one renderer. #}
 
 {% block content %}
+{#- A page of Upcoming games or of On your IPTV output (mockup 57): Prev and Next are links, so a new
+    tab opens that page, and stay in place greyed at either end. sports.js swaps only the card. -#}
+{% macro pager(p, kind) %}{% if p %}
+<div class="test-history-pagination sp-pager">
+  {% if p.prev %}<a class="btn btn-sm sp-prev" href="{{ p.prev }}" data-pager="{{ kind }}">{{ icon('back') }} Prev</a>{% else %}<button class="btn btn-sm sp-prev" type="button" disabled>{{ icon('back') }} Prev</button>{% endif %}
+  <span class="text-muted small sp-pager-n">{{ p.text }}</span>
+  {% if p.next %}<a class="btn btn-sm sp-next" href="{{ p.next }}" data-pager="{{ kind }}">Next {{ icon('forward') }}</a>{% else %}<button class="btn btn-sm sp-next" type="button" disabled>Next {{ icon('forward') }}</button>{% endif %}
+</div>
+{% endif %}{% endmacro %}
 <div class="page-head">
   <h1>Sports Schedules</h1>
   <a href="{{ url_for('sports.sports_page') }}" class="btn">{{ icon('back') }} All Leagues</a>
@@ -74,16 +85,16 @@
     </div>
   </div>
 
-  <div class="card" data-section="upcoming">
-    <div class="card-head"><h2>Upcoming {{ many }}{% if games %} <span class="cnt">{{ games | length }}</span>{% endif %}</h2></div>
+  <div class="card" data-section="upcoming" id="sp-upcoming">
+    <div class="card-head"><h2>Upcoming {{ many }}{% if games_total %} <span class="cnt">{{ games_total }}</span>{% endif %}</h2></div>
     <div class="card-body">
       <p class="card-note">{{ upcoming_note }}</p>
       {% if picked_teams %}
       {# duplicated from _macros.html::history_chips - a scope toggle between two pages of
          games, not a filter with counts over one list, so it keeps its own two links. #}
       <div class="rl-filter">
-        <a class="chip{{ ' active' if scope == 'followed' else '' }}" href="{{ url_for('sports.league_page', league_id=league.id) }}">Your teams<span class="n">{{ mine_total }}</span></a>
-        <a class="chip{{ ' active' if scope == 'all' else '' }}" href="{{ url_for('sports.league_page', league_id=league.id, scope='all') }}">All {{ many }}<span class="n">{{ all_total }}</span></a>
+        <a class="chip{{ ' active' if scope == 'followed' else '' }}" href="{{ scope_urls.followed }}">Your teams<span class="n">{{ mine_total }}</span></a>
+        <a class="chip{{ ' active' if scope == 'all' else '' }}" href="{{ scope_urls.all }}">All {{ many }}<span class="n">{{ all_total }}</span></a>
       </div>
       {% endif %}
       {% if games %}
@@ -94,21 +105,91 @@
             {% for g in games %}
             <tr>
               <td data-label="When" class="rl-when"><span class="day">{{ g.day }}</span>{% if g.guide_time %}<span class="sp-two">{{ g.guide_time }} <span class="sp-src">your guide</span></span><span class="sp-two text-warning">{{ g.time or 'Time not listed' }} <span class="sp-src">TheSportsDB</span></span>{% else %}{{ g.time or 'Time not listed' }}{% endif %}</td>
-              <td data-label="{{ one | capitalize }}" class="rl-prog"><span class="t">{{ g.game }}</span>{% for n in g.notes %}<span class="sp-note">{{ n }}</span>{% endfor %}</td>
+              <td data-label="{{ one | capitalize }}" class="rl-prog"><span class="t">{{ g.game }}</span>{% for n in g.notes %}<span class="sp-note">{{ n }}</span>{% endfor %}{% set h = g.held or g.replay_held or g.failed %}{% if h %}<span class="sp-held"><span class="badge {{ h.badge }}">{% if h.pulse %}<span class="pulse"></span>{% elif h.mark %}{{ icon('record') }}{% endif %}{{ h.text }}</span></span><span class="s">{{ h.sub }}</span>{% endif %}{% if g.live and g.live.on %}<span class="s">Go live now is on until {{ g.live.until }}, on {{ g.live.channels | join(', ') }}</span>{% endif %}</td>
               <td data-label="Venue" class="rl-where">{{ g.where or '-' }}</td>
               <td data-label="Where it&rsquo;s on" class="rl-prog">{% if g.guide.open %}<button class="sp-onguide" data-act="listings" data-event="{{ g.id }}" data-name="{{ g.game }}" data-names-only="{{ 1 if g.guide.names_only else 0 }}">{{ g.guide.text }}</button>{% else %}<span class="sp-none">{{ g.guide.text }}</span>{% endif %}<span class="s{{ ' text-warning' if g.guide_time else '' }}">{% if g.guide_time %}At {{ g.guide_time }} in your guide, not TheSportsDB's {{ g.time }}{% else %}{{ g.guide.sub }}{% endif %}</span>{% if g.guide.also %}<span class="s">{{ g.guide.also }}</span>{% endif %}</td>
-              <td data-label="" class="sp-kebab"><span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
+              <td data-label="" class="sp-kebab"><span class="sp-acts">
+                {#- Record, or Manage recording once the game has one (mockup 54): the recording's
+                    own options, worded as the Recordings list words them. -#}
+                {%- if g.held %}{% set h = g.held %}<span class="menu-wrap"><button class="btn btn-sm" data-menu>Manage recording {{ icon('dropdown') }}</button>
                 <div class="menu pop-left">
+                  {% if h.can_edit %}<button class="menu-item" data-act="edit-rec" data-rec="{{ h.id }}" data-rec-name="{{ h.name }}" data-edit="{{ h.edit | tojson | forceescape }}">Edit recording</button>{% endif %}
+                  <a class="menu-item" href="{{ h.url }}">Open recording {{ icon('forward') }}</a>
+                  {% if h.rule_url %}<a class="menu-item" href="{{ h.rule_url }}">Rule: {{ h.rule }} {{ icon('forward') }}</a>{% endif %}
+                  {% if h.can_cancel %}<div class="sep"></div><button class="menu-item danger" data-act="cancel-rec" data-rec="{{ h.id }}" data-rec-name="{{ h.name }}" data-consequence="{{ ('The ' ~ h.rule ~ ' rule made it, and will not schedule this ' ~ one ~ ' again.') if h.rule else '' }}">Cancel recording</button>{% endif %}
+                  {% if h.can_stop %}<div class="sep"></div><button class="menu-item danger" data-act="stop-rec" data-rec="{{ h.id }}" data-rec-name="{{ h.name }}">Stop recording</button>{% endif %}
+                </div></span>
+                {%- elif g.record %}<button class="btn btn-sm{{ ' disabled' if g.record.why else '' }}" data-act="record" data-event="{{ g.id }}"{% if g.record.why %} aria-disabled="true" data-why="{{ g.record.why }}"{% endif %}>{{ icon('record') }}{{ g.record.label }}</button>{% endif -%}
+                <span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
+                <div class="menu pop-left">
+                  {% if g.search and g.search.url %}<a class="menu-item" href="{{ g.search.url }}">Search programs {{ icon('forward') }}</a>{% elif g.search %}<button class="menu-item disabled" data-act="search-why" data-why="{{ g.search.why }}" aria-disabled="true">Search programs</button>{% endif %}
+                  {% if g.replay_held %}<a class="menu-item" href="{{ g.replay_held.url }}">Replay recording {{ icon('forward') }}</a>{% endif %}
+                  {% if g.failed %}<a class="menu-item" href="{{ g.failed.url }}">{{ g.failed.link }} {{ icon('forward') }}</a>{% endif %}
+                  {% if g.search %}<div class="sep"></div>{% endif %}
                   <button class="menu-item" data-act="listings" data-event="{{ g.id }}" data-name="{{ g.game }}" data-names-only="{{ 1 if g.guide.names_only else 0 }}"{{ ' disabled' if not g.guide.open else '' }}>{{ 'Event channels naming it' if g.guide.names_only else 'Listings on your guide' }}</button>
-                  <a class="menu-item" href="{{ g.tsdb_url }}" target="_blank" rel="noopener">Edit on TheSportsDB {{ icon('forward') }}</a>
-                </div></span></td>
+                  {% if g.live %}{% set lv = g.live %}<button class="menu-item" data-act="live-now" data-event="{{ lv.event }}" data-on="{{ 1 if lv.on else 0 }}" data-message="{{ lv.message }}" data-channels="{{ lv.channels | tojson | forceescape }}"{% if lv.why %} data-why="{{ lv.why }}"{% endif %}>{{ 'Turn off Go live now' if lv.on else 'Go live now' }}</button>{% endif %}
+                  <a class="menu-item" href="{{ g.tsdb_url }}" target="_blank" rel="noopener">View on TheSportsDB {{ icon('forward') }}</a>
+                </div></span></span></td>
             </tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
+      {{ pager(games_pager, 'games') }}
       {% else %}
       <p class="card-note">{{ no_games_note }}</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card" data-section="feed" id="sp-feed">
+    <div class="card-head"><h2>On your IPTV output</h2></div>
+    <div class="card-body">
+      <p class="card-note">ChannelBin can serve its own sports channels to your IPTV player through the IPTV output: one for a team, or numbered channels that carry every {{ one }} in the league. Each has a guide of its {{ many }} from TheSportsDB and plays whichever of your channels lists the {{ one }} in its own guide, from a little before its listing starts to a while after it ends, so tuning in early or to a {{ one }} running long still finds it on. How long before and after is in the IPTV output's settings. They are for watching: they are not in the TV Guide and nothing records from them.</p>
+      {% if not feed.feed_on %}
+      <div class="notice notice-info"><div><strong>The IPTV output is off.</strong> What you switch on here is saved, and appears in your IPTV player once the output is turned on, on the <a href="{{ url_for('iptv_output.page') }}">IPTV Output</a> page.</div></div>
+      {% endif %}
+      {% if not feed.followed %}
+      <p class="card-note">Follow this league, or a team in it, to give it a channel.</p>
+      {% elif not feed.whole and not feed.teams %}
+      <p class="card-note">Nothing here to give a channel yet.</p>
+      {% else %}
+      {% if feed.filterable %}
+      <div class="sp-feed-tools">
+        <div class="search-wrap{{ ' has-text' if feed.q else '' }}" id="sp-feed-wrap">
+          <input type="search" class="search" id="sp-feed-q" value="{{ feed.q }}" maxlength="120" placeholder="Filter by team" aria-label="Filter the channels by team" autocomplete="off">
+          <button class="search-clear" id="sp-feed-clear" type="button" aria-label="Clear the filter">{{ icon('close') }}</button>
+        </div>
+      </div>
+      {% endif %}
+      <div id="sp-feed-list">
+      {% if feed.show_league or feed.page_teams %}
+      <div class="table-scroll">
+        <table class="tbl tbl-cards rl-tbl">
+          <thead><tr><th>Channel</th><th>What it carries</th><th>On the output</th></tr></thead>
+          <tbody>
+            {% if feed.show_league %}
+            <tr>
+              <td data-label="Channel" class="rl-prog"><span class="t">{{ league.name }} 1{% if feed.numbered > 1 %} to {{ league.name }} {{ feed.numbered }}{% endif %}</span></td>
+              <td data-label="What it carries" class="rl-prog">Every {{ one }} in the league, spread over as many channels as it takes for none to overlap.<span class="s">A {{ one }} keeps the channel it is given.</span></td>
+              <td data-label="On the output"><label class="switch"><input type="checkbox" data-act="feed-channel" data-team="0" aria-label="{{ league.name }} league channels on the IPTV output"{{ ' checked' if feed.league_on else '' }}><span class="knob"></span></label></td>
+            </tr>
+            {% endif %}
+            {% for t in feed.page_teams %}
+            <tr>
+              <td data-label="Channel" class="rl-prog"><span class="t">{{ t.name }}</span></td>
+              <td data-label="What it carries" class="rl-prog">Every {{ t.name }} {{ one }}.</td>
+              <td data-label="On the output"><label class="switch"><input type="checkbox" data-act="feed-channel" data-team="{{ t.id }}" aria-label="{{ t.name }} on the IPTV output"{{ ' checked' if t.on else '' }}><span class="knob"></span></label></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {{ pager(feed.pager, 'feed') }}
+      {% else %}
+      <p class="card-note">Nothing here for that filter.</p>
+      {% endif %}
+      </div>
       {% endif %}
     </div>
   </div>
@@ -179,6 +260,9 @@
   </div>
 </div>
 <div class="sp-credit">Schedule data from <a href="https://www.thesportsdb.com/" target="_blank" rel="noopener">TheSportsDB</a>.</div>
+{# Record and Edit recording open the SAME schedule dialog the TV Guide opens, through
+   guide.js::openModal, as the Programs search does (dev/changelog/1539). #}
+{% include "_record_modal.html" %}
 {% endblock %}
 
 {% block scripts %}
@@ -191,6 +275,25 @@ window.SPORTS_LEAGUE = {
   sectionPref: {{ section_pref | tojson }},
   sectionsPrefKey: {{ sections_pref_key | tojson }},
 };
+{# duplicated from channels/search.html - what guide.js needs to drive the shared record dialog,
+   which every page that opens it carries a copy of; folding the copies into one include is tracked
+   in the backlog. No epgUrl, because this page has no guide grid. `const`, not window.X: guide.js
+   reads a bare GUIDE_CONFIG. #}
+const GUIDE_CONFIG = {
+  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',
+  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',
+  addChannelUrlBase: '/api/guide/channels/',
+  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
+  editRecordingUrlBase: '/recordings/',
+  recDetailUrlBase: '/recordings/',
+  profiles: {
+    {% for p in profiles %}
+    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
+    {% endfor %}
+  },
+};
 </script>
+<script src="{{ url_for('static', filename='js/guide.js') }}"></script>
+<script src="{{ url_for('static', filename='js/live-now.js') }}"></script>
 <script src="{{ url_for('static', filename='js/sports.js') }}"></script>
 {% endblock %}

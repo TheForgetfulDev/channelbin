@@ -354,12 +354,12 @@ ALERT_TYPES = {
     'SECOND_INSTANCE_DETECTED': {
         'label': 'Second Live Instance Detected', 'severity': 'CRIT'},
     # The output feed (app/output_feed.py, DESIGN-output-feed.md section 8). INFO for the two
-    # about one viewer: a recording taking an IPTV app's seat is ChannelBin doing what it is for, and
-    # the IPTV app reconnects on its own; the point is that the cut is named, never silent. WARN
+    # about one viewer: a recording taking an IPTV player's seat is ChannelBin doing what it is for, and
+    # the IPTV player reconnects on its own; the point is that the cut is named, never silent. WARN
     # for a group played with nothing servable - that one is a configuration to fix.
-    'VIEWER_PREEMPTED': {'label': 'IPTV App Cut For A Recording', 'severity': 'INFO'},
-    'VIEWER_REFUSED': {'label': 'IPTV App Refused', 'severity': 'INFO'},
-    'FEED_NO_MEMBER': {'label': 'Output Feed Group Has Nothing To Play', 'severity': 'WARN'},
+    'VIEWER_PREEMPTED': {'label': 'IPTV Player Cut For A Recording', 'severity': 'INFO'},
+    'VIEWER_REFUSED': {'label': 'IPTV Player Refused', 'severity': 'INFO'},
+    'FEED_NO_MEMBER': {'label': 'Output Feed Has Nothing To Play', 'severity': 'WARN'},
     # The one thread every scheduled recording, sync and window check depends on has
     # exited. Self-clearing because the only thing that ends the condition is the next
     # start, and init_scheduler() dismisses the row there (dev/changelog/1114).
@@ -474,11 +474,11 @@ def _build_recording_link(recording_id):
     """
     if not recording_id:
         return None
-    from .config import load_config
-    base_url = load_config().get('notifications', {}).get('base_url', '').strip()
+    from .config import load_config, public_url
+    base_url = public_url(load_config())
     if not base_url:
         return None
-    return f"{base_url.rstrip('/')}/recordings/{recording_id}"
+    return f"{base_url}/recordings/{recording_id}"
 
 
 def normalize_alert_title(title: str) -> str:

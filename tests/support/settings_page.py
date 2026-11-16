@@ -23,8 +23,8 @@ BASIC_SETTINGS = frozenset({
     'sync.sync_interval_hours', 'sync.epg_days_ahead', 'channel_testing.screenshots_enabled',
     'channel_testing.window.start', 'channel_testing.window.end', 'auth.enabled',
     'integrations.home_assistant.enabled',
-    'integrations.output_feed.enabled', 'integrations.output_feed.username',
-    'integrations.output_feed.password', 'integrations.output_feed.mode',
+    'integrations.output_feed.enabled', 'integrations.output_feed.mode',
+    'flask.public_url',
 })
 
 

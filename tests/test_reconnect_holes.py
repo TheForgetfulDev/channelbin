@@ -396,6 +396,41 @@ class JoinTests(unittest.TestCase):
         self.assertIn('so it stays', events[0].detail)
         self.assertEqual(json.loads(events[0].extra_data)['left_seconds'], [5.0])
 
+    def test_the_repairs_scratch_files_are_the_ones_a_delete_removes(self):
+        """dev/docs/BUGS.md 2026-11-15 @ 02:44:35 PM: the remux named its progress and stderr
+        files after the segment, a key no delete lists, so a killed repair left them in the
+        recordings folder for good."""
+        from app import proc_utils, recorder
+        rid = self._recording(FIX['holed'], FIX['clean'], holes={1: [FIX['hole']]})
+        real, seen = proc_utils.supervise_ffmpeg, []
+
+        def _watched(cmd, output_path, **kwargs):
+            seen.extend(proc_utils.scratch_file_paths(
+                os.path.dirname(output_path), kwargs['scratch_prefix'], kwargs['scratch_key']))
+            return real(cmd, output_path, **kwargs)
+
+        with mock.patch.object(proc_utils, 'supervise_ffmpeg', _watched):
+            rec = self._join(rid)
+        self.assertTrue(seen, 'the repair never ran')
+        self.assertEqual(len(self._repair_events(rid)), 1, self._details(rid))
+        self.assertEqual(os.path.dirname(rec.output_path), self.dvr)
+        self.assertLessEqual(set(seen), set(recorder.recording_disk_paths(rid)))
+
+    def test_scratch_beside_the_segments_goes_with_a_recording_that_never_joined(self):
+        """dev/docs/BUGS.md 2026-11-15 @ 02:44:35 PM: a join killed before it committed an
+        output leaves the row with no output path, and a delete listed scratch files only
+        beside one."""
+        from app import proc_utils, recorder
+        rid = self._recording(FIX['holed'], holes={1: [FIX['hole']]})
+        self.assertIsNone(db.session.get(Recording, rid).output_path)
+        left = os.path.join(self.dvr, f'.concat-stderr-{rid}-0a1b2c3d.log')
+        with open(left, 'w') as fh:
+            fh.write('killed')
+        listed = recorder.recording_disk_paths(rid)
+        self.assertIn(left, listed)
+        self.assertLessEqual(set(proc_utils.scratch_file_paths(self.dvr, 'concat', rid)),
+                             set(listed))
+
     def test_a_segment_with_no_reported_hole_is_not_scanned(self):
         rid = self._recording(FIX['clean'], FIX['clean'])
         with mock.patch('app.hole_repair.close_reconnect_holes') as close:

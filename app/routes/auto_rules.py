@@ -10,6 +10,7 @@ import logging
 from flask import Blueprint, abort, jsonify, render_template, request, url_for
 
 from .. import auto_rules, auto_rules_view, db
+from ..fmt_utils import plural
 from ..database import (
     AutoRule, RULE_MATCH_SCHEDULED, RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_EXISTING,
     RULE_MATCH_SKIPPED_LIMIT, RULE_MATCH_SKIPPED_REPEAT, RULE_MATCH_SKIPPED_REPLAY,
@@ -200,8 +201,8 @@ def update_rule_json(rule_id):
             what = 'search' if values.search_params != rule.search_params else 'settings'
             verb = 'matches' if what == 'search' else 'records'
             return jsonify({
-                'error': (f'The new {what} no longer {verb} {n} recording'
-                          f'{"" if n == 1 else "s"} this rule has scheduled. Say whether '
+                'error': (f'The new {what} no longer {verb} {n} {plural(n, "recording")} '
+                          'this rule has scheduled. Say whether '
                           'to cancel them or keep them, then save again.'),
                 'what': what, **found.payload()}), 409
         settle = (read[0], found.ids)

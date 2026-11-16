@@ -377,6 +377,9 @@ window.CHANNEL_SEARCH_CONFIG = {
   {# The rule action context, RESOLVED - null when `rule` named a rule that no longer exists,
      which drops the context exactly as a stale replace_rec is dropped. #}
   ruleCtx: {{ rule_ctx | tojson }},
+  {# The games a league page's Search programs narrowed to (f.event), named from the database:
+     the chip's words, and why a rule cannot be made from the search (dev/changelog/1539). #}
+  eventLabels: {{ event_labels | tojson }},
   savedSearches: {{ saved_searches | tojson }},
   dupGroups: {{ dup_groups | tojson }},
   newTagUrl: {{ (url_for('tags.tags_list') ~ '?new=1') | tojson }},

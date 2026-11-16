@@ -178,8 +178,8 @@ def create_app(config_overrides=None, start_scheduler=True):
 
     # App-wide rather than per view, because CSRFProtect parses the form body in a
     # before_request hook - a cap set inside a view would arrive after the bytes were
-    # already read. The only upload this app takes is a profile's poster image
-    # (app/profile_posters.py); every other request body is a small form or JSON document.
+    # already read. The only upload this app takes is a profile's poster or background
+    # image (app/profile_posters.py); every other request body is a small form or JSON document.
     app.config['MAX_CONTENT_LENGTH'] = MAX_REQUEST_BYTES
 
     @app.errorhandler(CSRFError)
@@ -201,6 +201,9 @@ def create_app(config_overrides=None, start_scheduler=True):
     if cfg['flask'].get('behind_proxy'):
         from werkzeug.middleware.proxy_fix import ProxyFix
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+        # What this process is doing, as against what config.yaml says now: the key is read
+        # here once, so a page asking "are the proxy's headers trusted" asks this.
+        app.config['BEHIND_PROXY'] = True
 
     db.init_app(app)
 

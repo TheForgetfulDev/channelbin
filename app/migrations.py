@@ -3603,9 +3603,123 @@ def _m122_prefer_sports_poster(conn, cur):
     """recording_profiles.prefer_sports_poster (dev/changelog/1505). No backfill: every existing
     profile keeps its pinned poster first, which is what 0 means. Re-runnable."""
     cols = {r[1] for r in cur.execute('PRAGMA table_info(recording_profiles)').fetchall()}
-    if cols and 'prefer_sports_poster' not in cols:
+    # 123 renames it to prefer_sports_art; a database already there must not get it back.
+    if cols and 'prefer_sports_poster' not in cols and 'prefer_sports_art' not in cols:
         cur.execute('ALTER TABLE recording_profiles ADD COLUMN prefer_sports_poster '
                     'BOOLEAN NOT NULL DEFAULT 0')
+    conn.commit()
+
+
+def _m123_profile_background(conn, cur):
+    """recording_profiles: a pinned background (background_file/_width/_height), and
+    prefer_sports_poster renamed prefer_sports_art now that it orders both images
+    (dev/changelog/1508). RENAME COLUMN keeps every profile's answer. Re-runnable."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recording_profiles)').fetchall()}
+    if not cols:
+        conn.commit()
+        return
+    if 'prefer_sports_poster' in cols and 'prefer_sports_art' not in cols:
+        cur.execute('ALTER TABLE recording_profiles RENAME COLUMN prefer_sports_poster TO prefer_sports_art')
+    elif 'prefer_sports_art' not in cols:
+        cur.execute('ALTER TABLE recording_profiles ADD COLUMN prefer_sports_art '
+                    'BOOLEAN NOT NULL DEFAULT 0')
+    for col, kind in (('background_file', 'VARCHAR(255)'), ('background_width', 'INTEGER'),
+                      ('background_height', 'INTEGER')):
+        if col not in cols:
+            cur.execute(f'ALTER TABLE recording_profiles ADD COLUMN {col} {kind}')
+    conn.commit()
+
+
+def _m124_sports_feed_channels(conn, cur):
+    """ChannelBin's own sports channels on the output feed (app/sports_feed.py, dev/changelog/1517,
+    1518): the channels themselves, a league's switch and each event's numbered channel. No
+    backfill: no sports channel exists before this, and an event is placed the first time its
+    league's switch is on. AUTOINCREMENT because a channel's id is its feed id, which an IPTV player
+    caches, so a deleted row's id must never be issued again. Re-runnable from the top."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS sports_feed_channels (
+            id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            league_id INTEGER NOT NULL REFERENCES sports_leagues (id),
+            team_tsdb_id INTEGER NOT NULL DEFAULT 0,
+            number INTEGER NOT NULL DEFAULT 0,
+            enabled BOOLEAN NOT NULL DEFAULT 0,
+            created_at DATETIME,
+            CONSTRAINT uq_sports_feed_channel UNIQUE (league_id, team_tsdb_id, number)
+        );
+    """)
+    for table, column, decl in (('sports_leagues', 'feed_league_channels', 'BOOLEAN NOT NULL DEFAULT 0'),
+                                ('sports_events', 'feed_number', 'INTEGER')):
+        cols = {r[1] for r in cur.execute(f'PRAGMA table_info({table})').fetchall()}
+        if cols and column not in cols:
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} {decl}')
+    conn.commit()
+
+
+def _m125_output_feed_page(conn, cur):
+    """The IPTV output's own switch and its play log (app/output_feed.py, dev/changelog/1525):
+    `on_output` on channels and groups, on for every row because nothing was ever off the
+    output before this, and the output_feed_plays table. No backfill: the plays before this
+    were held in memory and are gone with the process that held them. Re-runnable from the
+    top."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS output_feed_plays (
+            id INTEGER NOT NULL PRIMARY KEY,
+            kind VARCHAR(16) NOT NULL,
+            at DATETIME NOT NULL,
+            first_at DATETIME NOT NULL,
+            feed_id INTEGER NOT NULL,
+            label VARCHAR(255) NOT NULL DEFAULT '',
+            client VARCHAR(64) NOT NULL DEFAULT '',
+            channel_id INTEGER,
+            channel_name VARCHAR(255),
+            account_id INTEGER,
+            reason VARCHAR(32),
+            message TEXT NOT NULL DEFAULT '',
+            seconds INTEGER NOT NULL DEFAULT 0,
+            bytes_sent INTEGER NOT NULL DEFAULT 0,
+            moves INTEGER NOT NULL DEFAULT 0,
+            count INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS ix_output_feed_plays_at ON output_feed_plays (at);
+    """)
+    for table in ('channels', 'channel_groups'):
+        cols = {r[1] for r in cur.execute(f'PRAGMA table_info({table})').fetchall()}
+        if cols and 'on_output' not in cols:
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN on_output BOOLEAN NOT NULL DEFAULT 1')
+    conn.commit()
+
+
+def _m126_sports_live_now(conn, cur):
+    """sports_events.live_now_at and live_now_until: Go live now, a person opening a game early on
+    every sports channel carrying it (app/sports_feed.py, dev/changelog/1530). No backfill: nobody
+    has pressed it before this. Re-runnable from the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(sports_events)').fetchall()}
+    for column in ('live_now_at', 'live_now_until'):
+        if cols and column not in cols:
+            cur.execute(f'ALTER TABLE sports_events ADD COLUMN {column} DATETIME')
+    conn.commit()
+
+
+def _m127_sports_team_look(conn, cur):
+    """sports_teams.color1-3, short_name and badge_url: what a sports channel's waiting screen draws
+    a team in. They come from the same once-a-season lookupteam answer as the names, so every team
+    holding none of them is asked again now rather than at its next season: its lookup row is made
+    due and last_looked_up cleared. Re-runnable from the top: a team that already has its look is
+    left alone, and asking again twice costs one call more."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(sports_teams)').fetchall()}
+    if not cols:
+        conn.commit()
+        return
+    for column, kind in (('color1', 'VARCHAR(7)'), ('color2', 'VARCHAR(7)'), ('color3', 'VARCHAR(7)'),
+                         ('short_name', 'VARCHAR(32)'), ('badge_url', 'TEXT')):
+        if column not in cols:
+            cur.execute(f'ALTER TABLE sports_teams ADD COLUMN {column} {kind}')
+    bare = ('color1 IS NULL AND color2 IS NULL AND color3 IS NULL AND short_name IS NULL '
+            'AND badge_url IS NULL AND last_looked_up IS NOT NULL')
+    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')
+    cur.execute(f"UPDATE sports_fetches SET next_due_at = ? WHERE kind = 'team' AND next_due_at IS NULL "
+                f"AND target IN (SELECT 'team:' || tsdb_id FROM sports_teams WHERE {bare})", (now,))
+    cur.execute(f'UPDATE sports_teams SET last_looked_up = NULL WHERE {bare}')
     conn.commit()
 
 
@@ -4263,6 +4377,16 @@ SCHEMA_MIGRATIONS = [
      'fields', _m121_sports_name_template),
     (122, 'recording_profiles: prefer_sports_poster, TheSportsDB\'s poster ahead of the pinned one',
      _m122_prefer_sports_poster),
+    (123, 'recording_profiles: a pinned background, and prefer_sports_poster renamed '
+     'prefer_sports_art', _m123_profile_background),
+    (124, 'sports_feed_channels, sports_leagues.feed_league_channels and sports_events.feed_number: '
+     'ChannelBin\'s own sports channels on the output feed', _m124_sports_feed_channels),
+    (125, 'channels.on_output + channel_groups.on_output + output_feed_plays: the IPTV output\'s '
+     'own switch and its play log', _m125_output_feed_page),
+    (126, 'sports_events.live_now_at + live_now_until: Go live now, a game opened early on the '
+     'sports channels carrying it', _m126_sports_live_now),
+    (127, 'sports_teams: color1-3, short_name and badge_url, a team\'s look on a sports channel\'s '
+     'waiting screen, asked again for every team that has none', _m127_sports_team_look),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

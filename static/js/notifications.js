@@ -310,7 +310,7 @@
   function saveBaseUrl() {
     jsonFetch('/api/settings/field', {
       method: 'POST',
-      body: JSON.stringify({ path: 'notifications.base_url', value: $('#base-url-input').value.trim() }),
+      body: JSON.stringify({ path: 'flask.public_url', value: $('#base-url-input').value.trim() }),
     }).then(() => toast('Saved')).catch((e) => toast(e.message || 'Could not save', true));
   }
 
