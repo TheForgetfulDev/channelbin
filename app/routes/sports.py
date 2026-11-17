@@ -79,7 +79,7 @@ def lookup():
         return jsonify({'error': 'That link is not a league or a team. Links look like '
                                  'https://www.thesportsdb.com/league/4391-NFL or '
                                  'https://www.thesportsdb.com/team/134936-philadelphia-eagles.'}), 400
-    if kind == 'league' and not str(value).isdigit():
+    if kind == 'league' and not str(value).isdecimal():
         return jsonify({'error': 'That is not a league number.'}), 400
     try:
         if kind == 'league':
@@ -145,18 +145,20 @@ def set_following(league_id):
     if not all(isinstance(t, int) and not isinstance(t, bool) and t > 0 for t in raw):
         return jsonify({'error': 'team_ids must be team numbers. Send none to follow the whole league.'}), 400
     team_ids = sorted(set(raw))
+    before = _sports_served()
     if not sports_data.set_following(league_id, team_ids):
         return jsonify({'error': 'That league no longer exists.'}), 404
     sports_data.ensure_worker()
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'cut': _cut_unserved(before)})
 
 
 @sports_bp.route('/api/sports/leagues/<int:league_id>/following', methods=['DELETE'])
 def stop_following(league_id):
+    before = _sports_served()
     if not sports_data.stop_following(league_id):
         return jsonify({'error': 'That league no longer exists.'}), 404
     sports_data.ensure_worker()
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'cut': _cut_unserved(before)})
 
 
 @sports_bp.route('/api/sports/leagues/<int:league_id>/feed-channels', methods=['PUT'])
@@ -173,6 +175,7 @@ def set_feed_channel(league_id):
         return jsonify({'error': 'team_id must be a number.'}), 400
     if team_id < 0:
         return jsonify({'error': 'team_id must be a number.'}), 400
+    before = None if data['enabled'] else _sports_served()
     try:
         if team_id:
             done = sports_feed.set_team_channel(league_id, team_id, data['enabled'])
@@ -182,7 +185,21 @@ def set_feed_channel(league_id):
         return jsonify({'error': str(exc)}), 409
     if done is None:
         return jsonify({'error': 'That league no longer exists.'}), 404
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'cut': _cut_unserved(before)})
+
+
+def _sports_served():
+    """Before a person's act that can stop a sports channel being served: what is served now
+    (output_feed.sports_served_now; None and no query while no sports channel is being played)."""
+    from .. import output_feed
+    return output_feed.sports_served_now()
+
+
+def _cut_unserved(before) -> int:
+    """After that act has committed: end the plays of every sports channel the act stopped being
+    served (output_feed.stop_unserved_sports)."""
+    from .. import output_feed
+    return output_feed.stop_unserved_sports(before)
 
 
 @sports_bp.route('/api/sports/events/<int:event_id>/live-now', methods=['PUT'])
@@ -223,6 +240,7 @@ def set_live_now(event_id):
 
 @sports_bp.route('/api/sports/leagues/<int:league_id>', methods=['DELETE'])
 def delete_league(league_id):
+    before = _sports_served()
     try:
         deleted = sports_data.delete_league(league_id)
     except sports_data.LeagueInUse as exc:
@@ -230,7 +248,7 @@ def delete_league(league_id):
     if not deleted:
         return jsonify({'error': 'That league no longer exists.'}), 404
     sports_data.ensure_worker()
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'cut': _cut_unserved(before)})
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +309,22 @@ def mark_wrong(event_id):
     return jsonify({'success': True, 'changed': changed})
 
 
+@sports_bp.route('/api/sports/teams/<int:tsdb_id>/names', methods=['PUT'])
+def set_team_names(tsdb_id):
+    """The names a person adds for one team, beside TheSportsDB's own (design 6.2)."""
+    data = request.get_json(silent=True) or {}
+    names = data.get('names')
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        return jsonify({'error': 'names must be a list of names.'}), 400
+    try:
+        saved = sports_match.set_team_names(tsdb_id, data['names'])
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    if saved is None:
+        return jsonify({'error': 'Team not found.'}), 404
+    return jsonify({'success': True, 'names': saved})
+
+
 @sports_bp.route('/api/sports/leagues/<int:league_id>/terms', methods=['PUT'])
 def set_terms(league_id):
     """The names that mean this league in the guide (design 5.1)."""
@@ -325,6 +359,10 @@ def change_categories(league_id):
             or not all(isinstance(n, str) for n in add + remove + list(replay))
             or not all(isinstance(v, bool) for v in replay.values())):
         return jsonify({'error': 'add and remove must be lists of names, replay a map of name to true or false.'}), 400
-    if not sports_match.change_categories(league_id, add, remove, replay):
+    added = sports_match.change_categories(league_id, add, remove, replay)
+    if added is None:
         return jsonify({'error': 'That league no longer exists.'}), 404
-    return jsonify({'success': True})
+    # What was newly tied, and which of those arrived with Replays only already on, so the page
+    # can say what it switched on by itself.
+    return jsonify({'success': True, 'added': [name for name, _replay in added],
+                    'replay_on': [name for name, is_replay in added if is_replay]})

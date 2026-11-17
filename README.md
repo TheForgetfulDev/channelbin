@@ -47,7 +47,7 @@ It's actually been really fun using the search and surfacing channels that I did
 - [Moving to another machine](#moving-to-another-machine)
 - [Versioning and upgrades](#versioning-and-upgrades)
 - [Home Assistant integration](#home-assistant-integration)
-- [Output feed for an IPTV player](#output-feed-for-an-iptv-player)
+- [IPTV output](#iptv-output)
 - [Troubleshooting a provider sync](#troubleshooting-a-provider-sync)
 - [How I use AI on this project](#how-i-use-ai-on-this-project)
 - [Feedback and contributions](#feedback-and-contributions)
@@ -108,7 +108,7 @@ and hands them to whatever you already use to watch them.
 
 - Health checks that connect to a channel, measure resolution and bitrate against configurable
   thresholds, capture screenshots, and record the result.
-- An output feed: ChannelBin as an Xtream Codes source an IPTV player adds as an account, serving
+- An IPTV output: ChannelBin as an Xtream Codes source an IPTV player adds as an account, serving
   the TV Guide's channels and groups with the guide's listings, a group playing as one
   channel with failover. Its own page gives the details to connect with, lets you take a
   channel off the output, and shows who is watching and why each play ended. Off by default.
@@ -169,7 +169,7 @@ and hands them to whatever you already use to watch them.
   league, teams, venue and date in its file name.
 - An auto-record rule can name a league or a team: it then shows the games it expects, records each
   game once, can skip replays, and can record from an event channel when no guide lists the game.
-- A followed team or league can be a channel of its own on the output feed, which plays whichever of
+- A followed team or league can be a channel of its own on the IPTV output, which plays whichever of
   your channels lists the game and shows a waiting screen between games.
 
 ## Install
@@ -631,9 +631,9 @@ and it answers the same way in either case, so a switch left off looks exactly l
 
 ---
 
-## Output feed for an IPTV player
+## IPTV output
 
-ChannelBin can be an Xtream Codes source itself. Turn the output feed on and an IPTV player such as
+ChannelBin can be an Xtream Codes source itself. Turn the IPTV output on and an IPTV player such as
 TiviMate adds ChannelBin as an account the way it adds a provider - and then sees exactly the
 TV Guide: every channel and group in it, in the guide's order, with the guide's own listings,
 instead of the provider's twenty-thousand-channel list. A group plays as one channel, from the
@@ -643,7 +643,7 @@ one dies.
 Go to the **IPTV Output** page, under Channels & guide:
 
 1. **Set login**: the username and password the IPTV player logs in with. They are typed on a
-   remote, so short is fine; the feed is only as reachable as this server is.
+   remote, so short is fine; the IPTV output is only as reachable as this server is.
 2. **Turn on**.
 3. In the IPTV player, add an Xtream Codes account with the server address, username and
    password from the page's **Connect an IPTV player** card (each has a Copy button). A player
@@ -669,7 +669,7 @@ Three ways the stream can reach the IPTV player, chosen by **How the IPTV player
   **Recordings leave alone** applies here too.
 
 The page's **Watching now** and **Recent plays** cards list each IPTV player playing and how every
-play ended or why it was refused, and the Readiness check says whether the feed can serve. The feed is off by default
+play ended or why it was refused, and the Readiness check says whether the IPTV output can serve. It is off by default
 and nothing of it runs while it is off.
 
 ---

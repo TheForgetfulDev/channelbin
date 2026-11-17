@@ -271,6 +271,32 @@ class SearchTests(_Case):
         self.assertIn('looked up 1 game your guide lists by name and found 0', cut)
         self.assertIn('1 lookup came back with an answer ChannelBin could not use', cut)
 
+    def test_the_note_counts_only_lookups_for_games_still_to_come(self):
+        """dev/docs/BUGS.md 2026-11-16: the note listed every stored lookup, and a lookup row is kept
+        30 days, so a morning's bad lookups read as missing games for a month."""
+        def lookup(when, home, away, **kw):
+            return SportsFetch(target=f'search:{LEAGUE_ID}:{when}:{home}:{away}', kind=SPORTS_KIND_SEARCH,
+                               last_at=NOW, row_count=0, dropped_count=0, **kw)
+        fetches = [
+            SportsFetch(target=f'round:{LEAGUE_ID}:2099:9', kind=SPORTS_KIND_ROUND, outcome=SPORTS_FETCH_CAPPED,
+                        last_at=NOW, row_count=50, dropped_count=0),
+            lookup('2099-03-01', 1, 2, outcome=SPORTS_FETCH_EMPTY),      # yesterday
+            lookup('2099-02-20', 3, 4, outcome=SPORTS_FETCH_OK),         # long past, with an unusable answer
+            lookup('2099', 5, 6, outcome=SPORTS_FETCH_EMPTY),            # by season, from before lookups went by day
+            lookup('2099-03-02', 7, 8, outcome=SPORTS_FETCH_EMPTY),      # today
+            lookup('2099-03-05', 9, 10, outcome=SPORTS_FETCH_EMPTY),     # to come
+        ]
+        fetches[2].row_count = fetches[2].dropped_count = 1
+        teams = {7: 'Sevens', 8: 'Eights', 9: 'Nines', 10: 'Tens', 1: 'Ones', 2: 'Twos', 5: 'Fives', 6: 'Sixes'}
+        notes = sports_view._notices(self.league, sports_view.STATUS_OK, fetches, [], 'game', 'games', 0, 7, NOW,
+                                     ZoneInfo('UTC'), {}, teams)
+        (cut,) = [n[2] for n in notes if 'may be missing' in n[1]]
+        self.assertIn('looked up 2 games your guide lists by name and found 0', cut)
+        self.assertIn('Not found by name: Eights at Sevens, Tens at Nines.', cut)
+        self.assertNotIn('could not use', cut)
+        self.assertNotIn('Ones', cut)
+        self.assertNotIn('Fives', cut)
+
     def test_a_league_not_followed_queues_nothing(self):
         SportsFollow.query.filter_by(league_id=self.league.id).delete()
         db.session.commit()

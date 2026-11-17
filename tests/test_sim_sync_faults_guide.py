@@ -50,6 +50,20 @@ class _GuideCase(SimSyncCase):
             out[cid].append((start, title))
         return dict(out)
 
+    def pin_clock_inside_block_on_air(self) -> datetime:
+        """Set the simulator's clock so the renamed_slot_guide fault's cut, an hour before it, lands
+        a minute into the two-hour filler block on air by the REAL clock, and return that block's
+        start. The import keeps what stops after an hour before the real clock, while the clock
+        setUp froze stays put, so the one former-name block the import could keep fell outside
+        that line whenever an odd UTC hour passed between setUp and the sync
+        (dev/docs/BUGS.md 2026-11-17). Pinned here, the former-name block is the one on air, and
+        it stops at least an hour after anything the import drops."""
+        real = datetime.utcnow()
+        on_air = real.replace(hour=real.hour - real.hour % 2, minute=0, second=0, microsecond=0)
+        self.now = on_air + timedelta(hours=1, minutes=1)
+        self.sim.set_clock(self.now)
+        return on_air
+
 
 class GuideFetchFaultTests(_GuideCase):
     def test_a_guide_cut_off_mid_chunk_keeps_the_listings_and_says_why(self):
@@ -483,6 +497,7 @@ class RenamedSlotGuideTests(_GuideCase):
         real sync stores blocks titled with the slot's former name before its current ones, and the
         slot is still matched to its game by its name."""
         aid = self.add_xtream()
+        self.pin_clock_inside_block_on_air()
         self.sim.inject('renamed_slot_guide', 'north-tv')
         log = self.sync(aid)
         self.assertEqual(log.status, 'SUCCESS', log.error_message)
@@ -512,6 +527,83 @@ class RenamedSlotGuideTests(_GuideCase):
         db.session.expire_all()
         mine = SportsMatch.query.filter_by(event_id=event.id, channel_id=ch.id)
         self.assertEqual({x.kind for x in mine}, {SPORTS_MATCH_KIND_CHANNEL_NAME})
+
+
+class DuplicateCopyNameTests(_GuideCase):
+    """One provider, two logins listing the same streams. On the first, a slot renamed for its game
+    keeps a guide block under its former name; the second has no guide for it."""
+    world_source = {
+        'seed': 11, 'calibration': 'prod',
+        'backends': [{'name': 'north', 'channels': 120, 'stream_hosts': 2}],
+        'panels': [{'name': 'north-tv', 'backend': 'north', 'url_shape': {'bare': 1.0}},
+                   {'name': 'north-two', 'backend': 'north', 'url_shape': {'bare': 1.0}}],
+        'logins': [{'backend': 'north', 'panels': ['north-tv', 'north-two']}],
+    }
+
+    def test_a_game_named_only_by_a_duplicate_copy_is_recorded_from_the_kept_copy(self):
+        """Guards dev/docs/BUGS.md 2026-11-16 (a strong name on a duplicate copy was thrown away)
+        through a real sync of both logins: the kept copy has a real guide row at the game's time,
+        so it is never read by its name; the other login's copy is, and it is a duplicate. The
+        game must still have a channel to record from, the kept one, saying whose name was read."""
+        from app import duplicate_streams
+        from app.auto_rules_sports import GameIndex, event_pick
+        from app.database import Provider
+        first, second = self.add_xtream('north-tv'), self.add_xtream('north-two')
+        on_air = self.pin_clock_inside_block_on_air()
+        self.sim.inject('renamed_slot_guide', 'north-tv')
+        for aid in (first, second):
+            log = self.sync(aid)
+            self.assertEqual(log.status, 'SUCCESS', log.error_message)
+        provider = Provider(name='North', created_at=self.now, updated_at=self.now)
+        db.session.add(provider)
+        db.session.flush()
+        for aid in (first, second):
+            self.account(aid).provider_id = provider.id
+        db.session.commit()
+        found = None
+        for ch in Channel.query.filter_by(account_id=first).all():
+            m = _GAME_SLOT.search(ch.name)
+            titles = {e.title for e in EPGEntry.query.filter_by(channel_id=ch.id)} if m else set()
+            if m and len(titles) == 2:
+                found = ch, m
+                break
+        self.assertIsNotNone(found, 'the world carries no renamed event slot')
+        kept, m = found
+        copy_ = Channel.query.filter_by(account_id=second, provider_stream_id=kept.provider_stream_id).one()
+        self.assertEqual(EPGEntry.query.filter_by(channel_id=copy_.id).count(), 0)
+        kept.health_score, copy_.health_score = 90, 10
+        db.session.commit()
+        duplicate_streams.recompute_and_commit()
+        db.session.expire_all()
+        self.assertFalse(kept.is_duplicate_loser)
+        self.assertTrue(copy_.is_duplicate_loser)
+        sport, away, home = m.groups()
+        league = SportsLeague(tsdb_id=9103, name=sport, match_terms=json.dumps([sport]))
+        db.session.add(league)
+        for tid, team in ((931, home), (932, away)):
+            db.session.add(SportsTeam(tsdb_id=tid, full_name=team, names=json.dumps([team]), city='',
+                                      last_looked_up=self.now))
+        db.session.flush()
+        # Started while the kept copy's former-name block was on, so that copy is read by its
+        # listing, which names no game.
+        start = on_air + timedelta(minutes=5)
+        event = SportsEvent(tsdb_id=7004, league_id=league.id, name=f'{home} vs {away}', home_team_id=931,
+                            away_team_id=932, home_name=home, away_name=away, start_at=start, local_date=start.date())
+        db.session.add(event)
+        db.session.commit()
+        sports_match.run(pause=0)
+        db.session.expire_all()
+        # The slot's clock has no time zone, so the start to stand behind is TheSportsDB's.
+        league.trust_sample, league.trust_agreed = 30, 30
+        db.session.commit()
+        named = {x.channel_id for x in SportsMatch.query.filter_by(event_id=event.id, kind=SPORTS_MATCH_KIND_CHANNEL_NAME)}
+        self.assertEqual(named, {copy_.id}, 'only the copy with no guide is read by its name')
+        games = GameIndex.load([league.id], datetime.utcnow())
+        (one,) = games.named_by.get(event.id, [])
+        self.assertEqual((one.channel_id, one.source_name), (kept.id, copy_.name))
+        pick, why = event_pick(games, games.games[event.id])
+        self.assertIsNotNone(pick, why)
+        self.assertEqual(pick.named.channel_id, kept.id)
 
 
 class TeamChannelTests(_GuideCase):

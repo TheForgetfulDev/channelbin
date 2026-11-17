@@ -184,7 +184,7 @@ def normalize_host(raw: str) -> str:
     name, _, port = text.rpartition(':')
     if not name:
         name, port = text, ''
-    if port and not port.isdigit():
+    if port and not port.isdecimal():
         raise ValueError(f'"{raw.strip()}" is not a host name. The part after the colon must be a port number.')
     if any(ch.isspace() for ch in name) or '@' in name or not all(
             c.isalnum() or c in '.-_[]' for c in name):
@@ -613,7 +613,7 @@ def resolve_host(host: str, timeout: float = RESOLVE_TIMEOUT_SECONDS) -> tuple[b
     this costs the provider nothing and cannot take a seat. Run on a helper thread because
     getaddrinfo has no timeout; past `timeout` the lookup is abandoned and reported as such."""
     name, _, port = host.rpartition(':')
-    if not name or not port.isdigit():
+    if not name or not port.isdecimal():
         name = host
     result: dict = {}
 

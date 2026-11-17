@@ -84,7 +84,7 @@ DASHBOARD_SECTIONS = {
     # offers in Customize otherwise, so a module that is off has no card and no toggle
     # (DESIGN-output-feed.md 12).
     'viewers': {'label': 'Watching now',
-                'hint': 'IPTV players playing through the output feed, and how the last sessions ended.',
+                'hint': 'IPTV players playing through the IPTV output, and how the last sessions ended.',
                 'to': 'Settings', 'endpoint': 'settings.settings'},
 }
 DASHBOARD_FEED_SECTION = 'viewers'

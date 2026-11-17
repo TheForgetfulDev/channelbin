@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Regression test runner (standalone - run before deploying when you choose to).
 #
-#   ./run_tests.sh              Runs the full suite, split across 4 worker processes (~297s).
+#   ./run_tests.sh              Runs the full suite, split across 4 worker processes. How long it
+#                               takes is on the [SUITE-TIMING] line every run ends with.
 #   ./run_tests.sh -j 1         Runs everything in one process - the original path.
 #   ./run_tests.sh -j 6         More shards. Each worker peaks around 140MB.
 #   ./run_tests.sh --reverse-shards   A different, equally valid shard split. Use it to prove

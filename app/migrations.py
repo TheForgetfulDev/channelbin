@@ -3700,6 +3700,36 @@ def _m126_sports_live_now(conn, cur):
     conn.commit()
 
 
+def _m129_sports_feed_moved(conn, cur):
+    """sports_events.feed_moved_at, feed_moved_from and feed_moved_by: the record of a league game
+    placed again after a collision on its numbered channel, which the league page shows
+    (app/sports_feed.py::place_league_events, dev/changelog/1587). No backfill: a move made before
+    this was written to the log only and cannot be told from a first placement. Re-runnable from
+    the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(sports_events)').fetchall()}
+    for column, kind in (('feed_moved_at', 'DATETIME'), ('feed_moved_from', 'INTEGER'),
+                         ('feed_moved_by', 'INTEGER')):
+        if cols and column not in cols:
+            cur.execute(f'ALTER TABLE sports_events ADD COLUMN {column} {kind}')
+    conn.commit()
+
+
+def _m130_move_when_account_full(conn, cur):
+    """recording_profiles.move_when_account_full and recordings.move_when_account_full: the
+    profile and per-recording levels of the setting that lets a single-channel recording move
+    to another channel with the same program when its account has no connection free
+    (app/seat_moves.py, dev/changelog/1611).
+
+    Nullable with no default, for the reason migrations 68 and 69 give: NULL is "use the next
+    level up", which every existing profile and recording should do, and a DEFAULT would turn
+    that absence into an answer nobody gave. No backfill. Re-runnable from the top."""
+    for table in ('recording_profiles', 'recordings'):
+        cols = {r[1] for r in cur.execute(f'PRAGMA table_info({table})').fetchall()}
+        if cols and 'move_when_account_full' not in cols:
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN move_when_account_full BOOLEAN')
+    conn.commit()
+
+
 def _m127_sports_team_look(conn, cur):
     """sports_teams.color1-3, short_name and badge_url: what a sports channel's waiting screen draws
     a team in. They come from the same once-a-season lookupteam answer as the names, so every team
@@ -3720,6 +3750,16 @@ def _m127_sports_team_look(conn, cur):
     cur.execute(f"UPDATE sports_fetches SET next_due_at = ? WHERE kind = 'team' AND next_due_at IS NULL "
                 f"AND target IN (SELECT 'team:' || tsdb_id FROM sports_teams WHERE {bare})", (now,))
     cur.execute(f'UPDATE sports_teams SET last_looked_up = NULL WHERE {bare}')
+    conn.commit()
+
+
+def _m128_sports_team_own_names(conn, cur):
+    """sports_teams.own_names: the names a person adds for a team on its league's page, kept apart
+    from the names a lookup rewrites (dev/changelog/1580). No backfill: nobody could add one before
+    this. Re-runnable from the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(sports_teams)').fetchall()}
+    if cols and 'own_names' not in cols:
+        cur.execute("ALTER TABLE sports_teams ADD COLUMN own_names TEXT NOT NULL DEFAULT '[]'")
     conn.commit()
 
 
@@ -4387,6 +4427,12 @@ SCHEMA_MIGRATIONS = [
      'sports channels carrying it', _m126_sports_live_now),
     (127, 'sports_teams: color1-3, short_name and badge_url, a team\'s look on a sports channel\'s '
      'waiting screen, asked again for every team that has none', _m127_sports_team_look),
+    (128, 'sports_teams.own_names: the names a person adds for a team', _m128_sports_team_own_names),
+    (129, 'sports_events.feed_moved_at + feed_moved_from + feed_moved_by: a league game placed again '
+     'after a collision on its numbered channel', _m129_sports_feed_moved),
+    (130, 'recording_profiles + recordings: move_when_account_full, whether a recording may move '
+     'to another channel with the same program when its account is full',
+     _m130_move_when_account_full),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

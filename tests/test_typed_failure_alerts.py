@@ -34,7 +34,6 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import app as app_pkg  # noqa: E402
 import app.config as cfgmod  # noqa: E402
 import app.postprocessor as ppmod  # noqa: E402
 from app import db  # noqa: E402
@@ -43,7 +42,7 @@ from app.accounts import _do_sync  # noqa: E402
 from app.database import Account, Alert  # noqa: E402
 from app.postprocessor import ConversionResult, do_postprocess  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
-from tests.support import seed  # noqa: E402
+from tests.support import alert_handler, seed  # noqa: E402
 
 M3U_URL = 'http://provider.test/playlist.m3u'
 
@@ -66,18 +65,10 @@ class _LiveAlertHandlerCase(unittest.TestCase):
         self.t.cleanup()
 
     def _attach_alert_handler(self):
-        app_pkg._setup_logging({'logging': {'level': 'INFO'}})
-        root = logging.getLogger()
-        self._handlers = [h for h in root.handlers if type(h).__name__ == '_AlertHandler']
-        self.assertTrue(self._handlers,
-                        '_setup_logging did not attach an _AlertHandler - these tests would '
-                        'silently pass without one')
+        self._handlers = alert_handler.attach()
 
     def _detach_alert_handler(self):
-        root = logging.getLogger()
-        for h in list(root.handlers):
-            if type(h).__name__ == '_AlertHandler':
-                root.removeHandler(h)
+        alert_handler.detach()
 
     def _alerts_for(self, recording_id):
         return Alert.query.filter_by(recording_id=recording_id).all()

@@ -293,9 +293,9 @@ def _searches(rules, tz, h24, *, with_gone=False) -> dict:
             continue
         for f in st.filters:
             if f.key == 'acct':
-                acct_ids |= {int(v) for v in f.values + f.ex if str(v).isdigit()}
+                acct_ids |= {int(v) for v in f.values + f.ex if str(v).isdecimal()}
             elif f.key == 'chan':
-                chan_ids |= {int(v) for v in f.values + f.ex if str(v).isdigit()}
+                chan_ids |= {int(v) for v in f.values + f.ex if str(v).isdecimal()}
     accounts = dict(db.session.query(Account.id, Account.name).filter(
         Account.id.in_(sorted(acct_ids)))) if acct_ids else {}
     channels = dict(db.session.query(Channel.id, Channel.name).filter(

@@ -41,6 +41,7 @@ _FIELDS = (
     ProfileField('retention_days', 'Auto-delete after', INT),
     ProfileField('pre_check_enabled', 'Pre-recording health check', BOOL),
     ProfileField('metadata_sidecar_enabled', 'Metadata file for media servers', BOOL),
+    ProfileField('move_when_account_full', 'When the account is full', BOOL),
     # On or off, never inherit: pinned images exist only on a profile (dev/changelog/1505, 1508).
     ProfileField('prefer_sports_art', "TheSportsDB's images first", BOOL, blank_value=False),
 )
@@ -118,6 +119,7 @@ def _global_defaults(cfg):
         'retention_days': cfg['recording']['retention_days'],
         'pre_check_enabled': cfg['channel_testing']['pre_check']['enabled'],
         'metadata_sidecar_enabled': cfg['recording']['metadata_sidecar']['enabled'],
+        'move_when_account_full': cfg['recording']['move_when_account_full'],
     }
 
 
@@ -146,6 +148,7 @@ _OVERRIDE_ROWS = (
     ('retention_days', 'Auto-delete', _retention),
     ('pre_check_enabled', 'Pre-recording check', lambda v: 'On' if v else 'Off'),
     ('metadata_sidecar_enabled', 'Metadata file', lambda v: 'On' if v else 'Off'),
+    ('move_when_account_full', 'Account full', lambda v: 'Move' if v else 'Wait'),
 )
 
 

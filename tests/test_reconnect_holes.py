@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import concatenator, db  # noqa: E402
 from app.database import DIAGNOSTICS, Recording, RecordingEvent, RecordingSegment  # noqa: E402
-from app.hole_repair import (DIAGNOSTIC_KIND, HoleMatch, HoleRepair,  # noqa: E402
+from app.hole_repair import (DIAGNOSTIC_KIND, HoleMatch, HoleRepair, jumps_beside,  # noqa: E402
                              close_reconnect_holes, match_reconnect_holes, setts_args)
 from app.probe import scan_timeline_jumps  # noqa: E402
 from app.proc_utils import TIMELINE_GAP_KEEP_SECONDS  # noqa: E402
@@ -40,7 +40,12 @@ def _ffmpeg(*args):
     subprocess.run(['ffmpeg', '-v', 'error', '-y', *args], check=True, timeout=180)
 
 
-def _loop(path):
+# A seed whose cut hands ffmpeg the new connection's first sound as one packet it cannot
+# split, the second audio jump of dev/docs/BUGS.md 2026-11-16 (2 of 250 seeds on ffmpeg 7.1).
+SECOND_JUMP_SEED = 1112
+
+
+def _loop(path, seed=1437):
     """A synthetic channel: picture and sound, one keyframe a second, B-frames so the video
     PES order is a real encoder's. Noise rather than a tone, so each AAC frame is a real
     frame's size and its PES spans more than one TS packet, as a channel's does - a cut can
@@ -48,7 +53,7 @@ def _loop(path):
     where the cut lands: unseeded, 8 of 360 builds cut where ffmpeg leaves a second audio jump
     and the fixture was not the one hole these tests are about (dev/docs/BUGS.md 2026-11-04)."""
     _ffmpeg('-f', 'lavfi', '-i', f'testsrc2=size=192x108:rate=25:duration={SECONDS}',
-            '-f', 'lavfi', '-i', f'anoisesrc=amplitude=0.5:duration={SECONDS}:seed=1437',
+            '-f', 'lavfi', '-i', f'anoisesrc=amplitude=0.5:duration={SECONDS}:seed={seed}',
             '-c:v', 'libx264', '-preset', 'veryfast', '-g', '25', '-bf', '2',
             '-c:a', 'aac', '-f', 'mpegts', path)
 
@@ -204,6 +209,22 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(set(matches[0].shifts), {0})
 
+    def test_a_jump_beside_a_matched_hole_is_named_and_not_matched(self):
+        """dev/docs/BUGS.md 2026-11-16: only a jump near a hole the repair closed, and never
+        the hole itself or a gap elsewhere in the file."""
+        scan = self.scan([(9.24, 13.781, 0.04), (60, 70.04, 0.04)],
+                         [(8.776, 13.517, 0.0213), (13.56, 14.179, 0.0213), (80, 81, 0.0213)])
+        matches, left = match_reconnect_holes(scan, [4.5])
+        self.assertEqual((len(matches), left), (1, []))
+        self.assertEqual(jumps_beside(scan, matches), [(1, 0.598)])
+        self.assertEqual(jumps_beside(scan, []), [])
+        # A jump of a hole's size beside it is a hole or a gap, reported elsewhere, and one
+        # just before the hole is not what the cut leaves.
+        scan = self.scan([(9.24, 13.781, 0.04)],
+                         [(7.9, 8.5, 0.0213), (8.776, 13.517, 0.0213), (13.56, 15.6, 0.0213)])
+        matches, _left = match_reconnect_holes(scan, [4.5])
+        self.assertEqual(jumps_beside(scan, matches), [])
+
     def test_setts_moves_every_packet_after_each_boundary_by_the_holes_before_it(self):
         args = setts_args([HoleMatch(5.0, {0: (31.0, 5.1), 1: (31.0, 5.2)}),
                            HoleMatch(6.0, {0: (60.0, 6.0), 1: (60.0, 6.1)})])
@@ -237,6 +258,11 @@ def setUpModule():
                              f'{scan_timeline_jumps(FIX["holed"])}')
     FIX['clean'] = os.path.join(src, 'clean.ts')
     _capture(loop, FIX['clean'])
+    loop2, cut2 = os.path.join(src, 'loop2.ts'), os.path.join(src, 'cut2.ts')
+    _loop(loop2, seed=SECOND_JUMP_SEED)
+    _cut_and_replay(loop2, cut2)
+    FIX['second'] = os.path.join(src, 'second.ts')
+    _capture(cut2, FIX['second'])
 
 
 def tearDownModule():
@@ -286,6 +312,31 @@ class RepairTests(unittest.TestCase):
         scan = scan_timeline_jumps(self.path)
         self.assertAlmostEqual(scan[0]['last_dts'], scan[1]['last_dts'], delta=0.2)
 
+    def test_a_second_audio_jump_beside_the_hole_is_reported_and_left(self):
+        """dev/docs/BUGS.md 2026-11-16: the cut can hand the capture a stretch of the new
+        connection's sound as one packet, stepped over as about 0.6 s. The repair closed the
+        hole and said the file plays straight through. Closing the step too would move the
+        sound that far early; it stays, is named, and the streams end together."""
+        shutil.copyfile(FIX['second'], self.path)
+        scan = scan_timeline_jumps(self.path)
+        self.assertEqual((len(scan[0]['jumps']), len(scan[1]['jumps'])), (1, 2),
+                         f'seed {SECOND_JUMP_SEED} no longer makes the second jump: {scan}')
+        prev, dts, cadence = scan[0]['jumps'][0]
+        before = _counts(self.path)
+        repair = self.repair(self.path, [dts - prev - cadence])
+        self.assertIsNone(repair.error, repair)
+        self.assertEqual(len(repair.closed), 1, repair)
+        self.assertEqual([idx for idx, _s in repair.beside], [1], repair)
+        self.assertAlmostEqual(repair.beside[0][1], 0.6, delta=0.15)
+        after = scan_timeline_jumps(self.path)
+        self.assertEqual(after[0]['jumps'], [], after)
+        self.assertEqual(len(after[1]['jumps']), 1, after)
+        self.assertAlmostEqual(after[0]['last_dts'], after[1]['last_dts'], delta=0.2)
+        self.assertEqual(_counts(self.path), before)
+
+    def test_a_clean_close_names_nothing_beside_it(self):
+        self.assertEqual(self.repair(self.path, [self.hole]).beside, ())
+
     def test_a_reported_hole_the_file_does_not_show_leaves_the_file_alone(self):
         shutil.copyfile(self.clean, self.path)
         stamp = _head(self.path)
@@ -325,7 +376,7 @@ class JoinTests(unittest.TestCase):
         self.dvr = os.path.join(self.t._tmpdir, 'dvr')
         os.makedirs(self.dvr, exist_ok=True)
 
-    def _recording(self, *clips, holes=None):
+    def _recording(self, *clips, holes=None, reset=False):
         now = datetime.utcnow()
         rec = seed.make_recording(status='CONCATENATING', name='holes',
                                   start_time=now - timedelta(seconds=30), stop_time=now)
@@ -340,9 +391,12 @@ class JoinTests(unittest.TestCase):
                 db.session.add(RecordingEvent(
                     recording_id=rec.id, event_type=DIAGNOSTICS, segment_number=n,
                     detail='capture ended',
-                    extra_data=json.dumps({'kind': 'capture_stderr',
-                                           'reconnect_replay_seconds': holes[n],
-                                           'reconnect_hole_seconds': holes[n]})))
+                    extra_data=json.dumps(
+                        {'kind': 'capture_stderr', 'reset_seconds': holes[n],
+                         'reset_hole_seconds': holes[n], 'timeline_hole_seconds': holes[n]}
+                        if reset else
+                        {'kind': 'capture_stderr', 'reconnect_replay_seconds': holes[n],
+                         'reconnect_hole_seconds': holes[n]})))
         db.session.commit()
         return rec.id
 
@@ -379,6 +433,51 @@ class JoinTests(unittest.TestCase):
         self.assertAlmostEqual(extra['closed_seconds'][0], hole, delta=0.2)
         self.assertEqual(extra['left_seconds'], [])
         self.assertEqual(extra['outcome'], 'closed')
+
+    def test_a_jump_left_beside_a_closed_hole_is_said_on_the_event(self):
+        """dev/docs/BUGS.md 2026-11-16: the event said the file plays straight through while
+        a stretch of sound beside the hole was still stepped over."""
+        prev, dts, cadence = scan_timeline_jumps(FIX['second'])[0]['jumps'][0]
+        rid = self._recording(FIX['second'], holes={1: [dts - prev - cadence]})
+        self._join(rid)
+        events = self._repair_events(rid)
+        self.assertEqual(len(events), 1, self._details(rid))
+        self.assertIn('the join closed the 1 hole of about', events[0].detail)
+        self.assertIn('Just after it, stream 1 steps over 0.6 s', events[0].detail)
+        self.assertIn('not a reported hole', events[0].detail)
+        self.assertNotIn('plays straight through', events[0].detail)
+        extra = json.loads(events[0].extra_data)
+        self.assertEqual(len(extra['beside_seconds']), 1)
+
+    def test_a_hole_a_clock_reset_left_is_closed_like_a_reconnects(self):
+        """dev/docs/BUGS.md 2026-11-16 @ 06:11:43 PM: a clock reset closed once per
+        stream leaves the same hole as a reconnect, and the capture reports it under its own
+        key, with no reconnect behind it."""
+        rid = self._recording(FIX['holed'], holes={1: [FIX['hole']]}, reset=True)
+        rec = self._join(rid)
+        self.assertEqual(scan_timeline_jumps(rec.output_path)[0]['jumps'], [])
+        events = self._repair_events(rid)
+        self.assertEqual(len(events), 1, self._details(rid))
+        self.assertIn('the join closed the 1 hole of about', events[0].detail)
+
+    def test_holes_of_both_kinds_are_handed_over_in_file_order(self):
+        """dev/docs/BUGS.md 2026-11-16 @ 06:11:43 PM: the matcher reads the holes in file
+        order with a cursor that only moves forward, so a reset's 30 s hole logged before a
+        reconnect's 5 s one is found only when it is handed over first."""
+        rec = seed.make_recording(status='CONCATENATING', name='order')
+        db.session.flush()
+        db.session.add(RecordingEvent(
+            recording_id=rec.id, event_type=DIAGNOSTICS, segment_number=1, detail='x',
+            extra_data=json.dumps({'kind': 'capture_stderr', 'reconnect_hole_seconds': [5.0],
+                                   'reset_hole_seconds': [30.0],
+                                   'timeline_hole_seconds': [30.0, 5.0]})))
+        db.session.add(RecordingEvent(
+            recording_id=rec.id, event_type=DIAGNOSTICS, segment_number=2, detail='x',
+            extra_data=json.dumps({'kind': 'capture_stderr',
+                                   'reconnect_hole_seconds': [4.9]})))
+        db.session.commit()
+        reported, _done = concatenator._reported_reconnect_holes(rec.id)
+        self.assertEqual(reported, {1: [30.0, 5.0], 2: [4.9]})
 
     def test_a_single_segment_recording_is_repaired_too(self):
         rid = self._recording(FIX['holed'], holes={1: [FIX['hole']]})

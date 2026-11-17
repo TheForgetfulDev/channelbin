@@ -342,7 +342,7 @@ def _make_new_dump_dir(cfg: dict, account_id: int) -> str:
         if d.startswith(today + '_') and os.path.isdir(os.path.join(account_dir, d))
     ]
     if existing:
-        nums = [int(d.split('_')[-1]) for d in existing if d.split('_')[-1].isdigit()]
+        nums = [int(d.split('_')[-1]) for d in existing if d.split('_')[-1].isdecimal()]
         if nums:
             n = max(nums) + 1
     dump_dir = os.path.join(account_dir, f'{today}_{n:02d}')

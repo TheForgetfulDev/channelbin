@@ -61,6 +61,7 @@ function openManualRecordModal() {
       stop_time: document.getElementById('manual-modal-stop').value,
       start_time_utc: startField.utc(),
       stop_time_utc: stopField.utc(),
+      source: 'url',
     });
     submitManualRecord(payload, close);
   }

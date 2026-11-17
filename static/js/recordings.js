@@ -395,6 +395,7 @@
         recording_start_time: d.start_iso,
         recording_stop_time: d.stop_iso,
         recording_profile_id: d.profile_id,
+        recording_move_when_full: d.move_when_full,
         suggested_name: name,
         title: name,
         stream_url: d.url,

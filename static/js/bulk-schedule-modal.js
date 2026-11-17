@@ -71,8 +71,10 @@ function openBulkScheduleModal(opts) {
     const lines = [];
     if (w.connection_limit_warning) {
       lines.push(`<div class="bs-warn is-hard">${escHtml(w.connection_limit_warning.message)}${
-        escHtml(conflictLines(w.connection_limit_warning))} When they overlap, one waits for a `
-        + 'free connection and records less.</div>');
+        escHtml(conflictLines(w.connection_limit_warning))} ${plan.moves_when_full
+        ? 'If the account is still full when it starts, it moves to another channel with this '
+          + 'program that has a connection free, or waits for one and records less.'
+        : 'When they overlap, one waits for a free connection and records less.'}</div>`);
     }
     if (w.overlap_warning && !w.connection_limit_warning) {
       lines.push(`<div class="bs-warn">${escHtml(w.overlap_warning.message)}${

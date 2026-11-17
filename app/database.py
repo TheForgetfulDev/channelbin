@@ -55,10 +55,20 @@ CAPTURE_LOST_TO_OUTAGE              = 'CAPTURE_LOST_TO_OUTAGE'
 # RECORDING_FAILED if its own stop_time passes first. See app/recorder.py::start_recording()
 # and app/scheduler.py::reschedule_recording_start().
 RECORDING_START_DEFERRED            = 'RECORDING_START_DEFERRED'
+# The start or stop job of a recording raised (app/scheduler.py::_start_job / _stop_job).
+# extra_data: job ('start' | 'stop'), error, tries. Written on the first raise and again
+# whenever the error changes, never once per try: the job is retried every minute and one
+# cause repeats for as long as it lasts (dev/changelog/1590).
+RECORDING_JOB_ERROR                 = 'RECORDING_JOB_ERROR'
 RECORDING_ABORTED                   = 'RECORDING_ABORTED'
 RECORDING_PAUSED                    = 'RECORDING_PAUSED'
 RECORDING_MANUALLY_STOPPED          = 'RECORDING_MANUALLY_STOPPED'
 RECORDING_CREATED_AFTER_EVENT_START = 'RECORDING_CREATED_AFTER_EVENT_START'
+# Written with every recording a person made, in the commit that creates it, so a recording
+# nobody remembers making says where it came from. extra_data['source'] is a key of
+# RECORDING_SOURCES. An auto-record rule's recording carries RECORDING_RULE_SCHEDULED instead
+# (dev/changelog/1593).
+RECORDING_CREATED                   = 'RECORDING_CREATED'
 RECORDING_STARTED_LATE              = 'RECORDING_STARTED_LATE'
 RECORDING_STOPPED_EARLY             = 'RECORDING_STOPPED_EARLY'
 RECORDING_EDITED                    = 'RECORDING_EDITED'
@@ -139,6 +149,11 @@ RECORDING_RULE_RELEASED             = 'RECORDING_RULE_RELEASED'
 # (DESIGN-sync-resilience.md §6) - the channel it targeted was missing from the provider
 # feed and the same stream survives on another channel row.
 RECORDING_REPOINTED                 = 'RECORDING_REPOINTED'
+# A SCHEDULED single-channel recording found its account with no connection free at start and
+# moved to another channel carrying the same program, on an account with one free
+# (app/seat_moves.py, dev/changelog/1611). extra_data names both channels and accounts and the
+# health tier the new one was taken from.
+RECORDING_MOVED_FOR_CONNECTION      = 'RECORDING_MOVED_FOR_CONNECTION'
 # The record-start refresh of Recording.metadata_description/_category/_rating found the
 # program's listing again and at least one value had moved since the recording was
 # scheduled - the provider revised the synopsis, re-genred it, or re-rated it. Logged only
@@ -488,9 +503,11 @@ EVENT_LABELS = {
     RECORDING_RESUME_REFUSED: 'Not picked back up: a capture is already running',
     CAPTURE_LOST_TO_OUTAGE: 'Capture lost while ChannelBin was down',
     RECORDING_START_DEFERRED: 'Start delayed',
+    RECORDING_JOB_ERROR: 'Hit an error starting or stopping',
     RECORDING_ABORTED: 'Cancelled',
     RECORDING_PAUSED: 'Paused',
     RECORDING_MANUALLY_STOPPED: 'Stopped by hand',
+    RECORDING_CREATED: 'Scheduled by hand',
     RECORDING_CREATED_AFTER_EVENT_START: 'Created after the program started',
     RECORDING_STARTED_LATE: 'Started late',
     RECORDING_STOPPED_EARLY: 'Stopped before its stop time',
@@ -512,6 +529,7 @@ EVENT_LABELS = {
     RECORDING_RULE_PROGRAM_MOVED: 'Program moved, recording stayed',
     RECORDING_RULE_RELEASED: 'No longer follows its rule',
     RECORDING_REPOINTED: 'Moved to another copy of the channel',
+    RECORDING_MOVED_FOR_CONNECTION: 'Moved to a channel with a free connection',
     RECORDING_METADATA_REFRESHED: 'Description updated from the guide',
     RECORDING_METADATA_REFRESH_SKIPPED: 'Description kept as you set it',
     RECORDING_METADATA_EDITED: 'Description edited',
@@ -646,6 +664,11 @@ class RecordingProfile(db.Model):
     # finished recording gets the .nfo and poster that describe it to a media server
     # (app/metadata_sidecar.py, dev/changelog/1057).
     metadata_sidecar_enabled  = db.Column(db.Boolean)
+    # None = use global recording.move_when_account_full; tri-state override. Whether a
+    # single-channel recording made with this profile may move to another channel with the
+    # same program when its account has no connection free (app/seat_moves.py,
+    # dev/changelog/1611).
+    move_when_account_full    = db.Column(db.Boolean)
     # A poster image pinned to this profile, used as the sidecar's artwork for every
     # recording made under it instead of a frame captured from the recording. The file's
     # name inside images_dir's posters subfolder - chosen by the server as
@@ -731,6 +754,9 @@ FAILURE_CONVERSION_COLLISION     = 'CONVERSION_COLLISION'
 FAILURE_CONNECTION_SLOT_TIMEOUT  = 'CONNECTION_SLOT_TIMEOUT'
 FAILURE_DVR_DIR_UNUSABLE         = 'DVR_DIR_UNUSABLE'
 FAILURE_MISSED_AT_STARTUP        = 'MISSED_AT_STARTUP'
+# Every try to start it raised an error inside ChannelBin, and its window ended before one
+# worked. The RECORDING_JOB_ERROR events name the error (dev/changelog/1590).
+FAILURE_START_ERROR              = 'START_ERROR'
 # Every account it could record from was blocked by the user (app/account_blocks.py) for the
 # rest of its window. A state the user chose, so it raises no alert (dev/changelog/1151).
 FAILURE_ACCOUNT_BLOCKED          = 'ACCOUNT_BLOCKED'
@@ -751,6 +777,11 @@ FAILURE_CONVERSION_FAILED        = 'CONVERSION_FAILED'
 # picture from 8 minutes in (dev/changelog/1422, 1424).
 TRACK_END_GAP_OUT_OF_STEP_SECONDS = 2.0
 
+# RecordingSegment.exit_reason for a capture restarted because its video stopped while the
+# sound kept arriving. Named because app/track_ends.py reads it back: that segment's sound
+# runs on past its picture by construction.
+SEGMENT_EXIT_VIDEO_STOPPED = 'VIDEO_STOPPED'
+
 # Recording.gave_up_reason vocabulary: the three give-ups above, on a capture that held data
 # when it happened. A different column from failure_reason because the row is not FAILED: its
 # capture ended before the stop time and what it holds is joined (dev/changelog/1404).
@@ -761,7 +792,7 @@ FAILURE_REASONS = (
     FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED,
     FAILURE_FAST_DELIVERY_DETECTED, FAILURE_LAUNCH_FAILED,
     FAILURE_CONVERSION_COLLISION, FAILURE_CONNECTION_SLOT_TIMEOUT, FAILURE_DVR_DIR_UNUSABLE,
-    FAILURE_MISSED_AT_STARTUP, FAILURE_ACCOUNT_BLOCKED,
+    FAILURE_MISSED_AT_STARTUP, FAILURE_START_ERROR, FAILURE_ACCOUNT_BLOCKED,
     FAILURE_ALL_SEGMENTS_PLACEHOLDER, FAILURE_SEGMENT_FILES_MISSING, FAILURE_NO_VALID_SEGMENTS,
     FAILURE_PAUSED_NOTHING_CAPTURED, FAILURE_INSUFFICIENT_DISK_SPACE, FAILURE_CONCAT_ERROR,
     FAILURE_SOURCE_MISSING, FAILURE_CONVERSION_FAILED,
@@ -1054,6 +1085,12 @@ class Recording(db.Model):
     # touching its profile or the global setting. Tri-state, tested with `is not None`:
     # False here is an answer, not an absence.
     metadata_sidecar_enabled = db.Column(db.Boolean)
+    # None = inherit RecordingProfile.move_when_account_full, which in turn inherits the global
+    # recording.move_when_account_full. The innermost of the three-level gate on moving a
+    # single-channel recording to another channel with the same program when its account has
+    # no connection free (app/seat_moves.py, dev/changelog/1611). Tri-state, tested with
+    # `is not None`; written only by the record dialog's create and edit.
+    move_when_account_full = db.Column(db.Boolean)
     # The user's answer to "leave my wording alone": when set, the record-start refresh
     # FILTERS on it and writes RECORDING_METADATA_REFRESH_SKIPPED. It never clears it, and
     # no background job, sweep or reconcile pass may write it - CLAUDE.md's
@@ -1114,7 +1151,10 @@ class Recording(db.Model):
     converted_gap_seconds    = db.Column(db.Float)
     # The worst distance between where the video and the audio end, across the segments and
     # the final file (app/track_ends.py). NULL = not measured. Keeps the worst seen: a clean
-    # reading of a later stage does not undo a segment that was out of step.
+    # reading of a later stage does not undo a segment that was out of step. A segment whose
+    # picture is known to have stopped under its sound is left out: that distance is a
+    # stretch with no picture, not the tracks out of step (dev/changelog/1599). NULL too
+    # when every reading taken was one of those.
     track_end_gap_seconds    = db.Column(db.Float)
 
     # ── Near-empty/slate segment detection (app/postprocessor.py::_detect_near_empty_segments) ──
@@ -1533,6 +1573,33 @@ def rule_status(status, gave_up_reason):
     return status
 
 
+# Where a recording made by hand was made: the word a page sends (the record dialog's
+# GUIDE_CONFIG.recordSource, templates/_macros.html::record_dialog_config) or a route sets
+# itself, and how the creation event says it. A request that names no page, or one this
+# table does not hold, is RECORDING_SOURCE_UNKNOWN: it is recorded as that, never refused,
+# because the word only describes the recording.
+RECORDING_SOURCE_UNKNOWN = 'unknown'
+RECORDING_SOURCE_BULK = 'bulk'
+RECORDING_SOURCES = {
+    'guide': 'the TV Guide',
+    'recordings': 'the Recordings page',
+    'search': 'Search',
+    'channel': "a channel's page",
+    'group': "a channel group's page",
+    'recording': "another recording's page",
+    'league': "a league's page in Sports Schedules",
+    'url': 'Record from URL, with a typed stream address',
+    RECORDING_SOURCE_BULK: "Search, with several showings scheduled at once",
+    RECORDING_SOURCE_UNKNOWN: 'a request that named no page of ChannelBin',
+}
+
+
+def recording_source(raw) -> str:
+    """The RECORDING_SOURCES key for what a request sent as its source."""
+    key = (raw or '').strip().lower() if isinstance(raw, str) else ''
+    return key if key in RECORDING_SOURCES else RECORDING_SOURCE_UNKNOWN
+
+
 def add_recording_event(recording_id, event_type, detail=None, segment_number=None, extra=None):
     """Insert a RecordingEvent into the session without committing - caller owns the commit.
 
@@ -1636,8 +1703,9 @@ CHANNEL_NEEDING_STATUSES = (REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_ST
 
 def detach_channel_references(channel_ids) -> int:
     """Unlink the history rows that name a channels.id and outlive the channel: a recording
-    whose capture is over, that recording's segments, and a group's event. Returns how many
-    recordings were unlinked.
+    whose capture is over, that recording's segments, a group's event, an auto-record rule's
+    ledger row and a Recent plays line. The EPG similarity scan's per-channel rows are
+    deleted, having nothing of their own to keep. Returns how many recordings were unlinked.
 
     Mutates without committing, like detach_recording_references above: both channel delete
     paths call it inside the closure that deletes the rows. `channel_ids` is one chunk, sized
@@ -1650,7 +1718,17 @@ def detach_channel_references(channel_ids) -> int:
     (dev/docs/BUGS.md 2026-11-15, dev/changelog/1569). Each row keeps its own text, which is
     what names the channel once the link is gone.
 
-    A recording in CHANNEL_NEEDING_STATUSES and its segments are left as they are. A NULL
+    The three added by dev/changelog/1594, and what each is read for:
+    rule_matches.channel_id is one of a rule's reach inputs (auto_rules._reach_inputs), so a
+    re-issued id would add a stranger's guide source to the rule; with it NULL the row counts
+    through its group, or not at all, which is what a gone channel already did. The row's
+    anchor is channel-free, so a cancellation still sticks. output_feed_plays.channel_id is
+    only the link on a line that keeps its own channel_name; this is the one write to that
+    table outside the feed's log writer. epg_scan_schedule_channels has no text of its own
+    and the page already drops a gone channel by inner join, so its rows go.
+
+    A recording in CHANNEL_NEEDING_STATUSES, its segments and its ledger row are left as
+    they are. A NULL
     channel_id on a scheduled or running recording means "recorded from a typed URL" to the
     conflict check and the recorder, which a deleted channel is not. An account's delete does
     not refuse over such a recording, so it can still leave one naming a gone channel."""
@@ -1668,6 +1746,14 @@ def detach_channel_references(channel_ids) -> int:
     ).update({'channel_id': None}, synchronize_session=False)
     ChannelGroupEvent.query.filter(ChannelGroupEvent.channel_id.in_(ids)).update(
         {'channel_id': None}, synchronize_session=False)
+    RuleMatch.query.filter(
+        RuleMatch.channel_id.in_(ids),
+        db.or_(RuleMatch.recording_id.is_(None), RuleMatch.recording_id.notin_(live)),
+    ).update({'channel_id': None}, synchronize_session=False)
+    OutputFeedPlay.query.filter(OutputFeedPlay.channel_id.in_(ids)).update(
+        {'channel_id': None}, synchronize_session=False)
+    EpgScanScheduleChannel.query.filter(EpgScanScheduleChannel.channel_id.in_(ids)).delete(
+        synchronize_session=False)
     return unlinked
 
 
@@ -3320,7 +3406,8 @@ FEED_PLAY_KINDS = (FEED_PLAY_ENDED, FEED_PLAY_REFUSED, FEED_PLAY_REDIRECTED)
 class OutputFeedPlay(db.Model):
     """One line of the IPTV output's Recent plays (app/output_feed.py, dev/changelog/1525): a
     play that ended, one that was refused, or a redirect-mode tune-in. Written by the feed's
-    one log writer and by nothing else, and pruned by age. Not an observation: nothing here
+    one log writer, pruned by age, and touched by one thing more: a channel's delete clears
+    its id from the lines that link to it (detach_channel_references). Not an observation: nothing here
     feeds a health score.
 
     An IPTV player asks again for a refused play about every half minute, so a run of the same
@@ -3349,13 +3436,16 @@ class OutputFeedPlay(db.Model):
 
 
 class SportsTeam(db.Model):
-    """A team's names, read once a season (6.2). No league column: a team can be in more than one
-    competition, and which league it plays in is read from its events."""
+    """A team's names, read again about once a week (6.2). No league column: a team can be in more
+    than one competition, and which league it plays in is read from its events."""
     __tablename__ = 'sports_teams'
     id             = db.Column(db.Integer, primary_key=True)
     tsdb_id        = db.Column(db.Integer, nullable=False, unique=True)
     full_name      = db.Column(db.String(255), nullable=False)
     names          = db.Column(db.Text, nullable=False, default='[]', server_default=db.text("'[]'"))
+    # Names a person added on the league page, as a JSON list. Kept apart from `names`, which every
+    # lookup rewrites from TheSportsDB, and written only by sports_match.set_team_names().
+    own_names      = db.Column(db.Text, nullable=False, default='[]', server_default=db.text("'[]'"))
     city           = db.Column(db.String(255))
     last_looked_up = db.Column(db.DateTime)
     # strColour1-3 as lowercase `#rrggbb`, each NULL when TheSportsDB has none ('' as measured) or
@@ -3446,9 +3536,17 @@ class SportsEvent(db.Model):
     guide_start      = db.Column(db.DateTime)
     guide_channels   = db.Column(db.Integer)
     # Which of the league's numbered feed channels carries this event, NULL until it is placed.
-    # Written once by app/sports_feed.py::place_league_events() and never moved: an IPTV player caches
-    # the guide it was given.
+    # Written only by app/sports_feed.py::place_league_events(), which moves a placed game only off a
+    # collision: TheSportsDB moving it onto another game's time on the same number by more than
+    # sports_feed.COLLISION (dev/changelog/1529). An IPTV player caches the guide it was given.
     feed_number      = db.Column(db.Integer)
+    # The one move place_league_events() makes, kept so the league page can say it
+    # (dev/changelog/1587): when the game was placed again, the number it left, and the id of the
+    # game whose time it had come to share. All NULL for a game that never moved; a later move
+    # keeps the first number left and overwrites the other two. Written only there.
+    feed_moved_at    = db.Column(db.DateTime)
+    feed_moved_from  = db.Column(db.Integer)
+    feed_moved_by    = db.Column(db.Integer)
     # Go live now (app/sports_feed.py::set_live_now(), dev/changelog/1530): a person said this game
     # is on early, so every sports channel carrying it plays it ahead of its window until
     # `live_now_until`, fixed when the button is pressed so a game moved to next week cannot bring it

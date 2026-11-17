@@ -9,7 +9,7 @@ from app.postprocessor import kill_active_conversions
 from app.concatenator import kill_active_joins
 from app.preview import kill_all_previews
 from app.output_feed import kill_all_viewers
-from app.scheduler import release_pidfile
+from app.scheduler import release_pidfile, stop_taking_work
 
 app = create_app()
 
@@ -29,6 +29,10 @@ def _handle_shutdown(signum, frame):
     # A live preview is killed on the same terms: its ffmpeg holds a provider connection
     # open for a viewer this process can no longer serve (dev/changelog/1018). The output
     # feed's relays are the same thing for an IPTV player.
+    # First, so no job comes due between here and the process ending: once the main thread
+    # exits, the scheduler's thread is still alive but can no longer hand work to anything
+    # (dev/changelog/1591).
+    stop_taking_work()
     kill_all_active()
     kill_active_conversions()
     kill_active_joins()

@@ -807,7 +807,7 @@ class Headend:
             raise KeyError(label)
         kind, _, slug = key.partition('/')
         ch = self._by_slug[backend].get(slug) if slug else (
-            self._channel(backend, int(key)) if key.isdigit() else None)
+            self._channel(backend, int(key)) if key.isdecimal() else None)
         if ch is None:
             raise KeyError(label)
         return TsTiming(self.library.load(profile), self._feed(backend, ch, profile))

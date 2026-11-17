@@ -98,6 +98,15 @@ class Named:
     start: datetime | None
     score: int
     reason: str
+    # The duplicate copy whose name was read, when this channel is the kept copy of that stream and
+    # its own name does not name the game (design 6.8, dev/changelog/1579). '' when the name read is
+    # this channel's own.
+    source_name: str = ''
+
+    @property
+    def said_by(self) -> str:
+        """The channel whose name names the game."""
+        return self.source_name or self.channel_name
 
 
 @dataclass
@@ -173,11 +182,12 @@ class GameIndex:
             SportsMatch.event_id, SportsMatch.channel_id, SportsMatch.kind, SportsMatch.program_start_time,
             SportsMatch.program_stop_time, SportsMatch.title_key, SportsMatch.episode_key, SportsMatch.airing, SportsMatch.strength,
             SportsMatch.reason, SportsMatch.gone_since, Channel.account_id, Channel.name.label('channel_name'),
-            Channel.category_name, Channel.is_duplicate_loser, Channel.health_score,
-            Channel.manual_health_adjustment,
+            Channel.category_name, Channel.is_duplicate_loser, Channel.duplicate_cluster_id,
+            Channel.health_score, Channel.manual_health_adjustment,
         ).join(Channel, Channel.id == SportsMatch.channel_id).filter(
             SportsMatch.event_id.in_(ids), SportsMatch.rejected_at.is_(None), _offered(),
         ).all()
+        on_copies = []
         for m in rows:
             if m.gone_since is not None:
                 # A listing the guide no longer holds still says which game a ledger row was, so a
@@ -190,9 +200,12 @@ class GameIndex:
                 continue
             if m.kind == SPORTS_MATCH_KIND_CHANNEL_NAME:
                 out.named.add(m.event_id)
-                # Only a strong match on the copy of a stream that is kept is one a rule may record
-                # from (design 10): a duplicate loser is the same stream as a channel that is.
-                if m.strength == SPORTS_MATCH_STRONG and not m.is_duplicate_loser:
+                # Only the kept copy of a stream is one a rule may record from (design 10). A strong
+                # name on a duplicate copy is still a name for that stream, so it is carried over to
+                # the kept copy below.
+                if m.strength == SPORTS_MATCH_STRONG and m.is_duplicate_loser:
+                    on_copies.append(m)
+                elif m.strength == SPORTS_MATCH_STRONG:
                     from .channel_groups import effective_score
                     out.named_by.setdefault(m.event_id, []).append(Named(
                         channel_id=m.channel_id, account_id=m.account_id, channel_name=m.channel_name,
@@ -220,8 +233,50 @@ class GameIndex:
                                           m.program_stop_time - m.program_start_time)
             if m.event_id not in out.reasons:
                 out.reasons[m.event_id] = m.reason
+        out._name_kept_copies(on_copies)
         out._load_held()
         return out
+
+    def _name_kept_copies(self, on_copies: list):
+        """Give each strong name match on a duplicate copy to the kept copy of its stream, unless
+        that copy's own name already names the game. The kept copy's guide can keep repeating the
+        names it had on earlier days, so its own name is never read: on 2026-11-13, 16 of prod's 43
+        strong name matches were on duplicate copies and none of the 16 kept copies had a match, so
+        those games had nothing to record from (dev/changelog/1579). Two queries, and none when no
+        copy names a game."""
+        clusters = sorted({m.duplicate_cluster_id for m in on_copies if m.duplicate_cluster_id is not None})
+        if not clusters:
+            return
+        from .channel_groups import effective_score
+        # A cluster keeps one copy; a list all the same, since that is the duplicate module's rule
+        # and not a constraint on the table. The best-scored kept copy is the one named.
+        kept = {}
+        for ch in db.session.query(
+                Channel.id, Channel.account_id, Channel.name, Channel.category_name, Channel.duplicate_cluster_id,
+                Channel.health_score, Channel.manual_health_adjustment).filter(
+                Channel.duplicate_cluster_id.in_(clusters), Channel.is_duplicate_loser.is_(False), _offered()):
+            kept.setdefault(ch.duplicate_cluster_id, []).append(ch)
+        # A kept copy whose own name match for the game a person marked wrong stays out: the
+        # copy's name is the same claim about the same stream.
+        kept_ids = sorted({c.id for copies in kept.values() for c in copies})
+        wrong = set(db.session.query(SportsMatch.event_id, SportsMatch.channel_id).filter(
+            SportsMatch.event_id.in_(sorted({m.event_id for m in on_copies})),
+            SportsMatch.channel_id.in_(kept_ids), SportsMatch.kind == SPORTS_MATCH_KIND_CHANNEL_NAME,
+            SportsMatch.rejected_at.isnot(None))) if kept_ids else set()
+        for m in sorted(on_copies, key=lambda m: (m.event_id, m.channel_id)):
+            copies = kept.get(m.duplicate_cluster_id)
+            if not copies:
+                continue
+            ch = max(copies, key=lambda c: (effective_score(c), -c.id))
+            if (m.event_id, ch.id) in wrong:
+                continue
+            have = self.named_by.setdefault(m.event_id, [])
+            if any(n.channel_id == ch.id for n in have):
+                continue
+            have.append(Named(
+                channel_id=ch.id, account_id=ch.account_id, channel_name=ch.name, category=ch.category_name or '',
+                start=m.program_start_time, score=effective_score(ch), reason=m.reason,
+                source_name=m.channel_name))
 
     def _load_held(self):
         by_tsdb = {g.tsdb_id: g.id for g in self.games.values()}

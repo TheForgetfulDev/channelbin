@@ -32,6 +32,11 @@ w.fetch = (url, opts = {}) => {
     payload = { success: true, categories: [{ name: 'PFL Sunday Ticket', channels: 12, tied: false },
                                             { name: 'PFL Package', channels: 3, tied: true }] };
   }
+  if (method === 'PUT' && /\/categories$/.test(path) && body.add) {
+    // As the route answers an add: what was tied, and which arrived with Replays only on. The
+    // row already on the page stands in for a new one, since the swap is stubbed.
+    payload = { success: true, added: body.add.concat(['PFL Package']), replay_on: body.add };
+  }
   return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(payload), text: () => Promise.resolve(HTML) });
 };
 w.eval(JS[0]);
@@ -105,6 +110,31 @@ d.querySelector('.modal:not([id]) .sp-offer input').checked = true;
 await click(Array.from(d.querySelectorAll('.modal:not([id]) .modal-foot button')).find((b) => b.textContent.trim() === 'Add'));
 await wait(30);
 out.category_puts = sent((r) => r.method === 'PUT' && /\/categories$/.test(r.path));
+out.add_toast = d.getElementById('app-toast').textContent;
+const marked = d.querySelector('tr[data-cat="PFL Package"]');
+out.new_row = { marked: marked.classList.contains('sp-cat-new'), badge: (marked.querySelector('.sp-cat-newbadge') || {}).textContent || null };
+// A tap that lands while the list is still settling is put back and not sent.
+const late = d.querySelector('input[data-act="replay"]');
+const was = late.checked;
+late.checked = !was;
+late.dispatchEvent(new w.Event('change', { bubbles: true }));
+await wait(30);
+out.settling = { restored: late.checked === was, toast: d.getElementById('app-toast').textContent,
+  puts: sent((r) => r.method === 'PUT' && /\/categories$/.test(r.path)).length };
+
+await click(d.querySelector('[data-act="remove-team-name"]'));
+await wait(30);
+await click(d.querySelector('[data-act="team-name"]'));
+await wait(30);
+const pick = d.querySelector('.modal:not([id]) #sp-tn-team');
+out.team_options = Array.from(pick.options).map((o) => o.textContent);
+pick.value = pick.options[1].value;
+pick.dispatchEvent(new w.Event('change', { bubbles: true }));
+out.team_theirs = d.querySelector('.modal:not([id]) #sp-tn-theirs').textContent;
+d.querySelector('.modal:not([id]) #sp-tn-name').value = '  Harborview-on-Sea ';
+await click(Array.from(d.querySelectorAll('.modal:not([id]) .modal-foot button')).find((b) => b.textContent.trim() === 'Add'));
+await wait(30);
+out.team_puts = sent((r) => r.method === 'PUT' && /\/teams\/\d+\/names$/.test(r.path));
 
 console.log(JSON.stringify(out));
 // The page's live refresh keeps a timer running, so node would otherwise wait on it forever.

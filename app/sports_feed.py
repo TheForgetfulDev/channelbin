@@ -292,7 +292,7 @@ def _description(event, channels: int, unusable: int) -> str:
     elif unusable:
         bits.append(f'No stream it can play: {counted(unusable, "channel")} '
                     f"{'lists' if unusable == 1 else 'list'} this, on an account that is blocked or that "
-                    'the output feed is not allowed to use.')
+                    'the IPTV output is not allowed to use.')
     else:
         bits.append("No stream found yet: none of your channels' guides lists this. "
                     'ChannelBin looks again after each guide update.')
@@ -610,8 +610,9 @@ def place_league_events(league: SportsLeague, now: datetime) -> int:
     What is left to place is read from feed_number being NULL, which is the placement's own record,
     so this is re-runnable from the top. A game already placed keeps its number unless its time
     has changed onto another game's on the same number by more than COLLISION: then the one whose
-    time changed last gives its number up and is placed again, and a WARNING names both. Left
-    alone, one of the two would have no channel to be tuned on."""
+    time changed last gives its number up and is placed again, a WARNING names both, and the move
+    is kept on the game (feed_moved_*) for the league page to say. Left alone, one of the two
+    would have no channel to be tuned on."""
     if not league.feed_league_channels:
         return 0
     start = _event_start()
@@ -636,6 +637,12 @@ def place_league_events(league: SportsLeague, now: datetime) -> int:
                         event_game_name(clash), event_game_name(event), league.name, number,
                         event_game_name(mover))
             mover.feed_number = None
+            # The first number it left is the one kept: that is where the oldest cached guide
+            # still lists it, however many times it has moved since.
+            mover.feed_moved_at = now
+            if mover.feed_moved_from is None:
+                mover.feed_moved_from = number
+            mover.feed_moved_by = (event if mover is clash else clash).id
             if mover is clash:
                 kept[kept.index(clash)] = event
     taken, todo = {}, []
@@ -781,5 +788,25 @@ def card_context(league: SportsLeague, follows: list, team_names: dict, events: 
                     for i in team_ids), key=lambda t: t['name'].lower())
     return {'feed_on': output_feed.is_enabled(output_feed.feed_config(cfg)),
             'followed': bool(follows), 'whole': whole, 'league_on': bool(league.feed_league_channels),
-            'numbered': numbered, 'teams': teams}
+            'numbered': numbered, 'teams': teams,
+            'moved': moved_games(league, events) if whole and league.feed_league_channels else []}
+
+
+def moved_games(league: SportsLeague, events: list) -> list:
+    """One sentence per coming game of `events` that place_league_events() placed again after a
+    collision, soonest first: which game, the channel it left and the one it is on, and the game
+    it had come to share a time with. Pure: `events` is the league page's own list."""
+    from .sports_data import event_game_name
+    by_id = {e.id: e for e in events}
+    out = []
+    for e in sorted(events, key=lambda e: (e.start_at or datetime.max, e.id)):
+        if e.feed_moved_at is None or e.feed_number is None or e.feed_moved_from is None:
+            continue
+        other = by_id.get(e.feed_moved_by)
+        shared = f'the same time as {event_game_name(other)}' if other is not None else "another game's time"
+        out.append(f'{event_game_name(e)} moved from {league.name} {e.feed_moved_from} to {league.name} '
+                   f'{e.feed_number}: TheSportsDB changed a start time and it came to {shared} on one '
+                   f'channel. An IPTV player that has not refreshed its guide may still list it on '
+                   f'{league.name} {e.feed_moved_from}.')
+    return out
 

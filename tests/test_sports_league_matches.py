@@ -418,6 +418,33 @@ class NamesAndCategoriesTests(LeaguePageCase):
         cats = {c.category_name: c.is_replay for c in SportsLeagueCategory.query.filter_by(league_id=league.id)}
         self.assertEqual(cats, {'PFL Package': True})
 
+    def test_adding_a_category_answers_what_was_added_and_what_arrived_replays_only(self):
+        league, _, _, _ = seed_league()
+        db.session.commit()
+        r = self.client.put(f'/api/sports/leagues/{league.id}/categories', json={'add': ['PFL Package', 'US| PFL REPLAY']})
+        self.assertEqual(r.get_json(), {'success': True, 'added': ['PFL Package', 'US| PFL REPLAY'],
+                                        'replay_on': ['US| PFL REPLAY']})
+        both = self.client.put(f'/api/sports/leagues/{league.id}/categories',
+                               json={'add': ['US| PFL REPLAYS'], 'replay': {'US| PFL REPLAYS': False}})
+        self.assertEqual(both.get_json()['replay_on'], [])
+        again = self.client.put(f'/api/sports/leagues/{league.id}/categories', json={'add': ['PFL Package']})
+        self.assertEqual(again.get_json(), {'success': True, 'added': [], 'replay_on': []})
+
+    def test_a_replays_only_category_says_when_it_lists_a_coming_game_at_its_start(self):
+        """dev/docs/BUGS.md 2026-11-16: a Replays-only category held the only listing of 8 games at
+        their own start time, they read as replays, and nothing on the page showed it."""
+        league, (soon_ev, later_ev), ch, soon = seed_league()
+        add_match(soon_ev, ch[0], soon, airing='replay')
+        add_match(soon_ev, ch[1], soon + timedelta(hours=5), airing='replay')     # a real replay, hours later
+        add_match(later_ev, ch[2], later_ev.start_at, airing='first')             # not in the category
+        db.session.add(SportsLeagueCategory(league_id=league.id, category_name='PFL Package', is_replay=True))
+        db.session.commit()
+        self.assertEqual(sports_match.replay_category_live_games(league.id, datetime.utcnow()), {'PFL Package': 1})
+        text = self.page(league.id)
+        self.assertIn('Lists 1 coming game at its own start time, which looks live', text)
+        self.client.put(f'/api/sports/leagues/{league.id}/categories', json={'replay': {'PFL Package': False}})
+        self.assertNotIn('which looks live', self.page(league.id))
+
     def test_a_category_is_saved_exactly_as_the_channels_carry_it(self):
         league, _, ch, _ = seed_league()
         ch[3].category_name = 'PFL  Extra '
@@ -466,6 +493,10 @@ class LeaguePageScriptTests(unittest.TestCase):
             db.session.flush()
             add_name(soon_ev, slot)
             db.session.add(SportsLeagueCategory(league_id=league.id, category_name='PFL Package'))
+            from app.database import SportsTeam
+            db.session.add(SportsTeam(tsdb_id=2, full_name='Harborview Gulls', names=json.dumps(['Harborview Gulls', 'Gulls'])))
+            db.session.add(SportsTeam(tsdb_id=1, full_name='Ironvale Bears', names=json.dumps(['Ironvale Bears']),
+                                      own_names=json.dumps(['Ironvale U'])))
             db.session.commit()
             html = t.client.get(f'/sports/{league.id}').get_data(as_text=True)
             listings = t.client.get(f'/api/sports/events/{soon_ev.id}/listings').get_data(as_text=True)
@@ -530,6 +561,27 @@ class LeaguePageScriptTests(unittest.TestCase):
         self.assertEqual(bodies[0], {'replay': {'PFL Package': True}})
         self.assertEqual(bodies[1], {'remove': ['PFL Package']})
         self.assertEqual(bodies[2], {'add': ['PFL Sunday Ticket']})
+
+    def test_an_added_category_says_what_it_switched_on_and_is_marked(self):
+        """dev/docs/BUGS.md 2026-11-16: a category added with replay in its name arrived with Replays
+        only on and nothing said so, in a list whose rows had just moved."""
+        self.assertIn('Added 2 categories.', self.obs['add_toast'])
+        self.assertIn('Replays only is on for "PFL Sunday Ticket", because the name says replay', self.obs['add_toast'])
+        self.assertEqual(self.obs['new_row'], {'marked': True, 'badge': 'New'})
+
+    def test_a_tap_while_the_list_settles_is_put_back_and_not_saved(self):
+        """The tap that switched prod's NHL Center Ice to Replays only landed 1.4 seconds after a
+        category was added, on the row that had moved under it."""
+        self.assertTrue(self.obs['settling']['restored'])
+        self.assertIn('that tap was not saved', self.obs['settling']['toast'])
+        self.assertEqual(self.obs['settling']['puts'], 3)
+
+    def test_a_teams_name_is_removed_and_added_from_the_dialog(self):
+        self.assertEqual(self.obs['team_options'], ['Pick a team', 'Harborview Gulls', 'Ironvale Bears'])
+        self.assertEqual(self.obs['team_theirs'], 'Read as "Harborview Gulls", "Gulls" now.')
+        puts = self.obs['team_puts']
+        self.assertEqual((puts[0]['path'], puts[0]['body']), ('/api/sports/teams/1/names', {'names': []}))
+        self.assertEqual((puts[1]['path'], puts[1]['body']), ('/api/sports/teams/2/names', {'names': ['Harborview-on-Sea']}))
 
 
 if __name__ == '__main__':

@@ -1310,12 +1310,6 @@
 <script>
 const GUIDE_CONFIG = {
   epgUrl: '{{ url_for("guide.epg_api") }}',
-  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',  // GET list / POST create
-  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',  // + id + /delete
-  addChannelUrlBase: '/api/guide/channels/',
-  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
-  editRecordingUrlBase: '/recordings/',
-  recDetailUrlBase: '/recordings/',
   channelId: {{ channel.id }},
   windowDays: {{ guide_window_days }},
   // Layout state for both breakpoints, under this page's own keys (see
@@ -1331,11 +1325,7 @@ const GUIDE_CONFIG = {
   // The program chooser's Other airings: this program's title, searched in program titles
   // (routes/channels.py::airing_search_url, the one speller of the search's parameters).
   programAiringsUrl: {{ program_airings_url | tojson }},
-  profiles: {
-    {% for p in profiles %}
-    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
-    {% endfor %}
-  },
+  {{ m.record_dialog_config(profiles, 'channel') }}
 };
 </script>
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>

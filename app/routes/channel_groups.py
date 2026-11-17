@@ -54,6 +54,7 @@ from ..channel_groups import (
 )
 from ..config import load_config
 from ..db_utils import retry_on_locked
+from ..fmt_utils import plural
 from ..logo_cache import resolve_logo_url
 from ..tz_utils import local_input_value, format_local
 from .channel_tests import (
@@ -2089,7 +2090,7 @@ def _apply_demotion(group, state):
               'for recording.')
     if scheduled:
         n = len(scheduled)
-        detail += f" {n} scheduled recording{'' if n == 1 else 's'} cancelled."
+        detail += f" {n} scheduled {plural(n, 'recording')} cancelled."
     return demote_group_from_guide(group, scheduled, detail)
 
 
@@ -2838,7 +2839,7 @@ def clone_group(group_id):
     in_guide = bool(data.get('in_guide'))
     fmt_res = (data.get('format_resolution') or '').strip() or None
     fmt_fps = data.get('format_fps')
-    fmt_fps = int(fmt_fps) if str(fmt_fps or '').strip().isdigit() else None
+    fmt_fps = int(fmt_fps) if str(fmt_fps or '').strip().isdecimal() else None
     if (fmt_res is None) != (fmt_fps is None):
         return jsonify({'error': 'A manual group format needs both a resolution and a frame rate'}), 400
 

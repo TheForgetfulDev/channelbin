@@ -139,6 +139,39 @@ class DownloadTests(_Case):
             self.assertEqual(fh.read(), POSTER)
         self.assertIsNotNone(db.session.get(SportsState, 1).last_call_at)
 
+    def test_a_recordings_image_goes_ahead_of_a_team_lookup_and_behind_a_schedule_call(self):
+        """An image is fetched only while its recording is unfinished, so behind a long line of
+        team lookups a game could end with its artwork never downloaded (dev/changelog/1574)."""
+        from app.database import SPORTS_KIND_NEXT, SPORTS_KIND_TEAM, SportsFetch
+        self.recording()
+        db.session.add(SportsFetch(target='team:2', kind=SPORTS_KIND_TEAM, league_id=self.league.id,
+                                   next_due_at=NOW - timedelta(hours=1)))
+        db.session.add(SportsFetch(target='next:9001', kind=SPORTS_KIND_NEXT, league_id=self.league.id,
+                                   next_due_at=NOW))
+        db.session.commit()
+        with patch.object(sports_data, 'BASE_URL', self.fake.base_url):
+            now = NOW
+            for _ in range(4):
+                self.tick(now)
+                now += timedelta(minutes=5)
+        self.assertEqual([c[0] for c in self.fake.calls], ['eventsnextleague', 'image', 'image', 'lookupteam'])
+
+    def test_an_image_that_was_refused_does_not_hold_team_lookups_back(self):
+        """A 429 leaves an image due at once. Ahead of team lookups it would take every turn for as
+        long as the image host refused, so only an image's first try goes ahead of them."""
+        from app.database import SPORTS_KIND_TEAM, SportsFetch
+        self.recording()
+        db.session.add(SportsFetch(target='team:2', kind=SPORTS_KIND_TEAM, league_id=self.league.id,
+                                   next_due_at=NOW - timedelta(hours=1)))
+        db.session.commit()
+        self.fake.fault = 'rate_limited'
+        with patch.object(sports_data, 'BASE_URL', self.fake.base_url):
+            now = NOW
+            for _ in range(3):
+                self.tick(now)
+                now += timedelta(hours=2)
+        self.assertEqual([c[0] for c in self.fake.calls], ['image', 'image', 'lookupteam'])
+
     def test_two_recordings_of_one_event_share_one_download(self):
         self.recording()
         rec2 = seed.make_recording(channel_id=self.ch.id, program_start_time=KICKOFF,

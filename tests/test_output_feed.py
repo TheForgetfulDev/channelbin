@@ -83,6 +83,43 @@ class _FeedCase(unittest.TestCase):
         return self.get('/player_api.php', action='get_live_streams').get_json()
 
 
+class OneNameTests(_FeedCase):
+    """The feature has one name wherever a person reads it, "IPTV output" (dev/changelog/1588):
+    the page and its menu entry were named that, and Settings, the alerts and a dozen sentences
+    still said "output feed". Log lines and the settings search words keep the old name."""
+
+    def test_the_settings_page_says_iptv_output(self):
+        import re
+        html = self.client.get('/settings').get_data(as_text=True)
+        self.assertIn('data-path="integrations.output_feed.enabled"', html)
+        row = re.search(r'<div class="frow[^>]*data-path="integrations\.output_feed\.enabled".*?</div>\s*</div>',
+                        html, re.S).group(0)
+        self.assertIn('output feed', re.search(r'data-hay="([^"]*)"', row).group(1),
+                      'the old words still find the row')
+        shown = re.sub(r'<script.*?</script>|<!--.*?-->|data-hay="[^"]*"', '', html, flags=re.S)
+        self.assertNotIn('output feed', re.sub(r'<[^>]+>', ' ', shown).lower())
+        self.assertIn('<span class="fl-name">IPTV output</span>', html)
+        self.assertIn('Accounts the IPTV output may play from', html)
+
+    def test_a_refusals_alert_and_the_login_answer_say_iptv_output(self):
+        ch = make_channel(self.account, name='Paced')
+        ch.in_guide = True
+        db.session.commit()
+        self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 4242))
+        self.addCleanup(connlim.release, self.account.id, 'recording', 4242)
+        with self.t.app.test_request_context():
+            with self.assertRaises(feed.FeedRefused):
+                feed.start_session(feed.feed_id_for_channel(ch.id), 'tv')
+        self.assertTrue(Alert.query.filter_by(alert_type='VIEWER_REFUSED').one().title.startswith('IPTV output: '))
+        self.assertEqual(self.get('/player_api.php').get_json()['user_info']['message'], 'ChannelBin IPTV output')
+
+    def test_the_readiness_check_and_the_alert_type_say_iptv_output(self):
+        from app import alerts, readiness
+        check = next(c for c in readiness.CHECKS if c[0] == 'output_feed')
+        self.assertNotIn('output feed', ' '.join(v for v in check if isinstance(v, str)).lower())
+        self.assertEqual(alerts.ALERT_TYPES['FEED_NO_MEMBER']['label'], 'IPTV Output Has Nothing To Play')
+
+
 # ── Config and the gate ────────────────────────────────────────────────────────────────────
 
 class ConfigTests(unittest.TestCase):
@@ -903,6 +940,66 @@ class RelayFailoverTests(_Relay):
         self.assertIn('"Feed a"', event.detail)
         self.assertIn('"Feed b"', event.detail)
         self.assertEqual(session.failed_ids, {a.id})
+
+    def test_a_group_tune_in_tries_the_next_member_when_the_best_ones_account_is_full(self):
+        """dev/docs/BUGS.md 2026-11-16 (the tune-in walk): a group's play was refused 409 on the
+        best member's account with a member on another account free."""
+        other = make_account('Other', max_connections=1)
+        a = self._clip_channel('Feed a', clip='a.ts')
+        b = self._clip_channel('Feed b', clip='b.ts', account=other)
+        a.health_score, b.health_score = 90.0, 50.0
+        group = make_group('Game feeds', members=[a, b])
+        db.session.commit()
+        self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 4242))
+        self.addCleanup(connlim.release, self.account.id, 'recording', 4242)
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        self.assertEqual(session.channel_id, b.id)
+        self.assertEqual(session.account_id, other.id)
+        self.assertEqual(connlim._holders.get(other.id), [('viewer', session.id)])
+        self.assertEqual(session.failovers, [], 'starting lower down is not a move')
+        self.assertIn('Started on "Feed b"', feed.play_notes(session))
+        self.assertEqual(Alert.query.filter_by(alert_type='VIEWER_REFUSED').count(), 0)
+
+    def test_a_walked_play_is_not_ended_for_a_recording_on_the_account_it_left(self):
+        """A recording starting on the best member's account while the play waits there flags
+        every seatless play on that account as preempted (preempt_for_account). The play then
+        starts on another account, where nothing asked for its seat."""
+        from unittest import mock
+        other = make_account('Other', max_connections=1)
+        a = self._clip_channel('Feed a', clip='a.ts')
+        b = self._clip_channel('Feed b', clip='b.ts', account=other)
+        a.health_score, b.health_score = 90.0, 50.0
+        group = make_group('Game feeds', members=[a, b])
+        db.session.commit()
+        self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 4242))
+        self.addCleanup(connlim.release, self.account.id, 'recording', 4242)
+
+        def refused_and_flagged(session, member, first, deadline=0.0):
+            session.preempted, session.preempted_by = True, 4242
+            return False
+
+        with mock.patch.object(feed, '_take_seat', refused_and_flagged):
+            resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        self.assertEqual((session.channel_id, session.preempted), (b.id, False))
+
+    def test_a_group_with_every_account_full_is_still_refused_naming_the_best_member(self):
+        other = make_account('Other', max_connections=1)
+        a = self._clip_channel('Feed a', clip='a.ts')
+        b = self._clip_channel('Feed b', clip='b.ts', account=other)
+        a.health_score, b.health_score = 90.0, 50.0
+        group = make_group('Game feeds', members=[a, b])
+        db.session.commit()
+        for n, acct in enumerate((self.account, other)):
+            self.assertTrue(connlim.try_acquire(acct.id, 'recording', 4242 + n))
+            self.addCleanup(connlim.release, acct.id, 'recording', 4242 + n)
+        resp = self._play(feed.feed_id_for_group(group.id), expect=409)
+        self.assertIn('connection limit', resp.get_json()['error'])
+        self.assertEqual(feed.live_sessions(), [])
+        self.assertEqual(connlim._holders.get(other.id), [('recording', 4243)])
 
     def test_a_group_with_nothing_left_ends_by_name(self):
         group, (a,) = self._group('a.ts')

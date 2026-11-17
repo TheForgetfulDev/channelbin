@@ -146,7 +146,8 @@ class NeverChosenOpensInBasicTests(_Base, unittest.TestCase):
 
     def test_a_group_with_nothing_basic_hides_its_heading(self):
         self.assertEqual(self.obs['sections']['recording']['hiddenGroups'],
-                         ['conversion-resilience', 'collision-avoidance', 'measurement'])
+                         ['full-account', 'conversion-resilience', 'collision-avoidance',
+                          'measurement'])
 
     def test_the_basic_forms_stay(self):
         self.assertEqual(self.obs['sections']['security']['hiddenUnits'], 0)
@@ -361,7 +362,7 @@ def _gpu_gated(prefix):
 def _feed_gated():
     """The output feed's rows on first paint: the feed is off, so every one of its gated
     rows names that; the held seats also name the mode, which rests on proxy."""
-    off = 'Not used while Output feed for an IPTV player is off'
+    off = 'Not used while IPTV output is off'
     of = 'integrations.output_feed'
     out = {f'{of}.{leaf}': off for leaf in ('mode', 'accounts', 'reserve_seconds', 'buffer_mb',
                                              'max_viewers', 'idle_seconds',

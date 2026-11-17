@@ -732,6 +732,37 @@ REPLAY_MIN_SECONDS = 1.0
 # replay measured at most 4 closures, the stuck state 294 in 25 s (dev/changelog/1422).
 REPEAT_CLOSURES_STUCK = 10
 
+# How many progress lines may report a new position between a reconnect and a closure that is
+# still that reconnect's. ffmpeg closes a reconnect's jump on the first packets of the new
+# connection, so nothing but what was already in flight is written in between: at most 1 such
+# line across 17,900 closures on ffmpeg 7.1, whether the reconnect took 0 s or 1.5 s and through
+# 4 s and 25 s connect bursts (dev/changelog/1597). A line repeating the same position is the
+# wait for the new connection and does not count. Seconds of content cannot be the bound: a
+# burst moved the position 9 s between a reconnect and its own closure. A backward jump past
+# the bound is the provider's clock going back (recording 37, dev/docs/BUGS.md 2026-11-16).
+RECONNECT_CLOSURE_MAX_PROGRESS_STEPS = 2
+
+# How far back from a reconnect's line to look for the position before it: a progress line is
+# about 100 bytes, and whatever ffmpeg logged between the two is a few lines.
+_POSITION_LOOKBACK_BYTES = 4096
+
+_PROGRESS_TIME_RE = re.compile(rb'time=(\d+:[0-5]\d:[0-5]\d(?:\.\d+)?)')
+
+
+def _reconnect_block_end(raw: bytes, start: int) -> int:
+    """The offset in a stderr spool past which a closure is no longer the doing of the
+    reconnect logged at `start` (RECONNECT_CLOSURE_MAX_PROGRESS_STEPS). Stops reading at that
+    line, so a spool of many reconnects is not read once per reconnect."""
+    before = _PROGRESS_TIME_RE.findall(raw, max(0, start - _POSITION_LOOKBACK_BYTES), start)
+    position, steps = (before[-1] if before else None), 0
+    for m in _PROGRESS_TIME_RE.finditer(raw, start):
+        if m.group(1) != position:
+            position, steps = m.group(1), steps + 1
+            if steps > RECONNECT_CLOSURE_MAX_PROGRESS_STEPS:
+                return m.start()
+    return len(raw)
+
+
 # The lists no reconnect bounds. A closure that fires per packet pair would otherwise put
 # hundreds of thousands of numbers on one event.
 UNBOUNDED_JUMPS_KEPT = 200
@@ -755,8 +786,16 @@ class ReconnectJumps(NamedTuple):
     (dev/changelog/1415). `closed_gaps` is every forward jump ffmpeg closed up, in seconds:
     a jump past TIMELINE_GAP_KEEP_SECONDS, which is content the provider never sent or its
     clock moving ahead, and the file's timeline then runs on as if the stretch were not
-    there. `resets` is a backward jump closed with no reconnect behind it: the provider's
-    clock went back, and the file's timeline runs on from where it was.
+    there. `resets` is a backward jump closed with no reconnect behind it, or after a
+    reconnect's own closures were over (_reconnect_block_end): the provider's
+    clock went back, and the file's timeline runs on from where it was. A reset is closed
+    once per stream for the same reason a reconnect's jump is: the late frame left in the
+    parser lands a reset's length ahead, and the next frame is closed again. `reset_holes` is
+    that second closure, the next closure after a reset, inside the same bound and within a
+    second of its length; it leaves a hole as long as the reset in the file's timeline,
+    which the join closes like a reconnect's (dev/changelog/1604). `timeline_holes` is every
+    hole of both kinds in the order the spool logged them, which is the order the join's
+    matcher reads the file in.
 
     `repeats` counts closures past a reconnect's replay and hole. A few are a late packet.
     Thousands mean ffmpeg's one timestamp offset is being moved back and forth between the
@@ -771,6 +810,8 @@ class ReconnectJumps(NamedTuple):
     resets: tuple = ()
     repeats: int = 0
     repeat_seconds: float = 0.0
+    reset_holes: tuple = ()
+    timeline_holes: tuple = ()
 
 
 def read_reconnect_jumps(path, max_bytes: int = STDERR_SCAN_MAX_BYTES,
@@ -779,7 +820,8 @@ def read_reconnect_jumps(path, max_bytes: int = STDERR_SCAN_MAX_BYTES,
 
     Reads the whole spool, bounded like count_stderr_matches() and for the same reason: it
     runs between a dead ffmpeg and its relaunch. A backward jump logged before the first
-    reconnect is not attributed to one: it is a reset. A forward jump is never a replay,
+    reconnect, or after a reconnect's own closures were over, is not attributed to one: it is
+    a reset. A forward jump is never a replay,
     wherever it is logged: it is a closed gap. Never raises.
     """
     if not path:
@@ -790,35 +832,52 @@ def read_reconnect_jumps(path, max_bytes: int = STDERR_SCAN_MAX_BYTES,
             complete = not fh.read(1)
     except OSError:
         return ReconnectJumps((), (), True)
-    replays, holes, closed_gaps, resets = [], [], [], []
+    replays, holes, closed_gaps, resets, reset_holes, timeline_holes = [], [], [], [], [], []
     repeats, repeat_seconds = 0, 0.0
-    in_block, first, block_hole = False, True, None
+    block_end, first, block_hole = 0, True, None
+    # The reset whose second closure the next one may be, and where that chance ends.
+    reset_open, reset_end = None, 0
     for m in _RECONNECT_OR_JUMP_RE.finditer(raw):
         if m.group(1):
-            in_block, first, block_hole = True, True, None
+            # A block that ran to the end of the spool holds every later reconnect's too:
+            # a dead provider's thousands of reconnects are not each read to the end.
+            if block_end < len(raw):
+                block_end = _reconnect_block_end(raw, m.end())
+            first, block_hole, reset_open = True, None, None
             continue
         seconds = -int(m.group(2)) / 1_000_000
+        if abs(seconds) < min_seconds:
+            continue
+        after_reset, reset_open = reset_open, None
         if seconds <= -min_seconds:
             if block_hole is not None and abs(-seconds - block_hole) < 1.0:
                 repeats, repeat_seconds = repeats + 1, round(-seconds, 3)
             elif len(closed_gaps) < UNBOUNDED_JUMPS_KEPT:
                 closed_gaps.append(round(-seconds, 3))
             continue
-        if seconds < min_seconds:
-            continue
-        if not in_block:
-            if len(resets) < UNBOUNDED_JUMPS_KEPT:
-                resets.append(round(seconds, 3))
-        elif first:
+        in_block = m.start() < block_end
+        if in_block and first:
             replays.append(round(seconds, 3))
             first = False
-        elif block_hole is None:
+        elif in_block and block_hole is None:
             holes.append(round(seconds, 3))
+            timeline_holes.append(round(seconds, 3))
             block_hole = seconds
-        else:
+        elif in_block or (block_hole is not None and abs(seconds - block_hole) < 1.0):
+            # Streams stuck apart go on flipping long after the reconnect that left them so,
+            # by the hole's own length each time: that is what names one past the bound.
             repeats, repeat_seconds = repeats + 1, round(seconds, 3)
+        elif (after_reset is not None and m.start() < reset_end
+              and abs(seconds - after_reset) < 1.0):
+            if len(reset_holes) < UNBOUNDED_JUMPS_KEPT:
+                reset_holes.append(round(seconds, 3))
+                timeline_holes.append(round(seconds, 3))
+        elif len(resets) < UNBOUNDED_JUMPS_KEPT:
+            resets.append(round(seconds, 3))
+            reset_open, reset_end = seconds, _reconnect_block_end(raw, m.end())
     return ReconnectJumps(tuple(replays), tuple(holes), complete, tuple(closed_gaps),
-                          tuple(resets), repeats, repeat_seconds)
+                          tuple(resets), repeats, repeat_seconds, tuple(reset_holes),
+                          tuple(timeline_holes))
 
 
 # What `-loglevel level+info` makes ffmpeg write on every line: its own severity, after any
@@ -1040,16 +1099,24 @@ def read_replay_seconds_since(path, content_position, max_bytes: int = REPLAY_SC
     the hole. Both move ffmpeg's time= forward with nothing new delivered, which is how 73 s
     of replay read as 1.61x in recording 32 (dev/changelog/1423).
 
-    A jump is placed by the time= line before it. 0.0 when the spool cannot be read."""
+    A jump is placed by the time= line before it, and is a reconnect's only while the
+    position has moved on no more than RECONNECT_CLOSURE_MAX_PROGRESS_STEPS times since: a
+    later one is the provider's clock going back, which adds nothing to subtract. 0.0 when
+    the spool cannot be read."""
     raw = _read_spool_end(path, max_bytes)
     if raw is None:
         return 0.0
-    position, closures_left, total = None, 0, 0.0
+    position, closures_left, steps, total = None, 0, 0, 0.0
     for m in _POSITION_OR_RECONNECT_OR_JUMP_RE.finditer(raw):
         if m.group(1):
-            position = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            now = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            if closures_left and now != position:
+                steps += 1
+                if steps > RECONNECT_CLOSURE_MAX_PROGRESS_STEPS:
+                    closures_left = 0
+            position = now
         elif m.group(4):
-            closures_left = 2
+            closures_left, steps = 2, 0
         else:
             seconds = -int(m.group(5)) / 1_000_000
             if (seconds >= min_seconds and closures_left and position is not None

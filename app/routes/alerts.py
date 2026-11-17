@@ -80,11 +80,11 @@ def _resolve_alert_link(a: Alert) -> tuple[str, str] | None:
     parts = a.source.split(':')
 
     other_value = _LIFECYCLE_ALERT_OTHER_VALUE.get(a.alert_type)
-    if other_value is not None and len(parts) == 3 and parts[0] == 'account' and parts[1].isdigit():
+    if other_value is not None and len(parts) == 3 and parts[0] == 'account' and parts[1].isdecimal():
         return (url_for('channels.channel_browser', **{'f.other': other_value, 'f.acct': parts[1]}),
                 'Search')
 
-    if len(parts) >= 2 and parts[1].isdigit():
+    if len(parts) >= 2 and parts[1].isdecimal():
         if parts[0] == 'group':
             return url_for('channel_groups.group_detail', group_id=int(parts[1])), 'Group'
         if parts[0] == 'account':

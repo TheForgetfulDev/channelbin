@@ -6,6 +6,7 @@ APScheduler integration.
 - resume_in_progress_recordings() runs at startup to handle crashed sessions.
 - Per-account account_sync_<id> IntervalTrigger jobs for EPG sync.
 """
+import json
 import logging
 import os
 import re
@@ -22,6 +23,7 @@ from apscheduler.jobstores.base import JobLookupError
 from . import admission
 from .config import config_default
 from .db_utils import configure_sqlite_pragmas, retry_on_locked
+from .fmt_utils import counted
 from .tz_utils import to_naive_utc
 
 log = logging.getLogger(__name__)
@@ -148,6 +150,47 @@ class _GuardedScheduler(BackgroundScheduler):
                       'starts again.'),
                 source='scheduler')
             raise
+
+
+# True once the process has been told to stop (run.py's signal handler). After the main
+# thread exits, Python closes every thread pool to new work while the scheduler's daemon
+# thread is still running, so a job that comes due in that window cannot be handed to a
+# worker and APScheduler logs it at ERROR (dev/docs/BUGS.md 2026-11-16, dev/changelog/1591).
+_stopping = False
+
+
+def stop_taking_work():
+    """Stop the scheduler dispatching, without waiting on it. Safe in a signal handler:
+    pause() sets the scheduler's state and tells its listeners, touching no database and
+    taking only the listener and logging locks, both re-entrant and neither held across
+    I/O by a pass. shutdown() takes the jobstore lock and joins the loop thread, and would
+    hold a restart behind a pass that is waiting on a locked database. A paused scheduler's next pass
+    returns before reading the jobstore, so nothing due is submitted and nothing is lost:
+    the jobs are persisted and the next start fires what is overdue."""
+    global _stopping
+    _stopping = True
+    scheduler = _scheduler
+    if scheduler is not None and scheduler.running:
+        scheduler.pause()
+
+
+class _StoppingSubmitFilter(logging.Filter):
+    """A pass already past its pause check when the stop arrived can still fail to submit.
+    That is the stop itself, not a fault: keep the line, at INFO and with no traceback, so
+    it raises no alert. Any other record, and this one while running, passes untouched."""
+
+    def filter(self, record):
+        if (_stopping and record.levelno >= logging.ERROR
+                and str(record.msg).startswith('Error submitting job')):
+            record.levelno = logging.INFO
+            record.levelname = logging.getLevelName(logging.INFO)
+            record.msg = 'Not started, ChannelBin is stopping: ' + str(record.msg)
+            record.exc_info = None
+            record.exc_text = None
+        return True
+
+
+logging.getLogger('apscheduler.scheduler').addFilter(_StoppingSubmitFilter())
 
 
 def _alert_from_scheduler_thread(alert_type, title, body, source=None):
@@ -353,6 +396,10 @@ def schedule_recording(app, recording_id: int, start_time: datetime, stop_time: 
 
 
 def unschedule_recording(recording_id: int):
+    # A cancel, a delete or an edit ends whatever retry a raised job had armed, and the
+    # count with it: a later raise on this id is a first raise again, with its own alert.
+    _clear_job_error('start', recording_id)
+    _clear_job_error('stop', recording_id)
     for job_id in (f'start_{recording_id}', f'stop_{recording_id}', f'precheck_{recording_id}',
                    f'retry_{recording_id}', f'resume_{recording_id}'):
         remove_job_if_exists(job_id)
@@ -602,6 +649,7 @@ def resume_in_progress_recordings(app):
             REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
             REC_STATUS_FAILED,
             FAILURE_SOURCE_MISSING, FAILURE_CONVERSION_FAILED, FAILURE_MISSED_AT_STARTUP,
+            FAILURE_START_ERROR, RECORDING_JOB_ERROR, RecordingEvent,
             ACCOUNT_STATUS_SYNCING, ACCOUNT_STATUS_ERROR, ACCOUNT_STATUS_UNSYNCED,
             SYNC_LOG_CANCELLED,
         )
@@ -918,13 +966,24 @@ def resume_in_progress_recordings(app):
         import threading as _t
 
         @retry_on_locked()
-        def _mark_expired_failed(expired_recs):
+        def _mark_expired_failed(expired_recs, start_errors):
             for rec in expired_recs:
                 rec.status = REC_STATUS_FAILED
                 rec.completed_at = now
-                rec.failure_reason = FAILURE_MISSED_AT_STARTUP
-                add_recording_event(rec.id, RECORDING_FAILED,
-                                    'Recording missed entirely - stop time already passed at startup')
+                error = start_errors.get(rec.id)
+                if error:
+                    # The service was up for at least part of the window and the start
+                    # raised: that is why it never started, not the restart that found it.
+                    rec.failure_reason = FAILURE_START_ERROR
+                    add_recording_event(
+                        rec.id, RECORDING_FAILED,
+                        f'Never started: its start hit an error inside ChannelBin, the last '
+                        f'one "{error}", and its stop time had passed when the service '
+                        'restarted')
+                else:
+                    rec.failure_reason = FAILURE_MISSED_AT_STARTUP
+                    add_recording_event(rec.id, RECORDING_FAILED,
+                                        'Recording missed entirely - stop time already passed at startup')
             if expired_recs:
                 db.session.commit()
 
@@ -932,9 +991,23 @@ def resume_in_progress_recordings(app):
             Recording.status == REC_STATUS_SCHEDULED,
             Recording.stop_time <= now,
         ).all()
+        # The last start error each one recorded, in one query; ascending id, so a later
+        # event replaces an earlier one.
+        start_errors = {}
+        if expired:
+            for ev in RecordingEvent.query.filter(
+                    RecordingEvent.recording_id.in_([r.id for r in expired]),
+                    RecordingEvent.event_type == RECORDING_JOB_ERROR,
+            ).order_by(RecordingEvent.id).all():
+                try:
+                    extra = json.loads(ev.extra_data) if ev.extra_data else {}
+                except ValueError:
+                    extra = {}
+                if extra.get('job') == 'start' and extra.get('error'):
+                    start_errors[ev.recording_id] = extra['error']
         for rec in expired:
             log.info('Recording %d is SCHEDULED but past stop_time → marking FAILED', rec.id)
-        _mark_expired_failed(expired)
+        _mark_expired_failed(expired, start_errors)
         # A row that was held behind a slot or a conversion when the process went down is
         # not waiting any more; every other way out of the wait clears the same two facts.
         from .recorder import end_capture_wait
@@ -1097,16 +1170,283 @@ def resume_in_progress_recordings(app):
                             aps_job.id)
 
 
+# A start or stop job that raises is tried again on this interval. The raise is ChannelBin's
+# own (a database that could not be reached, a bug), never a refused stream - that is the
+# watchdog's to pace - so the retry opens no provider connection of its own.
+JOB_ERROR_RETRY_SECONDS = 60
+# A stop that keeps raising is given up on after this many tries; a start is bounded by the
+# recording's own stop time instead.
+STOP_JOB_MAX_TRIES = 10
+
+# {(job, recording_id): {'tries': int, 'first_at': datetime, 'error': str, 'written': str|None}}
+# for a job that has raised and not yet run clean. In memory only: after a restart the
+# startup sweep owns a recording still SCHEDULED, and reads the reason from the events.
+_job_errors = {}
+_job_errors_lock = threading.Lock()
+
+
+def _describe_error(exc) -> str:
+    text = f'{type(exc).__name__}: {exc}'.strip()
+    return text if len(text) <= 300 else text[:297] + '...'
+
+
+def _note_job_error(job, recording_id, exc):
+    """Count one raise and return (entry copy, whether the event is still owed). The event is
+    owed until it has been written for this error text, so a write that failed with the
+    database is made on a later try."""
+    error = _describe_error(exc)
+    with _job_errors_lock:
+        entry = _job_errors.setdefault(
+            (job, recording_id), {'tries': 0, 'first_at': datetime.utcnow(), 'error': error,
+                                  'written': None})
+        entry['tries'] += 1
+        entry['error'] = error
+        return dict(entry), entry['written'] != error
+
+
+def _clear_job_error(job, recording_id):
+    with _job_errors_lock:
+        return _job_errors.pop((job, recording_id), None)
+
+
+def _rollback_quietly(recording_id):
+    """Roll the session back on a path that is already handling a failure: a rollback that
+    raises too (the database is usually why we are here) must not end the retry."""
+    from . import db
+    try:
+        db.session.rollback()
+    except Exception:
+        log.warning('Recording %d: rollback after a job error also failed', recording_id,
+                    exc_info=True)
+
+
+def _write_job_error_event(job, recording_id, entry, detail):
+    """Write the RECORDING_JOB_ERROR event. False when the write itself failed: the cause of
+    the raise is often the database, and a failed report must not end the retry."""
+    from . import db
+    from .database import RECORDING_JOB_ERROR, Recording, add_recording_event
+
+    @retry_on_locked()
+    def _add_and_commit():
+        if db.session.get(Recording, recording_id) is None:
+            return
+        add_recording_event(recording_id, RECORDING_JOB_ERROR, detail,
+                            extra={'job': job, 'error': entry['error'], 'tries': entry['tries']})
+        db.session.commit()
+
+    try:
+        _add_and_commit()
+    except Exception:
+        log.warning('Recording %d: could not write the event for its %s error; it is tried '
+                    'again with the next attempt', recording_id, job, exc_info=True)
+        _rollback_quietly(recording_id)
+        return False
+    with _job_errors_lock:
+        live = _job_errors.get((job, recording_id))
+        if live is not None:
+            live['written'] = entry['error']
+    return True
+
+
+def _rearm_after_job_error(job, recording_id, run_date):
+    try:
+        if job == 'start':
+            reschedule_recording_start(recording_id, run_date)
+        else:
+            reschedule_recording_stop(recording_id, run_date)
+        return True
+    except Exception:
+        log.critical('Recording %d: could not schedule another try of its %s after an error, '
+                     'so nothing will %s it until ChannelBin restarts', recording_id, job, job,
+                     exc_info=True, extra={'recording_id': recording_id})
+        return False
+
+
+def _fail_start_after_errors(recording_id, entry):
+    """The window closed with every start try raising: FAILED, naming the error."""
+    from . import db
+    from .database import (
+        FAILURE_START_ERROR, REC_STATUS_FAILED, REC_STATUS_SCHEDULED, RECORDING_FAILED,
+        Recording, add_recording_event)
+    detail = (f'Never started: {counted(entry["tries"], "try", "tries")} to start it hit an error '
+              f'inside ChannelBin, the last one "{entry["error"]}", and its stop time passed '
+              'before one worked')
+
+    @retry_on_locked()
+    def _fail_and_commit():
+        rec = db.session.get(Recording, recording_id)
+        if rec is None or rec.status != REC_STATUS_SCHEDULED:
+            return None
+        rec.status = REC_STATUS_FAILED
+        rec.completed_at = datetime.utcnow()
+        rec.failure_reason = FAILURE_START_ERROR
+        add_recording_event(recording_id, RECORDING_FAILED, detail,
+                            extra={'job': 'start', 'error': entry['error'],
+                                   'tries': entry['tries']})
+        account_id = rec.channel.account_id if (rec.channel_id and rec.channel) else None
+        db.session.commit()
+        return rec.name, account_id
+
+    failed = _fail_and_commit()
+    if failed is None:
+        return
+    name, account_id = failed
+    unschedule_recording(recording_id)
+    # What the other never-started paths in app/recorder.py take down. The row was still
+    # SCHEDULED, so nothing was ever spawned, but a start that raised after taking the
+    # account's seat left it held, and nothing else would give it back.
+    if account_id is not None:
+        from . import connection_limits as connlim
+        connlim.release(account_id, 'recording', recording_id)
+    from .health_score import dismiss_recording_failing_alerts
+    from .recorder import end_capture_wait
+    dismiss_recording_failing_alerts(recording_id)
+    end_capture_wait(recording_id)
+    log.error('Recording "%s" (#%d) failed: %s', name, recording_id, detail,
+              extra={'recording_id': recording_id})
+
+
+def _start_job_raised(recording_id, exc):
+    """A start that raised leaves the row SCHEDULED with nothing armed to start it. Say so on
+    the recording, and try again while its window is open (dev/changelog/1590)."""
+    from . import db
+    from .database import REC_STATUS_SCHEDULED, Recording
+    entry, event_owed = _note_job_error('start', recording_id, exc)
+    first = entry['tries'] == 1
+    now = datetime.utcnow()
+    _rollback_quietly(recording_id)
+    try:
+        rec = db.session.get(Recording, recording_id)
+        state = (rec.status, rec.stop_time, rec.name) if rec is not None else None
+    except Exception:
+        # The database is what is failing. Assume the row is as the job found it and keep
+        # trying: a later try reads it, and start_recording() refuses a row that moved on.
+        log.warning('Recording %d: could not read the row after its start raised',
+                    recording_id, exc_info=True)
+        _rollback_quietly(recording_id)
+        state = (REC_STATUS_SCHEDULED, None, None)
+    if state is None:
+        _clear_job_error('start', recording_id)
+        return
+    status, stop_time, name = state
+    label = f'"{name}" (#{recording_id})' if name else f'#{recording_id}'
+
+    if status != REC_STATUS_SCHEDULED:
+        # The start got past its claim before it raised, so start_recording() would refuse
+        # the row and this job has nothing to retry. start_recording() unwinds and re-arms
+        # a raise after its claim itself (recorder._recover_claimed_launch), so reaching
+        # here means that recovery could not run; whether a capture is running is unknown
+        # to this job, and the event says what to check rather than claim either.
+        _clear_job_error('start', recording_id)
+        _write_job_error_event(
+            'start', recording_id, entry,
+            f'The start hit an error after the recording had left SCHEDULED '
+            f'({entry["error"]}). It is {status} and the start is not tried again. If '
+            'nothing is being captured, stop it and record it again; a restart of '
+            'ChannelBin also picks it back up.')
+        log.error('Recording %s: its start raised with the recording already %s (%s)', label,
+                  status, entry['error'], exc_info=exc, extra={'recording_id': recording_id})
+        return
+
+    if stop_time is not None and stop_time <= now:
+        try:
+            _fail_start_after_errors(recording_id, entry)
+        except Exception:
+            # The failure could not be written either. Keep the count and come back: the
+            # next try finds the window closed again and fails it then.
+            log.warning('Recording %s: could not record that it failed to start; trying '
+                        'again in %ds', label, JOB_ERROR_RETRY_SECONDS, exc_info=True)
+            _rollback_quietly(recording_id)
+            _rearm_after_job_error('start', recording_id,
+                                   now + timedelta(seconds=JOB_ERROR_RETRY_SECONDS))
+            return
+        _clear_job_error('start', recording_id)
+        return
+
+    if event_owed:
+        _write_job_error_event(
+            'start', recording_id, entry,
+            f'The start hit an error inside ChannelBin ({entry["error"]}). It is tried again '
+            f'every {JOB_ERROR_RETRY_SECONDS} seconds until it works or the stop time passes.')
+    _rearm_after_job_error('start', recording_id,
+                           now + timedelta(seconds=JOB_ERROR_RETRY_SECONDS))
+    # One alert for the first raise, not one a minute for as long as the cause lasts; the
+    # failure, if it comes to that, raises its own.
+    log.log(logging.ERROR if first else logging.WARNING,
+            'Recording %s could not start (%s) - try %d, trying again every %ds until its '
+            'stop time', label, entry['error'], entry['tries'], JOB_ERROR_RETRY_SECONDS,
+            exc_info=exc if first else None, extra={'recording_id': recording_id})
+
+
 def _start_job(recording_id):
     with _app.app_context():
         from .recorder import start_recording
-        start_recording(_app, recording_id)
+        try:
+            start_recording(_app, recording_id)
+        except Exception as exc:
+            _start_job_raised(recording_id, exc)
+            return
+        entry = _clear_job_error('start', recording_id)
+        if entry is not None:
+            _start_job_recovered(recording_id, entry)
+
+
+def _start_job_recovered(recording_id, entry):
+    """A start that ran clean after earlier raises. The stop job fired on time against a row
+    that was still SCHEDULED and did nothing, so a recording that started after its stop
+    time would have nothing left to stop it: arm it again (a past run_date fires at once)."""
+    from . import db
+    from .database import WINDOW_OPEN_STATUSES, Recording
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return
+    log.info('Recording %d: its start ran after %s that raised', recording_id,
+             counted(entry['tries'], 'try', 'tries'))
+    if rec.status in WINDOW_OPEN_STATUSES:
+        reschedule_recording_stop(recording_id, rec.stop_time)
+
+
+def _stop_job_raised(recording_id, exc):
+    """A stop that raised may have left the capture running past its stop time. Say so, and
+    try the stop again: stopping a recording already stopped does nothing."""
+    entry, event_owed = _note_job_error('stop', recording_id, exc)
+    first = entry['tries'] == 1
+    _rollback_quietly(recording_id)
+    if entry['tries'] >= STOP_JOB_MAX_TRIES:
+        _clear_job_error('stop', recording_id)
+        _write_job_error_event(
+            'stop', recording_id, entry,
+            f'{counted(entry["tries"], "try", "tries")} to stop it hit an error inside ChannelBin, the '
+            f'last one "{entry["error"]}". No more are made: stop it by hand if it is still '
+            'capturing, or restart ChannelBin.')
+        log.error('Recording #%d could not be stopped after %d tries (%s); giving up',
+                  recording_id, entry['tries'], entry['error'], exc_info=exc,
+                  extra={'recording_id': recording_id})
+        return
+    if event_owed:
+        _write_job_error_event(
+            'stop', recording_id, entry,
+            f'The stop hit an error inside ChannelBin ({entry["error"]}), so the capture may '
+            f'still be running past its stop time. It is tried again every '
+            f'{JOB_ERROR_RETRY_SECONDS} seconds, {STOP_JOB_MAX_TRIES} times at most.')
+    _rearm_after_job_error('stop', recording_id,
+                           datetime.utcnow() + timedelta(seconds=JOB_ERROR_RETRY_SECONDS))
+    log.log(logging.ERROR if first else logging.WARNING,
+            'Recording #%d could not be stopped (%s) - try %d of %d, trying again in %ds',
+            recording_id, entry['error'], entry['tries'], STOP_JOB_MAX_TRIES,
+            JOB_ERROR_RETRY_SECONDS, exc_info=exc if first else None,
+            extra={'recording_id': recording_id})
 
 
 def _stop_job(recording_id):
     with _app.app_context():
         from .recorder import stop_recording
-        stop_recording(_app, recording_id)
+        try:
+            stop_recording(_app, recording_id)
+        except Exception as exc:
+            _stop_job_raised(recording_id, exc)
+            return
+        _clear_job_error('stop', recording_id)
 
 
 def schedule_on_demand_job(job):
@@ -2265,7 +2605,7 @@ def schedule_auto_rule_sweep(app):
         return
     _add_job(func=_auto_rule_sweep_job, trigger='interval', hours=hours,
              id=AUTO_RULE_SWEEP_JOB_ID, replace_existing=True)
-    log.info('Auto-record rule sweep scheduled every %d hour%s', hours, '' if hours == 1 else 's')
+    log.info('Auto-record rule sweep scheduled every %s', counted(hours, 'hour'))
 
 
 def scheduler_app():
@@ -2315,11 +2655,20 @@ SPORTS_MATCH_JOB_ID = 'sports_match'
 
 def queue_sports_match(delay_seconds: int = 60, reason: str = '') -> bool:
     """Arm the one-shot that matches TheSportsDB's events to the guide (app/sports_match.py,
-    DESIGN-sports-data.md 6.6). A fixed id and replace_existing, so several imports finishing
-    together become one run. False, and nothing queued, when no scheduler is running."""
+    DESIGN-sports-data.md 6.6). A fixed id, so several asks become one run, and a run already armed
+    is only ever brought forward: an ask that would land later leaves it where it is. The worker
+    asks again after every answer, and replacing the date each time held a guide import's match for
+    33 minutes on 2026-11-14 (dev/changelog/1576). False, and nothing queued, when no scheduler is
+    running."""
     if not scheduler_is_live():
         return False
     run_date = datetime.utcnow() + timedelta(seconds=delay_seconds)
+    job = _scheduler.get_job(SPORTS_MATCH_JOB_ID)
+    armed = to_naive_utc(job.next_run_time) if job is not None and job.next_run_time else None
+    if armed is not None and armed <= run_date:
+        log.info('Sports schedule match already queued for %s, sooner than this ask%s', armed,
+                 f' ({reason})' if reason else '')
+        return True
     _add_job(func=_sports_match_job, trigger='date', run_date=run_date, id=SPORTS_MATCH_JOB_ID,
              replace_existing=True, max_instances=2, kwargs={'reason': reason or None})
     log.info('Sports schedule match queued for %s%s', run_date, f' ({reason})' if reason else '')

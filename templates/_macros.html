@@ -341,3 +341,24 @@
 {% endif %}
 {% endcall %}
 {% endmacro %}
+
+{#- The keys guide.js reads to drive the shared record dialog (_record_modal.html) and the
+    saved searches it loads on every page. Called inside a page's own
+    `const GUIDE_CONFIG = { ... }`, which keeps whatever else that page needs; a key the
+    dialog comes to need is added here once. `source` is the page's word in
+    database.RECORDING_SOURCES: the dialog sends it with a new recording, whose creation
+    event names where it was made (dev/changelog/1592, 1593). -#}
+{% macro record_dialog_config(profiles, source) -%}
+  savedSearchesUrl: {{ url_for('guide.list_saved_searches') | tojson }},  // GET list / POST create
+  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',  // + id + /delete
+  addChannelUrlBase: '/api/guide/channels/',  // + channel_id + /add
+  newRecordingUrl: {{ url_for('recordings.new_recording') | tojson }},
+  editRecordingUrlBase: '/recordings/',  // + id + /edit
+  recDetailUrlBase: '/recordings/',  // + id
+  recordSource: {{ source | tojson }},
+  profiles: {
+    {%- for p in profiles %}
+    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
+    {%- endfor %}
+  },
+{%- endmacro %}

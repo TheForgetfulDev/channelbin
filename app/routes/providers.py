@@ -14,7 +14,7 @@ from ..account_links import (create_provider, delete_provider, hosts_for_account
                              logins_for_accounts, rename_provider, set_account_provider,
                              share_login, unshare_login)
 from ..database import Account, Login, Provider
-from ..fmt_utils import join_labels
+from ..fmt_utils import join_labels, plural
 
 providers_bp = Blueprint('providers', __name__)
 
@@ -166,7 +166,7 @@ def _dropped_sentence(account_name: str, dropped) -> str:
     if not dropped:
         return ''
     which = ', '.join(f'"{n}"' for n in dropped)
-    return (f' {account_name} stopped sharing login{"" if len(dropped) == 1 else "s"} {which}, '
+    return (f' {account_name} stopped sharing {plural(len(dropped), "login")} {which}, '
             f'which only accounts on one provider may share.')
 
 
@@ -217,8 +217,8 @@ def delete_provider_api(provider_id):
     except LookupError as exc:
         return jsonify({'error': str(exc)}), 404
     return jsonify({'success': True,
-                    'message': (f'Provider "{name}" deleted; {count} account'
-                                f'{"" if count == 1 else "s"} no longer on it.')})
+                    'message': (f'Provider "{name}" deleted; {count} '
+                                f'{plural(count, "account")} no longer on it.')})
 
 
 @providers_bp.route('/api/providers/<int:provider_id>/accounts', methods=['POST'])
@@ -275,8 +275,8 @@ def share_login_api(login_id):
         return jsonify({'error': str(exc)}), 409
     return jsonify({'success': True,
                     'message': (f'Login "{login.name}" is shared with {_names([account_id])}. '
-                                f'Its {login.max_connections} seat'
-                                f'{"" if login.max_connections == 1 else "s"} now count across '
+                                f'Its {login.max_connections} '
+                                f'{plural(login.max_connections, "seat")} now count across '
                                 f'both accounts.')})
 
 

@@ -247,6 +247,39 @@ class WaitingScreenTests(_Waiting):
         self.assertIn('Its waiting screen could not be shown: the folder is gone', resp.get_json()['error'])
         self.assertEqual(feed.live_sessions(), [])
 
+    def test_what_went_wrong_with_the_screen_is_said_on_the_play_once(self):
+        """dev/docs/BUGS.md 2026-11-16 (said only in the log): an unreadable badge and a moving clip
+        that could not be made each wrote a WARNING and reached no page."""
+        render = self._fake_render
+
+        def still_only(cfg, screen, path, *, still=False, background=False):
+            if not still:
+                raise ss.ClipFailed('ffmpeg could not make it')
+            render(cfg, screen, path, still=still, background=background)
+
+        with mock.patch.object(ss, 'render_clip', still_only), \
+                mock.patch.object(ss, 'unread_badges', return_value=[('Ironvale Bears', 'IRO')]):
+            resp = self.play()
+            self.read(resp)
+            s = self.only_session()
+            self.assertTrue(_wait(lambda: 'moving waiting screen' in feed.play_notes(s), 10), s.notes)
+            # A redraw of the same screen says neither a second time.
+            feed._note_badges(s, self.renders[0][2])
+        self.assertEqual(len(s.notes), 2, s.notes)
+        self.assertIn('The badge for Ironvale Bears could not be read as a picture, so the waiting '
+                      'screen shows "IRO" in its place.', s.notes)
+        self.assertIn('stayed on (ffmpeg could not make it)', feed.play_notes(s))
+        self.assertTrue(s.live, 'neither costs the play its screen')
+        html = self.client.get('/iptv-output').get_data(as_text=True)
+        self.assertIn('The badge for Ironvale Bears could not be read', html)
+        self.assertIn('The moving waiting screen could not be made', html)
+        resp.close()
+        self.assertTrue(_wait(lambda: not s.live, 5))
+        feed.flush_play_log()
+        line = OutputFeedPlay.query.one()
+        self.assertIn('The badge for Ironvale Bears', line.message)
+        self.assertIn('The moving waiting screen could not be made', line.message)
+
     def test_a_clip_ffmpeg_that_dies_ends_the_play_by_name(self):
         self.play()
         s = self.only_session()
@@ -335,8 +368,8 @@ class WaitingScreenToGameTests(_Waiting):
         ch = self.game_comes_on()
         seat_for = feed._seat_for
 
-        def seat_then_a_recording_takes_it(session, play, cfg):
-            member = seat_for(session, play, cfg)
+        def seat_then_a_recording_takes_it(session, member, event_id, cfg, refused=()):
+            member = seat_for(session, member, event_id, cfg, refused)
             # What recorder._try_acquire_slot_with_preemption does when its own acquire fails.
             for _id, holder_account in connlim.preempt_viewers_for_slot(self.account.id):
                 feed.preempt_for_account(self.t.app, holder_account, 4242)
@@ -399,6 +432,55 @@ class WaitingScreenToGameTests(_Waiting):
         self.assertEqual(s.state, feed.STATE_WAITING)
         self.assertEqual(s.screen_held, ss.HELD_NO_CONNECTION)
         self.assertEqual(Alert.query.filter_by(alert_type='VIEWER_REFUSED').count(), 0)
+
+    def test_a_tune_in_tries_every_carrier_before_the_screen(self):
+        """dev/docs/BUGS.md 2026-11-16 (the tune-in walk): a tune-in asked one seat, on the best-ranked
+        carrier, and went to the screen for 30 seconds with another carrier's account free."""
+        busy = self.game_comes_on()
+        busy.health_score = 90.0
+        other = make_account('Other', max_connections=1)
+        free = self.carrier(name='Second carrier', account=other, start=datetime.utcnow() - timedelta(minutes=5))
+        free.health_score = 10.0
+        db.session.commit()
+        self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 4242))
+        self.addCleanup(connlim.release, self.account.id, 'recording', 4242)
+        self.play()
+        s = self.only_session()
+        self.assertFalse(s.waiting, 'the game starts at once on the carrier with a free connection')
+        self.assertEqual(s.channel_id, free.id)
+        self.assertEqual(s.account_id, other.id)
+        self.assertEqual(connlim._holders.get(other.id), [('viewer', s.id)])
+        self.assertEqual(connlim._holders.get(self.account.id), [('recording', 4242)])
+        self.assertIn('"Second carrier"', feed.play_notes(s))
+        self.assertIn('no connection free', feed.play_notes(s))
+
+    def test_a_seat_the_walk_found_and_a_recording_took_leaves_the_play_on_the_screen(self):
+        """The walk's seat is on another account than the one the play was registered under, so it
+        is confirmed with the account named (dev/docs/BUGS.md 2026-11-15 01:36 PM)."""
+        busy = self.game_comes_on()
+        busy.health_score = 90.0
+        other = make_account('Other', max_connections=1)
+        free = self.carrier(name='Second carrier', account=other, start=datetime.utcnow() - timedelta(minutes=5))
+        free.health_score = 10.0
+        db.session.commit()
+        self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 4242))
+        self.addCleanup(connlim.release, self.account.id, 'recording', 4242)
+        seat_for = feed._seat_for
+
+        def seat_then_a_recording_takes_it(session, member, event_id, cfg, refused=()):
+            got = seat_for(session, member, event_id, cfg, refused)
+            for _id, holder_account in connlim.preempt_viewers_for_slot(other.id):
+                feed.preempt_for_account(self.t.app, holder_account, 4343)
+            self.assertTrue(connlim.try_acquire(other.id, 'recording', 4343))
+            return got
+
+        self.addCleanup(connlim.release, other.id, 'recording', 4343)
+        with mock.patch.object(feed, '_seat_for', seat_then_a_recording_takes_it):
+            self.play()
+        s = self.only_session()
+        self.assertEqual(s.state, feed.STATE_WAITING)
+        self.assertEqual(s.screen_held, ss.HELD_NO_CONNECTION)
+        self.assertEqual(connlim._holders.get(other.id), [('recording', 4343)])
 
     def test_a_tune_in_to_a_game_at_the_cap_waits_on_the_screen(self):
         self.t.sandbox_config(_cfg(max_viewers=1))
@@ -587,6 +669,115 @@ class WaitingScreenTeardownTests(_Waiting):
         sports_feed.set_team_channel(self.league.id, 101, False)
         feed.recheck_waiting()
         self.assert_gone(s, proc, feed.REASON_SCREEN_GONE)
+
+
+class TurnedOffTests(_Waiting):
+    """dev/docs/BUGS.md 2026-11-16 (turning a sports channel off): a person's act that stops a
+    sports channel being served ends its plays at once, on a game or on the screen, as taking a
+    channel or a group off the output does. A rule's follow ending is not that act."""
+
+    def _on_game(self):
+        ch = self.game_comes_on()
+        resp = self.play()
+        self.read(resp)
+        s = self.only_session()
+        self.assertEqual(s.channel_id, ch.id)
+        return s, s.proc
+
+    def assert_cut(self, s, proc):
+        self.assertFalse(s.live)
+        self.assertEqual(s.reason, feed.REASON_TAKEN_OFF)
+        self.assertIsNotNone(proc.poll(), 'its ffmpeg is dead')
+        self.assertEqual(connlim._holders.get(self.account.id, []), [])
+
+    def test_the_switch_going_off_cuts_a_play_on_a_game(self):
+        s, proc = self._on_game()
+        resp = self.client.put(f'/api/sports/leagues/{self.league.id}/feed-channels',
+                               json={'team_id': 101, 'enabled': False})
+        self.assertEqual(resp.get_json(), {'success': True, 'cut': 1})
+        self.assert_cut(s, proc)
+
+    def test_the_switch_going_off_cuts_a_play_on_the_screen_at_once(self):
+        self.read(self.play())
+        s = self.only_session()
+        proc = s.proc
+        resp = self.client.put(f'/api/sports/leagues/{self.league.id}/feed-channels',
+                               json={'team_id': 101, 'enabled': False})
+        self.assertEqual(resp.get_json()['cut'], 1)
+        self.assert_cut(s, proc)
+
+    def test_the_switch_going_on_cuts_nothing(self):
+        s, _proc = self._on_game()
+        resp = self.client.put(f'/api/sports/leagues/{self.league.id}/feed-channels',
+                               json={'team_id': 101, 'enabled': True})
+        self.assertEqual(resp.get_json(), {'success': True, 'cut': 0})
+        self.assertTrue(s.live)
+
+    def test_stop_following_cuts_it(self):
+        s, proc = self._on_game()
+        resp = self.client.delete(f'/api/sports/leagues/{self.league.id}/following')
+        self.assertEqual(resp.get_json()['cut'], 1)
+        self.assert_cut(s, proc)
+
+    def test_following_other_teams_only_cuts_it(self):
+        s, proc = self._on_game()
+        resp = self.client.put(f'/api/sports/leagues/{self.league.id}/following', json={'team_ids': [102]})
+        self.assertEqual(resp.get_json()['cut'], 1)
+        self.assert_cut(s, proc)
+
+    def test_a_follow_that_still_covers_the_team_cuts_nothing(self):
+        s, _proc = self._on_game()
+        resp = self.client.put(f'/api/sports/leagues/{self.league.id}/following', json={'team_ids': [101]})
+        self.assertEqual(resp.get_json()['cut'], 0)
+        self.assertTrue(s.live)
+
+    def test_deleting_the_league_cuts_it(self):
+        s, proc = self._on_game()
+        resp = self.client.delete(f'/api/sports/leagues/{self.league.id}')
+        self.assertEqual(resp.get_json()['cut'], 1)
+        self.assert_cut(s, proc)
+
+    def test_a_game_left_on_by_a_rules_follow_ending_survives_an_act_about_something_else(self):
+        """A rule's follow ending cuts nothing, and the game it left playing is not cut by a
+        person's later act that did not stop it being served: only what an act itself stopped
+        is cut."""
+        from app import sports_data
+        SportsFollow.query.delete()
+        db.session.add(SportsFollow(league_id=self.league.id, team_tsdb_id=0, rule_id=5))
+        db.session.add(SportsFollow(league_id=self.league.id, team_tsdb_id=102, rule_id=0))
+        db.session.commit()
+        sports_feed.set_team_channel(self.league.id, 102, True)
+        s, _proc = self._on_game()
+        sports_data.set_rule_follow(5, None, None, datetime.utcnow())
+        db.session.commit()
+        self.assertNotIn(self.feed_id, feed.sports_served_now())
+        self.assertTrue(s.live, 'a game that is on is never cut for a rule ending')
+        resp = self.client.put(f'/api/sports/leagues/{self.league.id}/feed-channels',
+                               json={'team_id': 102, 'enabled': False})
+        self.assertEqual(resp.get_json(), {'success': True, 'cut': 0})
+        self.assertTrue(s.live, "another channel's switch must not cut it")
+
+    def test_one_read_before_and_one_after_however_many_plays_and_none_with_no_play(self):
+        with mock.patch.object(sports_feed, 'served_channels', wraps=sports_feed.served_channels) as served:
+            self.assertIsNone(feed.sports_served_now())
+            self.assertEqual(feed.stop_unserved_sports(None), 0)
+            self.assertEqual(served.call_count, 0)
+            self.t.sandbox_config(_cfg(max_viewers=5))
+            for _ in range(3):
+                self.read(self.play())
+            served.reset_mock()     # a tune-in reads what is served too
+            before = feed.sports_served_now()
+            self.assertEqual(feed.stop_unserved_sports(before), 0)
+        self.assertEqual(served.call_count, 2)
+
+    def test_a_badge_question_that_raises_never_costs_the_play_its_screen(self):
+        with mock.patch.object(ss, 'unread_badges', side_effect=MemoryError('a hostile file')):
+            with self.assertLogs('app.output_feed', level='WARNING'):
+                self.read(self.play())
+        s = self.only_session()
+        self.assertTrue(s.live)
+        self.assertIsNotNone(s.proc)
+        self.assertEqual(s.notes, [])
 
 
 class AdoptClaimTests(unittest.TestCase):

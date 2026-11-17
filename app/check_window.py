@@ -233,7 +233,7 @@ def window_close(app):
         from .database import (OnDemandTestJob, Alert,
                                OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING)
         from .alerts import create_alert, dismiss_open_alerts
-        from .fmt_utils import fmt_duration_hm, fmt_duration_phrase
+        from .fmt_utils import fmt_duration_hm, fmt_duration_phrase, plural
 
         ct_cfg = load_config().get('channel_testing', {})
         now_utc = datetime.utcnow()
@@ -283,7 +283,7 @@ def window_close(app):
 
         lines = [
             f'Window: {window_label} ({fmt_duration_hm(window_seconds)}). '
-            f'Due tonight: {len(cohort)} check{"" if len(cohort) == 1 else "s"}, '
+            f'Due tonight: {len(cohort)} {plural(len(cohort), "check")}, '
             f'{fmt_duration_phrase(cohort_total)}.',
             '',
         ]

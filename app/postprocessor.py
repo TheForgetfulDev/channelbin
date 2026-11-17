@@ -13,7 +13,7 @@ from datetime import datetime
 from flask import has_app_context
 
 from .db_utils import release_idle_connection, retry_on_locked
-from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration
+from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration, plural
 from .fs_utils import ensure_dir
 from .proc_utils import (TIMELINE_GAP_KEEP_SECONDS, iter_stderr_error_lines, supervise_ffmpeg,
                          terminate_or_kill, write_concat_list)
@@ -3596,7 +3596,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         total = (f'{gap_s:.1f}s' if gap_s < 60
                                  else fmt_duration(gap_s, with_seconds=True))
                         found = ('no video gaps' if not n else
-                                 f'{n} video gap{"" if n == 1 else "s"} totalling {total}')
+                                 f'{n} video {plural(n, "gap")} totalling {total}')
                         if lost is None:
                             verdict = ('the source was never measured, so they cannot be '
                                        'told apart from its own')
@@ -3610,7 +3610,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
                     if lost:
                         gaps = check['gaps']
-                        where = (f' in {len(gaps)} gap{"" if len(gaps) == 1 else "s"}: '
+                        where = (f' in {len(gaps)} {plural(len(gaps), "gap")}: '
                                  f'{describe_gaps(gaps)}' if gaps else '')
                         more = ('' if reencode else ' more than the source does')
                         add_recording_event(

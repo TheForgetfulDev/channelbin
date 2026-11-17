@@ -483,7 +483,7 @@ def channel_measured_formats():
     ids = []
     for part in raw:
         part = part.strip()
-        if part.isdigit():
+        if part.isdecimal():
             ids.append(int(part))
     # The id list arrives from the client, so it is bounded here the same way the delete
     # scopes are - this is one modal's selection, not a sweep.

@@ -12,12 +12,14 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db, recorder  # noqa: E402
 from app.config import load_config  # noqa: E402
+from app.database import RecordingSegment  # noqa: E402
 from app.proc_utils import (HlsVariant, best_hls_variant, build_capture_cmd,  # noqa: E402
                             pick_hls_variant)
 from sim import serve_for_test  # noqa: E402
@@ -264,6 +266,41 @@ class RecorderTests(unittest.TestCase):
         db.session.expire_all()
         detail = [e.detail for e in rec.events if e.event_type == 'SEGMENT_STARTED'][0]
         self.assertIn('could not be read', detail)
+
+    def test_a_failed_read_that_a_segment_recorded_with_stands_for_the_run(self):
+        """dev/docs/BUGS.md 2026-11-16: segment 1 recorded the first quality listed after a
+        failed playlist read, nothing was remembered, and the restart's read worked and
+        mapped the best one, changing the picture size mid-recording."""
+        rec = seed.make_recording(status='IN_PROGRESS', url=THIRD_PARTY)
+        db.session.add(RecordingSegment(recording_id=rec.id, segment_number=1,
+                                        file_path='/nowhere/1.ts', started_at=datetime.utcnow(),
+                                        bytes_recorded=4096))
+        db.session.commit()
+        state = recorder.RecordingState()
+        with mock.patch('app.recorder.pick_hls_variant', return_value=HlsVariant(0, 0, None)):
+            first = recorder._hls_variant_for(state, THIRD_PARTY, {}, rec.id)
+        with mock.patch('app.recorder.pick_hls_variant',
+                        return_value=HlsVariant(1, 2, '640x360')) as pick:
+            again = recorder._hls_variant_for(state, THIRD_PARTY, {}, rec.id)
+        pick.assert_not_called()
+        self.assertEqual((first.program, again), (0, first))
+
+    def test_a_failed_read_is_asked_again_while_nothing_is_recorded(self):
+        """A discarded placeholder segment is not a picture the file keeps."""
+        rec = seed.make_recording(status='IN_PROGRESS', url=THIRD_PARTY)
+        db.session.add(RecordingSegment(recording_id=rec.id, segment_number=1,
+                                        file_path='/nowhere/1.ts', started_at=datetime.utcnow(),
+                                        bytes_recorded=4096,
+                                        excluded_reason='PROVIDER_PLACEHOLDER'))
+        db.session.commit()
+        state = recorder.RecordingState()
+        best = HlsVariant(1, 2, '640x360')
+        with mock.patch('app.recorder.pick_hls_variant', return_value=HlsVariant(0, 0, None)):
+            recorder._hls_variant_for(state, THIRD_PARTY, {}, rec.id)
+        with mock.patch('app.recorder.pick_hls_variant', return_value=best) as pick:
+            self.assertEqual(recorder._hls_variant_for(state, THIRD_PARTY, {}, rec.id), best)
+            self.assertEqual(recorder._hls_variant_for(state, THIRD_PARTY, {}, rec.id), best)
+        pick.assert_called_once()
 
     def test_a_stream_with_a_login_in_its_url_gets_no_extra_connection(self):
         """A connection of its own on a single-seat login could cost the capture itself."""

@@ -400,6 +400,7 @@ def reset_module_globals():
     import app.readiness as readiness
     import app.routes.channel_search as channel_search_routes
     import app.routes.system as system_routes
+    import app.scheduler as scheduler
     import app.search_index as search_index
     import app.routes.sports as routes_sports
     import app.sports_screen as sports_screen
@@ -407,6 +408,10 @@ def reset_module_globals():
     import app.examples as examples
     import app.toolchain as toolchain
 
+    # A start or stop that raised in one module must not count as a retry in the next.
+    scheduler._job_errors.clear()
+    # A test of the stop path must not leave the next module's submit errors demoted.
+    scheduler._stopping = False
     # A run abandoned mid-flight leaves its admission ticket held, and the next module's
     # sync or maintenance job is then refused by a blocker that no longer exists.
     admission.reset_for_tests()

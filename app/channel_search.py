@@ -1213,7 +1213,7 @@ def rule_context_value(value):
     value = (value or '').strip()
     if value == RULE_CONTEXT_NEW:
         return value
-    return str(int(value)) if value.isdigit() and int(value) > 0 else None
+    return str(int(value)) if value.isdecimal() and int(value) > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -1281,10 +1281,10 @@ def describe_value(key: str, value: str, *, account_names=None, channel_names=No
     if key == 'group':
         return 'Any group' if value == GROUP_ANY else value
     if key == 'acct':
-        name = (account_names or {}).get(int(value)) if value.isdigit() else None
+        name = (account_names or {}).get(int(value)) if value.isdecimal() else None
         return name or f'#{value}'
     if key == 'chan':
-        name = (channel_names or {}).get(int(value)) if value.isdigit() else None
+        name = (channel_names or {}).get(int(value)) if value.isdecimal() else None
         return name or f'#{value}'
     if key == 'listings':
         return LISTINGS_PHRASES[value]['label'] if value in LISTINGS_PHRASES else value

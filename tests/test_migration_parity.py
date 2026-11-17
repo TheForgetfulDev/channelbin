@@ -639,10 +639,11 @@ class SportsDefaultRebuildTests(unittest.TestCase):
     def _fresh_tables(self, build):
         return {table: sql for table, (sql, _idx) in build.items()}
 
-    #: Step 124 (dev/changelog/1517).
+    #: Step 124 (dev/changelog/1517) and step 128 (dev/changelog/1580).
     ADDED_AFTER_118 = frozenset({
         ('sports_feed_channels', 'team_tsdb_id', '0'), ('sports_feed_channels', 'number', '0'),
         ('sports_feed_channels', 'enabled', '0'), ('sports_leagues', 'feed_league_channels', '0'),
+        ('sports_teams', 'own_names', "'[]'"),
     })
 
     def test_the_list_is_what_the_models_declare(self):

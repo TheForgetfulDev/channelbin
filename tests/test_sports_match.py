@@ -142,6 +142,16 @@ class LocalStationTests(MatchCase):
         self.run_match()
         self.assertEqual(self.matches(event), [])
 
+    def test_a_betting_show_about_the_game_is_not_the_game(self):
+        """A betting channel's `Illinois vs. UCLA College Football In-Game Live Gameday`, an hour
+        before kickoff and three hours long, names the league and both teams. It was never a pick
+        or a candidate in 23,483 audit observations (dev/changelog/1577); this holds it there."""
+        event = self.game(2, 1)
+        self.row('Harborview Gulls vs. Ironvale Bears PFL Football In-Game Live Gameday ᴸᶦᵛᵉ',
+                 start=KICKOFF - timedelta(hours=1))
+        self.run_match()
+        self.assertEqual(self.matches(event), [])
+
     def test_one_channels_game_is_never_another_channels(self):
         one = self.game(2, 1)
         two = self.game(4, 3)

@@ -420,6 +420,16 @@ class SportWordTests(NameCase):
         league = self.league(4479, ['NCAA Division 1 Football', 'College Football'])
         self.assertEqual(sports_match.suggested_terms(league), ['NCAAF'])
 
+    def test_college_football_is_known_for_ncaa_division_1_football(self):
+        """dev/docs/BUGS.md 2026-11-16: US guides title the league's games `College Football`, which
+        TheSportsDB's `NCAA Division 1 Football` and `NCAA Football` do not contain, so a new install
+        matched almost none of them."""
+        from app import sports_data
+        seeded = sports_data.with_known_terms(4479, ['NCAA Division 1 Football', 'NCAA Football'])
+        self.assertIn('College Football', seeded)
+        league = self.league(4479, ['NCAA Division 1 Football', 'NCAA Football'])
+        self.assertEqual(sports_match.suggested_terms(league), ['NCAAF', 'College Football'])
+
 
 class TimeTests(NameCase):
     def test_a_names_time_far_off_in_a_trusted_league_is_weak_and_says_how_far(self):

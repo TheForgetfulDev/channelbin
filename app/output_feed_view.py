@@ -311,6 +311,7 @@ def _watching(sessions, by_feed: dict, accounts: dict, sports: dict, now, tz, h2
                 'moves': len(s.failovers), 'moves_text': _times(len(s.failovers)),
                 'moves_tip': '\n'.join(output_feed.move_text(a, b, why) for a, b, why in s.failovers),
                 'reserve_note': output_feed.reserve_short_note(s.ring),
+                'notes': output_feed.play_notes(s),
                 'program': '', 'program_times': ''}
         if row is not None and row.kind == output_feed.KIND_SPORTS:
             view['row_url'] = url_for('sports.league_page', league_id=row.row.league.id)

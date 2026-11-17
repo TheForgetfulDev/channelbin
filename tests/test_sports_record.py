@@ -207,6 +207,43 @@ class PickTests(Case):
         self.assertIn('not sure enough which listing', r.get_json()['error'])
 
 
+class SeatTests(Case):
+    """Record on a league page gives the answer a rule's scheduling step gives when the picked
+    listing's first channel is on an account with no connection in the window
+    (auto_rules.seat_choice, dev/changelog/1602)."""
+
+    def test_a_full_account_opens_the_dialog_on_the_same_listing_on_a_free_one(self):
+        rig = Rig()
+        first = rig.channel('Sports One HD', health_score=90)
+        other = make_channel(make_account(name='Account Two'), name='Sports One', stream_id=900,
+                             health_score=60)
+        rig.listing(first)
+        moved_to = rig.listing(other)
+        make_recording(status='SCHEDULED', name='by hand', channel_id=rig.channel('Busy').id,
+                       start_time=rig.start - timedelta(minutes=30), stop_time=rig.start + timedelta(hours=1))
+        r = self.pick(rig)
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        body = r.get_json()
+        self.assertEqual(body['epg_id'], moved_to.id)
+        text = body['notice']['text']
+        self.assertIn('recorded from Sports One.', text)
+        self.assertNotIn('the healthiest of them', text)
+        self.assertIn('Moved to the same listing on an account with a connection free', text)
+        self.assertIn('Passed over "Sports One HD"', text)
+
+    def test_a_first_choice_with_a_connection_is_left_alone(self):
+        rig = Rig()
+        first = rig.channel('Sports One HD', health_score=90)
+        other = make_channel(make_account(name='Account Two'), name='Sports One', stream_id=900,
+                             health_score=60)
+        kept = rig.listing(first)
+        rig.listing(other)
+        body = self.pick(rig).get_json()
+        self.assertEqual(body['epg_id'], kept.id)
+        self.assertIn('Sports One HD, the healthiest of them', body['notice']['text'])
+        self.assertNotIn('Passed over', body['notice']['text'])
+
+
 class EventChannelTests(Case):
     def test_an_event_channel_with_a_clock_in_its_name_is_recorded_from(self):
         rig = Rig()

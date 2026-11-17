@@ -6,6 +6,7 @@ Real ffmpeg on small synthesized local files; the read is the same tail read a c
 """
 import json
 import os
+from datetime import datetime
 import shutil
 import subprocess
 import sys
@@ -17,7 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
 from app.concatenator import _note_segment_track_ends  # noqa: E402
-from app.database import Alert, DIAGNOSTICS, Recording, RecordingEvent, SOURCE_DELETED, SOURCE_KEPT  # noqa: E402
+from app.database import (Alert, CAPTURE_VIDEO_RESUMED, CAPTURE_VIDEO_STOPPED,  # noqa: E402
+                          DIAGNOSTICS, Recording, RecordingEvent, RecordingSegment,
+                          SEGMENT_EXIT_VIDEO_STOPPED, SOURCE_DELETED, SOURCE_KEPT,
+                          add_recording_event)
+from app.health_score import score_capture_quality_correction  # noqa: E402
 from app.postprocessor import SOURCE_KEPT_OUT_OF_STEP, _dispose_of_source  # noqa: E402
 from app.track_ends import note_track_ends, read_track_ends  # noqa: E402
 from tests.support import seed  # noqa: E402
@@ -45,6 +50,8 @@ class TrackEndsTests(unittest.TestCase):
         cls.together = os.path.join(cls.dir, 'together.ts')
         _make_ts(cls.apart, 20, 12)
         _make_ts(cls.together, 12, 12)
+        cls.sound_on = os.path.join(cls.dir, 'sound_on.ts')
+        _make_ts(cls.sound_on, 12, 20)
 
     @classmethod
     def tearDownClass(cls):
@@ -103,6 +110,75 @@ class TrackEndsTests(unittest.TestCase):
         note_track_ends(self.rid, [(None, self.apart)], 'converted file')
         note_track_ends(self.rid, [(None, self.together)], 'converted file')
         self.assertEqual(self._row().track_end_gap_seconds, worst)
+        self.assertEqual(len(self._alerts()), 1)
+
+    def _segment(self, number, exit_reason=None):
+        db.session.add(RecordingSegment(recording_id=self.rid, segment_number=number,
+                                        file_path=f'/nowhere/{number}.ts',
+                                        started_at=datetime.utcnow(),
+                                        exit_reason=exit_reason))
+        db.session.commit()
+
+    def _video_event(self, number, event_type):
+        add_recording_event(self.rid, event_type, detail='x', segment_number=number)
+        db.session.commit()
+
+    def test_a_restart_for_a_stopped_picture_is_not_out_of_step(self):
+        """dev/docs/BUGS.md 2026-11-16: the watchdog closes a segment once its picture has been
+        gone about 35 s under its sound, so that segment's tracks end apart by construction,
+        and the recording was alerted on, kept its source and cost its channel 80 points."""
+        self._segment(1, SEGMENT_EXIT_VIDEO_STOPPED)
+        self._segment(2)
+        note_track_ends(self.rid, [(1, self.sound_on), (2, self.together)], 'segments')
+        rec = self._row()
+        self.assertLess(rec.track_end_gap_seconds, 2)
+        self.assertIsNone(rec.picture_sound_apart_seconds)
+        self.assertEqual(self._alerts(), [])
+        event = self._track_events()[0]
+        self.assertIn('Segment 1 ends with', event.detail)
+        self.assertIn('of sound and no picture', event.detail)
+        self.assertIn('Everywhere else the picture and sound end together', event.detail)
+        self.assertNotIn('Expect them out of step', event.detail)
+        ends = json.loads(event.extra_data)['ends']
+        self.assertEqual([e.get('sound_only', False) for e in ends], [True, False])
+        self.assertGreater(ends[0]['audio'] - ends[0]['video'], 7)
+        quality, _ = score_capture_quality_correction(
+            0, 0, 3600, {}, picture_sound_apart_seconds=rec.picture_sound_apart_seconds)
+        self.assertEqual(quality, 100)
+
+    def test_a_capture_left_on_its_sound_is_not_out_of_step_in_any_file(self):
+        """dev/docs/BUGS.md 2026-11-16: with no restart left the capture stays for the sound,
+        and its segment, the joined file and the converted file all end sound past picture."""
+        self._segment(1)
+        self._video_event(1, CAPTURE_VIDEO_STOPPED)
+        note_track_ends(self.rid, [(1, self.sound_on)], 'capture')
+        note_track_ends(self.rid, [(None, self.sound_on)], 'converted file')
+        self.assertIsNone(self._row().picture_sound_apart_seconds)
+        self.assertEqual(self._alerts(), [])
+        self.assertIn('The converted file ends with', self._track_events()[1].detail)
+
+    def test_a_picture_that_came_back_on_the_segment_explains_nothing(self):
+        self._segment(1)
+        self._video_event(1, CAPTURE_VIDEO_STOPPED)
+        self._video_event(1, CAPTURE_VIDEO_RESUMED)
+        note_track_ends(self.rid, [(1, self.sound_on)], 'capture')
+        self.assertGreater(self._row().picture_sound_apart_seconds, 7)
+        self.assertEqual(len(self._alerts()), 1)
+
+    def test_a_picture_running_past_its_sound_is_never_explained_by_a_video_stop(self):
+        self._segment(1, SEGMENT_EXIT_VIDEO_STOPPED)
+        note_track_ends(self.rid, [(1, self.apart)], 'capture')
+        self.assertGreater(self._row().picture_sound_apart_seconds, 7)
+        self.assertEqual(len(self._alerts()), 1)
+
+    def test_another_segment_out_of_step_is_still_said_beside_a_video_stop(self):
+        self._segment(1, SEGMENT_EXIT_VIDEO_STOPPED)
+        self._segment(2)
+        note_track_ends(self.rid, [(1, self.sound_on), (2, self.apart)], 'segments')
+        self.assertGreater(self._row().picture_sound_apart_seconds, 7)
+        detail = self._track_events()[0].detail
+        self.assertIn('Segment 1 ends with', detail)
+        self.assertIn('apart in segment 2', detail)
         self.assertEqual(len(self._alerts()), 1)
 
     def test_an_unreadable_file_says_so_and_leaves_the_measure_empty(self):

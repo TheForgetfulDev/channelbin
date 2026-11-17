@@ -508,7 +508,7 @@ def _host_resources():
                 if not name:
                     continue
                 value = rest.strip().split(' ', 1)[0]
-                if value.isdigit():
+                if value.isdecimal():
                     out[name] = int(value) * 1024
     except OSError:
         pass    # non-Linux host, or /proc not mounted

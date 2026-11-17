@@ -525,19 +525,6 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 
 .note-indicator { font-size: var(--fs-sm); cursor: help; margin-left: 4px; opacity: 0.85; }
 
-/* Guide-local dense badge language (DESIGN.md §11.1) - deliberately smaller than the
-   app-wide .badge/.b-* system because the TV Guide renders a wall of programs in a fixed
-   grid. Do not add new callers outside guide.html/guide.js; every other surface uses
-   .badge + .b-*. .qbadge-ok/.qbadge-muted were retired with their last non-guide callers
-   (dev/changelog/579). */
-.qbadge {
-  /* 2px, below --radius-sm on purpose: a 6px radius on a 14px-tall badge is a pill. */
-  font-size: var(--fs-3xs); padding: 1px 4px; border-radius: 2px;
-  background: var(--bg2); color: var(--text-muted);
-  white-space: nowrap; flex-shrink: 0; line-height: 1.4;
-}
-.qbadge-warn { background: var(--warn-soft); color: var(--warn); }
-
 /* Group-modal suggest row for a known format-mismatch candidate: shown for
    visibility but not addable (its checkbox is rendered disabled). */
 .suggest-row-disabled {
@@ -4917,6 +4904,8 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .sp-terms { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .sp-term { cursor: default; }
 .sp-term .chip-x { background: none; border: none; padding: 0; color: inherit; cursor: pointer; display: inline-flex; }
+.sp-teamnames { margin-top: 6px; }
+.sp-teamnames-team { font-weight: 600; font-size: var(--fs-md); margin-right: 2px; }
 .sp-addterm { display: inline-flex; gap: 6px; align-items: center; }
 .sp-addterm .form-control { width: 180px; height: var(--ctl-h); }
 .sp-hint { color: var(--text-muted); font-size: var(--fs-md); margin: 8px 0 0; }
@@ -4926,6 +4915,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   padding: 8px 10px; background: var(--accent-soft); border-radius: var(--radius-sm); font-size: var(--fs-md);
 }
 .sp-catbar { margin-top: 10px; }
+.sp-cat-new { background: var(--accent-soft); }
 .sp-offer { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
 .sp-offer-row { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; padding: 4px 0; cursor: pointer; }
 /* A page of Upcoming games or On your IPTV output (mockup 57): the channel page's pager, under the

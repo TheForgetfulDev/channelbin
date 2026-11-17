@@ -359,7 +359,7 @@ ALERT_TYPES = {
     # for a group played with nothing servable - that one is a configuration to fix.
     'VIEWER_PREEMPTED': {'label': 'IPTV Player Cut For A Recording', 'severity': 'INFO'},
     'VIEWER_REFUSED': {'label': 'IPTV Player Refused', 'severity': 'INFO'},
-    'FEED_NO_MEMBER': {'label': 'Output Feed Has Nothing To Play', 'severity': 'WARN'},
+    'FEED_NO_MEMBER': {'label': 'IPTV Output Has Nothing To Play', 'severity': 'WARN'},
     # The one thread every scheduled recording, sync and window check depends on has
     # exited. Self-clearing because the only thing that ends the condition is the next
     # start, and init_scheduler() dismisses the row there (dev/changelog/1114).

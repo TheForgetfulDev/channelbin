@@ -108,6 +108,12 @@ recording:
     # Plex needs a Movie library with the "Plex NFO Movie" agent selected; an Other Videos
     # library ignores these files. Off by default, and overridable per recording profile.
     enabled: false
+  # When a single-channel recording's account has no connection free (at start, or when an
+  # auto-record rule schedules it), move it to another channel with the same program on an
+  # account that has one, instead of waiting. Channels whose latest health check passed are
+  # tried first, then channels never checked. Overridable per recording profile and per
+  # recording.
+  move_when_account_full: true
   live_thumbnail:
     enabled: true
     min_regen_interval_seconds: 10

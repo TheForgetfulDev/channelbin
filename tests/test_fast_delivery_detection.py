@@ -303,6 +303,35 @@ class ReplaySecondsTests(unittest.TestCase):
                            b'discontinuity (stream id=256): -23290000, new offset= 1\n')
         self.assertEqual(read_replay_seconds_since(path, 0.0), 0.0)
 
+    def test_a_clock_reset_long_after_a_reconnect_is_not_its_replay(self):
+        """dev/docs/BUGS.md 2026-11-16 (recording 37): a clock reset later in the segment was
+        subtracted from the window as the last reconnect's replay, so a feed really delivering
+        fast read as not fast."""
+        path = self._spool(
+            b'frame=1 time=00:01:00.00 speed=1.6x\r'
+            b'[http @ 0x1] Will reconnect at 58732392 in 0 second(s), error=Input/output error.\n'
+            b'frame=1 time=00:01:01.00 speed=1.6x\r'
+            b'frame=1 time=00:01:02.00 speed=1.6x\r'
+            b'frame=1 time=00:01:03.00 speed=1.6x\r'
+            b'frame=1 time=00:05:00.00 speed=1.6x\r'
+            b'[vist#0:0/h264 @ 0x2] timestamp discontinuity (stream id=256): -1020400000, '
+            b'new offset= 1\n'
+            b'[vist#0:0/h264 @ 0x2] timestamp discontinuity (stream id=256): -30400000, '
+            b'new offset= 2\n')
+        self.assertEqual(read_replay_seconds_since(path, 0.0), 0.0)
+
+    def test_a_reconnects_wait_does_not_end_its_replay(self):
+        """Progress lines repeating one position while the new connection opens are not the
+        capture moving on (dev/changelog/1597)."""
+        path = self._spool(
+            b'frame=1 time=00:01:00.00 speed=1.6x\r'
+            b'[http @ 0x1] Will reconnect at 58732392 in 0 second(s), error=Input/output error.\n'
+            + b'frame=1 time=00:01:00.00 speed=1.6x\r' * 30
+            + b'frame=1 time=00:01:00.50 speed=1.6x\r'
+            b'[vist#0:0/h264 @ 0x2] timestamp discontinuity (stream id=256): -23290000, '
+            b'new offset= 1\n')
+        self.assertAlmostEqual(read_replay_seconds_since(path, 0.0), 23.29, 3)
+
     def test_an_unreadable_spool_explains_nothing(self):
         self.assertEqual(read_replay_seconds_since('/nonexistent/spool', 0.0), 0.0)
 

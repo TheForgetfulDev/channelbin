@@ -11,6 +11,7 @@ import threading
 import time
 
 from .config import resolve_ffprobe_path
+from .fmt_utils import plural
 
 log = logging.getLogger(__name__)
 
@@ -1485,9 +1486,8 @@ def assess_seek_damage(filepath: str, *, joined_segments: int = 1, segment_rates
     threshold = max(DAMAGE_MIN_MISSING_SECONDS, span * DAMAGE_MIN_MISSING_FRACTION)
     damaged = missing > threshold
     pct = (missing / span * 100) if span > 0 else 0.0
-    plural = '' if metrics['gap_count'] == 1 else 's'
     summary = (f'{missing:.1f}s of video missing from a {span:.0f}s timeline ({pct:.1f}%) - '
-               f'{metrics["gap_count"]} decode-timeline gap{plural} '
+               f'{metrics["gap_count"]} decode-timeline {plural(metrics["gap_count"], "gap")} '
                f'>{metrics["gap_threshold"]}s '
                f'(largest {metrics["max_gap_seconds"]:.2f}s), frame deficit '
                f'{metrics["deficit_seconds"]:.1f}s, threshold {threshold:.1f}s -> '

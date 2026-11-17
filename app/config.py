@@ -292,6 +292,12 @@ _DEFAULTS = {
         'metadata_sidecar': {
             'enabled': False,
         },
+        # A single-channel recording that finds its account with no connection free - at
+        # start, or when an auto-record rule or a league page schedules it - moves to another
+        # channel with the same program on an account with one free, instead of waiting
+        # (app/seat_moves.py, dev/changelog/1611). On by default: a recording from another
+        # channel beats one that never starts. Overridable per profile and per recording.
+        'move_when_account_full': True,
         # Every image ChannelBin keeps OF a recording, not only the live one: the block
         # also governs the final-frame thumbnail and the poster frame below. Named for the
         # first of the three and left that way deliberately - renaming a config block costs
