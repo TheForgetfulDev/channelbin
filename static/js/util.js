@@ -880,7 +880,33 @@ function bindHistoryChips(selector, { after = null } = {}) {
   // "&amp;#10;", so the attribute genuinely holds those six characters, and textContent
   // renders exactly what it is handed (dev/docs/BUGS.md 2026-09-11). Decoded in this one
   // renderer rather than at 126 call sites; both spellings mean the same newline.
-  const tipText = (el) => (el.getAttribute('data-tip') || '').replace(/&#10;/g, '\n');
+  // A table drawn as cards (.tbl-cards) hides its header row, and with it every column's
+  // explanation: a card's label is the cell's ::before, which can carry no tip. So while the
+  // header is hidden a cell answers for its column - a tap on it opens its header's tip,
+  // unless the tap is on a tip of the cell's own or on a control inside it
+  // (dev/changelog/1589). Read from the header each time, never copied into the cells.
+  const CELL_CONTROLS = 'a, button, input, select, textarea, label, summary, [data-menu]';
+  const columnHead = (td) => {
+    const table = td.closest('table');
+    const head = table && table.tHead;
+    if (!head || !head.rows.length || getComputedStyle(head).display !== 'none') return null;
+    const th = head.rows[0].cells[td.cellIndex];
+    return th && th.hasAttribute('data-tip') ? th : null;
+  };
+  const tipHolder = (node) => {
+    if (!node || !node.closest) return null;
+    const own = node.closest('[data-tip]');
+    if (own) return own;
+    const td = node.closest('.tbl-cards td[data-label]');
+    if (!td) return null;
+    const control = node.closest(CELL_CONTROLS);
+    if (control && td.contains(control)) return null;
+    return columnHead(td) ? td : null;
+  };
+  const tipText = (el) => {
+    const source = el.hasAttribute('data-tip') ? el : columnHead(el);
+    return source ? (source.getAttribute('data-tip') || '').replace(/&#10;/g, '\n') : '';
+  };
   const place = (el) => {
     const r = el.getBoundingClientRect();
     const pw = pop.offsetWidth, ph = pop.offsetHeight;
@@ -907,7 +933,7 @@ function bindHistoryChips(selector, { after = null } = {}) {
     if (anchor.isConnected) { place(anchor); return; }
     const under = pointer && typeof document.elementFromPoint === 'function'
       ? document.elementFromPoint(pointer.x, pointer.y) : null;
-    const el = under && under.closest ? under.closest('[data-tip]') : null;
+    const el = tipHolder(under);
     if (el && tipText(el) === pop.textContent) { anchor = el; place(el); return; }
     hide();
   };
@@ -933,7 +959,7 @@ function bindHistoryChips(selector, { after = null } = {}) {
   };
   document.addEventListener('mouseover', (e) => {
     pointer = { x: e.clientX, y: e.clientY };
-    const el = e.target.closest('[data-tip]');
+    const el = tipHolder(e.target);
     if (el && el !== anchor) show(el);
     else if (!el && anchor) hide();
   });
@@ -1083,9 +1109,10 @@ function positionMenu(menu, trigger) {
       its unlock, and the symptom of that desync is a permanently frozen page, which is
       worse than the bug being fixed.
 
-   Visibility, not just the selector, decides. `_record_modal.html`'s two hand-rolled modals
-   sit in the DOM permanently as `.modal` hidden by inline display, so a bare `.modal` match
-   would lock the page on nearly every page load and never let go.
+   Visibility, not just the selector, decides. `_record_modal.html`'s two server-rendered
+   modals sit in the DOM permanently as `.modal` hidden by inline display (wireModal's
+   `persistent` mode), so a bare `.modal` match would lock the page on nearly every page
+   load and never let go.
    Matching on the inline style instead is not a fix: JS hiding serializes as
    `display: none` WITH a space, so a `[style*="display:none"]` test silently stops working.
 
@@ -1127,8 +1154,8 @@ function syncScrollLock() {
 // outermost overlay on mobile - anything opened over it owns Escape first - so base.html's
 // drawer Escape handler stands down whenever this is true. Derived from OVERLAY_SEL rather
 // than a second hand-written list, so a new overlay is covered by adding it in one place,
-// and gated on visibility for the same reason syncScrollLock is: four hand-rolled modals sit
-// in the DOM permanently, hidden by inline display, so a bare selector match is always true.
+// and gated on visibility for the same reason syncScrollLock is: the record dialogs sit in
+// the DOM permanently, hidden by inline display, so a bare selector match is always true.
 function overlayOpenAboveDrawer() {
   return Array.from(document.querySelectorAll(OVERLAY_SEL))
     .some(el => !el.classList.contains('topnav-menu') && el.getClientRects().length > 0);
@@ -1144,8 +1171,56 @@ function overlayOpen() {
     .some(el => el.getClientRects().length > 0);
 }
 
-// Modal builder (DESIGN.md 3.12 anatomy). Returns the overlay element; call
-// .remove() on it (or use the returned close()) to dismiss programmatically.
+// The modal anatomy's one implementation (DESIGN.md 3.12): Escape, the backdrop, the head's
+// close button and the scroll lock. buildModal() builds an overlay and hands it here; the
+// record and active-recording dialogs (_record_modal.html) are rendered by the server, so
+// they hand theirs here with `persistent`, which hides the overlay on close instead of
+// removing it - their form keeps its Jinja-rendered options, CSRF field and element ids
+// (dev/changelog/1608). Sets overlay.openModal() and overlay.closeModal(), and returns
+// close. Both are safe to call twice: a DOM listener added twice is added once. A removed
+// (non-persistent) overlay is never reopened, and a persistent one drops its escapeHandler
+// on close, since a step belongs to the opening that set it.
+function wireModal(overlay, { dismissable = true, onClose = null, persistent = false } = {}) {
+  // `overlay.escapeHandler`, when a host sets one, takes Escape instead of closing: a panel
+  // showing a STEP (the filename designer inside a profile, its guide picker) steps back
+  // one level. Still one listener per overlay, so there is never a second Escape handler
+  // to argue with this one (dev/changelog/1161).
+  const onKey = (e) => {
+    if (e.key !== 'Escape' || !dismissable) return;
+    if (overlay.escapeHandler) { overlay.escapeHandler(); return; }
+    close();
+  };
+  const close = () => {
+    document.removeEventListener('keydown', onKey);
+    if (persistent) {
+      overlay.style.display = 'none';
+      overlay.escapeHandler = null;
+    } else {
+      overlay.remove();
+    }
+    syncScrollLock();
+    if (onClose) onClose();
+  };
+  const open = () => {
+    if (!persistent && !overlay.isConnected) return;
+    if (persistent) overlay.style.display = 'flex';
+    if (dismissable) document.addEventListener('keydown', onKey);
+    syncScrollLock();
+  };
+  if (dismissable) {
+    const child = (el, cls) => el && Array.from(el.children).find((c) => c.classList.contains(cls));
+    const backdrop = child(overlay, 'modal-backdrop');
+    const x = child(child(child(overlay, 'modal-panel'), 'modal-head'), 'modal-close');
+    if (backdrop) backdrop.addEventListener('click', close);
+    if (x) x.addEventListener('click', close);
+  }
+  overlay.openModal = open;
+  overlay.closeModal = close;
+  return close;
+}
+
+// Modal builder (DESIGN.md 3.12 anatomy). Returns the overlay element; call its
+// closeModal() to dismiss it programmatically.
 //   buildModal({ title, body, footer: [{label, class, onClick, icon, iconAfter}], dismissable })
 // body: Node or HTML string. footer onClick(closeFn); returning false keeps
 // the modal open (e.g. validation failure). dismissable=false disables the
@@ -1170,34 +1245,18 @@ function buildModal({ title = '', body = '', footer = [], dismissable = true, on
   if (body instanceof Node) bodyEl.appendChild(body);
   else bodyEl.innerHTML = body;
 
-  const close = () => {
-    document.removeEventListener('keydown', onKey);
-    overlay.remove();
-    syncScrollLock();
-    if (onClose) onClose();
-  };
-  // `overlay.escapeHandler`, when a host sets one, takes Escape instead of closing: a panel
-  // showing a STEP (the filename designer inside a profile, its guide picker) steps back
-  // one level. Still one listener per overlay, so there is never a second Escape handler
-  // to argue with this one (dev/changelog/1161).
-  const onKey = (e) => {
-    if (e.key !== 'Escape' || !dismissable) return;
-    if (overlay.escapeHandler) { overlay.escapeHandler(); return; }
-    close();
-  };
-
   if (dismissable) {
     const x = document.createElement('button');
     x.className = 'modal-close';
     x.innerHTML = icon('close');
-    x.addEventListener('click', close);
     head.appendChild(x);
-    backdrop.addEventListener('click', close);
-    document.addEventListener('keydown', onKey);
   }
 
   panel.appendChild(head);
   panel.appendChild(bodyEl);
+  overlay.appendChild(backdrop);
+  overlay.appendChild(panel);
+  const close = wireModal(overlay, { dismissable, onClose });
   if (footer.length) {
     const foot = document.createElement('div');
     foot.className = 'modal-foot';
@@ -1221,11 +1280,8 @@ function buildModal({ title = '', body = '', footer = [], dismissable = true, on
     });
     panel.appendChild(foot);
   }
-  overlay.appendChild(backdrop);
-  overlay.appendChild(panel);
   document.body.appendChild(overlay);
-  syncScrollLock();
-  overlay.closeModal = close;
+  overlay.openModal();
   return overlay;
 }
 

@@ -316,6 +316,9 @@ class OptInTests(unittest.TestCase):
                       'templates/epg_source_review.html',
                       'templates/channels/guide_compare.html',
                       'templates/epg_manager.html'} | {p for p, _b, _n in REFLOWING_JS}
+        # util.js builds no table: its tooltip reads the class to find a card table's hidden
+        # header (dev/changelog/1589), so it has no cells to check for a label.
+        found.discard('static/js/util.js')
         self.assertEqual(
             registered, found,
             'A file opts into .tbl-cards but is not covered above (or is covered and no '

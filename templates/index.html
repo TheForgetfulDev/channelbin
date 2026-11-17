@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Recordings - ChannelBin{% endblock %}
 
-{% from "_macros.html" import status_badge, channel_pill, csrf_field %}
+{% from "_macros.html" import status_badge, channel_pill, csrf_field, record_dialog_config %}
 
 {# Schedule recording asks how: a .menu on desktop, the same three links as tiles in the
    phone's bottom sheet (static/js/recordings.js). In the header and on the empty page. #}
@@ -183,20 +183,8 @@
 <link rel="stylesheet" href="{{ url_for('static', filename='css/guide.css') }}">
 <script>
 const GUIDE_CONFIG = {
-  {# no epgUrl - this page has no guide grid; guide.js's grid paths are guarded on that.
-     fetchSavedSearches() etc. run unconditionally though, so this mirrors
-     recording_detail.html's full config shape rather than a page-specific subset. #}
-  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',  // GET list / POST create
-  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',  // + id + /delete
-  addChannelUrlBase: '/api/guide/channels/',  // + channel_id + /add
-  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
-  editRecordingUrlBase: '/recordings/',  // + id + /edit
-  recDetailUrlBase: '/recordings/',  // + id
-  profiles: {
-    {% for p in profiles %}
-    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
-    {% endfor %}
-  },
+  {# no epgUrl - this page has no guide grid; guide.js's grid paths are guarded on that #}
+  {{ record_dialog_config(profiles, 'recordings') }}
 };
 </script>
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>

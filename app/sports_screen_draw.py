@@ -278,6 +278,25 @@ def _badge_for(path):
     return path, (st.st_size, int(st.st_mtime))
 
 
+#: What decoding a downloaded badge can raise: a file that is not a picture, a truncated one, one
+#: past BADGE_MAX_PIXELS or past Pillow's own limit.
+_BAD_BADGE = (OSError, ValueError, SyntaxError, Image.DecompressionBombError)
+
+
+def badge_problem(path) -> str:
+    """Why the badge file at `path` is drawn as the team's code, or '' when it decodes or there is
+    none: the same decode badge_disc() makes, asked without drawing so a play can say it
+    (output_feed, dev/changelog/1587). Logs nothing; the draw's own WARNING is the log's record."""
+    badge = _badge_for(path)
+    if badge is None:
+        return ''
+    try:
+        _badge_image(badge[0], 64, badge[1])
+    except _BAD_BADGE as exc:
+        return str(exc) or type(exc).__name__
+    return ''
+
+
 def _decoded_badge(badge, box: int):
     """The badge fitted into `box`, or None when there is none or its file cannot be decoded: the
     disc then shows the team's code, as it does with no badge. A badge is a download, and one bad
@@ -286,7 +305,7 @@ def _decoded_badge(badge, box: int):
         return None
     try:
         return _badge_image(badge[0], box, badge[1])
-    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+    except _BAD_BADGE as exc:
         log.warning('The badge %s cannot be read as a picture (%s), so the waiting screen draws the '
                     "team's code in its place", badge[0], exc)
         return None

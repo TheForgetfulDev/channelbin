@@ -497,7 +497,7 @@ def _members_for_feed(group, blocked, allowed):
     if allowed is not None:
         kept = [m for m in kept if m.account_id in allowed]
         if not kept:
-            return [], ('every channel in the group is on an account the output feed is '
+            return [], ('every channel in the group is on an account the IPTV output is '
                         'not allowed to serve from')
     return kept, ''
 
@@ -628,7 +628,7 @@ def auth_payload(fcfg: dict, host: str, port: str, scheme: str) -> dict:
     return {
         'user_info': {
             'username': feed_username(fcfg), 'password': feed_password(fcfg),
-            'message': 'ChannelBin output feed', 'auth': 1, 'status': 'Active',
+            'message': 'ChannelBin IPTV output', 'auth': 1, 'status': 'Active',
             'exp_date': str(int((now + timedelta(days=3650)).timestamp())),
             'is_trial': '0', 'active_cons': str(len(live_sessions())),
             'created_at': '0', 'max_connections': str(int(fcfg.get('max_viewers') or 1)),
@@ -793,8 +793,8 @@ def _resolve_sports_play(feed_id: int, row_id: int, allowed, exclude_ids, event_
     if allowed is not None:
         kept = [m for m in kept if m.account_id in allowed]
         if not kept:
-            play.why_none = (f'every channel whose guide lists {game} is on an account the output '
-                             f'feed is not allowed to serve from')
+            play.why_none = (f'every channel whose guide lists {game} is on an account the IPTV '
+                             f'output is not allowed to serve from')
             return play
     play.member = pick_best_member(kept, _latest_tests_by_channel([m.id for m in kept]),
                                    exclude_ids=exclude_ids)
@@ -830,7 +830,7 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int 
             play.why_none, play.fault = WHY_TAKEN_OFF, False
             return play
         if allowed is not None and ch.account_id not in allowed:
-            play.why_none = 'its account is one the output feed is not allowed to serve from'
+            play.why_none = 'its account is one the IPTV output is not allowed to serve from'
             return play
         if ch.id in exclude_ids:
             play.why_none = 'it already failed this play'
@@ -990,6 +990,9 @@ class RelaySession:
     # Members that died this play, so a failover never returns to one (section 4.5).
     failed_ids: set = field(default_factory=set)
     failovers: list = field(default_factory=list)    # [(from name, to name, why)]
+    # Things that went less than right on this play and did not end it, each said once, as
+    # sentences: Watching now and the play's line in Recent plays show them (_note_once).
+    notes: list = field(default_factory=list)
     # Set by preempt_for_account() in the acquire-to-Popen window; the launch re-reads it
     # after Popen and never runs on a seat a recording already took.
     preempted: bool = False
@@ -1154,8 +1157,8 @@ def _refuse(feed_id: int, label: str, message: str, status: int, source_tail: st
     source = f'feed:{feed_id}:{source_tail}'
     alert_type = 'FEED_NO_MEMBER' if source_tail == 'no-member' else 'VIEWER_REFUSED'
     if not has_open_alert(alert_type, source):
-        title = (f'Output feed: nothing to play for {label}' if alert_type == 'FEED_NO_MEMBER'
-                 else f'Output feed: an IPTV player was refused {label}')
+        title = (f'IPTV output: nothing to play for {label}' if alert_type == 'FEED_NO_MEMBER'
+                 else f'IPTV output: an IPTV player was refused {label}')
         create_alert(alert_type, title, body=message, source=source)
     raise FeedRefused(message, status)
 
@@ -1173,7 +1176,7 @@ def start_session(feed_id: int, client: str, cfg=None) -> RelaySession:
     fcfg = feed_config(cfg)
     play = resolve_play(feed_id, cfg)
     if play is None:
-        raise FeedRefused('No such channel on this feed', 404)
+        raise FeedRefused('No such channel on the IPTV output', 404)
     if play.sports and play.member is None and not play.fault:
         return start_waiting(play, client, cfg)
     if play.member is None and not play.fault:
@@ -1228,7 +1231,7 @@ def start_session(feed_id: int, client: str, cfg=None) -> RelaySession:
         return start_waiting(play, client, cfg, held=_screen_mod().HELD_NO_CONNECTION)
     _ensure_reaper()
     log.info('Viewer %s from %s: %s playing channel %d (%s) on account %d%s', session.id,
-             client, session.label, member.id, member.name, member.account_id,
+             client, session.label, session.channel_id, session.channel_name, session.account_id,
              f' ({play.note})' if play.note else '')
     return session
 
@@ -1274,13 +1277,34 @@ def _launch(session: RelaySession, member, cfg, first: bool = True,
     """Take the seat and start ffmpeg on `member`, wiring its stdout to the ring through a
     reader thread. Raises FeedRefused; on the first play the session is finished first and
     the refusal alert raised, on a failover the caller decides what the refusal means. With
-    `hold`, a first play refused its seat raises _SeatHeld and touches nothing."""
+    `hold`, a first play refused its seat raises _SeatHeld and touches nothing.
+
+    A first play refused its seat on `member` asks every other channel that could play it, in
+    rank order, before it is refused or held (dev/changelog/1585): the next one down may be on
+    an account with a connection free. Only what this play starts on changes; a recording's
+    pick is channel_groups' and is not asked here."""
     from .account_blocks import blocked_reason
     from .account_links import render_held_login
     from .config import load_config
     from .recorder import resolve_capture_pacing
 
-    if not _take_seat(session, member, first, seat_deadline):
+    walked = False
+    got = _take_seat(session, member, first, seat_deadline)
+    if not got:
+        other = _seat_for(session, member, session.event_id, cfg, refused=(member,)) if first else None
+        if other is not None:
+            busy = member.account.name if member.account else f'account {member.account_id}'
+            # The same account can answer yes a moment later, so the account is blamed only
+            # when the play really starts on another one.
+            why = (f'{busy}, which "{member.name}" is on, had no connection free'
+                   if other.account_id != member.account_id
+                   else f'no connection was free for "{member.name}" when it was asked')
+            _note_once(session, f'Started on "{other.name}": {why}.')
+            log.info('Viewer %s: no connection free on account %d for "%s", so %s starts on "%s" '
+                     'on account %d', session.id, member.account_id, member.name, session.label,
+                     other.name, other.account_id)
+            member, walked, got = other, True, True
+    if not got:
         if first and hold:
             raise _SeatHeld()
         account_name = member.account.name if member.account else f'account {member.account_id}'
@@ -1305,7 +1329,22 @@ def _launch(session: RelaySession, member, cfg, first: bool = True,
         session.channel_id = member.id
         session.channel_name = member.name
         session.account_id = member.account_id
-        seated = first or session.id in connlim.seated_holder_ids('viewer')
+        seated = (first and not walked) or session.id in connlim.seated_holder_ids('viewer')
+        ending = walked and (not session.live or session._finishing)
+        if walked and seated and not ending:
+            # A recording that started on the account the play was registered under flagged
+            # it while it held no seat there (preempt_for_account matches by account). The
+            # seat it holds now is on another account, where nothing has asked for it.
+            session.preempted, session.preempted_by = False, None
+    if ending:
+        # Stopped while the walk was asking (shutdown, its row taken off): the stop released
+        # whatever the walk had taken, and the play is neither held nor preempted.
+        connlim.release(member.account_id, 'viewer', session.id)
+        raise FeedRefused(session.reason_text() or REASON_TEXT[REASON_STOPPED], 409)
+    if not seated and first and hold:
+        # A recording took the seat the walk found before the play was named on its account:
+        # nothing is held, and a sports play waits on the screen as it does for any seat.
+        raise _SeatHeld()
     if not seated:
         _finish(session, REASON_PREEMPTED,
                 detail=f'a recording took the connection as the play was moving to "{member.name}"')
@@ -1470,7 +1509,8 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
                 SCREEN_NAME if session.sports_row_id else ''),
             'account_id': session.account_id, 'reason': reason,
             'message': ' '.join(x for x in (session.reason_text(), detail, _screen_note(session),
-                                            _moves_note(session), reserve_short_note(session.ring)) if x),
+                                            _moves_note(session), play_notes(session),
+                                            reserve_short_note(session.ring)) if x),
             'seconds': int(max(0.0, time.monotonic() - session.started_mono)) if session.started_mono else 0,
             'bytes_sent': session.bytes_sent, 'moves': len(session.failovers)})
     return True
@@ -1528,6 +1568,47 @@ def stop_account(account_id: int, reason: str = REASON_ACCOUNT_OFF) -> int:
     with _lock:
         live = [s for s in _sessions.values() if s.live and s.account_id == account_id]
     return sum(1 for s in live if _finish(s, reason))
+
+
+def _live_sports_plays() -> list:
+    with _lock:
+        return [s for s in _sessions.values()
+                if s.live and decode_feed_id(s.feed_id)[0] == KIND_SPORTS]
+
+
+def sports_served_now() -> Optional[frozenset]:
+    """The feed ids of the sports channels served right now, for stop_unserved_sports(): read
+    before a person's act that may stop one being served. None, and no query, when no sports
+    channel is being played. Requires an app context."""
+    if not _live_sports_plays():
+        return None
+    from . import sports_feed
+    return frozenset(feed_id_for_sports(c.row.id) for c in sports_feed.served_channels())
+
+
+def stop_unserved_sports(before: Optional[frozenset], reason: str = REASON_TAKEN_OFF) -> int:
+    """End every live play of a sports channel that was served `before` (sports_served_now(), read
+    before the act) and is not now, on a game or on the waiting screen, by name. How many it
+    ended. The one place a person's act that stops a sports channel being served cuts its plays:
+    its switch going off, a follow a person changed or removed, its league deleted
+    (dev/changelog/1586). Called after that act's commit, never inside it.
+
+    Only what THIS act stopped being served is cut. A rule's follow ending is not a person
+    turning the channel off and does not come here, and a game still playing after one is not in
+    `before`, so a later act about something else leaves it alone: it plays out, and a play on
+    the waiting screen ends REASON_SCREEN_GONE at its next re-check. One read of what is served
+    whatever the number of plays; requires an app context."""
+    if not before:
+        return 0
+    live = [s for s in _live_sports_plays() if s.feed_id in before]
+    if not live:
+        return 0
+    from . import sports_feed
+    served = {feed_id_for_sports(c.row.id) for c in sports_feed.served_channels()}
+    cut = sum(1 for s in live if s.feed_id not in served and _finish(s, reason))
+    if cut:
+        log.info('IPTV output: %s of a sports channel that is no longer served cut', counted(cut, 'play'))
+    return cut
 
 
 def stop_session(session_id: str, reason: str = REASON_STOPPED) -> bool:
@@ -1598,6 +1679,9 @@ def _queue_play(app, entry: dict) -> None:
     with _lock:
         _play_queue.append(entry)
         if _log_writer is None:
+            # A kick meant for a writer that had already exited would end this one's first
+            # wait at once, writing the line before a caller's own flush_play_log() can.
+            _log_kick.clear()
             _log_writer = threading.Thread(target=_log_loop, args=(app,), name='relay-play-log',
                                            daemon=True)
             _log_writer.start()
@@ -1895,7 +1979,7 @@ def _failover(session: RelaySession, reason: str, detail: str) -> None:
                     source = f'feed:{session.feed_id}:no-member'
                     if not has_open_alert('FEED_NO_MEMBER', source):
                         create_alert('FEED_NO_MEMBER',
-                                     f'Output feed: nothing left to play for {session.label}',
+                                     f'IPTV output: nothing left to play for {session.label}',
                                      body=f'An IPTV player watching {session.label} was cut: {detail}.',
                                      source=source)
                 return
@@ -1930,7 +2014,7 @@ def _failover(session: RelaySession, reason: str, detail: str) -> None:
             db.session.add(ChannelGroupEvent(
                 group_id=session.group_id, channel_id=member.id,
                 event_type=GROUP_VIEWER_FAILOVER,
-                detail=(f'An IPTV player watching through the output feed was moved from "{failed_name}" '
+                detail=(f'An IPTV player watching through the IPTV output was moved from "{failed_name}" '
                         f'to "{member.name}": "{failed_name}" {why}.')))
             db.session.commit()
 
@@ -1953,6 +2037,19 @@ def _moves_note(session: 'RelaySession') -> str:
     """What a play's line in Recent plays says about its moves, or ''. A sports channel has no
     group timeline to keep them in, so the line is where each move's reason outlives the play."""
     return ' '.join(move_text(a, b, why) for a, b, why in session.failovers)
+
+
+def _note_once(session: 'RelaySession', sentence: str) -> None:
+    """Keep `sentence` on the play, once however often its cause repeats (a waiting screen is
+    redrawn at every re-check)."""
+    with _lock:
+        if sentence not in session.notes:
+            session.notes.append(sentence)
+
+
+def play_notes(session: 'RelaySession') -> str:
+    with _lock:
+        return ' '.join(session.notes)
 
 
 def _reap_loop():
@@ -2049,6 +2146,22 @@ def _set_screen(session: RelaySession, screen, path: str, still: bool, held: str
         session.waiting_for = screen.game.name if screen.game is not None else ''
 
 
+def _note_badges(session: RelaySession, screen) -> None:
+    """Say on the play, once, each badge its screen draws as the team's code (the draw warns in
+    the log at every clip made, dev/changelog/1587). Called only once the clip is playing, and
+    nothing it raises leaves here: it decodes a downloaded file, and a diagnostic must never be
+    able to cost the play its screen."""
+    try:
+        unread = _screen_mod().unread_badges(screen)
+    except Exception as exc:                            # noqa: BLE001 - a note, never the play
+        log.warning('Viewer %s: could not ask whether the badges of %s can be read: %s', session.id,
+                    session.label, exc)
+        return
+    for name, code in unread:
+        _note_once(session, f'The badge for {name} could not be read as a picture, so the waiting '
+                            f'screen shows "{code}" in its place.')
+
+
 def start_waiting(play: Play, client: str, cfg: dict, held: str = None) -> RelaySession:
     """Start `play`, a sports play, on its channel's waiting screen. `held` (a
     sports_screen.HELD_* reason) is a game that is on and cannot start here yet. Requires an app
@@ -2083,6 +2196,7 @@ def start_waiting(play: Play, client: str, cfg: dict, held: str = None) -> Relay
     except FeedRefused as exc:
         _finish(session, REASON_LAUNCH_FAILED, detail=exc.message)
         raise
+    _note_badges(session, screen)
     if still:
         _make_moving_later(session, cfg, screen, held)
     _ensure_reaper()
@@ -2148,6 +2262,7 @@ def _swap_clip(session: RelaySession, screen, path: str, still: bool, cfg: dict,
         return False
     if old != path:
         _discard_unplayed(old)
+    _note_badges(session, screen)
     log.info('Viewer %s: the waiting screen for %s now shows %s%s%s', session.id, session.label,
              screen.state, f' ({held})' if held else '', ', the quick still' if still else '')
     return True
@@ -2164,6 +2279,8 @@ def _make_moving_later(session: RelaySession, cfg: dict, screen, held: str = Non
         except ss.ClipFailed as exc:
             log.warning('Viewer %s: the moving waiting screen for %s could not be made, so the still '
                         'one stays on: %s', session.id, session.label, exc)
+            _note_once(session, f'The moving waiting screen could not be made, so the still one '
+                                f'stayed on ({exc}).')
             return
         key = ss.clip_key(screen)
         with session._swap_lock:
@@ -2259,7 +2376,7 @@ def _recheck_locked(session: RelaySession) -> None:
         if _finish(session, REASON_NO_MEMBER, detail=detail):
             source = f'feed:{session.feed_id}:no-member'
             if not has_open_alert('FEED_NO_MEMBER', source):
-                create_alert('FEED_NO_MEMBER', f'Output feed: nothing to play for {play.label}',
+                create_alert('FEED_NO_MEMBER', f'IPTV output: nothing to play for {play.label}',
                              body=f'An IPTV player on the waiting screen of {play.label} was cut: {detail}.',
                              source=source)
         return
@@ -2271,6 +2388,8 @@ def _recheck_locked(session: RelaySession) -> None:
     except ss.ClipFailed as exc:
         log.warning('Viewer %s: the waiting screen for %s stays as it is, its new one could not be '
                     'made: %s', session.id, session.label, exc)
+        _note_once(session, f'The waiting screen could not be redrawn, so it kept what it showed '
+                            f'({exc}).')
         return
     if _swap_clip(session, screen, path, still, cfg, held) and still:
         _make_moving_later(session, cfg, screen, held)
@@ -2289,7 +2408,7 @@ def _to_game(session: RelaySession, play: Play, cfg: dict, fcfg: dict) -> Option
             return ss.HELD_NO_SLOT
         session.slot_claimed = True
     try:
-        member = _seat_for(session, play, cfg)
+        member = _seat_for(session, play.member, play.event_id, cfg)
         if member is None:
             return ss.HELD_NO_CONNECTION
         if not _own_seat(session, member):
@@ -2323,16 +2442,17 @@ def _own_seat(session: RelaySession, member) -> bool:
     return seated
 
 
-def _seat_for(session: RelaySession, play: Play, cfg: dict):
-    """The best member playing the game whose account has a seat free, with the seat taken; None
-    when every one is out of connections."""
-    tried = set()
-    member = play.member
+def _seat_for(session: RelaySession, member, event_id, cfg: dict, refused=()):
+    """The best channel that can play what the session asked for whose account has a seat free,
+    with the seat taken, starting at `member` and going down the ranking; None when every one is
+    out of connections. `refused` are the ones already refused a seat, which are not asked again."""
+    tried = {m.id for m in refused}
     while member is not None:
-        if connlim.try_acquire(member.account_id, 'viewer', session.id):
+        if member.id not in tried and connlim.try_acquire(member.account_id, 'viewer', session.id):
             return member
         tried.add(member.id)
-        more = resolve_play(session.feed_id, cfg, exclude_ids=frozenset(tried), event_id=play.event_id)
+        more = resolve_play(session.feed_id, cfg, exclude_ids=frozenset(tried | session.failed_ids),
+                            event_id=event_id)
         member = more.member if more is not None else None
     return None
 
@@ -2396,7 +2516,7 @@ def redirect_target(feed_id: int, client: str, cfg=None, play: Play = None) -> s
     caller's resolve_play() answer when it already has one."""
     play = play or resolve_play(feed_id, cfg)
     if play is None:
-        raise FeedRefused('No such channel on this feed', 404)
+        raise FeedRefused('No such channel on the IPTV output', 404)
     if play.member is None and not play.fault:
         _refuse_nothing_on(play, client)
     if play.member is None:

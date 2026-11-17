@@ -576,9 +576,9 @@ def _check_output_feed(ctx):
     carries the URL to type into the IPTV player (DESIGN-output-feed.md section 8)."""
     from .output_feed import MODE_MIXED, MODE_PROXY, MODE_REDIRECT, max_reserve_seconds
     feed = ctx.feed
-    tested = 'Read the output feed settings and counted what the TV Guide would serve'
+    tested = 'Read the IPTV output settings and counted what the TV Guide would serve'
     if not feed['enabled']:
-        return Result(NOTHING, tested, 'The output feed is off')
+        return Result(NOTHING, tested, 'The IPTV output is off')
     fcfg = (ctx.cfg.get('integrations') or {}).get('output_feed') or {}
     from .config import public_url
     url = public_url(ctx.cfg)
@@ -586,7 +586,7 @@ def _check_output_feed(ctx):
               f'{url or "this ChannelBin address"} and the login set on the IPTV Output page.')
     if not feed['credentials_set']:
         return Result(PROBLEM, tested,
-                      'The feed is on but has no username or password, so every request '
+                      'The IPTV output is on but has no username or password, so every request '
                       'is refused', detail=detail)
     if not feed['reserve_fits']:
         return Result(PROBLEM, tested,
@@ -930,7 +930,7 @@ CHECKS = (
     Check('auth_gate', 'machine', 'The login gate does what you asked', 'the login gate', CHEAP,
           'Login is on but no password is stored, so every page is open to anyone.',
           Link('Settings', 'settings.settings', 'auth.enabled'), False, _check_auth_gate),
-    Check('output_feed', 'machine', 'The output feed can serve an IPTV player', 'the output feed',
+    Check('output_feed', 'machine', 'The IPTV output can serve an IPTV player', 'the IPTV output',
           CHEAP,
           'An IPTV player that added ChannelBin as an account sees no channels, or is refused on '
           'every request.',

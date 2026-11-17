@@ -26,7 +26,7 @@ from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
 from app import recorder  # noqa: E402
 from app.database import DIAGNOSTICS, Recording, RecordingEvent, RecordingSegment  # noqa: E402
-from app.proc_utils import (RECONNECT_MARKER, ReconnectJumps,  # noqa: E402
+from app.proc_utils import (REPEAT_CLOSURES_STUCK, RECONNECT_MARKER, ReconnectJumps,  # noqa: E402
                             count_stderr_matches, read_reconnect_jumps, read_stderr_tail,
                             UNBOUNDED_JUMPS_KEPT)
 
@@ -98,7 +98,8 @@ class ReadReconnectJumpsTests(unittest.TestCase):
     def test_a_jump_closed_once_per_stream_is_a_replay_and_a_hole(self):
         path = self._spool(_JUMP_SINGLE + _PROGRESS_LINE + _JUMP_DOUBLED)
         self.assertEqual(read_reconnect_jumps(path),
-                         ReconnectJumps((4.471, 5.138), (5.077,), True))
+                         ReconnectJumps((4.471, 5.138), (5.077,), True,
+                                        timeline_holes=(5.077,)))
 
     def test_the_other_streams_residual_is_not_a_hole(self):
         path = self._spool(_JUMP_RESIDUAL)
@@ -148,6 +149,102 @@ class ReadReconnectJumpsTests(unittest.TestCase):
         jumps = read_reconnect_jumps(self._spool(flip))
         self.assertEqual(len(jumps.resets), UNBOUNDED_JUMPS_KEPT)
         self.assertEqual(len(jumps.closed_gaps), UNBOUNDED_JUMPS_KEPT)
+
+    @staticmethod
+    def _progress(*seconds):
+        return ''.join(f'frame= 1 fps= 25 q=-1.0 size= 1KiB time=00:{s // 60:02d}:{s % 60:02d}.00 '
+                       f'bitrate= 1.0kbits/s speed=1.0x    \r' for s in seconds)
+
+    @staticmethod
+    def _back(seconds, stream='vist#0:0/h264', sid=256):
+        return (f'[{stream} @ 0x1] timestamp discontinuity (stream id={sid}): '
+                f'-{round(seconds * 1_000_000)}, new offset= 1\n')
+
+    def test_a_clock_going_back_long_after_a_reconnect_is_a_reset(self):
+        """dev/docs/BUGS.md 2026-11-16 (recording 37): the feed's clock went back in pairs with no
+        reconnect near, and the pair after segment 3's first reconnect was written down as
+        1020.4 s of repeated content and a 30.4 s hole for the join to close."""
+        path = self._spool(self._progress(60) + _JUMP_SINGLE + self._progress(61, 62, 63, 400)
+                           + self._back(1020.4) + self._progress(460) + self._back(30.4))
+        self.assertEqual(read_reconnect_jumps(path),
+                         ReconnectJumps((4.471,), (), True, (), (1020.4, 30.4)))
+
+    # Two closures as ffmpeg 7.1 logged them for one 30 s clock reset under load, the audio's
+    # first: the offset moves twice the reset (dev/changelog/1604).
+    _RESET_DOUBLED = (
+        '[aist#0:1/aac @ 0x58b027f98480] timestamp discontinuity (stream id=257): -29999999, '
+        'new offset= 40058266\n'
+        '[vist#0:0/h264 @ 0x58b027f7e480] timestamp discontinuity (stream id=256): -30000001, '
+        'new offset= 70058267\n')
+
+    def test_a_reset_closed_once_per_stream_is_one_reset_and_its_hole(self):
+        """dev/docs/BUGS.md 2026-11-16 @ 06:11:43 PM: a clock reset closed on each stream was
+        written down as two resets, and the 30 s hole the second closure left in the file's
+        timeline was named nowhere, so the join left it."""
+        path = self._spool(self._progress(60) + _JUMP_SINGLE + self._progress(61, 62, 63, 64)
+                           + self._RESET_DOUBLED + self._progress(65))
+        jumps = read_reconnect_jumps(path)
+        self.assertEqual((jumps.replays, jumps.holes), ((4.471,), ()))
+        self.assertEqual(jumps.resets, (30.0,))
+        self.assertEqual(jumps.reset_holes, (30.0,))
+
+    def test_holes_of_both_kinds_are_listed_in_the_order_logged(self):
+        """The join's matcher reads the file front to back (dev/changelog/1604)."""
+        path = self._spool(self._progress(60) + self._RESET_DOUBLED + self._progress(61, 62, 63)
+                           + _JUMP_SINGLE + self._progress(64) + _JUMP_DOUBLED)
+        jumps = read_reconnect_jumps(path)
+        self.assertEqual((jumps.holes, jumps.reset_holes), ((5.077,), (30.0,)))
+        self.assertEqual(jumps.timeline_holes, (30.0, 5.077))
+
+    def test_a_reconnect_between_a_resets_two_closures_ends_its_hole(self):
+        path = self._spool(self._progress(60) + self._back(30.0) + _RECONNECT_LINE
+                           + self._back(30.0))
+        jumps = read_reconnect_jumps(path)
+        self.assertEqual((jumps.resets, jumps.reset_holes, jumps.replays), ((30.0,), (), (30.0,)))
+
+    def test_two_resets_of_one_length_past_the_bound_are_two_resets(self):
+        """A reset's hole closure comes with the reset's own packets; one of the same length
+        three new positions later is the clock going back again."""
+        path = self._spool(self._progress(60) + self._back(30.0) + self._progress(61, 62, 63)
+                           + self._back(30.0))
+        jumps = read_reconnect_jumps(path)
+        self.assertEqual((jumps.resets, jumps.reset_holes), ((30.0, 30.0), ()))
+
+    def test_a_reset_followed_by_one_of_another_length_is_two_resets(self):
+        path = self._spool(self._progress(60) + self._back(30.0) + self._back(12.0))
+        jumps = read_reconnect_jumps(path)
+        self.assertEqual((jumps.resets, jumps.reset_holes), ((30.0, 12.0), ()))
+
+    def test_a_reconnect_that_closed_nothing_does_not_claim_a_later_reset(self):
+        """dev/docs/BUGS.md 2026-11-16: a reconnect the provider answered with no buffer leaves
+        no closure of its own, and the next clock reset is not its replay."""
+        path = self._spool(self._progress(60) + _RECONNECT_LINE + self._progress(61, 62, 63, 64)
+                           + self._back(38.9))
+        self.assertEqual(read_reconnect_jumps(path), ReconnectJumps((), (), True, (), (38.9,)))
+
+    def test_a_closure_after_a_long_wait_for_the_new_connection_is_still_the_reconnects(self):
+        """A progress line repeating one position is ffmpeg waiting, not the capture moving
+        on; one line with a new position is what was in flight (dev/changelog/1597)."""
+        path = self._spool(self._progress(60) + _RECONNECT_LINE + self._progress(*[60] * 40)
+                           + self._progress(61) + self._back(5.0) + self._progress(62)
+                           + self._back(5.1, 'aist#0:1/aac', 257))
+        self.assertEqual(read_reconnect_jumps(path),
+                         ReconnectJumps((5.0,), (5.1,), True, timeline_holes=(5.1,)))
+
+    def test_streams_stuck_apart_are_still_counted_long_after_their_reconnect(self):
+        """Recording 32's flips went on for hours past the reconnect that caused them
+        (dev/docs/BUGS.md 2026-11-03); the bound on a reconnect's closures must not turn each
+        into a reset."""
+        flips = ''.join(
+            self._progress(100 + i)
+            + '[aist#0:1/aac @ 0x2] timestamp discontinuity (stream id=257): 111745645, '
+              'new offset= 2\n' + self._back(111.745645)
+            for i in range(50))
+        path = self._spool(self._progress(60) + _RECONNECT_LINE + self._back(111.7)
+                           + self._back(111.745) + flips)
+        jumps = read_reconnect_jumps(path)
+        self.assertEqual((jumps.replays, jumps.holes, jumps.resets), ((111.7,), (111.745,), ()))
+        self.assertEqual(jumps.repeats, 100)
 
     def test_a_clean_spool_reports_nothing_at_all(self):
         path = self._spool(_PROGRESS_LINE * 20)
@@ -274,7 +371,8 @@ class CollectReturnsReconnectsTests(unittest.TestCase):
         self._spool_with(_JUMP_SINGLE + _PROGRESS_LINE * 20 + _JUMP_DOUBLED)
         *_rest, reconnects, _missing, jumps = recorder.collect_segment_diagnostics(self.rec.id)
         self.assertEqual(reconnects, (2, True))
-        self.assertEqual(jumps, ReconnectJumps((4.471, 5.138), (5.077,), True))
+        self.assertEqual(jumps, ReconnectJumps((4.471, 5.138), (5.077,), True,
+                                                timeline_holes=(5.077,)))
 
     def test_a_clean_segment_returns_no_jumps(self):
         self._spool_with(_PROGRESS_LINE * 40)
@@ -371,6 +469,27 @@ class ReconnectDisclosureTests(unittest.TestCase):
                       detail)
         self.assertIn("the provider's clock went back", detail)
         self.assertEqual(json.loads(self._events()[0].extra_data)['reset_seconds'], [30.0, 31.5])
+        self.assertNotIn('once per stream', detail)
+
+    def test_a_resets_hole_is_said_and_handed_to_the_join(self):
+        """dev/docs/BUGS.md 2026-11-16 @ 06:11:43 PM: the hole a reset closed once per stream
+        left is named, under the key the join reads."""
+        self._record(4, '', (0, True),
+                     jumps=ReconnectJumps((), (), True, (), (30.0,), reset_holes=(30.0,),
+                                          timeline_holes=(30.0,)))
+        event = self._events()[0]
+        self.assertIn('closed 1 backward timestamp jump of 30.0 s', event.detail)
+        self.assertIn('at 1 of them ffmpeg closed the jump once per stream, which leaves a '
+                      'hole of about 30.0 s', event.detail)
+        self.assertEqual(json.loads(event.extra_data)['reset_hole_seconds'], [30.0])
+        self.assertEqual(json.loads(event.extra_data)['timeline_hole_seconds'], [30.0])
+
+    def test_a_resets_hole_is_not_promised_while_the_streams_are_stuck_apart(self):
+        """The reconnect's own hole sentence is dropped in the same state (dev/changelog/1422)."""
+        self._record(4, '', (0, True),
+                     jumps=ReconnectJumps((), (), True, (), (30.0,), REPEAT_CLOSURES_STUCK, 30.0,
+                                          (30.0,), (30.0,)))
+        self.assertNotIn('once per stream', self._events()[0].detail)
 
     def test_many_closed_gaps_are_listed_in_part(self):
         self._record(4, '', (0, True), jumps=ReconnectJumps((), (), True, (12.0,) * 9, ()))

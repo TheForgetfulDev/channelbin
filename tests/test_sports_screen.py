@@ -239,6 +239,23 @@ class StillTests(unittest.TestCase):
         self.assertEqual(with_bad.getpixel((1102, 290)), without.getpixel((1102, 290)))
         self.assertIn('cannot be read as a picture', logs.output[0])
 
+    def test_a_badge_that_cannot_be_decoded_is_named_for_the_play(self):
+        """dev/docs/BUGS.md 2026-11-16 (said only in the log): the fallback to the code reached no page."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        bad, good = os.path.join(tmp, 'cut.png'), os.path.join(tmp, 'good.png')
+        with open(bad, 'wb') as f:
+            f.write(png_bytes(64, 64)[:60])
+        with open(good, 'wb') as f:
+            f.write(png_bytes(64, 64))
+        with self.assertNoLogs('app.sports_screen_draw', level='WARNING'):
+            self.assertEqual(ss.unread_badges(a_screen(badge=bad)), [('New York Rangers', 'NYR')])
+            self.assertEqual(ss.unread_badges(a_screen(badge=good)), [])
+            self.assertEqual(ss.unread_badges(a_screen()), [])
+            self.assertEqual(ss.unread_badges(a_screen(badge=os.path.join(tmp, 'gone.png'))), [],
+                             'a badge not downloaded yet is not a bad one')
+        self.assertTrue(draw.badge_problem(bad))
+
     def _bad_badge_matches_no_badge(self, data):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)

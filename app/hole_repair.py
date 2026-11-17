@@ -74,11 +74,13 @@ class HoleMatch(NamedTuple):
 class HoleRepair(NamedTuple):
     """What close_reconnect_holes did. `closed` is the seconds taken out per matched hole,
     `left` is [(reported seconds, why)] for the holes that stayed, `error` is why nothing
-    was changed at all, `scanned` says the file was read."""
+    was changed at all, `scanned` says the file was read. `beside` is [(stream index,
+    seconds)] for the jumps_beside() of the holes it closed, which it left in the file."""
     closed: list
     left: list
     error: str | None
     scanned: bool
+    beside: tuple = ()
 
 
 def match_reconnect_holes(scan: dict, reported, tolerance: float = HOLE_MATCH_TOLERANCE,
@@ -130,6 +132,41 @@ def match_reconnect_holes(scan: dict, reported, tolerance: float = HOLE_MATCH_TO
         cursors.update(advanced)
         matches.append(HoleMatch(hole, shifts))
     return matches, left
+
+
+#: A jump beside a hole is named only under this: the packet the capture could not split
+#: was stepped over as 0.62 s (dev/changelog/1598), and anything of a second or more is the
+#: size of a hole or a real gap, which other readings report.
+BESIDE_MAX_SECONDS = 1.0
+
+
+def jumps_beside(scan: dict, matches, window: float = HOLE_PLACE_WINDOW,
+                 limit: float = BESIDE_MAX_SECONDS) -> list:
+    """[(stream index, seconds over the stream's cadence)] for every jump under `limit`
+    within `window` after a matched hole that is not the hole itself, in file order per
+    stream.
+
+    A cut that lands in an audio PES can hand the capture the first stretch of the new
+    connection's sound as one packet it could not split into frames: 35 AAC frames in one
+    6.8 KB packet on ffmpeg 7.1, stepped over as 0.62 s (dev/changelog/1598). The stream's
+    next PES carries its own timestamp, so the picture and sound were in step again within
+    a fraction of a second and nothing after it was displaced. Closing it as a hole would
+    put every later packet of that stream that far early, so it is never closed. It is
+    named so a short stretch that may not play has a place it is written down; the scan
+    cannot tell that cause from a short real gap, and the sentence built on this says so."""
+    out = []
+    for idx in sorted(scan):
+        taken = [m.shifts[idx][0] for m in matches if idx in m.shifts]
+        if not taken:
+            continue
+        for prev_dts, dts, cadence in scan[idx].get('jumps', []):
+            place = (prev_dts + dts) / 2.0
+            excess = dts - prev_dts - (cadence or 0.0)
+            if place in taken or excess >= limit:
+                continue
+            if any(0 <= place - t <= window for t in taken):
+                out.append((idx, round(excess, 3)))
+    return out
 
 
 def setts_args(matches) -> list:
@@ -228,7 +265,8 @@ def close_reconnect_holes(path: str, reported, *, ffmpeg_path: str, pre_output_t
     # The holes as the capture reported them, the figure the segment's own event carries;
     # per stream the shift differs from it by the lead one stream had over the other at
     # the cut, which is what keeps them in step.
-    return HoleRepair([m.reported for m in matches], left, None, True)
+    return HoleRepair([m.reported for m in matches], left, None, True,
+                      tuple(jumps_beside(scan, matches)))
 
 
 def _verify(path: str, dest: str, before, matches) -> str | None:

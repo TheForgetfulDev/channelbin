@@ -156,6 +156,14 @@ const RECORDING_PROFILE_SECTIONS = [
         meta: 'Saves a .nfo file, a poster and a background beside each finished recording made with ' +
           'this profile, so Plex, Jellyfin, Emby and Kodi show its real title, synopsis ' +
           'and genre instead of guessing from the filename.' },
+      { key: 'move_when_account_full', label: 'When the account is full', type: 'tristate',
+        inheritable: true, trueLabel: 'Move to another channel', falseLabel: 'Wait for a connection',
+        meta: 'When a recording on one channel finds its account with no connection free, it ' +
+          'moves to another channel showing the same program, on an account with one free. ' +
+          'Channels whose latest health check passed are tried first, then channels never ' +
+          'checked, then ones whose latest check failed. Wait keeps it on its own channel ' +
+          'until a connection frees. At start, a recording from a channel group is not ' +
+          'affected - the group chooses among its own channels.' },
     ],
   },
 ];

@@ -515,8 +515,13 @@ def _reported_reconnect_holes(recording_id: int):
             continue  # a malformed row names no hole and records no repair
         if not isinstance(extra, dict):
             continue
-        if extra.get('kind') == 'capture_stderr' and extra.get('reconnect_hole_seconds'):
-            reported[row.segment_number] = list(extra['reconnect_hole_seconds'])
+        if extra.get('kind') == 'capture_stderr' and (
+                extra.get('timeline_hole_seconds') or extra.get('reconnect_hole_seconds')):
+            # A clock reset closed once per stream leaves the same hole as a reconnect, and
+            # the matcher reads holes in file order, so a capture with both hands over the
+            # one ordered list (dev/changelog/1604).
+            reported[row.segment_number] = list(extra.get('timeline_hole_seconds')
+                                                or extra['reconnect_hole_seconds'])
         elif extra.get('kind') == DIAGNOSTIC_KIND and extra.get('outcome') != 'error':
             # A repair that failed (no disk, a killed remux) is tried again on a Retry
             # join, as the concat's own "free space and retry" advice promises.
@@ -570,7 +575,7 @@ def _close_segment_holes(recording_id, seg, holes, cfg, ffmpeg_path):
     from . import db
     from .database import add_recording_event, DIAGNOSTICS
     from .db_utils import retry_on_locked
-    from .fmt_utils import SECONDS_LIST_SHOWN, counted, seconds_list
+    from .fmt_utils import SECONDS_LIST_SHOWN, counted, join_labels, seconds_list
     from .hole_repair import HOLE_REMUX_SUFFIX, DIAGNOSTIC_KIND, close_reconnect_holes
 
     dest = f'{seg.file_path}{HOLE_REMUX_SUFFIX}'
@@ -601,8 +606,9 @@ def _close_segment_holes(recording_id, seg, holes, cfg, ffmpeg_path):
             _untrack_join_child(recording_id)
     closed = list(repair.closed) if repair else []
     left = list(repair.left) if repair else [(h, 'the rewrite did not run') for h in holes]
+    beside = list(repair.beside) if repair else []
     what = (f'{counted(len(holes), "hole")} of about {seconds_list(holes, limit=SECONDS_LIST_SHOWN)} that ffmpeg\'s '
-            f'reconnect repair left in the file\'s timeline')
+            f'timestamp repair left in the file\'s timeline')
     if error is not None:
         detail = (f'Segment {seg.segment_number}: the join could not close the {what} '
                   f'({error}) - the file is left as it was')
@@ -611,15 +617,21 @@ def _close_segment_holes(recording_id, seg, holes, cfg, ffmpeg_path):
     elif closed:
         detail = (f'Segment {seg.segment_number}: the join closed the '
                   f'{counted(len(closed), "hole")} of about {seconds_list(closed, limit=SECONDS_LIST_SHOWN)} that '
-                  f'ffmpeg\'s reconnect repair left in the file\'s timeline, with no '
+                  f'ffmpeg\'s timestamp repair left in the file\'s timeline, with no '
                   f'content missing on either side - the file is {sum(closed):.1f} s '
-                  f'shorter and plays straight through')
+                  f'shorter' + ('' if beside else ' and plays straight through'))
         log.info('Recording %d seg %s: closed %d hole(s), %.1f s', recording_id,
                  seg.segment_number, len(closed), sum(closed))
     else:
         detail = f'Segment {seg.segment_number}: the join looked for the {what}'
     for hole, why in left:
         detail += f'; a hole of about {hole:.1f} s was reported but {why}, so it stays'
+    if beside:
+        detail += ('. Just after ' + ('it' if len(closed) == 1 else 'them') + ', '
+                   + join_labels([f'stream {idx} steps over {seconds:.1f} s' for idx, seconds in beside])
+                   + ', which is not a reported hole and is left as it is: most likely a '
+                     'stretch the capture read as one packet it could not split, which may '
+                     'not play')
 
     @retry_on_locked()
     def _note_and_commit():
@@ -627,6 +639,7 @@ def _close_segment_holes(recording_id, seg, holes, cfg, ffmpeg_path):
                             segment_number=seg.segment_number,
                             extra={'kind': DIAGNOSTIC_KIND, 'closed_seconds': closed,
                                    'left_seconds': [h for h, _why in left],
+                                   'beside_seconds': [s for _idx, s in beside],
                                    'outcome': ('error' if error is not None else
                                                'closed' if closed else 'not_found')})
         db.session.commit()

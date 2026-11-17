@@ -1,8 +1,11 @@
-{# Record/Edit modal + Active-recording control modal - included by guide.html,
-   channels/detail.html, recording_detail.html, and index.html. Both are driven by
-   static/js/guide.js (openModal / openActiveRecModal), which expects these exact element
-   IDs. Requires `profiles` (RecordingProfile list) and `display_timezone` in the template
-   context, plus a matching `profiles: {...}` map in the page's GUIDE_CONFIG. #}
+{# Record/Edit modal + Active-recording control modal - included by every page that can
+   schedule or control a recording. Both are driven by static/js/guide.js (openModal /
+   openActiveRecModal), which expects these exact element IDs, and both sit on the shared
+   modal anatomy through util.js::wireModal's persistent mode: it finds the backdrop and the
+   head's .modal-close by class, so keep each dialog's .modal > .modal-backdrop +
+   .modal-panel > .modal-head shape (dev/changelog/1608). Requires `profiles`
+   (RecordingProfile list) and `display_timezone` in the template context, plus a matching
+   `profiles: {...}` map in the page's GUIDE_CONFIG. #}
 
 {% macro block_picker(prefix) -%}
 <details class="form-group form-disclose acct-block-pick" id="{{ prefix }}-blocks" style="display:none">
@@ -19,11 +22,11 @@
 
 {# Record / Edit modal #}
 <div id="record-modal" class="modal" style="display:none" role="dialog" aria-modal="true">
-  <div class="modal-backdrop" id="modal-backdrop"></div>
+  <div class="modal-backdrop"></div>
   <div class="modal-panel">
     <div class="modal-head">
       <h2 id="modal-title">Schedule recording</h2>
-      <button type="button" class="modal-close" id="modal-close" aria-label="Close">{{ icon('close') }}</button>
+      <button type="button" class="modal-close" aria-label="Close">{{ icon('close') }}</button>
     </div>
     <form id="modal-form" method="post">
       {{ csrf_field() }}
@@ -97,10 +100,29 @@
           <select name="profile_id" id="modal-profile" class="form-control">
             <option value="">None (use global defaults)</option>
             {% for p in profiles %}
-            <option value="{{ p.id }}">{{ p.name }}</option>
+            <option value="{{ p.id }}" data-move-full="{{ '' if p.move_when_account_full is none else ('1' if p.move_when_account_full else '0') }}">{{ p.name }}</option>
             {% endfor %}
           </select>
         </div>
+        {# What a single-channel recording does when its account has no connection free at
+           start (app/seat_moves.py, dev/changelog/1611). Collapsed like Stream URL below, with
+           the answer that applies in its summary so it can be read without opening it.
+           guide.js::applyMoveChoice fills the summary and hides the row for a group target,
+           which the group's own member choice covers. move_when_full_loaded says the select
+           was set from the recording's stored value: an edit opened from a page that did not
+           hand it over posts without it, and the server then leaves the stored value alone. #}
+        <details class="form-group form-disclose" id="modal-move-pick"
+                 data-global="{{ '1' if move_when_full_global else '0' }}">
+          <summary id="modal-move-summary">If the account is full when it starts</summary>
+          <select name="move_when_full" id="modal-move" class="form-control"
+                  aria-label="If the account is full when it starts">
+            <option value="" id="modal-move-inherit">Use the profile's setting</option>
+            <option value="1">Move to another channel with this program</option>
+            <option value="0">Wait for a connection on this channel</option>
+          </select>
+          <span class="form-hint">Another channel is tried only when its account has a connection free. Channels whose latest health check passed go first, then channels never checked, then ones whose latest check failed.</span>
+          <input type="hidden" name="move_when_full_loaded" id="modal-move-loaded" value="">
+        </details>
         {# Which accounts to keep ChannelBin off while this recording can still open a stream
            (app/account_blocks.py, dev/changelog/1151). Filled per open by
            guide.js::loadBlockPicker; block_accounts_loaded is set only once the list has
@@ -135,11 +157,11 @@
 
 {# Active recording control modal #}
 <div id="active-rec-modal" class="modal" style="display:none" role="dialog" aria-modal="true">
-  <div class="modal-backdrop" id="active-rec-backdrop"></div>
+  <div class="modal-backdrop"></div>
   <div class="modal-panel">
     <div class="modal-head">
       <h2 id="active-rec-title">Recording in progress</h2>
-      <button type="button" class="modal-close" id="active-rec-close-x" aria-label="Close">{{ icon('close') }}</button>
+      <button type="button" class="modal-close" aria-label="Close">{{ icon('close') }}</button>
     </div>
     <div class="modal-body">
       <p id="active-rec-name" style="margin: 0 0 1rem; color: var(--text-muted); font-size: var(--fs-lg);"></p>

@@ -332,6 +332,11 @@
         {{ field_number('recording.segment_duration_seconds', 'Segment duration (seconds)',
            'How long each recording segment runs before a clean restart. 0 = one long run per restart (disabled). Any other value also makes every capture read the stream at real-time speed, whatever the real-time setting under FFmpeg says, because a timed segment read at full speed ends in seconds on a provider that sends a buffered backlog.', rec.get('segment_duration_seconds', 0), tier='advanced') }}
       </div>
+      <div data-sub="full-account">
+        <div class="sec-sub"><strong>When an account is full</strong></div>
+        {{ field_bool('recording.move_when_account_full', 'Move to another channel when the account is full',
+           'When a recording on one channel finds its account with no connection free - at start, or when an auto-record rule schedules it - it moves to another channel showing the same program, on an account that has a connection free, instead of waiting. Channels whose latest health check passed are tried first, then channels never checked, then channels whose latest check failed; a channel on a failing streak is never used. The recording says where it moved and why. Off, it waits for a connection on its own channel and records what is left once one frees. At start, a recording from a channel group is not affected - the group already chooses among its channels.', rec.get('move_when_account_full', True), overridable_by='recording_profile', tier='advanced') }}
+      </div>
       <div data-sub="retention">
         <div class="sec-sub"><strong>Retention</strong></div>
         {{ field_number('recording.retention_days', 'Auto-delete recordings after (days)',
@@ -773,7 +778,7 @@
           the route refuses it too. The help text says what is served and that a recording
           always wins a seat; in redirect and mixed modes it says what ChannelBin cannot see. -#}
       {% set feedcfg = cfg.get('integrations', {}).get('output_feed', {}) %}
-      {% call field_shell('integrations.output_feed.enabled', 'Output feed for an IPTV player',
+      {% call field_shell('integrations.output_feed.enabled', 'IPTV output',
          'When enabled, an IPTV player such as TiviMate can connect to ChannelBin as if it were an IPTV provider and gets the TV Guide: every channel and group in it that has not been taken off the output, in the guide\'s order, with the guide\'s own listings. A group plays as one channel from the member ChannelBin would record from, and moves to another member if that one dies. A recording always wins: an IPTV player holding the connection a recording needs is cut, and told why on the Alerts page. The login a player uses, the details to type into it, which channels it gets and who is watching are on the IPTV Output page, which has these same settings.', false, false, 'output feed tivimate xtream m3u xmltv iptv player app client username password login', tier='basic') %}
       <label class="switch{{ ' tip-plain' if not feed_credentials_set else '' }}"{% if not feed_credentials_set %} data-tip="Set the IPTV player's login on the IPTV Output page first"{% endif %}>
         <input type="checkbox" data-setting-path="integrations.output_feed.enabled"{{ ' checked' if feedcfg.get('enabled') else '' }}{{ ' disabled' if not feed_credentials_set else '' }}>
@@ -785,7 +790,7 @@
       {{ field_select('integrations.output_feed.mode', 'How the IPTV player gets the stream',
          'Proxy: ChannelBin plays every channel through itself, so it can hold a connection for the IPTV player, move a group to another member mid-stream and say why a play stopped. Redirect: the IPTV player is sent straight to the provider\'s stream for the member chosen at that moment - no failover, the provider\'s credentials reach the IPTV player, and ChannelBin never sees when the play ends, so a recording that then needs the connection is refused by the provider rather than warned about here. Mixed: channel groups and sports channels play through ChannelBin, which is what moving to another member mid-stream and a sports channel\'s waiting screen turning into the game need, and every other channel is sent straight to the provider.',
          feedcfg.get('mode', 'proxy'), [('proxy', 'Proxy - relayed through ChannelBin'), ('mixed', 'Mixed - groups and sports channels relayed, the rest straight from the provider'), ('redirect', 'Redirect - played straight from the provider')], tier='basic', gated_by=['integrations.output_feed.enabled']) }}
-      {{ field_list('integrations.output_feed.accounts', 'Accounts the feed may play from',
+      {{ field_list('integrations.output_feed.accounts', 'Accounts the IPTV output may play from',
          'The IPTV Output page has a switch per account that writes this list. Account ids, one per line (the number in an account page\'s address). Empty means every account. A group member on any other account is skipped before the format lock, and a channel on one is not served at all.',
          feedcfg.get('accounts', []), tier='advanced', gated_by=['integrations.output_feed.enabled']) }}
       {{ field_list('integrations.output_feed.held_seats', 'Connections recordings leave alone',

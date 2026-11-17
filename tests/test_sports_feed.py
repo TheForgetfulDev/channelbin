@@ -190,7 +190,7 @@ class ServedTests(_Case):
     def test_the_route_turns_a_team_on_and_off_and_validates(self):
         url = f'/api/sports/leagues/{self.league.id}/feed-channels'
         self.assertEqual(self.client.put(url, json={'team_id': BEARS, 'enabled': True}).get_json(),
-                         {'success': True})
+                         {'success': True, 'cut': 0})
         self.assertEqual([s['name'] for s in self.streams()], ['Ironvale Bears'])
         self.assertEqual(self.client.put(url, json={'team_id': BEARS, 'enabled': False}).status_code, 200)
         self.assertEqual(self.streams(), [])
@@ -883,6 +883,35 @@ class LeagueChannelTests(_Case):
         self.assertIn('placed again', logs.output[0])
         self.assertEqual(self.numbers(), {a.tsdb_id: 2, b.tsdb_id: 2, c.tsdb_id: 1})
         self.assertEqual(sports_feed.place_all(self.now), 0)
+
+    def test_a_game_placed_again_is_said_on_the_league_page(self):
+        """dev/docs/BUGS.md 2026-11-16 (said only in the log): the move was a WARNING and reached no
+        page, while an IPTV player's cached guide still listed the game on the channel it left."""
+        t = self.now + timedelta(hours=2)
+        a = self.event(BEARS, GULLS, t)
+        b = self.event(PANTHERS, COMETS, t)
+        c = self.event(GULLS, COMETS, t + timedelta(hours=6))
+        db.session.commit()
+        self.on()
+        html = self.client.get(f'/sports/{self.league.id}').get_data(as_text=True)
+        self.assertNotIn('Changed channel', html)
+        a.start_at, a.start_changed_at = c.start_at, self.now
+        db.session.commit()
+        sports_feed.place_all(self.now)
+        db.session.expire_all()
+        self.assertEqual((a.feed_moved_at, a.feed_moved_from, a.feed_moved_by), (self.now, 1, c.id))
+        self.assertEqual([(e.feed_moved_at, e.feed_moved_from, e.feed_moved_by) for e in (b, c)],
+                         [(None, None, None)] * 2, 'only the game that moved carries the record')
+        name = self.league.name
+        sentences = sports_feed.moved_games(self.league, [a, b, c])
+        self.assertEqual(len(sentences), 1)
+        self.assertIn(f'moved from {name} 1 to {name} 2', sentences[0])
+        self.assertIn(sports_data.event_game_name(a), sentences[0])
+        self.assertIn(f'the same time as {sports_data.event_game_name(c)}', sentences[0])
+        self.assertIn("another game's time", sports_feed.moved_games(self.league, [a])[0])
+        html = self.client.get(f'/sports/{self.league.id}').get_data(as_text=True)
+        self.assertEqual(html.count('Changed channel.</strong>'), 1)
+        self.assertIn(f'may still list it on {name} 1', html)
 
     def test_a_game_running_a_little_into_the_next_moves_nothing(self):
         t = self.now + timedelta(hours=2)

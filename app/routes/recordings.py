@@ -14,7 +14,9 @@ from flask import (
 from .. import db
 from ..database import (
     Recording, Channel, ChannelGroup, Account, EPGEntry, RecordingEvent, RecordingSegment,
-    RECORDING_CREATED_AFTER_EVENT_START, RECORDING_EDITED, RECORDING_STOP_TIME_ADJUSTED,
+    RecordingProfile,
+    RECORDING_CREATED, RECORDING_CREATED_AFTER_EVENT_START, RECORDING_EDITED,
+    RECORDING_SOURCE_BULK, RECORDING_SOURCES, recording_source, RECORDING_STOP_TIME_ADJUSTED,
     RECORDING_REPLACED_OTHER, RESTART_BLOCKING_STATUSES, RECORDING_ABORTED,
     DIAGNOSTICS, METADATA_SIDECAR_WRITTEN, RESTART_ATTEMPTED, RESTART_FAILED, RESTART_SUCCEEDED,
     STALL_DETECTED,
@@ -51,7 +53,7 @@ from ..logo_cache import resolve_logo_url
 from ..screenshot import capture_screenshot
 from ..storage_dirs import THUMBNAILS, image_dir
 from ..url_utils import mask_creds as _mask_creds_str
-from .. import fmt_utils, recording_story
+from .. import fmt_utils, recording_story, seat_moves
 
 recordings_bp = Blueprint('recordings', __name__)
 log = logging.getLogger(__name__)
@@ -140,7 +142,7 @@ class _WindowMoved(Exception):
 
 def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
                                profile_id=_UNSET, channel_id=_UNSET, member_reason=None,
-                               opened=None):
+                               opened=None, move_when_full=_UNSET):
     """Persist an edit to a SCHEDULED recording, then re-register its jobs.
 
     Only the mutate+commit is retried; the scheduler side effects must run
@@ -174,6 +176,8 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
             raise _WindowMoved()
         if profile_id is not _UNSET:
             r.profile_id = profile_id
+        if move_when_full is not _UNSET:
+            r.move_when_account_full = move_when_full
         old_start, old_stop = r.start_time, r.stop_time
         if name != r.name:
             # A name a person changed is theirs: the join must not fill TheSportsDB fields
@@ -313,21 +317,109 @@ def _match_channel_by_url(url: str):
     return None
 
 
+class _WindowSeats:
+    """Who holds which provider seat across one window, as the schedule-time checks see it.
+
+    The schedule-time twin of connection_limits' pools (account_blocks.account_pools()): an
+    account with logins has one pool per login, sized by the login and taken in list order;
+    one without has its own pool sized by `max_connections` or the global default. A login
+    shared by two accounts is ONE pool, so the model takes in every account reachable through
+    a shared login, not just the asked ones - two recordings on two accounts holding one
+    single-seat login are one seat too many even though neither account is full on its own.
+
+    Every overlapping SCHEDULED/IN_PROGRESS/PAUSED recording (and `pending`, the rest of a
+    bulk schedule) is one commitment per distinct channel, seated greedily in start order on
+    the first pool of its account with room. A commitment on the asked channel itself is left
+    out of that channel's answer: same-channel overlap is a handoff, not a second seat. Any
+    overlap counts as concurrent, as it always has - the check warns, record start decides
+    (dev/changelog/854, 858). A fixed number of queries whatever the member count."""
+
+    def __init__(self, account_ids, start_utc, stop_utc, exclude_recording_id=None,
+                 pending=None, cfg=None):
+        from ..account_links import login_seats_for_accounts, login_siblings
+        from ..account_blocks import account_pools
+        from ..connection_limits import limit_for_account
+        cfg = cfg if cfg is not None else load_config()
+        default_max = cfg.get('accounts', {}).get('default_max_connections', 1)
+        ids = {a for a in account_ids if a is not None}
+        seats = login_seats_for_accounts(ids)
+        frontier = {a for a in ids if seats.get(a)}
+        while frontier:
+            reached = {other for found in login_siblings(frontier).values() for other in found}
+            frontier = reached - ids
+            if frontier:
+                seats.update(login_seats_for_accounts(frontier))
+                ids |= frontier
+        accounts = {a.id: a for a in Account.query.filter(Account.id.in_(ids)).all()} if ids else {}
+        self.accounts = accounts
+        self.limits = {a_id: limit_for_account(a, default_max, seats.get(a_id))
+                       for a_id, a in accounts.items()}
+        self.pools = {a_id: account_pools(a_id, seats.get(a_id), self.limits[a_id])
+                      for a_id in accounts}
+
+        rows = []
+        if accounts:
+            q = (Recording.query
+                 .join(Channel, Recording.channel_id == Channel.id)
+                 .filter(Channel.account_id.in_(set(accounts)),
+                         Recording.status.in_([REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS,
+                                               REC_STATUS_PAUSED]),
+                         Recording.start_time < stop_utc,
+                         Recording.stop_time > start_utc))
+            if exclude_recording_id is not None:
+                q = q.filter(Recording.id != exclude_recording_id)
+            rows = q.all()
+        #: [(account_id, channel_id, start, recording or pending dict)] in seating order.
+        self.commitments = sorted(
+            [(r.channel.account_id, r.channel_id, r.start_time, r) for r in rows]
+            + [(p['account_id'], p['channel_id'], p['start'], p)
+               for p in _pending_overlapping(pending, start_utc, stop_utc)
+               if p['account_id'] in accounts],
+            key=lambda c: (c[2], c[1]))
+
+    def _sharing(self, account_id) -> set:
+        """The accounts whose pools overlap `account_id`'s, itself included."""
+        mine = {pool for pool, _ in self.pools.get(account_id, [])}
+        return {a for a, pools in self.pools.items() if mine & {pool for pool, _ in pools}}
+
+    def free_for(self, account_id, channel_id) -> bool:
+        """Whether a recording on `channel_id` (on `account_id`) finds a seat in the window."""
+        pools = self.pools.get(account_id)
+        if pools is None:
+            return True
+        used, seen = {}, set()
+        for owner, ch_id, _, _ in self.commitments:
+            if ch_id == channel_id or ch_id in seen:
+                continue
+            seen.add(ch_id)
+            for pool, size in self.pools.get(owner, []):
+                if used.get(pool, 0) < size:
+                    used[pool] = used.get(pool, 0) + 1
+                    break
+        return any(used.get(pool, 0) < size for pool, size in pools)
+
+    def contenders(self, account_id, channel_id) -> list:
+        """The commitments competing with a recording on `channel_id` for `account_id`'s
+        seats: every one on an account sharing a pool with it, on another channel."""
+        sharing = self._sharing(account_id)
+        return [c[3] for c in self.commitments if c[0] in sharing and c[1] != channel_id]
+
+
 def _check_account_connection_limit(account_id, new_channel_id, start_utc, stop_utc,
                                      exclude_recording_id=None, pending=None):
     """Return a dict {'message': str, 'conflicts': [...]} if scheduling new_channel_id
-    from start_utc to stop_utc would push this account's concurrent distinct-channel
-    commitments above its connection limit; None if OK.
+    from start_utc to stop_utc would find no free seat on this account; None if OK.
 
     Each entry in 'conflicts' describes one overlapping recording (id, channel_name,
     title, start_time/stop_time already formatted for display) so the caller can render
     a clickable link to it.
 
-    Counts overlapping SCHEDULED/IN_PROGRESS/PAUSED recordings on OTHER channels of
-    the same account as distinct commitments. Same-channel overlap is intentionally
-    excluded here - that's a handoff (old recording gracefully stopped when the new
-    one starts), not a conflict. Recordings with channel_id=None (ad-hoc URL) can't
-    be attributed to an account and are invisible to this check - an accepted gap.
+    Seats are counted the way record start counts them (_WindowSeats): per login when the
+    account lists logins, so a recording on another account holding the same login takes a
+    seat from this one too. Same-channel overlap is intentionally excluded - that's a
+    handoff (old recording gracefully stopped when the new one starts), not a conflict.
+    Recordings with channel_id=None (ad-hoc URL) can't be attributed to an account and are
+    invisible to this check - an accepted gap.
 
     `pending` is recordings a bulk schedule is about to create alongside this one
     (_pending_overlapping()); they count exactly as a stored one would, or eight showings
@@ -339,55 +431,37 @@ def _check_account_connection_limit(account_id, new_channel_id, start_utc, stop_
     soft, proceedable warning instead (dev/changelog/858;
     _pending_recording_warnings() below).
     """
-    account = db.session.get(Account, account_id)
-    if account is None:
+    seats = _WindowSeats([account_id], start_utc, stop_utc,
+                         exclude_recording_id=exclude_recording_id, pending=pending)
+    account = seats.accounts.get(account_id)
+    if account is None or seats.free_for(account_id, new_channel_id):
         return None
-    limit = account.max_connections
-    if not limit:
-        limit = load_config().get('accounts', {}).get('default_max_connections', 1)
-
-    q = (
-        Recording.query
-        .join(Channel, Recording.channel_id == Channel.id)
-        .filter(
-            Channel.account_id == account_id,
-            Recording.status.in_([REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED]),
-            Recording.start_time < stop_utc,
-            Recording.stop_time > start_utc,
-        )
-    )
-    if exclude_recording_id is not None:
-        q = q.filter(Recording.id != exclude_recording_id)
-
-    overlapping = q.all()
-    other_channel_recs = [r for r in overlapping if r.channel_id != new_channel_id]
-    other_pending = [p for p in _pending_overlapping(pending, start_utc, stop_utc)
-                     if p['account_id'] == account_id and p['channel_id'] != new_channel_id]
-    distinct_channels = {r.channel_id for r in other_channel_recs}
-    distinct_channels |= {p['channel_id'] for p in other_pending}
-    distinct_channels.add(new_channel_id)
-
-    if len(distinct_channels) > limit:
-        conflicts = [
-            {
-                'recording_id': r.id,
-                'channel_name': r.channel.name if r.channel else 'Unknown channel',
-                'title': r.name,
-                'start_time': local_time_filter(r.start_time),
-                'stop_time': local_time_filter(r.stop_time),
-            }
-            for r in sorted(
-                other_channel_recs,
-                key=lambda r: (r.channel.name if r.channel else '', r.start_time),
-            )
-        ] + [_serialize_pending(p) for p in other_pending]
-        names = sorted({c['channel_name'] for c in conflicts})
-        return {
-            'message': (f'This would exceed "{account.name}"\'s connection limit ({limit}). '
-                        f'Overlaps with recordings on: {", ".join(names)}.'),
-            'conflicts': conflicts,
+    limit = seats.limits[account_id]
+    found = seats.contenders(account_id, new_channel_id)
+    stored = [c for c in found if isinstance(c, Recording)]
+    batch = [c for c in found if not isinstance(c, Recording)]
+    conflicts = [
+        {
+            'recording_id': r.id,
+            'channel_name': r.channel.name if r.channel else 'Unknown channel',
+            'title': r.name,
+            'start_time': local_time_filter(r.start_time),
+            'stop_time': local_time_filter(r.stop_time),
         }
-    return None
+        for r in sorted(stored, key=lambda r: (r.channel.name if r.channel else '', r.start_time))
+    ] + [_serialize_pending(p) for p in batch]
+    names = sorted({c['channel_name'] for c in conflicts})
+    others = sorted({seats.accounts[r.channel.account_id].name for r in stored
+                     if r.channel.account_id != account_id}
+                    | {seats.accounts[p['account_id']].name for p in batch
+                       if p['account_id'] != account_id})
+    shared = (f' Its login is shared with {fmt_utils.join_labels(others)}, so recordings '
+              'there can take its connections.' if others else '')
+    return {
+        'message': (f'This would exceed "{account.name}"\'s connection limit ({limit}).{shared} '
+                    f'Overlaps with recordings on: {", ".join(names)}.'),
+        'conflicts': conflicts,
+    }
 
 
 def _overlap_conflicts(channel_id, group_id, start_utc, stop_utc, exclude_recording_id=None):
@@ -461,7 +535,7 @@ def _serialize_overlap_conflicts(conflicts):
 
 def _pending_recording_warnings(channel_id, group_id, start_utc, stop_utc,
                                 exclude_recording_id=None, pending_blocks=None,
-                                pending=None):
+                                pending=None, moves_when_full=False):
     """Every soft, proceedable schedule-time warning new_recording_json and
     edit_recording_json raise before committing a create/edit, in one place - the
     recording-scheduling counterpart to routes/channel_groups.py::_pending_warnings().
@@ -480,6 +554,11 @@ def _pending_recording_warnings(channel_id, group_id, start_utc, stop_utc,
 
     `pending` is the rest of a bulk schedule (_pending_overlapping()), counted in both
     warnings under the same same-channel / same-group handoff rule as a stored recording.
+
+    `moves_when_full` (_moves_when_full()) adds MOVE_WHEN_FULL_NOTE to the connection and block
+    warnings of a single-channel recording, whose start may move it (app/seat_moves.py). The
+    auto-record planner leaves it False: its own seat choice reads these messages as the reason
+    a channel was passed over.
     """
     if channel_id is None:
         return {}
@@ -508,6 +587,10 @@ def _pending_recording_warnings(channel_id, group_id, start_utc, stop_utc,
                                                exclude_recording_id, pending_blocks)
         if block_warning:
             warnings['account_block_warning'] = block_warning
+        if moves_when_full and group_id is None:
+            for key in ('connection_limit_warning', 'account_block_warning'):
+                if key in warnings:
+                    warnings[key]['message'] += ' ' + MOVE_WHEN_FULL_NOTE
 
     return warnings
 
@@ -546,6 +629,34 @@ def _account_block_warning(ch, group_id, start_utc, stop_utc, exclude_recording_
         + (', so as things stand it will not record anything.' if whole else '.'))}
 
 
+def _parse_move_form(form):
+    """(known, value): the record dialog's "if the account is full when it starts" choice
+    (app/seat_moves.py). `known` is False when the dialog could not show the recording's stored
+    answer (`move_when_full_loaded` unset) - an edit then leaves the stored answer alone rather
+    than read the blank select as "use the profile's". Raises ValueError on a bad value."""
+    if form.get('move_when_full_loaded') != '1':
+        return False, None
+    return True, seat_moves.parse_choice(form.get('move_when_full'))
+
+
+def _moves_when_full(cfg, profile_id, own, program=True):
+    """Whether a single-channel recording with this profile and its own answer `own` (None =
+    inherit) would move off a full account at start - what the schedule-time warnings say.
+    Never for one with no guide listing (`program` False): there is nothing to match it on."""
+    if not program:
+        return False
+    if own is not None:
+        return own
+    profile = db.session.get(RecordingProfile, profile_id) if profile_id is not None else None
+    return seat_moves.move_allowed(cfg, profile)
+
+
+#: Said after a connection or block warning on a single-channel recording that will move.
+MOVE_WHEN_FULL_NOTE = ('If the account still has no connection free when the recording starts, '
+                       'the recording moves to another channel with this program on an account '
+                       'that has one, if there is one.')
+
+
 def _parse_block_form(form):
     """The record modal's account-block picker, as {account_id: slots} (None = every slot),
     or None when the picker never loaded - a failed lookup must leave a recording's blocks
@@ -555,10 +666,10 @@ def _parse_block_form(form):
     wanted = {}
     for raw in form.getlist('block_account_ids'):
         raw = raw.strip()
-        if not raw.isdigit():
+        if not raw.isdecimal():
             continue
         slots_raw = (form.get(f'block_slots_{raw}') or '').strip()
-        wanted[int(raw)] = int(slots_raw) if slots_raw.isdigit() and int(slots_raw) > 0 else None
+        wanted[int(raw)] = int(slots_raw) if slots_raw.isdecimal() and int(slots_raw) > 0 else None
     return wanted
 
 
@@ -569,45 +680,22 @@ def _members_committed_in_window(members, start_utc, stop_utc, exclude_recording
     The schedule-time counterpart to recorder._busy_account_channel_ids(). Live slot
     occupancy answers "can this start right now"; a recording scheduled for tomorrow
     evening needs the same question asked of *its own window*, which is the overlap the
-    limit check above already computes. Same rules, so the two cannot disagree: only
-    SCHEDULED/IN_PROGRESS/PAUSED recordings count, distinct channels are the unit, and a
-    member's own channel is excluded because same-channel overlap is a handoff.
+    limit check above already computes. Same model (_WindowSeats), so the two cannot
+    disagree: only SCHEDULED/IN_PROGRESS/PAUSED recordings count, distinct channels are the
+    unit, seats are per login, and a member's own channel is excluded because same-channel
+    overlap is a handoff.
 
-    Batched over every member account in one query - the limit check runs per candidate
-    and would otherwise re-read the config and re-query per member
-    (CLAUDE.md, no hidden I/O in per-row loops).
+    One model over every member account - the limit check runs per candidate and would
+    otherwise re-read the config and re-query per member (CLAUDE.md, no hidden I/O in
+    per-row loops).
     """
     account_ids = {ch.account_id for ch in members if ch.account_id is not None}
     if not account_ids:
         return set()
-    default_max = load_config().get('accounts', {}).get('default_max_connections', 1)
-    limits = {a.id: (a.max_connections or default_max)
-              for a in Account.query.filter(Account.id.in_(account_ids)).all()}
-
-    q = (db.session.query(Channel.account_id, Recording.channel_id)
-         .join(Channel, Recording.channel_id == Channel.id)
-         .filter(Channel.account_id.in_(account_ids),
-                 Recording.status.in_([REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS,
-                                       REC_STATUS_PAUSED]),
-                 Recording.start_time < stop_utc,
-                 Recording.stop_time > start_utc))
-    if exclude_recording_id is not None:
-        q = q.filter(Recording.id != exclude_recording_id)
-    committed_channels = {}
-    for account_id, channel_id in q.all():
-        committed_channels.setdefault(account_id, set()).add(channel_id)
-    for p in _pending_overlapping(pending, start_utc, stop_utc):
-        committed_channels.setdefault(p['account_id'], set()).add(p['channel_id'])
-
-    blocked = set()
-    for ch in members:
-        limit = limits.get(ch.account_id)
-        if limit is None:
-            continue
-        others = committed_channels.get(ch.account_id, set()) - {ch.id}
-        if len(others) >= limit:
-            blocked.add(ch.id)
-    return blocked
+    seats = _WindowSeats(account_ids, start_utc, stop_utc,
+                         exclude_recording_id=exclude_recording_id, pending=pending)
+    return {ch.id for ch in members
+            if ch.account_id in seats.accounts and not seats.free_for(ch.account_id, ch.id)}
 
 
 def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_threshold,
@@ -1172,7 +1260,8 @@ def schedule_edit_payload(rec) -> dict:
     """What guide.js::openModal needs to open a SCHEDULED recording in edit mode, from a page
     that has no program to hand it: the Recordings list's Edit schedule and a league page's Edit
     recording (dev/changelog/1539). edit_recording_json only reads name/url/start_time/stop_time/
-    profile_id from the posted form, so channel_id/group_id only need to be roughly right."""
+    profile_id/move_when_full from the posted form, so channel_id/group_id only need to be roughly
+    right."""
     return {
         'url': rec.url,
         'start_iso': rec.start_time.isoformat(),
@@ -1180,6 +1269,7 @@ def schedule_edit_payload(rec) -> dict:
         'channel_id': rec.channel_id,
         'group_id': rec.group_id,
         'profile_id': rec.profile_id,
+        'move_when_full': rec.move_when_account_full,
     }
 
 
@@ -1444,7 +1534,7 @@ def index():
         try:
             for fn in os.listdir(folder):
                 stem, ext = os.path.splitext(fn)
-                if ext == '.jpg' and stem.isdigit():
+                if ext == '.jpg' and stem.isdecimal():
                     thumb_ids.add(int(stem))
         except OSError:
             pass  # image dir missing/unreadable -> those rows just show placeholders
@@ -1870,6 +1960,12 @@ def recording_detail(recording_id):
         sports=_sports_panel(rec, now, cfg),
         profiles=profiles,  # _record_modal.html + GUIDE_CONFIG.profiles expect this name
         blocked_accounts=_recording_block_labels(rec.id),
+        # What a single-channel recording does if its account is full at start, and which
+        # level of the setting says so (app/seat_moves.py). A group picks its own channel.
+        move_when_full=(seat_moves.describe(*seat_moves.move_source(cfg, rec.profile, rec),
+                                            program=seat_moves.has_program(rec))
+                        if rec.status == REC_STATUS_SCHEDULED and rec.group_id is None
+                        else None),
     )
     # The page keeps itself current by swapping regions in place, so the document a browser
     # cached is only what it looked like at its last full load. Back served that copy: the
@@ -2572,11 +2668,15 @@ def resume_recording_route(recording_id):
 
     from flask import current_app
     from ..scheduler import reschedule_recording_stop
-    resume_recording(current_app._get_current_object(), recording_id)
+    error = resume_recording(current_app._get_current_object(), recording_id)
     # Re-register the stop job in case it was removed - the stop job only: the start has
     # already happened (dev/changelog/1242).
     reschedule_recording_stop(recording_id, rec.stop_time)
-    flash(f'Recording "{rec.name}" resumed.', 'success')
+    if error:
+        flash(f'Could not resume "{rec.name}": {error}. It is tried again every minute '
+              f'until it works or the stop time passes.', 'error')
+    else:
+        flash(f'Recording "{rec.name}" resumed.', 'success')
     return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
 
@@ -2658,8 +2758,11 @@ def resume_recording_json(recording_id):
         return jsonify({'error': 'Stop time has already passed'}), 400
     from flask import current_app
     from ..scheduler import reschedule_recording_stop
-    resume_recording(current_app._get_current_object(), recording_id)
+    error = resume_recording(current_app._get_current_object(), recording_id)
     reschedule_recording_stop(rec.id, rec.stop_time)
+    if error:
+        return jsonify({'error': f'Could not resume: {error}. It is tried again every minute '
+                                 f'until it works or the stop time passes.'}), 500
     return jsonify({'success': True})
 
 
@@ -2751,7 +2854,7 @@ def _submitted_sports_template(form, name, entry):
 
 def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_id,
                                  group_id, profile_id, entry=None, blocks=None, link=None,
-                                 sports_name_template=None):
+                                 sports_name_template=None, source=None, move_when_full=None):
     """Create one SCHEDULED recording and arm its start - the one create path, shared by
     the record modal (new_recording_json), the bulk schedule (bulk_schedule_json) and
     auto-record rules (app/auto_rules.py), so none of them can drift in what a new
@@ -2769,6 +2872,13 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
     or not at all - a rule's provenance, its event and its ledger row (DESIGN-autoschedule.md
     §4.4). It returns False to call the create off, and then nothing is written and this
     returns None.
+
+    `move_when_full` is the record dialog's "if the account is full" answer (None = use the
+    profile's, Recording.move_when_account_full).
+
+    `source` is where a person made it, as the request sent it; database.recording_source()
+    reads it. A create with no `link` is a person's, and its RECORDING_CREATED event is
+    written in the same commit; a rule's `link` writes the rule's own event instead.
 
     Returns the committed Recording, or None when `link` called it off.
     """
@@ -2808,6 +2918,8 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
     # retried second commit can never re-run db.session.add(rec) and create a
     # duplicate Recording row (see dev/docs/BUGS.md for the same class of bug fixed here
     # after being caught in create_on_demand_job).
+    source_key = recording_source(source)
+
     @retry_on_locked()
     def _create_recording_and_commit():
         r = Recording(
@@ -2829,13 +2941,19 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
             channel_id=channel_id,
             group_id=group_id,
             profile_id=profile_id,
+            move_when_account_full=move_when_full,
         )
         db.session.add(r)
+        db.session.flush()
         if link is not None:
-            db.session.flush()
             if not link(r):
                 db.session.rollback()
                 return None
+        else:
+            add_recording_event(
+                r.id, RECORDING_CREATED,
+                detail=f'Scheduled by hand from {RECORDING_SOURCES[source_key]}.',
+                extra={'source': source_key})
         db.session.commit()
         return r
 
@@ -2890,7 +3008,7 @@ def new_recording_json():
     cfg = load_config()
 
     channel_id_raw = request.form.get('channel_id', '').strip()
-    channel_id = int(channel_id_raw) if channel_id_raw.isdigit() else None
+    channel_id = int(channel_id_raw) if channel_id_raw.isdecimal() else None
     if channel_id is None:
         # URL matching is correct here and deliberately left alone by the URL-drift work
         # (DESIGN-url-drift.md 2/3): this branch only runs when the form supplied no
@@ -2904,13 +3022,13 @@ def new_recording_json():
     # Parsed before the group block below, which needs it to discount the recording
     # being replaced when it reads the window's existing commitments.
     replace_raw = request.form.get('replace_recording_id', '').strip()
-    replace_recording_id = int(replace_raw) if replace_raw.isdigit() else None
+    replace_recording_id = int(replace_raw) if replace_raw.isdecimal() else None
     wanted_blocks = _parse_block_form(request.form)
 
     # Group-backed recording (created from a channel-group guide row): channel_id must
     # be a member; the best member is re-resolved at record start (app/recorder.py).
     group_id_raw = request.form.get('group_id', '').strip()
-    group_id = int(group_id_raw) if group_id_raw.isdigit() else None
+    group_id = int(group_id_raw) if group_id_raw.isdecimal() else None
     if group_id is not None:
         group = db.session.get(ChannelGroup, group_id)
         if group is None:
@@ -2936,7 +3054,11 @@ def new_recording_json():
                 channel_id = resolved
 
     profile_id_raw = request.form.get('profile_id', '').strip()
-    profile_id = int(profile_id_raw) if profile_id_raw.isdigit() else None
+    profile_id = int(profile_id_raw) if profile_id_raw.isdecimal() else None
+    try:
+        move_known, move_when_full = _parse_move_form(request.form)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
 
     if replace_recording_id is not None:
         old = db.session.get(Recording, replace_recording_id)
@@ -2949,15 +3071,19 @@ def new_recording_json():
     if not force:
         warnings = _pending_recording_warnings(
             channel_id, group_id, start_utc, stop_utc,
-            exclude_recording_id=replace_recording_id, pending_blocks=wanted_blocks)
+            exclude_recording_id=replace_recording_id, pending_blocks=wanted_blocks,
+            moves_when_full=_moves_when_full(
+                cfg, profile_id, move_when_full,
+                program=any(request.form.get(k, '').strip().isdecimal()
+                            for k in ('source_epg_id', 'sports_event_id'))))
         if warnings:
             return jsonify({'success': False, **warnings})
 
     source_epg_id_raw = request.form.get('source_epg_id', '').strip()
     entry = (db.session.get(EPGEntry, int(source_epg_id_raw))
-             if source_epg_id_raw.isdigit() else None)
+             if source_epg_id_raw.isdecimal() else None)
     sports_event_raw = request.form.get('sports_event_id', '').strip()
-    if entry is None and sports_event_raw.isdigit():
+    if entry is None and sports_event_raw.isdecimal():
         # A league page's Record on a game only an event channel names (dev/changelog/1539): no
         # listing to snapshot, so the program times are the pick's, worked out again here from
         # the event, as an auto-record rule's are (_plan_event_schedule). The window is the
@@ -2970,7 +3096,9 @@ def new_recording_json():
         cfg, name=name, url=url, start_utc=start_utc, stop_utc=stop_utc,
         channel_id=channel_id, group_id=group_id, profile_id=profile_id,
         entry=entry, blocks=wanted_blocks,
-        sports_name_template=_submitted_sports_template(request.form, name, entry))
+        sports_name_template=_submitted_sports_template(request.form, name, entry),
+        source=request.form.get('source'),
+        move_when_full=move_when_full if move_known else None)
 
     if replace_recording_id is not None:
         unschedule_recording(replace_recording_id)
@@ -3177,6 +3305,9 @@ def _fill_plan(plan, entry, ch, group, target, profile, cfg, tags_by_name, tz, p
         warnings=warnings,
         verdict=(BULK_HARD if 'connection_limit_warning' in warnings
                  else BULK_WARN if warnings else BULK_OK),
+        # Whether its start may move it off a full account (app/seat_moves.py), so the bulk
+        # dialog's connection warning says what will happen. A group picks its own channel.
+        moves_when_full=group is None and seat_moves.move_allowed(cfg, profile),
     )
     plan['_create'] = dict(
         name=name, url=normalize_url(target.stream_url, target.account, cfg),
@@ -3257,7 +3388,7 @@ def bulk_schedule_json():
         # response text goes through describe_error(): a database error's own text carries
         # the INSERT's parameters, the stream URL and its login among them.
         try:
-            rec = _create_scheduled_recording(cfg, **args)
+            rec = _create_scheduled_recording(cfg, **args, source=RECORDING_SOURCE_BULK)
         except Exception as exc:
             from ..auto_rules import describe_error
             db.session.rollback()
@@ -3390,16 +3521,24 @@ def edit_recording_json(recording_id):
         if resolved is not None and resolved != rec.channel_id:
             channel_id, member_reason = resolved, reason
 
+    profile_id_raw = request.form.get('profile_id', '').strip()
+    profile_id = int(profile_id_raw) if profile_id_raw.isdecimal() else None
+    try:
+        move_known, move_when_full = _parse_move_form(request.form)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
     force = request.form.get('force') == '1'
     if not force:
         warnings = _pending_recording_warnings(
             channel_id, rec.group_id, start_utc, stop_utc,
-            exclude_recording_id=recording_id, pending_blocks=pending_blocks)
+            exclude_recording_id=recording_id, pending_blocks=pending_blocks,
+            moves_when_full=_moves_when_full(
+                load_config(), profile_id,
+                move_when_full if move_known else rec.move_when_account_full,
+                program=seat_moves.has_program(rec)))
         if warnings:
             return jsonify({'success': False, **warnings})
-
-    profile_id_raw = request.form.get('profile_id', '').strip()
-    profile_id = int(profile_id_raw) if profile_id_raw.isdigit() else None
 
     # The blocks are written after the edit, so an edit refused for a moved window leaves
     # them as they were too.
@@ -3407,7 +3546,8 @@ def edit_recording_json(recording_id):
         _apply_edit_and_reschedule(
             recording_id, name, url, start_utc, stop_utc, profile_id=profile_id,
             channel_id=channel_id if member_reason is not None else _UNSET,
-            member_reason=member_reason, opened=opened)
+            member_reason=member_reason, opened=opened,
+            move_when_full=move_when_full if move_known else _UNSET)
     except _WindowMoved:
         db.session.rollback()
         current = db.session.get(Recording, recording_id)
@@ -3429,7 +3569,7 @@ def account_block_options():
     `recording_id` - which of them that recording already blocks."""
     from ..account_blocks import account_limits
     rid = request.args.get('recording_id', '').strip()
-    current = recording_blocks(int(rid)) if rid.isdigit() else {}
+    current = recording_blocks(int(rid)) if rid.isdecimal() else {}
     accounts = Account.query.order_by(Account.name).all()
     limits = account_limits([a.id for a in accounts])
     return jsonify({'success': True, 'accounts': [{

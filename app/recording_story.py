@@ -103,8 +103,8 @@ def _trouble_clauses(rec):
     # to clear and nothing to gate it on.
     if rec.discarded_segment_count:
         out.append((
-            f'{rec.discarded_segment_count} segment'
-            f'{"" if rec.discarded_segment_count == 1 else "s"} discarded '
+            f'{rec.discarded_segment_count} '
+            f'{fmt_utils.plural(rec.discarded_segment_count, "segment")} discarded '
             f'({fmt_utils.fmt_duration(rec.discarded_seconds or 0, with_seconds=True)} of '
             f'provider placeholder video), not joined into the file.', True))
     # Unconditional for the same reason as the discard above: the threshold behind this is
@@ -113,8 +113,8 @@ def _trouble_clauses(rec):
     if rec.fast_delivery_segment_count:
         fast_secs = fmt_utils.fmt_duration(rec.fast_delivery_seconds or 0, with_seconds=True)
         out.append((
-            f'{rec.fast_delivery_segment_count} segment'
-            f'{"" if rec.fast_delivery_segment_count == 1 else "s"} delivered video faster '
+            f'{rec.fast_delivery_segment_count} '
+            f'{fmt_utils.plural(rec.fast_delivery_segment_count, "segment")} delivered video faster '
             f'than real time ({fast_secs} of the file) - kept, but worth checking before '
             f'you watch.', False))
     return out

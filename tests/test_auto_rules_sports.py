@@ -591,6 +591,49 @@ class EventChannelTests(_EventCase):
         self.evaluate(rid)
         self.assertEqual(self.recordings(rid), [])
 
+    def duplicate_pair(self, kept_name, copy_name):
+        kept, copy_ = self.channel(kept_name), self.channel(copy_name)
+        kept.duplicate_cluster_id = copy_.duplicate_cluster_id = kept.id
+        copy_.is_duplicate_loser = True
+        db.session.commit()
+        return kept, copy_
+
+    def test_a_name_on_a_duplicate_copy_records_from_the_kept_copy_and_says_whose_name_it_read(self):
+        """dev/docs/BUGS.md 2026-11-16: 16 of prod's 43 strong name matches were on duplicate copies
+        whose kept copy had no match, so those games had nothing to record from."""
+        g = self.game()
+        kept, copy_ = self.duplicate_pair('Gulls @ Bears', 'PFL | 01 - Gulls at Bears 8:15pm ET')
+        self.named(g, copy_, start=self.kickoff)
+        rid = self.event_rule()
+        self.evaluate(rid)
+        (rec,) = self.recordings(rid)
+        self.assertEqual(rec.channel_id, kept.id)
+        row = RuleMatch.query.filter_by(rule_id=rid, recording_id=rec.id).one()
+        self.assertIn('Read from the channel name "PFL | 01 - Gulls at Bears 8:15pm ET"', row.detail)
+        self.assertIn('Recorded from "Gulls @ Bears", the copy of that stream ChannelBin keeps', row.detail)
+        link = db.session.get(RecordingSports, rec.id)
+        self.assertIsNotNone(link, 'linked to its game through the copy that names it')
+        self.assertEqual(link.tsdb_event_id, g.tsdb_id)
+
+    def test_a_kept_copy_marked_a_wrong_match_is_not_brought_back_by_its_copys_name(self):
+        from app.auto_rules_sports import GameIndex
+        g = self.game()
+        kept, copy_ = self.duplicate_pair('PFL | 01 - Gulls at Bears 8:15pm ET', 'PFL 01 Gulls at Bears')
+        self.named(g, kept, start=self.kickoff)
+        self.named(g, copy_, start=self.kickoff)
+        SportsMatch.query.filter_by(channel_id=kept.id).update({'rejected_at': datetime.utcnow()})
+        db.session.commit()
+        self.assertEqual(GameIndex.load([self.league.id], datetime.utcnow()).named_by.get(g.id, []), [])
+
+    def test_a_kept_copy_that_names_the_game_itself_is_listed_once(self):
+        g = self.game()
+        kept, copy_ = self.duplicate_pair('PFL | 01 - Gulls at Bears 8:15pm ET', 'PFL 01 Gulls at Bears')
+        self.named(g, kept, start=self.kickoff)
+        self.named(g, copy_, start=self.kickoff)
+        from app.auto_rules_sports import GameIndex
+        games = GameIndex.load([self.league.id], datetime.utcnow())
+        self.assertEqual([(n.channel_id, n.source_name) for n in games.named_by[g.id]], [(kept.id, '')])
+
     def test_the_searchs_account_and_day_filters_apply(self):
         g = self.game()
         self.named(g, self.channel('PFL | 01'), start=self.kickoff)

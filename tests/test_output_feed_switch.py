@@ -91,6 +91,18 @@ class ServedSetTests(_Case):
 
 
 class RefusedPlayTests(_Case):
+    def test_a_kick_left_over_from_an_exited_writer_does_not_write_the_line_early(self):
+        """dev/docs/BUGS.md 2026-11-16 (play log kick): discard_play_log() can set the kick
+        just after the writer it meant has exited, and the next writer then drained the
+        queue at once, so a caller's flush_play_log() found nothing to write."""
+        feed._log_kick.set()
+        self.addCleanup(feed._log_kick.clear)
+        self.switch(feed.KIND_CHANNEL, self.alpha.id, False)
+        fid = feed.feed_id_for_channel(self.alpha.id)
+        self.client.get(f'/live/{USER}/{PASS}/{fid}.ts')
+        time.sleep(0.2)   # long enough for a writer that did not wait to have drained it
+        self.assertEqual(feed.flush_play_log(), 1)
+
     def test_a_play_of_a_row_taken_off_is_refused_by_name_with_no_alert(self):
         self.switch(feed.KIND_CHANNEL, self.alpha.id, False)
         fid = feed.feed_id_for_channel(self.alpha.id)

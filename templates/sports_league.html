@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {# _record_modal.html calls csrf_field() unqualified, so it has to be in this template's namespace. #}
-{% from '_macros.html' import csrf_field %}
+{% from '_macros.html' import csrf_field, record_dialog_config %}
 {% block title %}{{ league.name }} - Sports Schedules - ChannelBin{% endblock %}
 
 {#  One league (dev/docs/DESIGN-sports-data.md 11, mockup 50): the rule page's shell. Everything in
@@ -154,6 +154,9 @@
       {% elif not feed.whole and not feed.teams %}
       <p class="card-note">Nothing here to give a channel yet.</p>
       {% else %}
+      {% for sentence in feed.moved %}
+      <div class="notice notice-warn"><div><strong>Changed channel.</strong> {{ sentence }}</div></div>
+      {% endfor %}
       {% if feed.filterable %}
       <div class="sp-feed-tools">
         <div class="search-wrap{{ ' has-text' if feed.q else '' }}" id="sp-feed-wrap">
@@ -194,7 +197,7 @@
     </div>
   </div>
 
-  <div class="card sp-wide" data-section="matching" id="sp-matching" data-terms="{{ matching.terms | tojson | forceescape }}">
+  <div class="card sp-wide" data-section="matching" id="sp-matching" data-terms="{{ matching.terms | tojson | forceescape }}" data-teams="{{ matching.teams | tojson | forceescape }}">
     <div class="card-head"><h2>Matching your guide</h2></div>
     <div class="card-body">
       <p class="card-note">ChannelBin finds this league's {{ many }} in your guide by reading each listing's title for two things: a name for the league (one of the names below) and, for a game, the names of both teams. When a listing has both, it counts as that {{ one }}.</p>
@@ -208,6 +211,18 @@
       <div class="sp-suggest"><span>Guides often call this league <strong>{{ t }}</strong>, and TheSportsDB does not list that name. Add it?</span>
         <button class="btn btn-sm" data-act="accept-term" data-term="{{ t }}">Add</button></div>
       {% endfor %}
+      {% if matching.teams %}
+      <h3 class="sp-h3">Other names for a team</h3>
+      <p class="sp-hint sp-hint-top">A team's names come from TheSportsDB too, and ChannelBin reads them again about once a week. Add one when your guide spells a team differently. For example, a guide says "Texas-El Paso" where TheSportsDB says "UTEP", so that team's {{ many }} are missed until the guide's spelling is added.</p>
+      {% for t in matching.teams if t.own %}
+      <div class="sp-terms sp-teamnames"><span class="sp-teamnames-team">{{ t.name }}</span>
+        {% for n in t.own %}<span class="chip sp-term">{{ n }}<button class="chip-x" data-act="remove-team-name" data-team="{{ t.id }}" data-term="{{ n }}" aria-label="Remove {{ n }} from {{ t.name }}">{{ icon('close') }}</button></span>{% endfor %}
+      </div>
+      {% else %}
+      <p class="sp-hint">None added.</p>
+      {% endfor %}
+      <div class="sp-catbar"><button class="btn btn-sm" data-act="team-name">{{ icon('add') }}Add a name for a team</button></div>
+      {% endif %}
       <h3 class="sp-h3">Categories (optional)</h3>
       <p class="sp-hint sp-hint-top">If your provider has a category just for this league, such as "NFL Sunday Ticket", add it. A listing on a channel in that category counts as this league even when its title does not name it. A game still has to name both teams. Turn on Replays only for a category that only shows old {{ many }}.</p>
       {% if matching.categories %}
@@ -216,8 +231,8 @@
           <thead><tr><th>Category</th><th>Channels</th><th>Replays only</th><th></th></tr></thead>
           <tbody>
             {% for c in matching.categories %}
-            <tr>
-              <td data-label="Category" class="rl-prog"><span class="t">{{ c.name }}</span>{% if not c.channels %}<span class="s text-warning">Not on any of your accounts right now. Kept, since providers often bring a name back.</span>{% endif %}</td>
+            <tr data-cat="{{ c.name }}">
+              <td data-label="Category" class="rl-prog"><span class="t">{{ c.name }}</span>{% if not c.channels %}<span class="s text-warning">Not on any of your accounts right now. Kept, since providers often bring a name back.</span>{% endif %}{% if c.live_games %}<span class="s text-warning">Lists {{ c.live_games }} coming {{ one if c.live_games == 1 else many }} at {{ 'its' if c.live_games == 1 else 'their' }} own start time, which looks live. With Replays only on, {{ 'it counts as a replay' if c.live_games == 1 else 'they count as replays' }}, so auto-record rules and sports channels skip {{ 'it' if c.live_games == 1 else 'them' }} here. Turn Replays only off if this category shows live {{ many }}.</span>{% endif %}</td>
               <td data-label="Channels">{{ c.channels }}</td>
               <td data-label="Replays only"><label class="switch"><input type="checkbox" data-act="replay" data-name="{{ c.name }}"{{ ' checked' if c.replay else '' }}><span class="knob"></span></label></td>
               <td data-label="" class="sp-kebab"><button class="btn btn-sm" data-act="untie" data-name="{{ c.name }}">Remove</button></td>
@@ -275,22 +290,10 @@ window.SPORTS_LEAGUE = {
   sectionPref: {{ section_pref | tojson }},
   sectionsPrefKey: {{ sections_pref_key | tojson }},
 };
-{# duplicated from channels/search.html - what guide.js needs to drive the shared record dialog,
-   which every page that opens it carries a copy of; folding the copies into one include is tracked
-   in the backlog. No epgUrl, because this page has no guide grid. `const`, not window.X: guide.js
-   reads a bare GUIDE_CONFIG. #}
+{# No epgUrl, because this page has no guide grid. `const`, not window.X: guide.js reads a bare
+   GUIDE_CONFIG. #}
 const GUIDE_CONFIG = {
-  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',
-  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',
-  addChannelUrlBase: '/api/guide/channels/',
-  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
-  editRecordingUrlBase: '/recordings/',
-  recDetailUrlBase: '/recordings/',
-  profiles: {
-    {% for p in profiles %}
-    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
-    {% endfor %}
-  },
+  {{ record_dialog_config(profiles, 'league') }}
 };
 </script>
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>

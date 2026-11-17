@@ -164,16 +164,17 @@ def _file_present(cfg: dict, img) -> bool:
         return False
 
 
-def next_due(cfg: dict, now: datetime):
+def next_due(cfg: dict, now: datetime, recordings_only: bool = False):
     """The address to download next, or None. A recording's image only for a recording whose
     metadata file is on, since that is the only place one is used, and a badge only for a team a
     waiting screen would draw: nothing is fetched that nobody gets. A recording's come first, since
-    it has a deadline. A file that went missing is downloaded again. A few queries, whatever the
-    count."""
+    it has a deadline, and `recordings_only` asks for nothing else: the turn tick() gives an image
+    ahead of team lookups. A file that went missing is downloaded again. A few queries, whatever
+    the count."""
     from .metadata_sidecar import sidecar_enabled
     urls = [u for link, rec in _wanting() if sidecar_enabled(cfg, rec.profile, rec)
             for u in (link.poster_url, link.thumb_url) if u]
-    urls = list(dict.fromkeys(urls + _badge_urls(cfg, now)))
+    urls = list(dict.fromkeys(urls + ([] if recordings_only else _badge_urls(cfg, now))))
     if not urls:
         return None
     known = {i.url: i for i in SportsImage.query.filter(SportsImage.url.in_(urls))}
@@ -184,7 +185,9 @@ def next_due(cfg: dict, now: datetime):
         if img.file_name:
             if not _file_present(cfg, img):
                 return url
-        elif img.next_try_at is not None and img.next_try_at <= now:
+        elif img.next_try_at is not None and img.next_try_at <= now and not recordings_only:
+            # A retry keeps its old place, when no call at all is due: a 429 leaves an image due at
+            # once, and ahead of team lookups it would take every turn while the image host refuses.
             return url
     return None
 
@@ -230,13 +233,13 @@ def _download(url: str):
     return SPORTS_FETCH_OK, bytes(data), info, ''
 
 
-def fetch_next(cfg: dict, settings: dict, now: datetime):
+def fetch_next(cfg: dict, settings: dict, now: datetime, recordings_only: bool = False):
     """Download the one image that is due, if any. Called by sports_data.tick() with its client lock
     held and the pace already checked, so this is a call like any other. Returns the outcome, or
     None when nothing was due."""
     if not enabled(cfg):
         return None
-    url = next_due(cfg, now)
+    url = next_due(cfg, now, recordings_only)
     db.session.rollback()  # holds no read transaction across the outbound call
     if url is None:
         return None

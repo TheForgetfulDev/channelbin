@@ -548,10 +548,17 @@ function applyChannelColumnStyle() {
 
 // ── Fetch & render ───────────────────────────────────────────────────────────
 
+// The newest grid request's number. Requests overlap - the 5-minute refresh, a nav-poll
+// re-read, the re-read after a save or a cancel, a day change - and their answers can come
+// back in any order, so only the newest request's answer is drawn. Drawing whichever came
+// last put a just-cancelled recording back in its cell (dev/docs/BUGS.md 2026-11-16).
+let _gridRequest = 0;
+
 function fetchAndRender() {
   // No-op on pages that embed only the search/record modals, not the guide grid
   // (recording detail) - their GUIDE_CONFIG has no epgUrl and initWindow() never ran.
   if (!GUIDE_CONFIG.epgUrl || !windowStart) return;
+  const request = ++_gridRequest;
   const area = document.getElementById('guide-program-area');
   const savedScroll = area ? area.scrollLeft : 0;
   const isInitial = savedScroll === 0 && !channelData.length;
@@ -568,6 +575,7 @@ function fetchAndRender() {
       return r.json();
     })
     .then(data => {
+      if (request !== _gridRequest) return;
       // The schedules card keeps the whole payload and shows the rows its own controls pick;
       // channelData is always exactly what is on screen, so every consumer below agrees.
       channelData = EMBED === 'schedules' ? schedLoad(data) : (data.channels || []);
@@ -2027,6 +2035,31 @@ function setOpenedWindow(startIso, stopIso) {
   document.getElementById('modal-opened-stop').value = stopIso ? `${stopIso}Z` : '';
 }
 
+// The two dialogs in _record_modal.html, on the shared modal anatomy: util.js::wireModal owns
+// show/hide, Escape, the backdrop, the head's close button and the scroll lock
+// (dev/changelog/1608). Wired on first use, from the element the server rendered.
+let _recordModalEl = null;
+let _activeRecModalEl = null;
+
+function recordModalEl() {
+  if (!_recordModalEl) {
+    _recordModalEl = document.getElementById('record-modal');
+    wireModal(_recordModalEl, {
+      persistent: true,
+      onClose: () => { document.getElementById('modal-error').style.display = 'none'; },
+    });
+  }
+  return _recordModalEl;
+}
+
+function activeRecModalEl() {
+  if (!_activeRecModalEl) {
+    _activeRecModalEl = document.getElementById('active-rec-modal');
+    wireModal(_activeRecModalEl, { persistent: true, onClose: () => { _activeRecId = null; } });
+  }
+  return _activeRecModalEl;
+}
+
 function openModal(prog, ch, opts = {}) {
   const isActive = prog.has_recording && prog.recording_id &&
     (prog.recording_status === 'IN_PROGRESS' || prog.recording_status === 'PAUSED' ||
@@ -2121,6 +2154,8 @@ function openModal(prog, ch, opts = {}) {
     }
   }
 
+  setMoveChoice(prog, isEdit && !replaceRecId);
+
   const head = document.getElementById('modal-prog-head');
   if (head) {
     const html = progHeadHtml(prog);
@@ -2168,8 +2203,54 @@ function openModal(prog, ch, opts = {}) {
   _modalLateApplicable = !isEdit;
   applyLateNote();
 
-  document.getElementById('record-modal').style.display = 'flex';
-  syncScrollLock();
+  recordModalEl().openModal();
+}
+
+// The record dialog's "if the account is full when it starts" row (app/seat_moves.py,
+// dev/changelog/1611). A new recording starts on "use the profile's setting"; an edit shows
+// the recording's stored answer when the opening page handed it over
+// (`recording_move_when_full`, null = inherit) and otherwise posts nothing, so the server
+// leaves the stored answer alone. A group target hides the row: the group picks its channel.
+function setMoveChoice(prog, isEdit) {
+  const pick = document.getElementById('modal-move-pick');
+  const sel = document.getElementById('modal-move');
+  const loaded = document.getElementById('modal-move-loaded');
+  if (!pick || !sel || !loaded) return;
+  pick.open = false;
+  const group = Boolean(prog.group_id);
+  pick.style.display = group ? 'none' : '';
+  const known = !isEdit || Object.prototype.hasOwnProperty.call(prog, 'recording_move_when_full');
+  const stored = isEdit ? prog.recording_move_when_full : null;
+  sel.value = stored === true ? '1' : stored === false ? '0' : '';
+  loaded.value = known && !group ? '1' : '';
+  applyMoveChoice();
+}
+
+// What "use the profile's setting" resolves to now - the picked profile's own answer, else the
+// global one - named on the inherit option, and the answer that applies named in the summary.
+function moveChoiceText() {
+  const pick = document.getElementById('modal-move-pick');
+  const sel = document.getElementById('modal-move');
+  const profileSel = document.getElementById('modal-profile');
+  const opt = profileSel && profileSel.selectedIndex >= 0
+    ? profileSel.options[profileSel.selectedIndex] : null;
+  const own = opt && opt.value ? (opt.dataset.moveFull || '') : '';
+  const inherited = own !== '' ? own === '1' : pick.dataset.global === '1';
+  const from = own !== '' ? "the profile's setting" : 'the global setting';
+  const effective = sel.value === '' ? inherited : sel.value === '1';
+  return { inherited, from, effective };
+}
+
+function applyMoveChoice() {
+  const sel = document.getElementById('modal-move');
+  const summary = document.getElementById('modal-move-summary');
+  const inherit = document.getElementById('modal-move-inherit');
+  if (!sel || !summary || !inherit) return;
+  const t = moveChoiceText();
+  inherit.textContent = `Use ${t.from} (${t.inherited ? 'move' : 'wait'})`;
+  summary.textContent = t.effective
+    ? 'If the account is full when it starts: moves to another channel with this program'
+    : 'If the account is full when it starts: waits for a connection on this channel';
 }
 
 function showModalError(msg, conflicts) {
@@ -2240,9 +2321,7 @@ function showModalWarnings(data, formData) {
 }
 
 function closeModal() {
-  document.getElementById('record-modal').style.display = 'none';
-  document.getElementById('modal-error').style.display = 'none';
-  syncScrollLock();
+  recordModalEl().closeModal();
 }
 
 // ── Active Recording Modal ────────────────────────────────────────────────────
@@ -2274,14 +2353,11 @@ function openActiveRecModal(prog) {
 
   document.getElementById('active-rec-error').style.display = 'none';
   loadBlockPicker('active-rec', prog.recording_id);
-  document.getElementById('active-rec-modal').style.display = 'flex';
-  syncScrollLock();
+  activeRecModalEl().openModal();
 }
 
 function closeActiveRecModal() {
-  document.getElementById('active-rec-modal').style.display = 'none';
-  _activeRecId = null;
-  syncScrollLock();
+  activeRecModalEl().closeModal();
 }
 
 function showActiveRecError(msg) {
@@ -3363,10 +3439,8 @@ document.addEventListener('DOMContentLoaded', function () {
     });
   }
 
-  // Record modal close
-  document.getElementById('modal-cancel').addEventListener('click',  closeModal);
-  document.getElementById('modal-close').addEventListener('click',   closeModal);
-  document.getElementById('modal-backdrop').addEventListener('click', closeModal);
+  // The head's close button, the backdrop and Escape are wireModal's (recordModalEl).
+  document.getElementById('modal-cancel').addEventListener('click', closeModal);
 
   // Recompute padded start/stop when the profile selection changes (new recordings only) -
   // but never for a field the user has since hand-edited (dev/docs/BUGS.md 2026-08-06).
@@ -3379,16 +3453,22 @@ document.addEventListener('DOMContentLoaded', function () {
   const modalProfileSel = document.getElementById('modal-profile');
   if (modalProfileSel) {
     modalProfileSel.addEventListener('change', () => {
-      applyProfilePadding(); applyProfileName(); applyLateNote();
+      applyProfilePadding(); applyProfileName(); applyLateNote(); applyMoveChoice();
+    });
+  }
+  const modalMoveSel = document.getElementById('modal-move');
+  if (modalMoveSel) {
+    modalMoveSel.addEventListener('change', () => {
+      // A choice made here is an answer whether or not the stored one was handed over.
+      document.getElementById('modal-move-loaded').value = '1';
+      applyMoveChoice();
     });
   }
   const modalNameInput = document.getElementById('modal-name');
   if (modalNameInput) modalNameInput.addEventListener('input', () => { _modalNameEdited = true; });
 
-  // Active recording modal
+  // Active recording modal: its head's close button, the backdrop and Escape are wireModal's.
   document.getElementById('active-rec-close').addEventListener('click', closeActiveRecModal);
-  document.getElementById('active-rec-close-x').addEventListener('click', closeActiveRecModal);
-  document.getElementById('active-rec-backdrop').addEventListener('click', closeActiveRecModal);
 
   document.getElementById('active-rec-save-stop').addEventListener('click', async function () {
     const recId = _activeRecId;
@@ -3470,6 +3550,9 @@ document.addEventListener('DOMContentLoaded', function () {
     e.preventDefault();
     document.getElementById('modal-error').style.display = 'none';
     const data = new URLSearchParams(new FormData(this));
+    // Which page the dialog was opened on, for the new recording's creation event. The
+    // server reads it against its own list and never trusts it for anything else.
+    data.set('source', GUIDE_CONFIG.recordSource || '');
     await submitModalForm(this, data);
   });
 
@@ -3492,13 +3575,6 @@ document.addEventListener('DOMContentLoaded', function () {
       showModalError(e.message || 'Cancel failed.');
     }
   });
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') {
-      closeModal();
-      closeActiveRecModal();
-    }
-  });
-
   // The channel column's click handling lives in wireChannelTaps() - one listener covering
   // both the desktop navigation and the mobile channel sheet.
 

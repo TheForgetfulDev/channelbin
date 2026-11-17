@@ -108,7 +108,7 @@ class ResumeReArmsTheStopJobOnlyTests(_RouteCase):
         def _add_job(**kwargs):
             registered.append(kwargs['id'])
 
-        with mock.patch('app.routes.recordings.resume_recording'), \
+        with mock.patch('app.routes.recordings.resume_recording', return_value=None), \
              mock.patch.object(schedmod, '_add_job', _add_job):
             resp = self.t.client.post(path)
         return resp, registered

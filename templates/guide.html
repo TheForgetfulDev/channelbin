@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from '_macros.html' import csrf_field %}
+{% from '_macros.html' import csrf_field, record_dialog_config %}
 {% block title %}TV Guide - ChannelBin{% endblock %}
 
 {% block content %}
@@ -316,12 +316,6 @@
 <script>
 const GUIDE_CONFIG = {
   epgUrl: '{{ url_for("guide.epg_api") }}',
-  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',  // GET list / POST create
-  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',  // + id + /delete
-  addChannelUrlBase: '/api/guide/channels/',  // + channel_id + /add
-  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
-  editRecordingUrlBase: '/recordings/',  // + id + /edit
-  recDetailUrlBase: '/recordings/',  // + id
   chDetailUrlBase: '/channels/',           // + channel id (mobile channel sheet, 13.10)
   groupDetailUrlBase: '/channel-groups/',  // + group id, for a group row
   // The program chooser's Other airings, + &q=<title> (routes/channels.py::airing_search_url,
@@ -339,11 +333,7 @@ const GUIDE_CONFIG = {
   // crossed. Its Layout surface is a sheet built in JS, so it has no markup here.
   layoutMobile: {{ guide_layout_mobile | tojson }},
   layoutMobilePrefKey: '{{ guide_layout_mobile_pref_key }}',
-  profiles: {
-    {% for p in profiles %}
-    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
-    {% endfor %}
-  },
+  {{ record_dialog_config(profiles, 'guide') }}
 };
 
 const MANUAL_RECORD_CONFIG = {

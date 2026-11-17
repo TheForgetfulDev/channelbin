@@ -24,7 +24,8 @@
   let swapsPending = 0;
   const swap = (regions = REGIONS) => {
     swapsPending += 1;
-    const run = swapQueue.then(() => swapFromServer(regions)).then(applySort);
+    // A swap redraws the rows, so what the page holds about them is put back on (the sort, a new category's mark).
+    const run = swapQueue.then(() => swapFromServer(regions)).then(applySort).then(markNewCategories);
     swapQueue = run.catch(() => {}).finally(() => { swapsPending -= 1; });
     return run;
   };
@@ -256,7 +257,7 @@
           }
           jsonFetch(`/api/sports/leagues/${d.id}/following`, {
             method: 'PUT', body: JSON.stringify({ team_ids: useTeams ? [...chosen] : [] }),
-          }).then(() => { close(); return refresh(); })
+          }).then((data) => { saidCut(data); close(); return refresh(); })
             .catch((err) => showToast(err.message, { type: 'error' }));
           return false;
         },
@@ -277,6 +278,16 @@
   // d.one and d.many are the league's own noun (sports_view._dialog), so a race is never a game.
   const gamesWord = (d) => `${d.stored} upcoming ${d.stored === 1 ? d.one : d.many}`;
 
+  // A person's act that stopped a sports channel being served ended the plays of it
+  // (output_feed.stop_unserved_sports); say so, since the IPTV player just went dark.
+  const saidCut = (data) => {
+    if (data && data.cut) {
+      showToast(`${data.cut === 1 ? 'An IPTV player' : `${data.cut} IPTV players`} watching a sports channel `
+        + `that is no longer on the IPTV output ${data.cut === 1 ? 'was' : 'were'} cut.`, { type: 'warning' });
+    }
+    return data;
+  };
+
   async function stop(d) {
     const ok = await confirmModal({
       title: `Stop following ${d.name}?`,
@@ -285,7 +296,7 @@
       confirmLabel: 'Stop following',
     });
     if (!ok) return;
-    jsonFetch(`/api/sports/leagues/${d.id}/following`, { method: 'DELETE' }).then(refresh)
+    jsonFetch(`/api/sports/leagues/${d.id}/following`, { method: 'DELETE' }).then(saidCut).then(refresh)
       .catch((err) => showToast(err.message, { type: 'error' }));
   }
 
@@ -312,8 +323,11 @@
       confirmLabel: 'Delete league', danger: true,
     });
     if (!ok) return;
-    jsonFetch(`/api/sports/leagues/${d.id}`, { method: 'DELETE' }).then(() => {
-      if (PAGE) window.location.href = PAGE.listUrl; // nav-ok: the page this was on no longer exists
+    jsonFetch(`/api/sports/leagues/${d.id}`, { method: 'DELETE' }).then((data) => {
+      saidCut(data);
+      const leave = () => { window.location.href = PAGE.listUrl; }; // nav-ok: the page this was on no longer exists
+      // A cut play is said before the page goes, since the toast would go with it.
+      if (PAGE) { if (data && data.cut) setTimeout(leave, 2500); else leave(); }
       else refresh();
     }).catch((err) => showToast(err.message, { type: 'error' }));
   }
@@ -419,9 +433,93 @@
       .catch((err) => showToast(err.message, { type: 'error' }));
   }
 
+  /* A team's added names (app/sports_match.py::set_team_names). The whole list for one team is
+     sent each time, read from the page as the server last drew it. */
+  const teamsNow = () => JSON.parse((document.getElementById('sp-matching') || {}).dataset.teams || '[]');
+
+  function saveTeamNames(teamId, names) {
+    return jsonFetch(`/api/sports/teams/${teamId}/names`, { method: 'PUT', body: JSON.stringify({ names }) })
+      .then(() => { showToast('Saved. ChannelBin checks your guide again in a minute.'); return refresh(); })
+      .catch((err) => showToast(err.message, { type: 'error' }));
+  }
+
+  function openTeamName() {
+    const teams = teamsNow();
+    const modal = buildModal({
+      title: 'Add a name for a team',
+      body: `<div class="sp-dialog-body">
+        <p class="sp-intro">Type the team's name the way your guide or your provider's channel names spell it. It is read exactly like the names from TheSportsDB, and it stays when those are read again.</p>
+        <div class="form-group"><label for="sp-tn-team">Team</label>
+          <select class="form-control" id="sp-tn-team"><option value="">Pick a team</option>${teams.map((t) => `<option value="${t.id}">${escHtml(t.name)}</option>`).join('')}</select></div>
+        <p class="sp-intro sp-faint" id="sp-tn-theirs" hidden></p>
+        <div class="form-group"><label for="sp-tn-name">Name</label>
+          <input class="form-control" id="sp-tn-name" maxlength="120" autocomplete="off"></div>
+      </div>`,
+      footer: [{ label: 'Cancel', class: 'btn' }, {
+        label: 'Add', class: 'btn btn-primary',
+        onClick: (close) => {
+          const team = teams.find((t) => String(t.id) === modal.querySelector('#sp-tn-team').value);
+          const value = modal.querySelector('#sp-tn-name').value.trim();
+          if (!team) { showToast('Pick a team.', { type: 'error' }); return false; }
+          if (!value) { showToast('Type a name.', { type: 'error' }); return false; }
+          close();
+          saveTeamNames(team.id, [...team.own, value]);
+          return false;
+        },
+      }],
+    });
+    const theirs = modal.querySelector('#sp-tn-theirs');
+    modal.querySelector('#sp-tn-team').addEventListener('change', (e) => {
+      const team = teams.find((t) => String(t.id) === e.target.value);
+      theirs.hidden = !team;
+      if (team) {
+        const have = [...team.theirs, ...team.own].map((n) => `"${n}"`).join(', ');
+        theirs.textContent = `Read as ${have} now.`;
+      }
+    });
+  }
+
+  /* A category just added lands in name order, so every row under it moves down one, and one whose
+     name says replay arrives with Replays only already on. A tap aimed at where a row used to be
+     then lands on its neighbor (dev/changelog/1582). So the new rows are marked, the toast says
+     what was switched on, and a Replays only tap is put back and asked for again from the add's
+     answer until SETTLE_MS after the moved rows are drawn. The mark comes off after NEW_MS. */
+  const SETTLE_MS = 2500;
+  const NEW_MS = 60 * 1000;
+  let settlingUntil = 0;
+  let newCategories = [];
+  let rowsMoving = false;
+
+  function markNewCategories() {
+    if (rowsMoving) { rowsMoving = false; settlingUntil = Date.now() + SETTLE_MS; }
+    document.querySelectorAll('#sp-matching tr[data-cat]').forEach((row) => {
+      const fresh = newCategories.includes(row.dataset.cat);
+      row.classList.toggle('sp-cat-new', fresh);
+      if (!fresh) row.querySelectorAll('.sp-cat-newbadge').forEach((b) => b.remove());
+      if (fresh && !row.querySelector('.sp-cat-newbadge')) {
+        row.querySelector('.t').insertAdjacentHTML('beforeend', ' <span class="badge b-sched sp-cat-newbadge">New</span>');
+      }
+    });
+  }
+
   function saveCategories(change) {
     return jsonFetch(`/api/sports/leagues/${leagueId()}/categories`, { method: 'PUT', body: JSON.stringify(change) })
-      .then(refresh)
+      .then((d) => {
+        const added = d.added || [];
+        if (added.length) {
+          newCategories = added;
+          rowsMoving = true;
+          settlingUntil = Infinity;
+          setTimeout(() => { if (newCategories === added) { newCategories = []; markNewCategories(); } }, NEW_MS);
+          const on = d.replay_on || [];
+          const what = added.length === 1 ? `Added "${added[0]}".` : `Added ${added.length} categories.`;
+          const auto = on.length
+            ? ` Replays only is on for ${on.map((n) => `"${n}"`).join(' and ')}, because the name says replay. Turn it off if it shows live games.`
+            : '';
+          showToast(`${what}${auto} The rows below ${added.length === 1 ? 'it' : 'them'} moved down.`, { type: on.length ? 'warning' : 'success', durationMs: 9000 });
+        }
+        return refresh();
+      })
       .catch((err) => { showToast(err.message, { type: 'error' }); return refresh(); });
   }
 
@@ -463,13 +561,21 @@
   function saveFeedChannel(teamId, enabled) {
     return jsonFetch(`/api/sports/leagues/${leagueId()}/feed-channels`,
       { method: 'PUT', body: JSON.stringify({ team_id: teamId, enabled }) })
-      .then(refresh)
+      .then(saidCut).then(refresh)
       .catch((err) => { showToast(err.message, { type: 'error' }); return refresh(); });
   }
 
   document.addEventListener('change', (e) => {
     const sw = e.target.closest('input[data-act="replay"]');
-    if (sw) { saveCategories({ replay: { [sw.dataset.name]: sw.checked } }); return; }
+    if (sw) {
+      if (Date.now() < settlingUntil) {
+        sw.checked = !sw.checked;
+        showToast('The list just changed, so that tap was not saved. Check the row and tap again.', { type: 'warning' });
+        return;
+      }
+      saveCategories({ replay: { [sw.dataset.name]: sw.checked } });
+      return;
+    }
     const feed = e.target.closest('input[data-act="feed-channel"]');
     if (feed) saveFeedChannel(Number(feed.dataset.team), feed.checked);
   });
@@ -582,6 +688,7 @@
     openModal({
       has_recording: true, recording_id: Number(btn.dataset.rec), recording_status: statusVocab('REC_STATUS').SCHEDULED,
       recording_start_time: d.start_iso, recording_stop_time: d.stop_iso, recording_profile_id: d.profile_id,
+      recording_move_when_full: d.move_when_full,
       suggested_name: name, title: name, stream_url: d.url, channel_id: d.channel_id, group_id: d.group_id,
       id: null, description: null,
     }, null);
@@ -648,6 +755,12 @@
       return;
     }
     if (name === 'accept-term') { saveTerms([...termsNow(), act.dataset.term]); return; }
+    if (name === 'team-name') { openTeamName(); return; }
+    if (name === 'remove-team-name') {
+      const team = teamsNow().find((t) => String(t.id) === act.dataset.team);
+      if (team) saveTeamNames(team.id, team.own.filter((n) => n !== act.dataset.term));
+      return;
+    }
     if (name === 'tie') { openTie(); return; }
     if (name === 'untie') { saveCategories({ remove: [act.dataset.name] }); return; }
     if (name === 'add-term' || name === 'replay' || name === 'feed-channel') return;

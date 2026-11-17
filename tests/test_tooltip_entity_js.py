@@ -147,6 +147,41 @@ class PressClosesTipTests(unittest.TestCase):
         self.assertEqual(self.obs['press']['afterMouse'], 'none')
 
 
+@unittest.skipIf(shutil.which('node') is None, 'node not installed')
+@unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
+class CardTableColumnTipTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-16 (column explanations on a phone): a column's explanation is a
+    tip on its <th>, and a table drawn as cards hides its header at 960px and under, so on a
+    phone the IPTV Output page's "#", "Plays from" and seven more had no explanation anyone
+    could reach. While the header is hidden a cell answers for its column."""
+
+    def setUp(self):
+        self.obs = _observe()
+        self.assertEqual(self.obs['errors'], [], 'util.js must load cleanly')
+        self.cards = self.obs['cards']
+
+    def test_a_cell_opens_its_columns_tip_with_its_line_break(self):
+        self.assertEqual(self.cards['cell'], {
+            'displayed': 'block',
+            'text': "The channel number the IPTV player shows.\nIt follows the TV Guide's order."})
+
+    def test_text_inside_a_cell_opens_it_too(self):
+        self.assertEqual(self.cards['inner']['text'], 'What a play would come from.')
+
+    def test_a_column_with_no_tip_opens_nothing(self):
+        self.assertEqual(self.cards['untipped']['displayed'], 'none')
+
+    def test_a_control_in_the_cell_keeps_its_tap(self):
+        self.assertEqual(self.cards['control']['displayed'], 'none')
+
+    def test_a_tip_of_the_cells_own_wins(self):
+        self.assertEqual(self.cards['own']['text'], 'Its own tip')
+
+    def test_with_the_header_showing_a_cell_opens_nothing(self):
+        self.assertEqual(self.cards['headerShown']['displayed'], 'none',
+                         'on a desktop the header carries the tip and a cell must not repeat it')
+
+
 class MacroTipEscapingTests(unittest.TestCase):
     """Why the decode above is load-bearing, pinned on the server side."""
 

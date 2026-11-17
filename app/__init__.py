@@ -4,7 +4,8 @@ import logging.handlers
 import os
 import threading
 
-from flask import Flask, current_app, flash, jsonify, redirect, request, url_for
+from flask import (Flask, current_app, flash, has_app_context, jsonify, redirect, request,
+                   url_for)
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf import CSRFProtect
 from flask_wtf.csrf import CSRFError
@@ -365,6 +366,8 @@ def create_app(config_overrides=None, start_scheduler=True):
     app.jinja_env.globals['icon_sprite'] = _ICON_SPRITE
     app.jinja_env.globals['icon_names'] = ' '.join(_ICONS)
 
+    from . import seat_moves as _seat_moves
+
     @app.context_processor
     def inject_globals():
         cfg = load_config()
@@ -406,6 +409,9 @@ def create_app(config_overrides=None, start_scheduler=True):
             'restart_needed': is_restart_needed(),
             'in_docker': bool(os.environ.get('CHANNELBIN_DOCKER')),
             'display_timezone': get_display_tz_name(),
+            # The record dialog's "if the account is full" row names the global answer when
+            # nothing narrower is set (app/seat_moves.py).
+            'move_when_full_global': _seat_moves.globally_enabled(cfg),
             # Resolved once here off the config this processor has already loaded, so every
             # template and every row inside it bands from the same list without a second
             # read. base.html also serializes it for the browser.
@@ -462,6 +468,14 @@ def _resolve_secret_key(cfg):
     logging.getLogger(__name__).info(
         'flask.secret_key is the shipped default - generated a persistent key at %s', key_path)
     return key
+
+
+def _alert_app():
+    """The app a log record from a context-less thread is alerted against: the one the live
+    scheduler was started for, which is the process's own. None for an app built without a
+    scheduler (a tool, a test), where such a record stays in the log."""
+    from . import scheduler
+    return scheduler._app
 
 
 def _setup_logging(cfg, force=False):
@@ -538,17 +552,31 @@ def _setup_logging(cfg, force=False):
             # here is an unexpected error no site knew to alert on (dev/changelog/930).
             if getattr(record, 'already_alerted', False):
                 return
+            # A record from a thread with no app context of its own (APScheduler's loop and
+            # its workers log a job's exception outside the job's own context) gets one
+            # pushed here, or create_alert() refuses it and the error is never shown
+            # (dev/changelog/1590). With no live app there is nothing to write the alert to
+            # and the record stays in the log.
+            ctx_app = None
+            if not has_app_context():
+                ctx_app = _alert_app()
+                if ctx_app is None:
+                    return
             _in_alert.active = True
             try:
                 from .alerts import create_alert
                 alert_type = 'LOG_CRIT' if record.levelno >= logging.CRITICAL else 'LOG_ERROR'
-                create_alert(
-                    alert_type,
+                kwargs = dict(
                     title=record.getMessage()[:255],
                     body=self.format(record),
                     source=record.name,
                     recording_id=getattr(record, 'recording_id', None),
                 )
+                if ctx_app is None:
+                    create_alert(alert_type, **kwargs)
+                else:
+                    with ctx_app.app_context():
+                        create_alert(alert_type, **kwargs)
             finally:
                 _in_alert.active = False
 

@@ -21,7 +21,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.config import _DEFAULTS  # noqa: E402
-from app.proc_utils import build_capture_cmd  # noqa: E402
+from app.proc_utils import build_capture_cmd, read_reconnect_jumps  # noqa: E402
 from sim import serve_for_test  # noqa: E402
 
 from tests.support.sim_streams import library, live_ids, origin, stream_world  # noqa: E402
@@ -185,6 +185,31 @@ class StreamSignatureTests(_Capture):
         _, text, _, _ = self.capture(stop_after=15.0)
         self.assertGreater(text.count('Will reconnect at'), 1, text[-1500:])
         self.assertIn('timestamp discontinuity', text)
+
+    def test_a_clock_going_back_after_a_reconnect_is_read_as_a_reset(self):
+        """dev/docs/BUGS.md 2026-11-16 (recording 37): a provider whose clock goes back some
+        time after a reconnect. ffmpeg logs the same closure for both, and only how soon after
+        the reconnect it comes tells them apart; the reset was read as the reconnect's hole.
+
+        Which stream's packet ffmpeg closes first is the box's timing, not the feed's: under
+        load the reconnect, and the reset, are each sometimes closed once per stream, the
+        second closure a hole as long as the first (6 and 2 of 44 runs with five busy
+        loops on four cores, dev/changelog/1604). Either way there is one replay and one reset."""
+        self.sim.inject('close_mid_stream', self.label, after_bytes=300_000, times=1)
+        self.sim.inject('timestamp_jump', self.label, start=at(7), seconds=-30)
+        _, text, _, _ = self.capture(stop_after=13.0)
+        self.assertEqual(text.count('Will reconnect at'), 1, text[-1500:])
+        spool = os.path.join(self.dir, 'spool.txt')
+        with open(spool, 'w', encoding='utf-8') as f:
+            f.write(text)
+        jumps = read_reconnect_jumps(spool)
+        self.assertEqual(len(jumps.replays), 1, jumps)
+        self.assertLessEqual(len(jumps.holes), 1, jumps)
+        for hole in jumps.holes:
+            self.assertAlmostEqual(hole, jumps.replays[0], delta=1.0, msg=jumps)
+        self.assertEqual(len(jumps.resets), 1, jumps)
+        self.assertAlmostEqual(jumps.resets[0], 30.0, delta=0.2)
+        self.assertIn(jumps.reset_holes, ((), jumps.resets), jumps)
 
     def test_hls_with_the_raw_stream_reconnect_flags_spins_on_the_playlist(self):
         """dev/changelog/195: a playlist answers EOF on every GET, so -reconnect_at_eof re-fetches

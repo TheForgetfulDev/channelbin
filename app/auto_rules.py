@@ -226,7 +226,7 @@ def known_names(states, ctx=None) -> _Known:
     wanted_chan, wanted_cat = set(), set()
     for state in states:
         named = _named(state)
-        wanted_chan |= {int(v) for v in named['chan'] if str(v).isdigit()}
+        wanted_chan |= {int(v) for v in named['chan'] if str(v).isdecimal()}
         wanted_cat |= named['cat']
     channels = set()
     if wanted_chan:
@@ -257,9 +257,9 @@ def gone_values(state, known: _Known) -> dict:
         'group': {n for n in named['group'] if n not in known.groups},
         'cat': {n for n in named['cat'] if n not in known.categories},
         'chan': {v for v in named['chan']
-                 if not str(v).isdigit() or int(v) not in known.channels},
+                 if not str(v).isdecimal() or int(v) not in known.channels},
         'acct': {v for v in named['acct']
-                 if not str(v).isdigit() or int(v) not in known.accounts},
+                 if not str(v).isdecimal() or int(v) not in known.accounts},
     }
 
 
@@ -1589,13 +1589,15 @@ def _schedule(rule_id, revision, program, row, settings, run, judge, event=None)
     from .routes import recordings as rec_routes
     lead = program.lead
     when = judge._when(lead.start)
+    # `used` is the showing the recording is made from: the lead, unless its account has no
+    # connection in the window and another channel with the same listing does (seat_choice).
+    used, choice = lead, None
     if event is not None:
         plan = rec_routes._plan_event_schedule(lead.channel_id, lead.title, lead.start, lead.stop,
                                                settings.profile_choice(rule_id), run.cfg)
     else:
-        plan = rec_routes._plan_bulk_schedule([(lead.entry_id, lead.group_id)],
-                                              settings.profile_choice(rule_id), run.cfg,
-                                              skip_overlapped=False)[0]
+        choice = seat_choice(program, settings.profile_choice(rule_id), run.cfg)
+        used, plan = choice.showing, choice.plan
     args = plan.get('_create')
     if plan['verdict'] == rec_routes.BULK_SKIP or args is None:
         message = f'"{lead.title}" on {when} could not be placed: {plan.get("reason")}'
@@ -1605,7 +1607,7 @@ def _schedule(rule_id, revision, program, row, settings, run, judge, event=None)
     # never yields to a rule check) deletes and re-inserts a source's listings - SQLite can
     # hand a deleted id to a different program. Recording whatever holds the id now while the
     # ledger names the judged program would mark the race done and record something else.
-    if event is None and not _listing_is(args.get('entry'), lead):
+    if event is None and not _listing_is(args.get('entry'), used):
         message = (f'"{lead.title}" on {when} could not be placed: the guide changed while '
                    'it was being checked.')
         log.warning('Auto-record rule #%d: %s - judged again next run', rule_id, message)
@@ -1613,11 +1615,16 @@ def _schedule(rule_id, revision, program, row, settings, run, judge, event=None)
 
     warnings = [w['message'] for w in plan.get('warnings', {}).values()
                 if isinstance(w, dict) and w.get('message')]
-    chosen_over = list(dict.fromkeys(s.group_name or s.channel_name
-                                     for s in program.showings[1:]))
-    where = (f'{lead.group_name} (via {plan.get("member_name") or lead.channel_name})'
-             if args.get('group_id') else plan.get('channel_name') or lead.channel_name)
+    passed = [s for s, _why in choice.refused] if choice is not None else []
+    # "Chosen over" is the simulcast order's word. Once that order was set aside for a
+    # connection, the sentence about what was passed over is the whole account of it.
+    chosen_over = ([] if passed else list(dict.fromkeys(
+        s.group_name or s.channel_name for s in program.showings if s is not used)))
+    where = (f'{used.group_name} (via {plan.get("member_name") or used.channel_name})'
+             if args.get('group_id') else plan.get('channel_name') or used.channel_name)
     detail = (_event_detail(event, when) if event is not None else f'Scheduled on {where}.')
+    if choice is not None and (choice.refused or choice.kept is not None):
+        detail += ' ' + choice.sentence()
     if chosen_over:
         # A simulcast on a big provider can be twenty feeds; name a few and count the rest.
         shown = ', '.join(chosen_over[:_CHOSEN_OVER_NAMED])
@@ -1640,7 +1647,10 @@ def _schedule(rule_id, revision, program, row, settings, run, judge, event=None)
                     f'({when}). {detail}'),
             extra={'rule_id': rule_id, 'rule_name': rule.name,
                    'program_start': lead.start.strftime('%Y-%m-%dT%H:%M:%S'),
-                   'chosen_over_channel_ids': [s.channel_id for s in program.showings[1:]],
+                   'chosen_over_channel_ids': [s.channel_id for s in program.showings
+                                               if s is not used],
+                   **({'moved_from_channel_id': lead.channel_id} if used is not lead else {}),
+                   **({'passed_over_channel_ids': [s.channel_id for s in passed]} if passed else {}),
                    'warnings': sorted(plan.get('warnings', {})),
                    **({'sports_event_tsdb_id': event.game.tsdb_id, 'start_from': event.source}
                       if event is not None else {})})
@@ -1656,9 +1666,9 @@ def _schedule(rule_id, revision, program, row, settings, run, judge, event=None)
             m.title_key, m.program_start_time = program.identity[0], program.identity[2]
         m.channel_id = rec.channel_id
         m.group_id = rec.group_id
-        m.program_title = lead.title
-        m.program_sub_title = lead.sub_title or None
-        m.program_stop_time = lead.stop
+        m.program_title = used.title
+        m.program_sub_title = used.sub_title or None
+        m.program_stop_time = used.stop
         m.action_taken = RULE_MATCH_SCHEDULED
         m.recording_id = rec.id
         m.removed_status = None
@@ -1687,20 +1697,161 @@ def _schedule(rule_id, revision, program, row, settings, run, judge, event=None)
             return None, f'"{lead.title}" on {when} could not be scheduled: {describe_error(exc)}'
         log.exception('Auto-record rule #%d: recording #%d was created but a step after its '
                       'commit failed; re-arming its start', rule_id, holder['recording_id'])
-        judge.note_created(program, holder, lead)
-        return _snapshot_created(holder, program, lead, judge), _rearm(rule_id, holder)
+        judge.note_created(program, holder, used)
+        return _snapshot_created(holder, program, used, judge), _rearm(rule_id, holder)
     if rec is None:
         return _CHANGED
-    judge.note_created(program, holder, lead)
-    return _snapshot_created(holder, program, lead, judge), ''
+    judge.note_created(program, holder, used)
+    return _snapshot_created(holder, program, used, judge), ''
+
+
+#: The plan warnings that say the planned channel's account has no connection for the
+#: recording's window: every seat committed to another recording, or the account blocked.
+NO_SEAT_WARNINGS = ('connection_limit_warning', 'account_block_warning')
+#: How many channels of one listing are planned, the first choice among them, before the
+#: recording stays on the first choice. Each is one planner pass.
+MAX_SEAT_TRIES = 6
+
+
+def _no_seat(plan):
+    """The sentence saying this plan's channel has no connection in its window, or None."""
+    warnings = plan.get('warnings') or {}
+    for key in NO_SEAT_WARNINGS:
+        if warnings.get(key):
+            return warnings[key].get('message') or key
+    return None
+
+
+@dataclass
+class SeatChoice:
+    """Which showing of a program a recording is planned on. `refused` is every showing that
+    was planned and not taken, the first choice first, each with why (no connection in the
+    window, failing its health checks, or its listing gone); empty when the first choice had
+    a connection. `untried` counts the candidates past MAX_SEAT_TRIES. `kept` is the first
+    choice's no-connection sentence when the recording's profile, or the global setting, says
+    not to move (app/seat_moves.py); `tier` is the health tier a moved-to channel came from."""
+    showing: '_Showing'
+    plan: dict
+    lead: '_Showing'
+    refused: list = field(default_factory=list)
+    untried: int = 0
+    kept: str | None = None
+    tier: int | None = None
+
+    @property
+    def moved(self) -> bool:
+        return self.showing is not self.lead
+
+    def sentence(self) -> str:
+        """What was passed over and why, for the ledger row and the recording's event."""
+        from .fmt_utils import counted, join_labels
+        from .seat_moves import TIER_WORDS
+        if self.kept is not None:
+            return ('Moving to another channel with this listing when the account is full is '
+                    'turned off, so it stays on the first choice and waits for a connection.')
+        by_why = {}
+        for s, why in self.refused:
+            by_why.setdefault(why, []).append(f'"{s.group_name or s.channel_name}"')
+        said = ' '.join(f'{join_labels(names)}: {why}' for why, names in by_why.items())
+        if self.moved:
+            why = f' Chosen because {TIER_WORDS[self.tier]}.' if self.tier is not None else ''
+            return ('Moved to the same listing on an account with a connection free in this '
+                    f'window.{why} Passed over {said}')
+        more = (f' {counted(self.untried, "more channel")} with this listing '
+                f'{"was" if self.untried == 1 else "were"} not tried.' if self.untried else '')
+        return ('No other channel with this listing could take it, so it stays on the first '
+                f'choice and waits for a connection. Tried {said}{more}')
+
+
+def seat_choice(program, profile_choice, cfg) -> SeatChoice:
+    """The showing of `program` to record from, with its plan. The lead, unless its plan says
+    its account has no connection in the window (NO_SEAT_WARNINGS); then the program's other
+    showings - the same listing by the program's identity, never another listing of the same
+    game - are planned in turn, a channel group first, then single channels by health tier
+    (app/seat_moves.py: latest check passed, never checked, latest check failed), the simulcast
+    order (3.7) within each, and the first with a connection is taken. When every one tried is
+    refused the lead stands, as a start that waits for a connection. When the lead's profile,
+    or the global setting, says not to move off a full account, the lead stands and `kept`
+    says so (dev/changelog/1611).
+
+    Three kinds of showing are never taken. A single channel on the refused account itself:
+    its plan reads clean only on the channel the overlapping recording is on, where the limit
+    check sees a handoff, and taking it would cut that recording short. A channel on a
+    failing streak: a connection does not outrank a feed the health checks say is down. And a
+    second showing of a group already planned, which is the same resolver answer.
+
+    One planner pass for a lead with a seat. The planner reads only (dev/changelog/1157)."""
+    from .channel_groups import DEFAULT_FAILING_STREAK_THRESHOLD
+    from .routes import recordings as rec_routes
+
+    def plan_of(s):
+        return rec_routes._plan_bulk_schedule([(s.entry_id, s.group_id)], profile_choice, cfg,
+                                              skip_overlapped=False)[0]
+
+    lead = program.lead
+    plan = plan_of(lead)
+    why = _no_seat(plan) if plan.get('_create') is not None else None
+    others = program.showings[1:]
+    if why is None or not others:
+        return SeatChoice(lead, plan, lead)
+    from .seat_moves import TIER_PASSED, health_tiers, move_allowed
+    profile_id = plan['_create'].get('profile_id')
+    profile = db.session.get(RecordingProfile, profile_id) if profile_id is not None else None
+    if not move_allowed(cfg, profile):
+        return SeatChoice(lead, plan, lead, kept=why)
+    planned_on = plan['_create']['channel_id']
+    rows = {cid: (account_id, failures or 0) for cid, account_id, failures in db.session.query(
+        Channel.id, Channel.account_id, Channel.consecutive_test_failures).filter(
+        Channel.id.in_({s.channel_id for s in others} | {planned_on}))}
+    full = rows.get(planned_on, (None, 0))[0]
+    streak = cfg.get('channel_testing', {}).get('failing_streak_threshold',
+                                                DEFAULT_FAILING_STREAK_THRESHOLD)
+
+    def account(s):
+        return rows.get(s.channel_id, (None, 0))[0]
+
+    candidates, groups = [], {lead.group_id} - {None}
+    for s in others:
+        if s.group_id is not None:
+            if s.group_id in groups:
+                continue
+            groups.add(s.group_id)
+        elif account(s) == full:
+            continue
+        candidates.append(s)
+    tiers = health_tiers([s.channel_id for s in candidates if s.group_id is None])
+    # A group picks its own member by health, so it sorts with the passed tier. Stable, so the
+    # simulcast order holds inside each tier.
+    candidates.sort(key=lambda s: TIER_PASSED if s.group_id is not None else tiers[s.channel_id])
+    refused = [(lead, why)]
+    for s in candidates[:MAX_SEAT_TRIES - 1]:
+        alt = plan_of(s)
+        args = alt.get('_create')
+        if alt['verdict'] == rec_routes.BULK_SKIP or args is None:
+            refused.append((s, alt.get('reason') or 'It could not be planned.'))
+        elif not _listing_is(args.get('entry'), s):
+            refused.append((s, 'The guide changed while it was being checked.'))
+        elif _no_seat(alt) is not None:
+            refused.append((s, _no_seat(alt)))
+        elif (s.group_id is None and streak > 0
+              and rows.get(s.channel_id, (None, 0))[1] >= streak):
+            refused.append((s, 'It is failing its health checks.'))
+        else:
+            return SeatChoice(s, alt, lead, refused,
+                              tier=None if s.group_id is not None else tiers[s.channel_id])
+    return SeatChoice(lead, plan, lead, refused,
+                      max(0, len(candidates) - (MAX_SEAT_TRIES - 1)))
 
 
 def _event_detail(event, when) -> str:
     """Why an event-channel recording exists and what its start rests on, said on its ledger row
     and its RECORDING_RULE_SCHEDULED event (DESIGN-sports-data.md 10)."""
     from .auto_rules_sports import START_FROM_NAME, START_FROM_TSDB
-    head = (f'Read from the channel name "{event.named.channel_name}", not a guide listing: the guide '
+    head = (f'Read from the channel name "{event.named.said_by}", not a guide listing: the guide '
             'has no listing of this game.')
+    if event.named.source_name:
+        head += (f' Recorded from "{event.named.channel_name}", the copy of that stream ChannelBin keeps, '
+                 'whose own name does not name the game.')
     if event.source == START_FROM_NAME:
         return f'{head} Start: {when}, the time its name gives.'
     if event.source == START_FROM_TSDB:
@@ -1760,6 +1911,7 @@ class GamePick:
     kind: str
     game: object = None
     showing: '_Showing' = None
+    program: '_Program' = None
     channels: int = 0
     airing: str = ''
     event: object = None
@@ -1812,7 +1964,8 @@ def game_pick(event_id, now=None, cfg=None):
         keep = keepers(mine, games_of, replays=replays)
         if keep:
             program = next(p for p in mine if p.identity in keep)
-            return GamePick(kind, game=game, showing=program.lead, channels=len(program.showings),
+            return GamePick(kind, game=game, showing=program.lead, program=program,
+                            channels=len(program.showings),
                             airing=games_of[program.identity][1])
     if game.id in games.listed:
         return GamePick(PICK_NONE, game=game, why=WHY_UNSURE if showings else WHY_ENDED)

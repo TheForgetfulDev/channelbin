@@ -343,6 +343,10 @@ class StripTests(unittest.TestCase):
         self._assert_names(FAILURE_MISSED_AT_STARTUP, 'service was not running during its window',
                            'nothing was captured - use Record again')
 
+    def test_start_error(self):
+        self._assert_names(dbmod.FAILURE_START_ERROR, 'every try to start it hit an error',
+                           'nothing was captured - use Record again')
+
     def test_launch_failed(self):
         self._assert_names(FAILURE_LAUNCH_FAILED, 'ffmpeg itself could not be started',
                            'use Record again')

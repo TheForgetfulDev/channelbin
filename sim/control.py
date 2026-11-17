@@ -149,7 +149,7 @@ class Control:
         if method == 'DELETE' and not rest:
             sim.clear()
             return {'cleared': 'all'}
-        if method == 'DELETE' and len(rest) == 1 and rest[0].isdigit():
+        if method == 'DELETE' and len(rest) == 1 and rest[0].isdecimal():
             fid = int(rest[0])
             for f in sim.faults.active():
                 if f.id == fid:

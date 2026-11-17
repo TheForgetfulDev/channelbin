@@ -17,6 +17,7 @@ arguments. tests/test_preview.py::FollowerTests runs the real follower.
 """
 import os
 import sys
+import time
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -214,18 +215,26 @@ class StartRouteTests(_Rig):
         return rec, SimpleNamespace(current_segment_num=1)
 
     def test_live_follows_the_segment_the_recorder_is_writing(self):
+        began = time.monotonic()
         rec, state = self._capturing()
         code, data = self._play(rec, {'live': True}, state)
+        # The segment's age is read off the wall clock when the request runs, so it has grown
+        # by however long seeding and the request took - over a second on a loaded suite run
+        # (dev/docs/BUGS.md 2026-11-16 @ 10:40:27 PM).
+        waited = time.monotonic() - began
         self.assertEqual(code, 200, data)
         call = self.calls[-1]
         self.assertTrue(call['path'].endswith('_seg_001.ts'))
         self.assertIs(call['capture'].follow_state, state)
         # A few seconds before what the growing segment holds so far (60 s of it).
-        self.assertAlmostEqual(call['offset'], 60 - playback.FOLLOW_FROM_END_SECONDS, delta=1)
+        expected = 60 - playback.FOLLOW_FROM_END_SECONDS
+        self.assertGreaterEqual(call['offset'], expected - 1)
+        self.assertLessEqual(call['offset'], expected + waited + 1)
         self.assertTrue(call['capture'].live)
         self.assertAlmostEqual(call['capture'].base, 100.0, delta=1)
         self.assertTrue(data['following'] and data['capturing'])
-        self.assertAlmostEqual(data['captured_seconds'], 160.0, delta=2)
+        self.assertGreaterEqual(data['captured_seconds'], 160.0 - 2)
+        self.assertLessEqual(data['captured_seconds'], 160.0 + waited + 2)
         self.assertEqual(data['capture_note'], '')
 
     def test_a_position_in_a_finished_segment_plays_it_and_ends_with_it(self):

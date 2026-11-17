@@ -54,7 +54,7 @@ from .epg_sources import (
     provider_xmltv_url, refresh_source_counts, resolve_row, sources_refreshed_by_sync,
     subscriber_ids, subscriptions_for, sources_without_directory, write_directory,
 )
-from .fmt_utils import fmt_bytes
+from .fmt_utils import fmt_bytes, plural
 from .tz_utils import format_local, parse_epoch_utc, to_naive_utc
 from .url_utils import mask_account_urls_in_text, mask_creds, mask_creds_in_text, mask_url_path
 
@@ -225,7 +225,7 @@ def _parse_m3u_as_streams(content: str) -> list:
                     # checking the URL first drops all but 157 of its 13,106 channels
                     # (DESIGN-live-vod.md §3.1). Do not reorder.
                     cuid = attrs.get('CUID', '')
-                    if cuid.isdigit():
+                    if cuid.isdecimal():
                         stream_id, id_source = int(cuid), 'cuid'
                     else:
                         sid_match = re.search(r'/(\d+)(?:\.ts|\.m3u8)?(?:\?.*)?$', url)
@@ -2103,7 +2103,7 @@ def _classify_alert_body(note: str | None, added: int, why_it_matters: str,
     what came in because of it, and what to try (dev/changelog/1359). The first sentence is
     the sync log's own note, so the alert and the account page's sync row say the same."""
     if added:
-        came_in = (f'This sync added {added:,} new channel{"" if added == 1 else "s"}. If '
+        came_in = (f'This sync added {added:,} new {plural(added, "channel")}. If '
                    'any of them are movies or series, this is why; the account page\'s '
                    'Activity line links them.')
     else:

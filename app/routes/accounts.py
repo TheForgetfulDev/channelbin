@@ -15,7 +15,7 @@ from ..accounts import (NORM_DISABLED, NORM_HLS, NORM_MODES, NORM_MPEGTS, NORM_M
                         report_source_removed, resolve_source_alerts,
                         start_source_refresh, sync_signature, update_source_stale_alert)
 from .. import account_stats_view
-from ..fmt_utils import iso_or_none
+from ..fmt_utils import iso_or_none, plural
 from ..account_links import (add_host, add_login, delete_hosts_for_account,
                              delete_logins_for_account, host_list, hosts_for_accounts,
                              is_refused_now, logins_for_accounts, move_login, refusal_cooldown,
@@ -1258,7 +1258,7 @@ def activate_host_api(account_id, host_id):
     except LookupError as exc:
         return jsonify({'error': str(exc)}), 404
     n = summary['channels']
-    message = (f'{account.name} now uses {summary["host"]}: {n:,} stream URL{"" if n == 1 else "s"} '
+    message = (f'{account.name} now uses {summary["host"]}: {n:,} stream {plural(n, "URL")} '
                f'rewritten')
     if summary['account_urls']:
         message += ', and the account\'s own URL'
@@ -1310,7 +1310,7 @@ def add_login_api(account_id):
         return jsonify({'error': str(exc)}), 400
     return jsonify({'success': True, 'login_id': row.id,
                     'message': (f'Login "{row.name}" added to {account.name} with '
-                                f'{row.max_connections} seat{"" if row.max_connections == 1 else "s"}.')})
+                                f'{row.max_connections} {plural(row.max_connections, "seat")}.')})
 
 
 @accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>', methods=['POST'])
@@ -2019,10 +2019,10 @@ def _validate_account_form(form, *, new=False) -> list[str]:
         if new and not form.get('password'):
             errors.append('Password is required.')
     max_conn_raw = _field(form, 'max_connections')
-    if max_conn_raw and not (max_conn_raw.isdigit() and int(max_conn_raw) >= 1):
+    if max_conn_raw and not (max_conn_raw.isdecimal() and int(max_conn_raw) >= 1):
         errors.append('Max connections must be a positive whole number.')
     sync_hours_raw = _field(form, 'sync_interval_hours')
-    if sync_hours_raw and not (sync_hours_raw.isdigit() and int(sync_hours_raw) >= 1):
+    if sync_hours_raw and not (sync_hours_raw.isdecimal() and int(sync_hours_raw) >= 1):
         errors.append('Sync interval must be a positive whole number of hours.')
     return errors
 

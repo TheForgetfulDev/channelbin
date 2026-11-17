@@ -638,10 +638,6 @@ const GUIDE_CONFIG = {
   embed: 'schedules',
   epgUrl: '{{ url_for("guide.epg_api") }}',
   groupId: {{ group.id }},
-  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',
-  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
-  editRecordingUrlBase: '/recordings/',
-  recDetailUrlBase: '/recordings/',
   windowDays: {{ whatson.window_days }},
   // The card's own Layout, under its own keys (routes/guide.py::GROUP_WHATSON_LAYOUT_PREF_KEY).
   // `layoutMobile` is also the opt-in to the mobile guide's behaviors (guide.js::isMobileGuide).
@@ -650,11 +646,7 @@ const GUIDE_CONFIG = {
   layoutMobile: {{ whatson.layout_mobile | tojson }},
   layoutMobilePrefKey: {{ whatson.layout_mobile_pref_key | tojson }},
   programAiringsUrl: {{ whatson.program_airings_url | tojson }},
-  profiles: {
-    {% for p in recording_profiles %}
-    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
-    {% endfor %}
-  },
+  {{ m.record_dialog_config(recording_profiles, 'group') }}
 };
 </script>
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>

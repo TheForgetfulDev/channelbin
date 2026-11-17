@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from '_macros.html' import csrf_field, status_badge, channel_pill, account_pill, stat_row, history_chips %}
+{% from '_macros.html' import csrf_field, status_badge, channel_pill, account_pill, stat_row, history_chips, record_dialog_config %}
 {% block title %}{{ rec.name }} - ChannelBin{% endblock %}
 {% block main_class %}detail-page{% endblock %}
 
@@ -509,6 +509,7 @@
     {%- elif rec.failure_reason == 'CONNECTION_SLOT_TIMEOUT' %}it <b>never started</b>: the account had no free connection slot, and its own window ended while it waited for one
     {%- elif rec.failure_reason == 'DVR_DIR_UNUSABLE' %}it <b>never started</b>: the DVR output directory could not be used, and the activity log below names the problem
     {%- elif rec.failure_reason == 'MISSED_AT_STARTUP' %}it <b>never started</b>: the service was not running during its window, and its stop time had already passed when the service came back
+    {%- elif rec.failure_reason == 'START_ERROR' %}it <b>never started</b>: every try to start it hit an error inside ChannelBin, and its window ended before one worked - the activity log below names the error
     {%- elif rec.failure_reason == 'ACCOUNT_BLOCKED' %}it <b>never started</b>: every account it could record from was <b>blocked</b> for the rest of its window, as you asked
     {%- elif rec.failure_reason == 'ALL_SEGMENTS_PLACEHOLDER' %}every captured segment was the <b>provider's placeholder clip</b> rather than the channel, so there was nothing to join - the channel was down for the whole window
     {%- elif rec.failure_reason == 'SEGMENT_FILES_MISSING' %}the capture recorded data, but its segment files <b>went missing</b> before they could be joined, which is not a stream fault
@@ -529,7 +530,7 @@
     {%- if recover_act == 'retry-convert' %}the joined <b>.ts</b> is still on disk - use <b>Retry conversion</b> to finish it
     {%- elif recover_act == 'retry-concat' %}segments kept on disk - use <b>Retry join</b> to finish it
     {%- elif rec.failure_reason == 'ALL_SEGMENTS_PLACEHOLDER' %}a join would refuse the same placeholder clips again - use <b>Record again</b> to reschedule
-    {%- elif rec.failure_reason in ('CONVERSION_COLLISION', 'CONNECTION_SLOT_TIMEOUT', 'DVR_DIR_UNUSABLE', 'MISSED_AT_STARTUP', 'ACCOUNT_BLOCKED', 'NO_VALID_SEGMENTS', 'PAUSED_NOTHING_CAPTURED') %}nothing was captured - use <b>Record again</b> to reschedule
+    {%- elif rec.failure_reason in ('CONVERSION_COLLISION', 'CONNECTION_SLOT_TIMEOUT', 'DVR_DIR_UNUSABLE', 'MISSED_AT_STARTUP', 'START_ERROR', 'ACCOUNT_BLOCKED', 'NO_VALID_SEGMENTS', 'PAUSED_NOTHING_CAPTURED') %}nothing was captured - use <b>Record again</b> to reschedule
     {%- else %}nothing recoverable is left on disk - use <b>Record again</b> to reschedule{% endif %}</span>
 </div>
 {% elif rec.status == REC_STATUS.ABORTED %}
@@ -871,6 +872,8 @@
         {{ stat_row('Scheduled window', rec.scheduled_duration_seconds | int | duration) }}
         {% if blocked_accounts %}{{ stat_row('Blocks account use', blocked_accounts | join(', '),
              tip='Blocks account use.&#10;While this recording can still record, nothing in ChannelBin opens a stream on these accounts - so a TV can watch live on them. Change it from Edit (scheduled) or the in-progress controls.') }}{% endif %}
+        {% if move_when_full %}{{ stat_row('If the account is full', move_when_full,
+             tip='What this recording does if its account has no connection free when it starts.&#10;Moving takes another channel showing the same program, on an account with a connection free - channels whose latest health check passed first, then channels never checked. Set per recording from Edit, per profile on the Profiles page, or for everything in Settings - the narrowest answer wins.') }}{% endif %}
         {% if rec.program_duration_seconds is not none and rec.program_duration_seconds != rec.scheduled_duration_seconds %}
         {{ stat_row('Program length', rec.program_duration_seconds | int | duration) }}
         {% endif %}
@@ -1280,6 +1283,7 @@
 {% set ev_cls = {
   'STALL_DETECTED': 'warn', 'RESTART_FAILED': 'warn', 'RECORDING_STOPPED_EARLY': 'warn',
   'RECORDING_ABORTED': 'warn', 'SEEK_DAMAGE_DETECTED': 'warn', 'RECORDING_RETRY_SCHEDULED': 'warn',
+  'RECORDING_JOB_ERROR': 'bad',
   'RECORDING_START_DEFERRED': 'warn', 'CONVERSION_YIELDED': 'warn', 'CONVERSION_CANCELLED': 'warn',
   'CAPTURE_LOST_TO_OUTAGE': 'warn', 'SEGMENT_DISCARDED': 'warn',
   'FAST_DELIVERY_DETECTED': 'warn', 'CAPTURE_VIDEO_STOPPED': 'warn',
@@ -1306,6 +1310,8 @@
   'RECORDING_STARTED_LATE': 'warn', 'RECORDING_HOST_ROLLED': 'warn', 'RECORDING_LOGIN_REFUSED': 'warn',
   'PROVIDER_STALLS_CORRELATED': 'warn',
   'RECORDING_HANDOFF': 'info', 'RECORDING_URL_RERESOLVED': 'info', 'RECORDING_REPOINTED': 'info',
+  'RECORDING_MOVED_FOR_CONNECTION': 'info',
+  'RECORDING_CREATED': 'info',
   'RECORDING_CREATED_AFTER_EVENT_START': 'info',
 } %}
 <div class="card" id="panel-eventlog" data-sec="log">
@@ -1375,17 +1381,7 @@
 <script>
 const GUIDE_CONFIG = {
   {# no epgUrl - this page has no guide grid; guide.js's grid paths are guarded on that #}
-  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',  // GET list / POST create
-  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',  // + id + /delete
-  addChannelUrlBase: '/api/guide/channels/',  // + channel_id + /add
-  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
-  editRecordingUrlBase: '/recordings/',  // + id + /edit
-  recDetailUrlBase: '/recordings/',  // + id
-  profiles: {
-    {% for p in profiles %}
-    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
-    {% endfor %}
-  },
+  {{ record_dialog_config(profiles, 'recording') }}
 };
 
 {% if rec.status == REC_STATUS.SCHEDULED %}
@@ -1398,6 +1394,7 @@ function openEditModal() {
     recording_start_time: {{ rec.start_time.isoformat() | tojson }},
     recording_stop_time: {{ rec.stop_time.isoformat() | tojson }},
     recording_profile_id: {{ rec.profile_id | tojson }},
+    recording_move_when_full: {{ rec.move_when_account_full | tojson }},
     suggested_name: {{ rec.name | tojson }},
     title: {{ rec.name | tojson }},
     stream_url: {{ rec.url | tojson }},

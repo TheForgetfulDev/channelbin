@@ -240,6 +240,9 @@ def ago(when: datetime, now: datetime, none_value: str = 'never') -> str:
     """'just now' / '5 minutes ago' / '3 hours ago' / '2 days ago' for a past naive-UTC
     instant: rounded, one unit, the register a person uses for "when did this last happen".
     Hours run to 48 so "yesterday evening" does not read as "1 day ago"."""
+    # Here, not at the top: this module imports nothing of the app's, and fmt_utils imports
+    # the models.
+    from .fmt_utils import plural
     if when is None:
         return none_value
     minutes = (now - when).total_seconds() / 60
@@ -247,13 +250,13 @@ def ago(when: datetime, now: datetime, none_value: str = 'never') -> str:
         return 'just now'
     if minutes < 60:
         m = int(round(minutes))
-        return f'{m} minute{"" if m == 1 else "s"} ago'
+        return f'{m} {plural(m, "minute")} ago'
     hours = minutes / 60
     if hours < 48:
         h = int(round(hours))
-        return f'{h} hour{"" if h == 1 else "s"} ago'
+        return f'{h} {plural(h, "hour")} ago'
     d = int(round(hours / 24))
-    return f'{d} day{"" if d == 1 else "s"} ago'
+    return f'{d} {plural(d, "day")} ago'
 
 
 def relative(dt_utc: datetime, *, style: str = 'compact', now: datetime = None) -> str:

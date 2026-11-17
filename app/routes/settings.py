@@ -492,7 +492,7 @@ def api_settings_field():
             if leaf == 'enabled' and value:
                 if not output_feed.credentials_set(feed_cfg):
                     return jsonify({'error': 'Set a username and password before turning the '
-                                             'output feed on'}), 400
+                                             'IPTV output on'}), 400
             if leaf == 'mode' and value not in output_feed.MODES:
                 return jsonify({'error': 'Pick one of ' + ', '.join(output_feed.MODES)}), 400
             if leaf in ('username', 'password'):

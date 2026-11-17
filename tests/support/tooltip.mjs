@@ -37,6 +37,14 @@ const PAGE = `<!doctype html><html><head><meta name="csrf-token" content="t"></h
   <span id="plain" class="tip-plain" data-tip="One line, no break.">x</span>
   <div id="host"><span id="bar" class="tip-plain" data-tip="Live: Channel 5">bar</span></div>
   <span id="elsewhere" class="tip-plain" data-tip="Something else">y</span>
+  <table class="tbl tbl-cards" id="cards">
+    <thead id="cards-head" style="display:none"><tr><th class="tip-plain" data-tip="The channel number the IPTV player shows.&#10;It follows the TV Guide's order.">#</th><th>Channel</th><th class="tip-plain" data-tip="What a play would come from.">Plays from</th></tr></thead>
+    <tbody><tr>
+      <td id="c-num" data-label="#">7</td>
+      <td id="c-name" data-label="Channel">News</td>
+      <td id="c-from" data-label="Plays from"><span id="c-from-text">Feed a</span> <a id="c-link" href="#x">open</a> <span id="c-own" class="tip-plain" data-tip="Its own tip">i</span></td>
+    </tr></tbody>
+  </table>
 </body></html>`;
 
 async function boot() {
@@ -137,6 +145,22 @@ async function boot() {
   const afterTouch = pop().style.display;
   press(plain, 'mouse');
   result.press = { afterTouch, afterMouse: pop().style.display };
+
+  // 6. A table drawn as cards hides its header: a cell answers for its column's tip
+  //    (dev/changelog/1589). The header's `display` stands in for the 960px media query.
+  const at = (id) => {
+    hover(w.document.getElementById('elsewhere'), 0, 0);
+    hover(w.document.body, 0, 0);
+    hover(w.document.getElementById(id), 0, 0);
+    return { displayed: pop().style.display, text: pop().style.display === 'block' ? pop().textContent : null };
+  };
+  const cards = {
+    cell: at('c-num'), untipped: at('c-name'), inner: at('c-from-text'),
+    control: at('c-link'), own: at('c-own'),
+  };
+  w.document.getElementById('cards-head').style.display = '';
+  cards.headerShown = at('c-num');
+  result.cards = cards;
   return result;
 }
 

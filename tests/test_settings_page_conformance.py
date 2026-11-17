@@ -360,7 +360,7 @@ class SubGroupTests(unittest.TestCase):
     """
 
     GROUPS = {
-        'recording': ['Output', 'Retention', 'Conversion', 'Conversion resilience',
+        'recording': ['Output', 'When an account is full', 'Retention', 'Conversion', 'Conversion resilience',
                       'Collision avoidance', 'After completion',
                       'Measurement and local contention', 'Thumbnails and logos'],
         'watchdog': ['Stall detection', 'Moving off a member', 'Dead-stream detection'],
@@ -728,7 +728,8 @@ class GatingAndOverrideTests(unittest.TestCase):
                               'watchdog.stall_timeout_seconds', 'watchdog.restart_delay_seconds',
                               'watchdog.max_consecutive_failures', 'watchdog.stall_move_count',
                               'watchdog.stall_move_window_minutes',
-                              'channel_testing.pre_check.enabled'),
+                              'channel_testing.pre_check.enabled',
+                              'recording.move_when_account_full'),
         'health_check_profile': ('channel_testing.test_duration_seconds',
                                  'channel_testing.wait_between_channels_seconds',
                                  'channel_testing.screenshots_enabled',

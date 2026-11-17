@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 
 import requests
-from sqlalchemy import and_, or_, update
+from sqlalchemy import and_, case, or_, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from . import db
@@ -59,6 +59,10 @@ MISSING_KEEP_DAYS = 7
 EMPTY_RECHECK_DAYS = 3
 REFUSED_RETRY_HOURS = 6
 MATCH_AFTER_REFRESH_SECONDS = 180
+#: How often a team's lookup is asked again, so a name added on TheSportsDB reaches the matcher
+#: within days instead of next season. About one call a team a week, behind every other call
+#: (QUEUE_RANK_REREAD): 144 for college football, 24 minutes of the worker at the default pace.
+TEAM_REREAD_DAYS = 7
 #: The most rows the free key's eventsround sends. A college football week is bigger, and the answer
 #: then carries 50 of its games with nothing saying it was cut. Which 50 changed from call to call on
 #: NCAA Division 1 Football, and was the season's first 50 every time on the NBA's round 0 (measured
@@ -102,12 +106,14 @@ SHIPPED_LEAGUES = (
 #: (design 5.1). All were seen in prod's guide: TheSportsDB calls 5093 `NASCAR Truck Series`, and
 #: still calls 4573 `NASCAR Xfinity Series` after its 2025 rename. 4479's event channels say only
 #: `NCAAF 27: 1pm Arkansas State at Coastal Carolina`; all 186 channel names carrying the word on
-#: 2026-11-14 were college football (dev/changelog/1562). Seeded when a league is added, and offered
-#: on its page while missing.
+#: 2026-11-14 were college football (dev/changelog/1562). Its guide listings say `College Football`,
+#: which neither of TheSportsDB's names for it contains: about 4,800 listings on the weekend of
+#: 2026-11-13, when 1 of 55 college games had a guide match (dev/changelog/1577). Seeded when a league is
+#: added, and offered on its page while missing.
 KNOWN_EXTRA_TERMS = {
     5093: ('NASCAR Craftsman Truck Series',),
     4573: ("NASCAR O'Reilly Auto Parts Series",),
-    4479: ('NCAAF',),
+    4479: ('NCAAF', 'College Football'),
 }
 
 _client_lock = threading.Lock()
@@ -392,6 +398,43 @@ def _ensure_fetch(target: str, kind: str, league_id: int, now: datetime) -> Spor
     return row
 
 
+#: The order due calls are made in (4.1). Calls that find games go first; a team's lookup that has not
+#: had a good answer yet, which adds its other names, colors and badge, waits for them; and one whose
+#: last answer was good, the weekly re-read, goes last. A league followed on 2026-11-13 waited three hours for one round call
+#: behind 160 team lookups (dev/changelog/1574). An unfinished recording's poster and background take
+#: their turn between the first and the second, in tick().
+QUEUE_RANK_SCHEDULE, QUEUE_RANK_TEAM, QUEUE_RANK_REREAD = 0, 1, 2
+
+
+def _due_query(now: datetime):
+    """Every due queue row, in the order tick() takes them. The one place that order is written, so
+    what a page says about the line (queue_line) cannot drift from what the worker does."""
+    rank = case((SportsFetch.kind != SPORTS_KIND_TEAM, QUEUE_RANK_SCHEDULE),
+                (or_(SportsFetch.outcome.is_(None), SportsFetch.outcome != SPORTS_FETCH_OK), QUEUE_RANK_TEAM),
+                else_=QUEUE_RANK_REREAD).label('rank')
+    return (db.session.query(SportsFetch.id, SportsFetch.target, SportsFetch.kind, SportsLeague.tsdb_id,
+                             SportsFetch.league_id, SportsFetch.last_at, rank)
+            .join(SportsLeague, SportsLeague.id == SportsFetch.league_id)
+            .filter(SportsFetch.next_due_at.isnot(None), SportsFetch.next_due_at <= now)
+            .order_by(rank, SportsFetch.next_due_at, SportsFetch.id))
+
+
+def queue_line(now: datetime) -> list:
+    """[(league id, kind, never run)] for every due call, first in line first. One query."""
+    return [(r.league_id, r.kind, r.last_at is None) for r in _due_query(now).all()]
+
+
+def seconds_until_call(position: int, now: datetime, settings: dict = None) -> int:
+    """About how long until the call at `position` in the line (0 is next) is made: what is left of
+    the worker's current wait, then one spacing per call ahead. The backed-off spacing while a 429
+    is being waited out. An image's turn is not counted, so this is a floor."""
+    settings = settings or _settings()
+    state = db.session.get(SportsState, 1)
+    spacing = max(settings['call_spacing_seconds'], state.backoff_seconds if state is not None else 0)
+    left = (state.next_call_at - now).total_seconds() if state is not None and state.next_call_at else 0
+    return int(max(0, left) + position * spacing)
+
+
 def _enqueue_league(league: SportsLeague, now: datetime):
     """Register what a follow obliges, in the follow's own commit and before any call: a restart
     resumes from these rows rather than guessing from what is stored (data-model rule)."""
@@ -653,7 +696,9 @@ def _apply_team_next(row, league, answer, team_id, now):
 
 
 def _ensure_team_rows(league: SportsLeague, parsed: list, now: datetime):
-    """A row per new team's lookup, once a season (6.2). Until it runs only the full name counts."""
+    """A row per new team's lookup (6.2). Until it runs only the full name counts. A team whose
+    weekly re-read lapsed, because it had no stored game when its turn came, is asked again when a
+    game of its arrives."""
     wanted = {}
     for e in parsed:
         if e['home_team_id']:
@@ -669,7 +714,7 @@ def _ensure_team_rows(league: SportsLeague, parsed: list, now: datetime):
             team = SportsTeam(tsdb_id=tsdb_id, full_name=name or str(tsdb_id),
                               names=json.dumps([name] if name else []))
             db.session.add(team)
-        if team.last_looked_up is None:
+        if team.last_looked_up is None or now - team.last_looked_up >= timedelta(days=TEAM_REREAD_DAYS):
             _ensure_fetch(f'team:{tsdb_id}', SPORTS_KIND_TEAM, league.id, now)
 
 
@@ -723,9 +768,8 @@ def _apply_league(row, league, answer, offset, now):
         SportsFetch.query.filter(SportsFetch.target.like(old_rounds), SportsFetch.outcome == SPORTS_FETCH_EMPTY).update(
             {SportsFetch.next_due_at: None}, synchronize_session=False)
         league.current_season = season
-        # Team names are read once a season, so a new one is what asks again.
-        SportsTeam.query.filter(SportsTeam.tsdb_id.in_(_league_team_ids(league.id))).update(
-            {SportsTeam.last_looked_up: None}, synchronize_session=False)
+        # Teams are not asked again here: each is re-read weekly (TEAM_REREAD_DAYS), and clearing
+        # last_looked_up would drop every team to its full name until its turn came round.
     _record_outcome(row, SPORTS_FETCH_OK, '', now)
 
 
@@ -736,11 +780,15 @@ def _league_team_ids(league_id: int) -> list:
 
 
 def _apply_team(row, answer, tsdb_id, now):
-    # A looked-up team has nothing further to ask until the season changes.
-    row.next_due_at = None
+    # Asked again in a week while the league still stores a game of the team's; a team with none
+    # stops, and _ensure_team_rows() starts it again when one arrives. A person's own names are
+    # another column and are never touched here.
+    plays = tsdb_id in _league_team_ids(row.league_id)
+    row.next_due_at = now + timedelta(days=TEAM_REREAD_DAYS) if plays and answer.rows else None
     team = SportsTeam.query.filter_by(tsdb_id=tsdb_id).first()
     if not answer.rows:
-        # Asked and answered: its full name from the schedule stands until the season changes.
+        # Asked and answered: its full name from the schedule stands until a game of its arrives a
+        # week or more from now.
         if team is not None:
             team.last_looked_up = now
         _record_outcome(row, SPORTS_FETCH_EMPTY, 'TheSportsDB has no team by this number.', now)
@@ -935,17 +983,17 @@ def tick(now: datetime = None) -> str:
                 return 'waiting'
             if state.last_call_at and (now - state.last_call_at).total_seconds() < MIN_WAIT_SECONDS:
                 return 'waiting'
-        due = (db.session.query(SportsFetch.id, SportsFetch.target, SportsFetch.kind, SportsLeague.tsdb_id)
-               .join(SportsLeague, SportsLeague.id == SportsFetch.league_id)
-               .filter(SportsFetch.next_due_at.isnot(None), SportsFetch.next_due_at <= now)
-               .order_by(SportsFetch.next_due_at, SportsFetch.id).first())
+        due = _due_query(now).first()
         db.session.rollback()  # holds no read transaction across the outbound call
-        if due is None:
-            # With no schedule call due, the turn goes to an image a recording is waiting on, at the
-            # same pace (app/sports_images.py).
+        if due is None or due.rank >= QUEUE_RANK_TEAM:
+            # An image a recording is waiting on has a deadline, the end of its recording, so it goes
+            # ahead of every team lookup; a team's badge waits until no call at all is due. At the
+            # same pace either way (app/sports_images.py).
             from .sports_images import fetch_next
-            return fetch_next(cfg, settings, now) or 'idle'
-        fetch_id, target, kind, league_tsdb_id = due
+            image = fetch_next(cfg, settings, now, recordings_only=due is not None)
+            if image or due is None:
+                return image or 'idle'
+        fetch_id, target, kind, league_tsdb_id = due.id, due.target, due.kind, due.tsdb_id
         answer = _call_for(kind, target, league_tsdb_id)
         log.info('TheSportsDB %s: %s%s', target, answer.outcome, f' ({answer.reason})' if answer.reason else '')
         try:
@@ -964,7 +1012,8 @@ def tick(now: datetime = None) -> str:
             from .sports_feed import place_all_guarded
             place_all_guarded(now)
         if kind in (SPORTS_KIND_ROUND, *ONE_GAME_KINDS) and answer.rows:
-            # Longer than the call spacing, so a first fill's rounds become one match after the last.
+            # Longer than the call spacing, so the answers that arrive while one run is armed share it.
+            # An armed run is never moved later (scheduler.queue_sports_match).
             from .scheduler import queue_sports_match
             queue_sports_match(MATCH_AFTER_REFRESH_SECONDS, f'{target} refreshed')
         return answer.outcome
@@ -1211,7 +1260,7 @@ def parse_entry(text: str) -> tuple:
         return 'teamlink', int(m.group(1))
     if re.match(r'https?://', text, re.I) or 'thesportsdb.com' in text.lower():
         return 'badlink', text
-    if text.isdigit():
+    if text.isdecimal():
         return 'league', int(text)
     return 'team', text
 
@@ -1433,12 +1482,20 @@ NAME_LINK_WINDOW = timedelta(hours=3)
 def recording_name_matches(rec) -> list:
     """For a recording with no guide listing - one an auto-record rule made from an event channel
     (dev/changelog/1491), or one a person made on it - the strong channel-name matches on its
-    channels whose game starts near its program start. Not rejected."""
+    channels whose game starts near its program start. Not rejected. A duplicate copy of one of its
+    channels counts as that channel: a game can be named only by a copy's name and recorded from the
+    kept copy of the stream (dev/changelog/1579)."""
     if rec.program_start_time is None:
         return []
     ids = recording_channel_ids(rec)
     if not ids:
         return []
+    from .database import Channel
+    clusters = [c for (c,) in db.session.query(Channel.duplicate_cluster_id).filter(
+        Channel.id.in_(ids), Channel.duplicate_cluster_id.isnot(None)).distinct()]
+    if clusters:
+        ids = sorted(set(ids) | {i for (i,) in db.session.query(Channel.id).filter(
+            Channel.duplicate_cluster_id.in_(clusters))})
     rows = db.session.query(SportsMatch, SportsEvent.start_at).join(
         SportsEvent, SportsEvent.id == SportsMatch.event_id).filter(
         SportsMatch.kind == SPORTS_MATCH_KIND_CHANNEL_NAME, SportsMatch.channel_id.in_(ids),

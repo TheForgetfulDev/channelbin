@@ -733,6 +733,21 @@
 
 .guide-channel-meta:empty { display: none; }
 
+/* The guide's compact badge (DESIGN.md 3.4, 11.1): the Missing, DUP and group badges in the
+   channel column. Smaller than the app-wide .badge on purpose - 9.6px sentence-case text
+   and a 2px corner against .badge's bold capitals in a pill, because this strip sits in a
+   230px column beside a wall of program cells. Guide-only: every other page uses .badge +
+   a .b-* class, and QbadgeIsGuideOnlyTests holds it to guide.html and guide.js
+   (dev/changelog/1607). Defined before .guide-group-badge, which overrides it at the same
+   specificity. */
+.qbadge {
+  /* 2px, below --radius-sm on purpose: a 6px radius on a 14px-tall badge is a pill. */
+  font-size: var(--fs-3xs); padding: 1px 4px; border-radius: 2px;
+  background: var(--bg2); color: var(--text-muted);
+  white-space: nowrap; flex-shrink: 0; line-height: 1.4;
+}
+.qbadge-warn { background: var(--warn-soft); color: var(--warn); }
+
 /* ── A guide row that is a channel group (dev/changelog/856) ─────────────────
    The channel search already settled how a group row is made legible, and this is that
    vocabulary ported rather than a fourth one invented (dev/changelog/811,
@@ -781,7 +796,7 @@
   border: 1px solid var(--border);
 }
 
-/* 11.1 keeps the guide on the dense .qbadge language, so this is the existing badge given
+/* 11.1 keeps the guide on its compact .qbadge, so this is the existing badge given
    weight rather than a .badge promoted in from elsewhere. flex-shrink is pinned because
    .guide-channel-meta is nowrap + overflow:hidden - the strip clips, and the one cue that
    names the row must not be what it clips. */
@@ -1510,8 +1525,8 @@
 
 /* The old per-channel qbadge row (resolution/fps/bitrate/drops chips) and the quality dot
    were replaced by 12.4's numeric health badge (.guide-health-badge) plus the tech readout
-   on the row's second line (.guide-channel-tech). .qbadge itself is a shared style.css
-   component and is still used for the group and DUP badges in .guide-channel-meta. */
+   on the row's second line (.guide-channel-tech). .qbadge itself, defined above, is still
+   used for the group, Missing and DUP badges in .guide-channel-meta. */
 
 .guide-dup-badges {
   display: flex;

@@ -14,6 +14,7 @@ are in the [README](../README.md).
 - [Channel groups and failover](#channel-groups-and-failover)
 - [Finding a show: Search Programs](#finding-a-show-search-programs)
 - [Recording a show every time it is on](#recording-a-show-every-time-it-is-on)
+- [Sports schedules: following a league or team](#sports-schedules-following-a-league-or-team)
 - [Recording profiles](#recording-profiles)
 - [What happens to the file: joining and conversion](#what-happens-to-the-file-joining-and-conversion)
 - [Getting told when something breaks](#getting-told-when-something-breaks)
@@ -239,6 +240,79 @@ listings refresh, so a weekly show or a team's games get recorded without you co
 The Auto-record page lists each rule with its next recording and when it last checked. **Check
 now** runs one straight away. If a check could not schedule everything it found, the rule says so.
 
+## Sports schedules: following a league or team
+
+A guide listing says a game is on. It does not always say so the same way twice, and many sports
+channels have no listings at all. **Sports Schedules** keeps the real schedule for the leagues
+and teams you follow, from [TheSportsDB](https://www.thesportsdb.com/), and works out which of
+your channels each game is on. An auto-record rule can then record a team's games by the game,
+once each, instead of by whatever the listing happens to say.
+
+**Following.** On **Sports Schedules**, click **Add league or team** and pick a league from the
+list, or type a team's name. A league's page can follow every team in it or only the ones you
+choose. With nothing followed, ChannelBin makes no calls to TheSportsDB at all.
+
+**A new schedule takes a while.** ChannelBin makes one call to TheSportsDB at a time, spaced
+out so it stays well inside what their free service allows. The calls that find the games go
+first and each team's other names, colors and badge come after, so the games show up
+first and the matching gets better as the teams fill in. While it is working, the league's
+page says how many calls are left, how many are ahead of them in line and about when they will
+run.
+
+**What a league's page shows.** **Upcoming games** lists each game with where it is in your
+guide. Click that to see every listing ChannelBin matched to the game and why. A match is
+*strong* when the listing names the league and both teams, and *weak* when it had to go on less,
+such as a city. Each listing is marked live or replay. If a listing is not that game, click
+**Wrong match**. That only tells ChannelBin to stop counting the listing as that game: it never
+records, cancels or deletes anything.
+
+**Event channels.** Some providers have numbered channels that are renamed for each game, such
+as "NHL 02: Bruins @ Rangers", with no guide listings of their own. ChannelBin reads
+those names too and shows them as *read from its name*. A name is weaker than a listing: it was
+true when your account last synced, and the provider can rename the channel before the game. A
+rule records from an event channel only when you turn on **Record from event channels**, and
+only for a game that no guide listing carries.
+
+**When a game is not matched: add the name your guide uses.** The **Matching your guide** card
+is where to look. ChannelBin finds a game by reading a listing for a name of the league and the
+names of both teams, and both sets of names come from TheSportsDB. Your provider may spell them
+differently.
+
+- **Names for this league.** If your guide calls the league something TheSportsDB does not, add
+  it here.
+- **Other names for a team.** If your guide spells a team out where TheSportsDB uses initials,
+  or the other way around, click **Add a name for a team**, pick the team and type the guide's
+  spelling. Your names stay when ChannelBin reads TheSportsDB's again, which it does about once
+  a week.
+- **Categories.** If your provider has a category just for the league, add it, and a listing in
+  that category counts as the league even when its title does not name it. **Replays only**
+  marks a category that only shows old games. A category with "replay" in its name starts with
+  it on, and the page tells you when it did. If a Replays-only category lists a coming game at
+  the game's own start time, its row says so, because a rule and a sports channel both skip
+  replays.
+
+ChannelBin checks your guide again about a minute after any of these changes.
+
+**Sports channels in an IPTV player.** With the [IPTV output](#watching-your-channels-in-an-iptv-player)
+on, a followed team or league can have a channel of its own that plays whichever of your
+channels has the game. Between games it shows a waiting screen with the next game. **Go live
+now** on a game opens it on those channels early, and turns itself off afterwards. In Redirect
+mode the waiting screen ends on its own and you tune in again when the game is on.
+
+**If a sport is not matching, please tell me.** Matching depends on how each provider's guide
+words each sport, and I can only see my own providers. A league whose wording ChannelBin does
+not know can go unmatched for a long time without anyone noticing. If games you follow are not
+being found, or are matched to the wrong thing, open an issue (see
+[Feedback](../README.md#feedback-and-contributions)) with:
+
+- the league, as Sports Schedules names it
+- one game it missed or got wrong
+- the exact title and sub-title of a guide listing for that game, and the channel and category
+  it is on. For an event channel, the channel's name
+- what the league page's **Matching your guide** card shows, and what the game's row says
+
+Adding the name on the league's page fixes it for you in the meantime.
+
 ## Recording profiles
 
 A **recording profile** bundles a filename template, padding before and after the program, and
@@ -383,4 +457,4 @@ stop a play, and **Recent plays** keeps 30 days of plays that ended or were refu
 its reason.
 
 The Dashboard's **Watching now** section shows the same plays at a glance. The setup steps and the three modes in more detail are in the
-[README](../README.md#output-feed-for-an-iptv-player).
+[README](../README.md#iptv-output).

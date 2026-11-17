@@ -391,7 +391,7 @@ def is_channel_label(world, target) -> bool:
     lu = world.lineups.get(backend)
     if lu is None:
         return False
-    if rest.isdigit():
+    if rest.isdecimal():
         return any(c.stream_id == int(rest) and c.kind in TRIPLET_KINDS for c in lu.channels)
     return any(channel_label(backend, c) == target for c in lu.channels
                if c.kind not in TRIPLET_KINDS)
@@ -564,7 +564,7 @@ def _fresh_ids(view, n: int, tag: str) -> list[int]:
 
 
 def _new_category(view, label: str) -> tuple[str, str]:
-    ids = [int(cid) for cid, _ in view.categories if cid.isdigit()]
+    ids = [int(cid) for cid, _ in view.categories if cid.isdecimal()]
     names = {n for _, n in view.categories}
     name, n = label, 1
     while name in names:
@@ -1269,8 +1269,10 @@ _KINDS = (
           '10 s)',
           'the channel\'s video packets are withheld for the window while audio, PAT and PMT '
           'flow on', forms=(FORM_TS, FORM_HLS_SEGMENT)),
-    _kind('timestamp_jump', SCOPE_CHANNEL, LAYER_STREAM, (EP_STREAM,), ASSUMED,
-          'none; no backward timestamp in any of the 32 timeline scans the two installs hold',
+    _kind('timestamp_jump', SCOPE_CHANNEL, LAYER_STREAM, (EP_STREAM,), OBSERVED,
+          'BUGS.md 2026-11-16, dev/changelog/1597: prod recording 37\'s feed went back in pairs '
+          'all night with no reconnect near (38.9 and 1199.2 s, 1045.0 and 31.6 s), read from '
+          'ffmpeg\'s closures; a forward jump is assumed',
           'from the window\'s start every timestamp is moved by `seconds`',
           {'seconds': (30.0, _signed_seconds)}, forms=(FORM_TS, FORM_HLS_SEGMENT)),
     _kind('pts_wrap', SCOPE_CHANNEL, LAYER_STREAM, (EP_STREAM,), ASSUMED,

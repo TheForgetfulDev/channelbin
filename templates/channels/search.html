@@ -406,22 +406,12 @@ window.CHANNEL_SEARCH_CONFIG = {
   },
 };
 
-{# What guide.js needs to drive the shared record modal. Same shape as index.html's -
+{# What guide.js needs to drive the shared record modal -
    no epgUrl, because this page has no guide grid and guide.js's grid paths are guarded
    on that. `const`, not window.X: guide.js reads a bare GUIDE_CONFIG, which resolves
    against the global lexical scope a top-level const lives in. #}
 const GUIDE_CONFIG = {
-  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',
-  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',
-  addChannelUrlBase: '/api/guide/channels/',
-  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
-  editRecordingUrlBase: '/recordings/',
-  recDetailUrlBase: '/recordings/',
-  profiles: {
-    {% for p in profiles %}
-    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
-    {% endfor %}
-  },
+  {{ m.record_dialog_config(profiles, 'search') }}
 };
 {# Re-run the search rather than reloading: a reload would throw away the search that
    is on screen, and the only thing that changed is one row's record_state. #}

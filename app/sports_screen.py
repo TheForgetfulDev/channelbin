@@ -405,6 +405,16 @@ STILL_FRAMES = 64
 _CLIP_RE = re.compile(r'^(\d+)-([0-9a-f]{20})(?:-still)?\.ts$')
 
 
+def unread_badges(screen: Screen) -> list:
+    """[(team name, code)] for each side of `screen`'s game whose downloaded badge cannot be read
+    as a picture, so the screen draws the code in its place."""
+    from .sports_screen_draw import badge_problem
+    if screen.game is None or screen.game.field:
+        return []
+    return [(side.name, side.code) for side in (screen.game.away, screen.game.home)
+            if side.badge and badge_problem(side.badge)]
+
+
 class ClipFailed(Exception):
     """A clip could not be made. The message names why, for a log line or a surface."""
 

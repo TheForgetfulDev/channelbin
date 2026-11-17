@@ -23,9 +23,11 @@ from . import db
 from .config import load_config
 from .version import __version__
 from .database import (
+    RECORDING_JOB_ERROR,
     Channel, Recording, RecordingSegment, RecordingEvent, add_recording_event,
     SEGMENT_STARTED, SEGMENT_ENDED, RECORDING_HANDOFF, DIAGNOSTICS, RESTART_ATTEMPTED,
     GROUP_MEMBER_SELECTED, GROUP_FAILOVER, RECORDING_FORMAT_OVERRIDE,
+    RECORDING_MOVED_FOR_CONNECTION,
     RECORDING_URL_RERESOLVED, RECORDING_RESUME_REFUSED,
     RECORDING_FAILED, RECORDING_START_DEFERRED, RECORDING_ABORTED, RECORDING_PAUSED,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
@@ -34,7 +36,8 @@ from .database import (
     FAILURE_LAUNCH_FAILED, FAILURE_ACCOUNT_BLOCKED,
     CANCEL_DURING_CAPTURE,
 )
-from .channel_groups import (effective_score, pick_best_member, recording_members,
+from .channel_groups import (effective_score, is_streaking, pick_best_member,
+                             recording_members,
                              format_eligible_members, format_key, format_label,
                              segment_pin_format_key, DEFAULT_FAILING_STREAK_THRESHOLD)
 from .db_utils import retry_on_locked
@@ -1154,8 +1157,11 @@ def start_recording(app, recording_id: int):
         account_id = rec.channel.account_id if (rec.channel_id and rec.channel) else None
         if account_id is not None:
             if not _try_acquire_slot_with_preemption(app, recording_id, account_id):
-                _defer_start_for_slot(app, recording_id, account_id)
-                return
+                moved_to, move_note = _move_off_full_account(app, recording_id, account_id)
+                if moved_to is None:
+                    _defer_start_for_slot(app, recording_id, account_id, move_note=move_note)
+                    return
+                account_id = moved_to
             # Fairness, checked only now that a slot is actually held: yielding on the
             # mere existence of an earlier waiter would defer this recording even when
             # the account has slots to spare. at_limit() is advisory and racy by its own
@@ -1223,34 +1229,189 @@ def start_recording(app, recording_id: int):
             db.session.commit()
             return True
 
-        if not _claim_in_progress_and_commit():
+        try:
+            claimed = _claim_in_progress_and_commit()
+        except Exception:
+            # A claim that raised (the database, usually) decided nothing, and nothing has
+            # been spawned. Leaving the live state registered would make the scheduler's
+            # next try of this start stop at "already has live state" and return as if it
+            # had worked, with the row still SCHEDULED and the account's seat held
+            # (dev/changelog/1590). This caller registered the state, so no other caller
+            # owns the capture or the seat: both are this one's to give back.
+            _release_live_state(recording_id, state)
+            if account_id is not None:
+                from . import connection_limits as connlim
+                connlim.release(account_id, 'recording', recording_id)
+            raise
+        if not claimed:
             _abandon_unclaimed_start(recording_id, state, account_id)
             return
 
+        # From here the row is claimed, so a raise can no longer be answered by the
+        # scheduler trying the start again: start_recording() refuses a row that is not
+        # SCHEDULED. Whatever raises below is unwound here and the capture brought back
+        # through the resume path (_recover_claimed_launch, dev/changelog/1601).
+        try:
+            _start_claimed_capture(app, recording_id)
+        except Exception as exc:
+            _recover_claimed_launch(app, recording_id, state, account_id, exc, 'start')
+
+
+def _start_claimed_capture(app, recording_id: int):
+    """The rest of start_recording() once its claim is won: clear what the wait left
+    standing, refresh the program details, launch segment 1."""
+    # Neither is worth a minute of the recording: a standing alert or wait note is
+    # cleared again by the next thing that ends them.
+    try:
         from .health_score import dismiss_recording_failing_alerts
         dismiss_recording_failing_alerts(recording_id)
         end_capture_wait(recording_id)
+    except SQLAlchemyError:
+        log.warning('Recording %d: could not clear its waiting alert or wait note at '
+                    'record start - starting the capture anyway', recording_id,
+                    exc_info=True)
+        db.session.rollback()
 
-        # Re-read the program's synopsis/genre/rating from the guide now that the channel
-        # is settled: a recording scheduled days ago may be describing a program the
-        # provider has since revised (dev/changelog/1055). Its own DB unit, deliberately
-        # kept out of everything around it - and it never raises into the start path,
-        # because a description is a convenience and Product Principle 2 does not let one
-        # cost a capture.
+    # Re-read the program's synopsis/genre/rating from the guide now that the channel
+    # is settled: a recording scheduled days ago may be describing a program the
+    # provider has since revised (dev/changelog/1055). Its own DB unit, deliberately
+    # kept out of everything around it - and it never raises into the start path,
+    # because a description is a convenience and Product Principle 2 does not let one
+    # cost a capture.
+    try:
+        from .recording_metadata import refresh_from_guide
+        refresh_from_guide(recording_id)
+    except SQLAlchemyError:
+        log.warning('Recording %d: could not refresh the program details at record '
+                    'start - keeping what was captured when it was scheduled',
+                    recording_id, exc_info=True)
+        # The launch below shares this session, so a half-failed unit has to be put
+        # back rather than carried into it.
+        db.session.rollback()
+
+    # 1-based segment numbering for new recordings (DESIGN.md section 5 -
+    # display matches filenames); pre-existing recordings keep 0-based files.
+    _launch_segment(app, recording_id, seg_num=1)
+
+
+# How long after a start or a resume raised, with the recording already claimed, its capture
+# is tried again. The scheduler's own pace for a start that raised before its claim
+# (scheduler.JOB_ERROR_RETRY_SECONDS).
+CLAIMED_LAUNCH_RETRY_SECONDS = 60
+
+
+def _recover_claimed_launch(app, recording_id: int, state: RecordingState, account_id,
+                            exc: Exception, what: str) -> str:
+    """Unwind a start or resume (`what`) that raised after it registered its live state,
+    and arm resume_<id> to bring the capture back while the window is open. Returns the
+    error as it was written down.
+
+    Without it the row sits IN_PROGRESS (or PAUSED / RETRYING) with live state and a seat
+    held and nothing capturing: every later resume stops at "already has live state", and
+    the stop job fails the recording for having no segments (dev/docs/BUGS.md 2026-11-16).
+    The same state after a crash is what startup recovery hands to resume_recording(), so
+    that is the path taken here too, a minute later.
+
+    Everything the launch may have acquired is given back first: an ffmpeg already attached
+    to the state, its open segment row and spool, the live state, the seat. An ffmpeg
+    spawned but not yet attached is killed by _launch_segment itself before it raises.
+    Never raises: the database is the likeliest cause of the raise, so each step is tried
+    on its own and a step that fails is logged and passed over."""
+    error = mask_creds_in_text(f'{type(exc).__name__}: {exc}')[:300]
+
+    def _step(name, fn):
         try:
-            from .recording_metadata import refresh_from_guide
-            refresh_from_guide(recording_id)
-        except SQLAlchemyError:
-            log.warning('Recording %d: could not refresh the program details at record '
-                        'start - keeping what was captured when it was scheduled',
-                        recording_id, exc_info=True)
-            # The launch below shares this session, so a half-failed unit has to be put
-            # back rather than carried into it.
-            db.session.rollback()
+            return fn()
+        except Exception:
+            log.warning('Recording %d: after its %s raised, could not %s', recording_id, what,
+                        name, exc_info=True)
+            return None
 
-        # 1-based segment numbering for new recordings (DESIGN.md section 5 -
-        # display matches filenames); pre-existing recordings keep 0-based files.
-        _launch_segment(app, recording_id, seg_num=1)
+    _step('roll the session back', db.session.rollback)
+    # The full teardown only when a process was attached, since that is when this launch
+    # has an open segment of its own to close. With none attached, an open row is one a
+    # crash left, and the next resume owes it its real end time and SERVICE_RESTART.
+    if state.process is not None and get_state(recording_id) is state:
+        if _step('finish the teardown', lambda: _teardown_active_ffmpeg(
+                app, recording_id, exit_reason='ERROR', hard_kill=True)) is None:
+            _step('roll the session back', db.session.rollback)
+    # Whatever the teardown did not reach. Each is a no-op when it did.
+    state.stop_event.set()
+    proc = state.process
+    if proc is not None and proc.poll() is None:
+        _step('stop its ffmpeg', lambda: terminate_or_kill(proc, hard=True))
+    if state.stderr_fh is not None or state.stderr_path:
+        _discard_stderr_spool(state.stderr_path, state.stderr_fh)
+        state.stderr_fh, state.stderr_path = None, None
+    _release_live_state(recording_id, state)
+    if account_id is not None:
+        from . import connection_limits as connlim
+        _step('give its seat back',
+              lambda: connlim.release(account_id, 'recording', recording_id))
+
+    retry_at = datetime.utcnow() + timedelta(seconds=CLAIMED_LAUNCH_RETRY_SECONDS)
+    TRY_AGAIN, WINDOW_ENDS, MOVED_ON = 'again', 'window', 'moved_on'
+
+    @retry_on_locked()
+    def _note_and_commit():
+        rec = db.session.get(Recording, recording_id)
+        if rec is None or rec.status not in WINDOW_OPEN_STATUSES:
+            # Aborted, failed or deleted while the launch was raising: its own event says
+            # how it ended, and there is nothing to bring back.
+            return MOVED_ON, False
+        outcome = TRY_AGAIN if rec.stop_time > retry_at else WINDOW_ENDS
+        detail = (f'The {what} hit an error inside ChannelBin after the recording was claimed '
+                  f'({error}). Nothing is left capturing from that try. '
+                  + (f'The capture is started again every {CLAIMED_LAUNCH_RETRY_SECONDS} '
+                     f'seconds until it works or the stop time passes.'
+                     if outcome == TRY_AGAIN else
+                     'Its window ends before another try, so whatever was already captured '
+                     'is finalized by its stop job.'))
+        last = (RecordingEvent.query
+                .filter_by(recording_id=recording_id, event_type=RECORDING_JOB_ERROR)
+                .order_by(RecordingEvent.id.desc()).first())
+        try:
+            told = json.loads(last.extra_data or '{}') if last is not None else {}
+        except ValueError:
+            told = {}
+        # One event per distinct error, not one a minute for as long as the cause lasts.
+        # A segment started since then means that run of tries ended: the same error
+        # later is a new failure and is said again.
+        same = (isinstance(told, dict) and told.get('after_claim') is True
+                and told.get('error') == error and outcome == TRY_AGAIN
+                and RecordingEvent.query.filter(
+                    RecordingEvent.recording_id == recording_id,
+                    RecordingEvent.event_type == SEGMENT_STARTED,
+                    RecordingEvent.id > last.id).first() is None)
+        if not same:
+            add_recording_event(recording_id, RECORDING_JOB_ERROR, detail=detail,
+                                extra={'job': what, 'error': error, 'after_claim': True})
+            db.session.commit()
+        return outcome, same
+
+    try:
+        outcome, repeat = _note_and_commit()
+    except Exception:
+        log.warning('Recording %d: could not write the event for its %s error; trying the '
+                    'capture again anyway', recording_id, what, exc_info=True)
+        _step('roll the session back', db.session.rollback)
+        # The row could not be read, so whether it is still open is unknown. One more try:
+        # resume_recording() does nothing for a row that has ended.
+        outcome, repeat = TRY_AGAIN, False
+    if outcome == MOVED_ON:
+        log.warning('Recording %d: its %s raised (%s), and the recording has ended or gone '
+                    'since - nothing to bring back', recording_id, what, error)
+        return error
+    log.log(logging.WARNING if repeat else logging.ERROR,
+            'Recording %d: its %s raised after the recording was claimed (%s); %s',
+            recording_id, what, error,
+            f'trying the capture again in {CLAIMED_LAUNCH_RETRY_SECONDS}s'
+            if outcome == TRY_AGAIN else 'its window ends before another try',
+            exc_info=None if repeat else exc, extra={'recording_id': recording_id})
+    if outcome == TRY_AGAIN:
+        from .scheduler import reschedule_recording_resume
+        _step('arm the next try', lambda: reschedule_recording_resume(recording_id, retry_at))
+    return error
 
 
 def _abandon_unclaimed_start(recording_id: int, state: RecordingState, account_id):
@@ -1515,7 +1676,9 @@ def close_segments_left_open_on_ended_recordings() -> list:
 
 
 def resume_recording(app, recording_id: int):
-    """Resume an IN_PROGRESS, PAUSED, or RETRYING recording."""
+    """Resume an IN_PROGRESS, PAUSED, or RETRYING recording. Returns None, or the error as
+    text when the resume raised with the live state held and was unwound and armed again
+    (_recover_claimed_launch), so a caller a person is waiting on can say so."""
     with app.app_context():
         rec = db.session.get(Recording, recording_id)
         if rec is None:
@@ -1564,60 +1727,74 @@ def resume_recording(app, recording_id: int):
                         'caller owns this capture, so this resume does nothing', recording_id)
             return
 
-        if rec.status == REC_STATUS_PAUSED:
-            @retry_on_locked()
-            def _claim_resumed_and_commit():
-                from .database import RECORDING_RESUMED
-                if not _claim_status_row(recording_id, (REC_STATUS_PAUSED,),
-                                         REC_STATUS_IN_PROGRESS):
-                    db.session.rollback()
-                    return False
-                add_recording_event(recording_id, RECORDING_RESUMED, detail='Recording manually resumed from pause')
-                db.session.commit()
-                return True
+        # Live state and the seat are held from here, so a raise below is unwound and the
+        # resume armed again rather than left to hold both with nothing capturing
+        # (_recover_claimed_launch, dev/changelog/1601).
+        try:
+            _resume_claimed_capture(app, recording_id, rec, state, account_id, open_seg)
+        except Exception as exc:
+            return _recover_claimed_launch(app, recording_id, state, account_id, exc, 'resume')
+        return None
 
-            if not _claim_resumed_and_commit():
-                _abandon_unclaimed_start(recording_id, state, account_id)
-                return
-        elif rec.status == REC_STATUS_RETRYING:
-            @retry_on_locked()
-            def _claim_retry_resumed_and_commit():
-                from .database import RECORDING_RESUMED
-                from .watchdog import close_retry_wait
-                r = db.session.get(Recording, recording_id)
-                close_retry_wait(r, datetime.utcnow())
-                if not _claim_status_row(recording_id, (REC_STATUS_RETRYING,),
-                                         REC_STATUS_IN_PROGRESS):
-                    db.session.rollback()
-                    return False
-                add_recording_event(recording_id, RECORDING_RESUMED,
-                                    detail=f'Retry attempt {r.dead_stream_retry_count} - reconnecting')
-                db.session.commit()
-                return True
 
-            if not _claim_retry_resumed_and_commit():
-                _abandon_unclaimed_start(recording_id, state, account_id)
-                return
+def _resume_claimed_capture(app, recording_id: int, rec, state: RecordingState, account_id,
+                            open_seg):
+    """The rest of resume_recording() once it holds the live state: claim the status where
+    one is owed, close the segment a crash left open, launch the next one."""
+    if rec.status == REC_STATUS_PAUSED:
+        @retry_on_locked()
+        def _claim_resumed_and_commit():
+            from .database import RECORDING_RESUMED
+            if not _claim_status_row(recording_id, (REC_STATUS_PAUSED,),
+                                     REC_STATUS_IN_PROGRESS):
+                db.session.rollback()
+                return False
+            add_recording_event(recording_id, RECORDING_RESUMED, detail='Recording manually resumed from pause')
+            db.session.commit()
+            return True
 
-        end_capture_wait(recording_id)
+        if not _claim_resumed_and_commit():
+            _abandon_unclaimed_start(recording_id, state, account_id)
+            return
+    elif rec.status == REC_STATUS_RETRYING:
+        @retry_on_locked()
+        def _claim_retry_resumed_and_commit():
+            from .database import RECORDING_RESUMED
+            from .watchdog import close_retry_wait
+            r = db.session.get(Recording, recording_id)
+            close_retry_wait(r, datetime.utcnow())
+            if not _claim_status_row(recording_id, (REC_STATUS_RETRYING,),
+                                     REC_STATUS_IN_PROGRESS):
+                db.session.rollback()
+                return False
+            add_recording_event(recording_id, RECORDING_RESUMED,
+                                detail=f'Retry attempt {r.dead_stream_retry_count} - reconnecting')
+            db.session.commit()
+            return True
 
-        # Next segment number comes from this recording's OWN segment rows. Deriving it
-        # from a directory listing of `{safe_name}_seg_*` instead - as this did until
-        # dev/changelog/643 - counted a same-named sibling recording's segment files into
-        # this recording's numbering, because Recording.name is not unique and nothing at
-        # create time makes it so.
-        highest = db.session.query(db.func.max(RecordingSegment.segment_number)).filter(
-            RecordingSegment.recording_id == recording_id).scalar()
-        next_seg = (highest or 0) + 1
+        if not _claim_retry_resumed_and_commit():
+            _abandon_unclaimed_start(recording_id, state, account_id)
+            return
 
-        # Close out the segment found open above, if any (left that way by the crash).
-        if open_seg:
-            _close_open_segment(
-                recording_id, open_seg.id, open_seg.segment_number,
-                detail=f'Segment {open_seg.segment_number} closed at service restart')
+    end_capture_wait(recording_id)
 
-        state.current_segment_num = next_seg
-        _launch_segment(app, recording_id, seg_num=next_seg)
+    # Next segment number comes from this recording's OWN segment rows. Deriving it
+    # from a directory listing of `{safe_name}_seg_*` instead - as this did until
+    # dev/changelog/643 - counted a same-named sibling recording's segment files into
+    # this recording's numbering, because Recording.name is not unique and nothing at
+    # create time makes it so.
+    highest = db.session.query(db.func.max(RecordingSegment.segment_number)).filter(
+        RecordingSegment.recording_id == recording_id).scalar()
+    next_seg = (highest or 0) + 1
+
+    # Close out the segment found open above, if any (left that way by the crash).
+    if open_seg:
+        _close_open_segment(
+            recording_id, open_seg.id, open_seg.segment_number,
+            detail=f'Segment {open_seg.segment_number} closed at service restart')
+
+    state.current_segment_num = next_seg
+    _launch_segment(app, recording_id, seg_num=next_seg)
 
 
 def fire_dead_stream_retry(app, recording_id: int):
@@ -1975,6 +2152,17 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
                    f'reconnect behind it - the provider\'s clock went back - so the file\'s '
                    f'timeline runs on from where it was')
         extra['reset_seconds'] = list(jumps.resets)
+        if jumps.reset_holes:
+            # The same once-per-stream closure as a reconnect's hole, and closed by the
+            # same repair at the join, which reads the holes in file order (dev/changelog/1604).
+            if jumps.repeats < REPEAT_CLOSURES_STUCK:
+                n = len(jumps.reset_holes)
+                detail += (f'; at {n} of them ffmpeg closed the jump once per stream, which '
+                           f'leaves a hole of about '
+                           f'{seconds_list(jumps.reset_holes, limit=SECONDS_LIST_SHOWN)} in '
+                           f'the file\'s timeline, which the join tries to close')
+            extra['reset_hole_seconds'] = list(jumps.reset_holes)
+            extra['timeline_hole_seconds'] = list(jumps.timeline_holes)
     if spool_missing:
         detail += ('; ffmpeg\'s output was not captured for this segment - another process '
                    'deleted the file it was being written to, so there is no record of what '
@@ -1985,19 +2173,36 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
                         extra=extra)
 
 
-def _hls_variant_for(state, url: str, cfg: dict):
+def _has_recorded_bytes(recording_id) -> bool:
+    """Whether a segment of this recording already holds content the file will keep (a
+    discarded placeholder is not the channel's picture). Requires an app context."""
+    if recording_id is None:
+        return False
+    return db.session.query(
+        RecordingSegment.query.filter(RecordingSegment.recording_id == recording_id,
+                                      RecordingSegment.bytes_recorded > 0,
+                                      RecordingSegment.excluded_reason.is_(None))
+        .exists()).scalar()
+
+
+def _hls_variant_for(state, url: str, cfg: dict, recording_id=None):
     """The HlsVariant a segment of `url` should map, or None for a stream with no choice to
-    make. A URL with a provider login in it never gets the playlist read (pick_hls_variant)."""
+    make. A URL with a provider login in it never gets the playlist read (pick_hls_variant).
+
+    The first answer stands for the run, a failed read's first-quality-listed included once
+    a segment recorded with it: a later read that worked would map the best quality and
+    change the picture size mid-recording (dev/docs/BUGS.md 2026-11-16). While nothing has
+    been recorded there is no format to keep, so a failed read is asked again."""
     if not is_hls_url(url):
         return None
     from .accounts import parse_stream_url_parts
     if parse_stream_url_parts(url) is not None:
         return None
     known = state.hls_variants.get(url) if state is not None else None
-    if known is not None:
+    if known is not None and (known.offered or _has_recorded_bytes(recording_id)):
         return known
     variant = pick_hls_variant(cfg, url)
-    if state is not None and variant is not None and variant.offered:
+    if state is not None and variant is not None:
         state.hls_variants[url] = variant
     return variant
 
@@ -2055,7 +2260,7 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
             connlim.reseat_if_refused(channel.account_id, 'recording', recording_id)
             launch_url, _login_id = render_held_login(rec.url, channel.account_id,
                                                       'recording', recording_id)
-        hls_variant = _hls_variant_for(get_state(recording_id), launch_url, cfg)
+        hls_variant = _hls_variant_for(get_state(recording_id), launch_url, cfg, recording_id)
         cmd = build_capture_cmd(cfg, launch_url, seg_path, segment_duration,
                                 pace_realtime=pace, keep_video_track=True,
                                 hls_program=hls_variant.program if hls_variant else 0)
@@ -2143,7 +2348,23 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
             db.session.commit()
             return seg.id
 
-        seg_id = _record_segment_started_and_commit()
+        try:
+            seg_id = _record_segment_started_and_commit()
+        except Exception:
+            # ffmpeg is running and nothing can reach it: no segment row names its file and
+            # the live state does not hold the process yet. It is this launch's to end
+            # before the error leaves here (dev/docs/BUGS.md 2026-11-16).
+            # A warning: the raise goes on to the caller, which reports it.
+            log.warning('Recording %d seg %d: could not record that the segment started; '
+                        'stopping the ffmpeg just launched (pid=%d)', recording_id, seg_num,
+                        proc.pid)
+            terminate_or_kill(proc, hard=True)
+            _discard_stderr_spool(stderr_path, stderr_fh)
+            try:
+                os.unlink(seg_path)
+            except OSError:
+                pass  # ffmpeg had written nothing yet, or the folder is the problem
+            raise
 
         state = get_state(recording_id)
         if state is None or state.stop_event.is_set():
@@ -2318,8 +2539,37 @@ def _pin_eligible_members(members, pin, latest_by_channel):
     return keep, False
 
 
+def _members_near(channel, members) -> tuple:
+    """(avoid, same_login): the members that share a backend with `channel`. `avoid` is the
+    id sets a feed-death failover keeps away from, widest first: everything on its account's
+    provider or one of its logins, then only what is on one of its logins (its own account
+    among them), an empty or repeated set left out. `same_login` is that second set whether
+    or not it is in `avoid`, for saying which of the two a member shares. Two queries.
+
+    One provider is one backend, so what killed a feed there may have killed its copies; one
+    login is one seat pool as well (DESIGN-account-providers.md 9-10)."""
+    from .account_links import login_siblings
+    from .database import Account
+    if channel is None or channel.account_id is None:
+        return (), frozenset()
+    own = channel.account_id
+    logins = {own} | set(login_siblings([own]).get(own, {}))
+    provider_of = dict(db.session.query(Account.id, Account.provider_id).filter(
+        Account.id.in_({ch.account_id for ch in members} | {own})))
+    provider = provider_of.get(own)
+    same_login = frozenset(ch.id for ch in members if ch.account_id in logins)
+    same_provider = same_login | frozenset(
+        ch.id for ch in members
+        if provider is not None and provider_of.get(ch.account_id) == provider)
+    out = []
+    for ids in (same_provider, same_login):
+        if ids and (not out or ids != out[-1]):
+            out.append(ids)
+    return tuple(out), same_login
+
+
 def _pick_by_tiers(members, latest_by_channel, stay_put, busy, busy_account, demoted,
-                   streak_threshold):
+                   streak_threshold, near=()):
     """The failover's preference tiers, best-first; the first that yields a member wins.
     The inner three are the long-standing busy cascade - prefer a member whose account has
     a free slot, then any free member, then knowingly take the best busy one rather than
@@ -2330,13 +2580,25 @@ def _pick_by_tiers(members, latest_by_channel, stay_put, busy, busy_account, dem
     not-yet-demoted members first, and only then re-tried with the demoted ones allowed
     back in. That second round is what keeps a small group cycling instead of running dry
     - a three-member group goes A -> B -> C -> A - and it ranks by health score, which each
-    demotion has just made more honest about this run."""
+    demotion has just made more honest about this run.
+
+    `near` (_members_near) is the innermost preference and only a feed death passes it:
+    inside each busy tier, a member off the dead feed's provider is tried first, then one off
+    its login, then anyone. A free connection still comes first, since a member that cannot
+    take the seat is no move at all, and health score ranks inside each step. A member on a
+    failing streak is never preferred for where it sits: distance from a dead backend does
+    not outrank a feed the health checks say is down (dev/changelog/1603)."""
     best = None
     for preferred in ([demoted, frozenset()] if demoted else [frozenset()]):
         base = set(stay_put) | set(preferred)
         for tier in (base | busy | busy_account, base | busy, base):
-            best = pick_best_member(members, latest_by_channel, exclude_ids=tier,
-                                    streak_threshold=streak_threshold)
+            for avoid in (*near, frozenset()):
+                best = pick_best_member(members, latest_by_channel, exclude_ids=tier | avoid,
+                                        streak_threshold=streak_threshold)
+                if best is not None and avoid and is_streaking(best, streak_threshold):
+                    best = None
+                if best is not None:
+                    break
             if best is not None:
                 break
         if best is not None:
@@ -2535,6 +2797,9 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         latest_by_channel = _latest_tests_by_channel([ch.id for ch in members])
         pin_mismatch = False
         target_key = None
+        # The member health score alone would have picked, when the dead feed's backend
+        # moved the choice off it, and what it shares with that feed.
+        passed_near, passed_shares = None, ''
         if manual:
             # The user's pick. No ranking and no format filter - but the busy sets are
             # still read, so the event can say what the pick cost, and the pin is read so
@@ -2612,8 +2877,20 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
                 # connection the block asked back.
                 stay_put = set(stay_put) | {ch.id for ch in members
                                             if ch.account_id == old_channel.account_id}
+            # Only a feed that died says anything about its backend. A stall move and a
+            # block move leave a working feed, so they rank as they always have.
+            near, near_login = (((), frozenset()) if (demote or block_move)
+                                else _members_near(old_channel, members))
             best = _pick_by_tiers(members, latest_by_channel, stay_put, busy, busy_account,
-                                  demoted, streak_threshold)
+                                  demoted, streak_threshold, near=near)
+            if near and best is not None:
+                plain = _pick_by_tiers(members, latest_by_channel, stay_put, busy,
+                                       busy_account, demoted, streak_threshold)
+                if plain is not None and plain.id != best.id:
+                    passed_near = plain
+                    passed_shares = ('its account' if plain.account_id == old_channel.account_id
+                                     else 'its login' if plain.id in near_login
+                                     else 'its provider')
         took_busy = best is not None and best.id in busy
         took_busy_account = best is not None and best.id in busy_account
         took_demoted = best is not None and best.id in demoted
@@ -2715,6 +2992,11 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         if took_demoted:
             override_note += (' - every other member has already been moved off during '
                               'this recording, so this is the best of them')
+        if passed_near is not None:
+            override_note += (f' - "{passed_near.name}" ({passed_near.account.name}, score '
+                              f'{effective_score(passed_near)}) ranks higher but shares '
+                              f'{passed_shares} with the feed that died, so a member that '
+                              f'does not was tried first')
         if skipped_blocked and not block_move and not manual:
             override_note += (' - skipped member(s) on a blocked account: '
                               + ', '.join(f'"{ch.name}" ({ch.account.name})'
@@ -2772,6 +3054,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
                        # demoted rather than burned and can be selected again this run.
                        'demoted': demote,
                        'took_demoted': took_demoted,
+                       'passed_near_channel_id': passed_near.id if passed_near else None,
                        'block_move': block_move,
                        # True = the user picked this member (Switch channel); from_channel_id
                        # is neither burned nor demoted, and the format filters were the
@@ -2985,7 +3268,8 @@ def _slot_wait_reason(account_id: int, waiting_on=None) -> str:
             f'recording')
 
 
-def _note_slot_wait_once(recording_id: int, account_id: int, why: str, waiting_on=None):
+def _note_slot_wait_once(recording_id: int, account_id: int, why: str, waiting_on=None,
+                         move_note=None):
     """Write the deferral event and its alert the FIRST time this recording waits.
 
     The wait re-enters every SLOT_WAIT_POLL_SECONDS, so writing these per attempt would
@@ -3005,9 +3289,11 @@ def _note_slot_wait_once(recording_id: int, account_id: int, why: str, waiting_o
             recording_id, RECORDING_START_DEFERRED,
             detail=(f'Start deferred: {why}. Waiting for a slot rather than exceeding the '
                     f'account\'s connection limit - will start as soon as one frees, if '
-                    f'this recording\'s window is still open.'),
+                    f'this recording\'s window is still open.'
+                    + (f' {move_note}' if move_note else '')),
             extra={'kind': 'connection_limit', 'account_id': account_id,
-                   'waiting_on_recording_id': waiting_on.id if waiting_on else None})
+                   'waiting_on_recording_id': waiting_on.id if waiting_on else None,
+                   'move_note': move_note})
         db.session.commit()
 
     _mark_slot_deferred_and_commit()
@@ -3088,7 +3374,85 @@ def end_capture_wait(recording_id: int):
         recording_id, 'RECORDING_WAITING_FOR_CONNECTION_SLOT')
 
 
-def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=None):
+#: How many channels with the same program a start tries to take a seat on before it waits.
+MAX_START_MOVE_TRIES = 6
+
+
+def _move_off_full_account(app, recording_id: int, account_id: int):
+    """Move a SCHEDULED single-channel recording whose account has no connection free (full or
+    blocked) to another channel with the same program, holding a seat there. Returns (that
+    channel's account id, None), or (None, why it did not move) - the start then waits as
+    before and its deferral event says why (app/seat_moves.py, dev/changelog/1611). A group
+    recording returns (None, None): its member choice above already looked for a free account.
+
+    Asked again on every retry of a waiting start, so a seat that frees on another account later
+    is taken then. The seat is taken BEFORE the row is rewritten - taking it is the in-memory
+    side effect retry_on_locked must never repeat - and given back if the write fails, so a
+    seat is never held for a recording still pointing at the full account. The write happens
+    only while the row is still SCHEDULED on the channel the move was decided from: two starts
+    of one recording can run at once (an overdue job beside the startup sweep, dev/changelog/987),
+    and the one that loses must give its new seat back rather than repoint a row the other is
+    already capturing."""
+    from . import connection_limits as connlim
+    from . import seat_moves
+    from .accounts import normalize_url
+    rec = db.session.get(Recording, recording_id)
+    if rec is None or rec.group_id is not None or rec.channel is None:
+        return None, None
+    cfg = load_config()
+    level, allowed = seat_moves.move_source(cfg, rec.profile, rec)
+    if not allowed:
+        return None, seat_moves.note_turned_off(level)
+    if not seat_moves.has_program(rec):
+        return None, seat_moves.NOTE_NO_LISTING
+    old = rec.channel
+    old_id, old_name = old.id, old.name
+    old_account = old.account.name if old.account else f'account {account_id}'
+    for ch, tier in seat_moves.start_candidates(rec, account_id, cfg)[:MAX_START_MOVE_TRIES]:
+        if not _try_acquire_slot_with_preemption(app, recording_id, ch.account_id):
+            continue
+        new_id, new_name, new_account_id = ch.id, ch.name, ch.account_id
+        new_account = ch.account.name if ch.account else f'account {new_account_id}'
+        new_url = normalize_url(ch.stream_url, ch.account, cfg)
+        setting = {seat_moves.LEVEL_RECORDING: 'this recording is set to move',
+                   seat_moves.LEVEL_PROFILE: 'its profile is set to move',
+                   seat_moves.LEVEL_GLOBAL: 'the global setting is to move'}[level]
+        detail = (f'Moved from "{old_name}" ({old_account}) to "{new_name}" ({new_account}): '
+                  f'{old_account} had no connection free when the recording started, and '
+                  f'"{new_name}" shows the same program on an account with one free. Chosen '
+                  f'because {seat_moves.TIER_WORDS[tier]}; {setting} when the account is full.')
+
+        @retry_on_locked()
+        def _move_and_commit():
+            r = db.session.get(Recording, recording_id, populate_existing=True)
+            if r is None or r.status != REC_STATUS_SCHEDULED or r.channel_id != old_id:
+                return False
+            r.channel_id = new_id
+            r.url = new_url
+            add_recording_event(recording_id, RECORDING_MOVED_FOR_CONNECTION, detail=detail,
+                                extra={'from_channel_id': old_id, 'from_account_id': account_id,
+                                       'to_channel_id': new_id, 'to_account_id': new_account_id,
+                                       'health_tier': tier, 'setting_level': level})
+            db.session.commit()
+            return True
+
+        try:
+            moved = _move_and_commit()
+        except Exception:
+            connlim.release(new_account_id, 'recording', recording_id)
+            raise
+        if not moved:
+            connlim.release(new_account_id, 'recording', recording_id)
+            log.info('Recording %d: not moved to "%s" - another start already moved or claimed '
+                     'it', recording_id, new_name, extra={'recording_id': recording_id})
+            return None, None
+        log.info('Recording %d: %s', recording_id, detail, extra={'recording_id': recording_id})
+        return new_account_id, None
+    return None, seat_moves.NOTE_NONE_FREE
+
+
+def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=None,
+                          move_note=None):
     """Hold a SCHEDULED recording that cannot have a connection slot yet, or fail it loudly.
 
     Same shape as the mp4-conversion collision defer in start_recording, and for the same
@@ -3097,7 +3461,8 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
     slot acquire are all re-decided against current state rather than replayed.
 
     `waiting_on` is the recording ahead of this one in the queue, when the wait is the
-    fairness yield rather than a full account.
+    fairness yield rather than a full account. `move_note` is why the start did not move to
+    another channel (_move_off_full_account), said in the first deferral event.
     """
     now = datetime.utcnow()
     rec = db.session.get(Recording, recording_id)
@@ -3107,7 +3472,7 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
         from .account_blocks import free_at
         block_until = free_at(account_id, now)
         if block_until is not None:
-            _defer_start_for_block(rec, account_id, block_until, now)
+            _defer_start_for_block(rec, account_id, block_until, now, move_note)
             return
     why = _slot_wait_reason(account_id, waiting_on)
 
@@ -3147,7 +3512,7 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
         )
         return
 
-    _note_slot_wait_once(recording_id, account_id, why, waiting_on)
+    _note_slot_wait_once(recording_id, account_id, why, waiting_on, move_note)
     _note_start_deferred(recording_id, _slot_wait_for(account_id, waiting_on))
     log.info('Recording %d: deferring start - %s', recording_id, why)
     from .scheduler import reschedule_recording_start
@@ -3161,7 +3526,7 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
 BLOCK_WAIT_MAX_POLL_SECONDS = 300
 
 
-def _note_block_wait_once(recording_id: int, account_id: int, why: str):
+def _note_block_wait_once(recording_id: int, account_id: int, why: str, move_note=None):
     """The deferral event for a wait on a block, written once per account. No alert: the
     user set the block, so the recording waiting on it is a state they chose, shown on the
     recording, not a problem to raise (dev/changelog/1151)."""
@@ -3178,14 +3543,15 @@ def _note_block_wait_once(recording_id: int, account_id: int, why: str):
             recording_id, RECORDING_START_DEFERRED,
             detail=(f'Start deferred: {why}, and every account this recording could use is '
                     f'blocked. It starts as soon as a block ends and records what is left of '
-                    f'its window.'),
-            extra={'kind': 'account_block', 'account_id': account_id})
+                    f'its window.' + (f' {move_note}' if move_note else '')),
+            extra={'kind': 'account_block', 'account_id': account_id, 'move_note': move_note})
         db.session.commit()
 
     _mark_block_deferred_and_commit()
 
 
-def _defer_start_for_block(rec, account_id: int, block_until: datetime, now: datetime):
+def _defer_start_for_block(rec, account_id: int, block_until: datetime, now: datetime,
+                           move_note=None):
     """The block-shaped half of _defer_start_for_slot: every account this SCHEDULED recording
     could start on is blocked by the user. It waits and records what is left once a block
     ends - labeled partial by the late start, like any other late start - or, when the block
@@ -3217,7 +3583,7 @@ def _defer_start_for_block(rec, account_id: int, block_until: datetime, now: dat
         end_capture_wait(recording_id)
         return
 
-    _note_block_wait_once(recording_id, account_id, why)
+    _note_block_wait_once(recording_id, account_id, why, move_note)
     _note_start_deferred(recording_id, f'the block on "{account_name}" to end')
     log.info('Recording %d: deferring start - %s', recording_id, why)
     retry_at = min(block_until, rec.stop_time,
@@ -3438,6 +3804,10 @@ def pause_recording(app, recording_id: int):
                 db.session.commit()
 
             _mark_paused_and_commit()
+            # A resume armed for later (a wait for a seat, a launch that raised) would
+            # otherwise undo the pause when it fires: PAUSED is a status it resumes.
+            from .scheduler import remove_job_if_exists
+            remove_job_if_exists(f'resume_{recording_id}')
 
         ev.publish(recording_id, RECORDING_PAUSED, {'status': REC_STATUS_PAUSED})
 

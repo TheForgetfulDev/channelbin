@@ -150,8 +150,8 @@ class HideRulesPageTests(unittest.TestCase):
         self.assertEqual(cfg['totalChannels'], 3)
 
     def test_no_superseded_ui_classes(self):
-        # DESIGN.md / CLAUDE.md "UI components and tokens": .table and qbadge-* are frozen
-        # legacy systems, never extended by new pages.
+        # DESIGN.md 3.4: .table is retired and .qbadge is the TV Guide's own compact badge,
+        # so neither belongs on this page.
         tpl = _read('templates/channels/hide_rules.html')
         self.assertNotRegex(tpl, r'class="[^"]*\btable\b[^"]*"')
         self.assertNotIn('qbadge-', tpl)

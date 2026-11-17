@@ -1068,6 +1068,39 @@ class RetiredUiClassTests(unittest.TestCase):
             f'(and say why it came back) or delete the rule: {revived}')
 
 
+class QbadgeIsGuideOnlyTests(unittest.TestCase):
+    """`.qbadge` is the TV Guide's compact badge and the guide's only (DESIGN.md 3.4,
+    dev/changelog/1607). It is smaller than `.badge` because the guide is the densest page
+    in the app; copied onto a normal page it imports compression that page never needed,
+    which is how a Groups mockup once grew a 9px health chip (DESIGN.md 11.1). Blessing it
+    is what kept it; this is what keeps it in the guide."""
+
+    CALLERS = {os.path.join('templates', 'guide.html'), os.path.join('static', 'js', 'guide.js')}
+    HOME = os.path.join('static', 'css', 'guide.css')
+    _NAME = re.compile(r'(?<![\w-])qbadge(?:-[\w-]+)?(?![\w-])')
+
+    def test_only_the_guide_uses_it(self):
+        offenders = []
+        for path in list(_walk(TPL_DIR, '.html')) + list(_walk(JS_DIR, '.js')):
+            if _rel(path) in self.CALLERS:
+                continue
+            for lineno, line in enumerate(_read(path).splitlines(), 1):
+                if self._NAME.search(line):
+                    offenders.append(f'{_rel(path)}:{lineno}')
+        self.assertEqual(
+            offenders, [],
+            '.qbadge is the TV Guide\'s compact badge; every other surface uses `.badge` + '
+            f'a `.b-*` class (DESIGN.md 3.4): {offenders}')
+
+    def test_it_is_defined_in_the_guides_stylesheet_and_nowhere_else(self):
+        homes = sorted({_rel(p) for p, text in _css_sources()
+                        if re.search(r'\.qbadge\b', text)})
+        self.assertEqual(
+            homes, [self.HOME],
+            '.qbadge belongs in static/css/guide.css, which loads only where a guide grid '
+            f'is drawn; a copy in a shared stylesheet invites a second page to use it: {homes}')
+
+
 class TipPlainScopeTests(unittest.TestCase):
     """`.tip-plain` cancels `.tip`'s dotted underline and may do nothing else.
 
@@ -3888,6 +3921,14 @@ _VIS_MUTATION_RE = re.compile(
     r"style\.display\s*=|\.hidden\s*=|classList\.(?:add|remove|toggle)\('(?:open|show)'"
     r"|\.remove\(\)|appendChild\(")
 
+# Calls whose open and close already sync the scroll lock (util.js::wireModal): the two
+# builders, and the open/close of an overlay reached through a `*ModalEl()` accessor, the
+# shape guide.js gives each server-rendered dialog it wires. Deliberately not any
+# `.closeModal(`: one sheet's close in a file wrapped in one IIFE would vouch for every
+# overlay in it.
+_SYNCED_BY_DEFINITION_RE = re.compile(
+    r"\b(?:buildModal|wireModal)\(|ModalEl\(\)\.(?:open|close)Modal\(")
+
 _OVERLAY_SEL_RE = re.compile(r"const\s+OVERLAY_SEL\s*=\s*((?:'[^']*'\s*\+?\s*)+);")
 
 # `(() => {`, `(function () {`, `!function() {`, and any `document.addEventListener(...)` -
@@ -3990,14 +4031,16 @@ def _script_blocks(path, text):
 
 def _unsynced_overlay_sites(lines, ref_re, offset=0):
     """Line numbers (1-based, + `offset`) of top-level units that open or close an overlay
-    without calling syncScrollLock. buildModal() call sites are exempt: buildModal syncs on
-    both its append and its close(), so every one of its call sites is covered by definition."""
+    without calling syncScrollLock. A unit that calls buildModal(), wireModal(), or a
+    `*ModalEl().openModal()`/`.closeModal()` accessor is exempt: wireModal's open and close
+    both sync, and buildModal goes through it (dev/changelog/1608), so those sites are
+    covered by definition."""
     sites = []
     for start, end in _top_level_units(lines):
         block = '\n'.join(lines[start:end])
         if not _VIS_MUTATION_RE.search(block) or not ref_re.search(block):
             continue
-        if 'syncScrollLock' in block or 'buildModal(' in block:
+        if 'syncScrollLock' in block or _SYNCED_BY_DEFINITION_RE.search(block):
             continue
         sites.append((start + 1 + offset, lines[start].strip()[:70]))
     return sites
@@ -4133,6 +4176,41 @@ class ScrollLockScanCorrectnessTests(unittest.TestCase):
             "}\n"
         )
         self.assertEqual(self._sites(source), [])
+
+    def test_wiremodal_call_site_is_exempt(self):
+        """The record dialogs' accessors hand the overlay to wireModal, whose open and close
+        both sync; their onClose hiding the error box is not an unsynced overlay close."""
+        source = (
+            "function recordModalEl() {\n"
+            "  wireModal(document.getElementById('record-modal'), {\n"
+            "    onClose: () => { document.getElementById('modal-error').style.display = 'none'; },\n"
+            "  });\n"
+            "}\n"
+        )
+        self.assertEqual(self._sites(source), [])
+
+    def test_a_wired_overlays_open_call_is_exempt(self):
+        """guide.js::openModal shows the record dialog through recordModalEl().openModal()
+        and passes the 'modal' id prefix to a helper, which the scan reads as naming an
+        overlay."""
+        source = (
+            "function openIt() {\n"
+            "  loadBlockPicker('modal', null);\n"
+            "  document.getElementById('modal-late-note').style.display = 'none';\n"
+            "  recordModalEl().openModal();\n"
+            "}\n"
+        )
+        self.assertEqual(self._sites(source), [])
+
+    def test_a_bare_close_modal_call_does_not_vouch(self):
+        """A sheet's closeModal() in the same unit says nothing about a hand-shown overlay."""
+        source = (
+            "function both() {\n"
+            "  sheet.closeModal();\n"
+            "  document.getElementById('record-modal').style.display = 'flex';\n"
+            "}\n"
+        )
+        self.assertEqual([s[0] for s in self._sites(source)], [1])
 
     def test_non_overlay_element_is_not_flagged(self):
         """Inline display is used on ~170 ordinary elements; only overlays are in scope, and

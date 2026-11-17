@@ -5,6 +5,78 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.43.0 - 2026-11-17
+
+Recordings move off a full account, and sharper sports matching.
+
+**Added**
+
+- A recording that finds its account with no connection free when it starts now moves to
+  another channel showing the same program, on an account with one free, instead of waiting
+  and failing when none frees. Channels whose latest health check passed are tried first, and
+  a channel on a failing streak never. It is on by default, and can be set in Settings, on a
+  recording profile or on the recording itself.
+- An auto-record rule, and Record on a league's page, records a game from another channel
+  with the same listing when its first choice has no connection free in the recording's
+  window, and says on the recording and the rule's history what it passed over.
+- A league's page takes a name of your own for a team, for a guide that calls it something
+  TheSportsDB does not (`Texas-El Paso` for `UTEP`). Your names are kept apart, so a re-read
+  from TheSportsDB never touches them.
+- A league's page says how many TheSportsDB calls are ahead of it and about when the next one
+  runs, and Sports Schedules says when the last one runs.
+- A recording scheduled by hand says which page it was scheduled from: the TV Guide,
+  Recordings, Search, a channel's or group's page, a league's page, Record from URL or the
+  bulk schedule.
+- The user guide covers following a league or team, adding a name the guide uses, and how to
+  report a sport that is not matching.
+
+**Changed**
+
+- When a group recording's feed dies, the failover tries a member on a different IPTV
+  provider first, then one on a different login, before another copy on the same one. The
+  activity log names any higher-scoring member it passed over.
+- Tuning in to a sports channel or a group starts on the first channel with a connection free,
+  in ranked order, instead of waiting on the best-ranked one, and the play says where it
+  started and why.
+- Turning a sports channel off, unfollowing its team or deleting its league ends its plays at
+  once.
+- Calls that find games run before team lookups and images, so a newly followed league gets
+  its schedule sooner. Team names are re-read from TheSportsDB about once a week instead of
+  once a season.
+- An unreadable team badge and a waiting screen that could not be made are shown on the play,
+  and a league game moved to another channel number is shown on the league's page, instead of
+  only in the log.
+- Every page, setting and alert now says "IPTV output".
+- On a phone, tapping a cell on the IPTV Output page shows its column's explanation.
+- The connection warning when a recording is scheduled counts seats per login, with a login
+  shared by two accounts counted once, the same way a recording's start does.
+
+**Fixed**
+
+- A recording whose start hits an error is tried again every minute until its stop time and
+  says why, instead of staying Scheduled and later being called missed. One that hits an
+  error after it has started gives back its connection and resumes a minute later.
+- Stopping or restarting ChannelBin no longer logs errors for jobs that came due as it shut
+  down.
+- A provider's clock reset some time after a reconnect is no longer reported as that
+  reconnect's replayed content, and a reset closed once per stream is one reset whose gap is
+  repaired at the join.
+- A capture restarted because its picture stopped no longer marks the recording as out of
+  step, raises an alert or costs the channel health score.
+- A short sound jump just after a repaired reconnect gap is named on the recording instead of
+  the file being reported as playing straight through.
+- A typed HLS address keeps the quality it started on when the capture restarts.
+- After Cancel recording, the TV Guide no longer goes back to showing it as Scheduled.
+- Sports matching no longer reads `Texas` in `Texas Tech at Kansas State`, records a game
+  named only on a duplicate copy of an event channel from the kept copy, matches college
+  football on a new install, and no longer stalls while TheSportsDB answers keep arriving.
+- The "not found by name" note on a league's page counts only lookups for games still ahead.
+- Adding a category no longer lets a mistimed tap mark a neighboring one as Replays only, and
+  says when Replays only arrived on.
+- Deleting a channel no longer leaves its id on an auto-record rule's history, Recent plays or
+  the EPG similarity scan.
+- A malformed number in a request no longer causes a server error.
+
 ## 0.42.0 - 2026-11-16
 
 The IPTV Output page, and sports channels for your IPTV player.

@@ -157,7 +157,7 @@ def profile_summary(video_codec, bit_depth, chroma_subsampling, interlaced, is_v
         height = None
         if resolution and 'x' in str(resolution):
             tail = str(resolution).split('x')[-1].strip()
-            if tail.isdigit():
+            if tail.isdecimal():
                 height = tail
         parts.append(f'{height}i' if height else 'Interlaced')
     if is_vfr:

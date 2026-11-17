@@ -11,7 +11,7 @@ from typing import NamedTuple
 
 from .database import (
     add_recording_event, CAPTURE_GAVE_UP, REC_STATUS_FAILED, REC_STATUS_RETRYING,
-    WINDOW_OPEN_STATUSES,
+    SEGMENT_EXIT_VIDEO_STOPPED, WINDOW_OPEN_STATUSES,
     FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED, FAILURE_FAST_DELIVERY_DETECTED,
 )
 from .db_utils import retry_on_locked
@@ -666,7 +666,7 @@ class WatchdogThread(threading.Thread):
                                         budget, window_seconds, None, True)
                                     terminate_or_kill(self.state.process)
                                     _close_active_segment(self.app, self.recording_id,
-                                                          exit_reason='VIDEO_STOPPED')
+                                                          exit_reason=SEGMENT_EXIT_VIDEO_STOPPED)
                                     member_video_stop_times = []
                                     member_video_stop_channel_id = None
                                     member_stall_times = []
@@ -873,7 +873,7 @@ class WatchdogThread(threading.Thread):
                         # cannot give. Every state is named - a trailing else that rendered
                         # one of them would swallow the next one added.
                         if video_restart:
-                            exit_reason = 'VIDEO_STOPPED'
+                            exit_reason = SEGMENT_EXIT_VIDEO_STOPPED
                             stall_reason = 'video_stopped'
                             stall_detail = None  # CAPTURE_VIDEO_STOPPED already said so
                         elif fast_delivery is not None:
