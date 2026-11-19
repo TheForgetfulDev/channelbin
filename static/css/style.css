@@ -1557,6 +1557,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .ch-pill:hover, .rows .row:hover .ch-pill { background: var(--bg3); text-decoration: none; }
 .ch-pill .acct-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 .ch-pill.acct-pill { padding: 1px 9px; }
+/* A channel's name as a link inside running text, beside its account pill: the text's own color,
+   the accent on hover (the IPTV Output page, a game's listings dialog). */
+.name-link { color: inherit; }
+.name-link:hover { color: var(--accent-text); }
 /* channel logo: Channel.logo_url image, or colored-initials fallback */
 .ch-pill .ch-logo {
   min-width: 16px; height: 16px; padding: 0 3px; border-radius: var(--radius-sm); flex: 0 0 auto;
@@ -3233,6 +3237,12 @@ th.gd-c-part { text-align: center; }
    shows, so the Select chip is not offered here; the note says a wider window has the bulk
    actions. */
 .gd-cards-for-room #gd-chip-select { display: none; }
+/* The kebab's Preview row is for the phone's overflow sheet only; above the phone breakpoint the
+   bar's Preview button is the one control. One more class than the shared `.menu button.menu-item`
+   rule, which sets display (the channel page's .cd-phone-only, dev/changelog/1018). */
+@media (min-width: 961px) {
+  .menu button.menu-item.gd-phone-only { display: none; }
+}
 .gd-room-note { margin-left: auto; font-size: var(--fs-sm); color: var(--text-muted); }
 
 /* ── Responsive ────────────────────────────────────────────────────── */
@@ -4838,8 +4848,6 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   color: var(--text); font: inherit; font-size: var(--fs-md); text-align: left; cursor: pointer;
 }
 .sp-pick:hover { background: var(--bg2); border-color: var(--border-soft); }
-.sp-pick[disabled] { cursor: default; color: var(--text-muted); }
-.sp-pick[disabled]:hover { background: none; border-color: transparent; }
 .sp-pick .meta { color: var(--text-muted); font-size: var(--fs-sm); flex: none; }
 .sp-lookup { margin-top: 10px; }
 .sp-entry-group { margin-bottom: 0; }
@@ -4849,7 +4857,11 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .sp-msg.warn { color: var(--warn); }
 .sp-confirm-name { font-size: var(--fs-lg); font-weight: 600; }
 .sp-confirm-sub { font-size: var(--fs-sm); color: var(--text-muted); margin-top: 2px; }
-.sp-teams-note { margin-bottom: 8px; }
+/* The team picker (mockup 60, dev/changelog/1641): the chips sit where the ticked list sits for a
+   league with games, and why its button is disabled is a .notice-warn, whose bottom margin is a page's. */
+.sp-chosen { margin-top: 8px; }
+.sp-chosen + .sp-addterm { margin-top: 8px; }
+.sp-msg.notice { margin-bottom: 0; }
 .sp-team-filter { margin-top: 6px; }
 .sp-teams { max-height: 260px; overflow-y: auto; margin-top: 8px; padding-right: 4px; }
 .sp-radio { display: flex; align-items: center; gap: .5rem; min-height: var(--ctl-h); font-size: var(--fs-md); }
@@ -4900,10 +4912,12 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .sp-cat { display: block; color: var(--text-faint); font-size: var(--fs-xs); }
 .sp-rej { color: var(--text-muted); font-size: var(--fs-sm); }
 .sp-foot { margin-top: 12px; color: var(--text-muted); font-size: var(--fs-sm); }
-/* Event channels (design 6.8): one row per channel, its name, category and why it matched. A
-   provider's event name runs past 100 characters, so it wraps anywhere rather than widening the row. */
+/* A channel's name in the listings dialog wraps anywhere rather than widening its row: an event
+   channel's name runs past 100 characters, and a listing's channel can be one unbroken run like
+   "GREENVILLE/SPARTANBURG/ASHEVILLE", which pushed the row past a 375px dialog (dev/changelog/1638).
+   Event channels (design 6.8): one row per channel, its name, category and why it matched. */
 .sp-enames { border-top: 1px solid var(--border-soft); }
-.sp-ename .sp-cname { min-width: 0; overflow-wrap: anywhere; }
+.sp-chan .sp-cname { min-width: 0; overflow-wrap: anywhere; }
 .sp-ename .sp-why { display: block; margin: 2px 0 0; }
 
 /* Matching your guide: the league's names and its categories (design 5.1, 5.2). Its explainer runs
@@ -4947,7 +4961,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   .sp-pager .sp-next { margin-left: auto; }
   .sp-feed-tools .search-wrap, .sp-feed-tools .search { width: 100%; }
   .sp-kebab { width: auto; text-align: left; }
-  .sp-acts { display: flex; }
+  .sp-acts { display: flex; flex-wrap: wrap; row-gap: 6px; }
   .sp-addterm { width: 100%; }
   .sp-addterm .form-control { flex: 1; width: auto; }
   .sp-chan { align-items: flex-start; }
@@ -5033,16 +5047,15 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .of-tools select.form-control { flex: 0 1 220px; width: auto; height: var(--ctl-h); }
 .of-tools .rl-filter { margin: 0; }
 .of-num { width: 1%; white-space: nowrap; color: var(--text-muted); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-.of-sw { width: 1%; white-space: nowrap; }
-/* A row that is off stays in the list, quieter, with its switch at full strength. */
-.of-off td:not(.of-sw) { opacity: .55; }
+.of-sw, .of-prev { width: 1%; white-space: nowrap; }
+/* A row that is off stays in the list, quieter, with its switch and its Preview at full strength. */
+.of-off td:not(.of-sw):not(.of-prev) { opacity: .55; }
 .of-plays .ch-pill { margin-left: 6px; vertical-align: baseline; }
 .of-plays .ch-pill:first-child { margin-left: 0; }
-.of-link { color: inherit; }
-/* Go live now under a sports row's game (dev/changelog/1530). */
-.of-live { display: block; margin-top: 6px; }
-.of-live .s { margin-bottom: 4px; }
-.of-link:hover { color: var(--accent-text); }
+/* Start broadcast under a sports row's game (dev/changelog/1530, 1644), and Channel it would use beside it
+   (dev/changelog/1639), wrapping under it on a narrow row. Its sentence takes a line of its own. */
+.of-live { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+.of-live .s { flex-basis: 100%; margin-bottom: -2px; }
 .of-pager { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 .of-pager-n { color: var(--text-muted); font-size: var(--fs-sm); margin-right: 4px; }
 
@@ -5070,7 +5083,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 @media (max-width: 960px) {
   .of-conn { flex-wrap: wrap; gap: 4px 10px; }
   .of-conn .k { flex-basis: 100%; }
-  .of-num, .of-sw { width: auto; }
+  .of-num, .of-sw, .of-prev { width: auto; }
   .of-tools .search { max-width: none; }
   /* The notice's button goes under its sentence, which had a word or two to a line beside it. */
   .of-addr { flex-direction: column; }

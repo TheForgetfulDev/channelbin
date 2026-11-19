@@ -375,8 +375,7 @@ function schedSummaryHtml(all) {
   }
   if (by(SCHED_VERDICTS.UNRELATED).length) parts.push(`<strong>${by(SCHED_VERDICTS.UNRELATED).length}</strong> unrelated`);
   if (by(SCHED_VERDICTS.NO_OVERLAP).length) parts.push(`<strong>${by(SCHED_VERDICTS.NO_OVERLAP).length}</strong> with no listings`);
-  const tail = parts.length > 1
-    ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts.join('');
+  const tail = joinLabels(parts);
   return `<strong>${escHtml(counted(all.length, 'schedule'))}</strong> across ` +
     `${escHtml(counted(channels, 'channel'))}${tail ? `: ${tail}` : ''}.`;
 }

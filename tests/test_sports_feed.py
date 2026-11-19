@@ -3,8 +3,9 @@ app/routes/sports.py, dev/changelog/1517 and 1518).
 
 Covers which channels are served (a team's switch, the follow it needs, a row and its feed id
 kept through off and on, a league's teardown), the guide (a game's time from the guide's own
-listing, the note when nothing lists it, what has no time), a play (only a channel whose guide
-lists the game now, ranked by health, refused by name with no alert when nothing is on), a
+listing, the note when nothing lists it, what has no time), a play (a channel whose guide lists
+the game now, ranked by health, else for a game no guide lists the channel whose name Record would
+record it from, refused by name with no alert when nothing is on), a
 league's numbered channels (placed once, never moved, only growing), the league page's card and
 the dashboard's refused plays. Made-up leagues and teams; a throwaway temp SQLite database.
 
@@ -21,7 +22,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
-from tests.support.seed import make_account, make_channel  # noqa: E402
+from tests.support.seed import make_account, make_channel, make_guide_match  # noqa: E402
 
 import app.output_feed as feed  # noqa: E402
 from app import db, sports_data, sports_feed, sports_match  # noqa: E402
@@ -79,15 +80,7 @@ class _Case(unittest.TestCase):
         return ch
 
     def listing(self, event, channel, start=None, hours=3.0, **kw):
-        start = start or event.start_at
-        fields = dict(kind='guide', strength='strong', airing='first', title_key='pfl football',
-                      program_title='PFL Football', reason='Matched on the league and both teams.')
-        fields.update(kw)
-        m = SportsMatch(event_id=event.id, channel_id=channel.id, program_start_time=start,
-                        program_stop_time=start + timedelta(hours=hours), **fields)
-        db.session.add(m)
-        db.session.flush()
-        return m
+        return make_guide_match(event, channel, start, hours, **kw)
 
     def team_on(self, team=BEARS):
         self.assertTrue(sports_feed.set_team_channel(self.league.id, team, True))
@@ -598,7 +591,7 @@ class WindowTests(_Case):
 
 
 class LiveNowTests(_Case):
-    """Go live now (dev/changelog/1530): a person opens one game early, and every sports channel
+    """Start broadcast (dev/changelog/1530, Go live now until 1644): a person opens one game early, and every sports channel
     carrying it plays it ahead of its window until the end fixed when the button was pressed,
     which is `sports_after_minutes` (120 by default) past the end of its listings."""
 
@@ -625,7 +618,7 @@ class LiveNowTests(_Case):
         resp = self.play(fid)
         self.assertEqual(resp.status_code, 302, resp.get_data(as_text=True))
         self.assertEqual(resp.headers['Location'], ch.stream_url)
-        self.assertRegex(feed.resolve_play(fid).note, r'^Go live now is on; its listing starts (Today|Tomorrow) ')
+        self.assertRegex(feed.resolve_play(fid).note, r'^broadcasting early; its listing starts (Today|Tomorrow) ')
 
     def test_it_reaches_every_sports_channel_carrying_the_game(self):
         bears, gulls = self.fid(BEARS), self.fid(GULLS)
@@ -686,7 +679,7 @@ class LiveNowTests(_Case):
         self.press(e)
         resp = self.press(e, on=False)
         self.assertEqual(resp.status_code, 200)
-        self.assertIn('off', resp.get_json()['message'])
+        self.assertEqual(resp.get_json()['message'], 'Stopped the early broadcast of Harborview Gulls at Ironvale Bears.')
         self.nothing_on(fid)
         db.session.expire_all()
         stored = db.session.get(SportsEvent, e.id)
@@ -725,9 +718,9 @@ class LiveNowTests(_Case):
         self.assertIn('&#34;Ironvale Bears&#34;', html, 'the confirm lists every sports channel it plays on')
         self.press(e)
         html = self.client.get('/iptv-output').get_data(as_text=True)
-        self.assertIn('Turn off Go live now', html)
+        self.assertIn('Stop broadcast', html)
         self.assertIn('playing ahead of its listing', html)
-        self.assertRegex(html, r'Go live now is on for Harborview Gulls at Ironvale Bears until (today|tomorrow) at ')
+        self.assertRegex(html, r'Broadcasting Harborview Gulls at Ironvale Bears early, until (today|tomorrow) at ')
 
     def test_a_game_opened_early_whose_listing_went_says_so(self):
         fid = self.fid()
@@ -735,8 +728,8 @@ class LiveNowTests(_Case):
         self.press(e)
         SportsMatch.query.filter_by(event_id=e.id).delete()
         db.session.commit()
-        self.assertIn("Go live now is on for Harborview Gulls at Ironvale Bears, but no channel's guide "
-                      'lists it any more', self.nothing_on(fid))
+        self.assertIn("Harborview Gulls at Ironvale Bears was started early with Start broadcast, but no "
+                      "channel's guide lists it any more", self.nothing_on(fid))
 
     def test_a_game_whose_listings_all_ended_is_not_called_unlisted(self):
         self.fid()
@@ -762,7 +755,7 @@ class LiveNowTests(_Case):
         self.fid()
         e, _ch = self.far_game()
         self.assertRegex(self.press(e).get_json()['message'],
-                         r'^Go live now is on for Harborview Gulls at Ironvale Bears until (today|tomorrow) at ')
+                         r'^Broadcasting Harborview Gulls at Ironvale Bears early, until (today|tomorrow) at ')
 
     def test_the_iptv_output_page_offers_nothing_while_a_game_is_on(self):
         self.t.sandbox_config(_feed_cfg(mode='proxy'))
@@ -775,9 +768,11 @@ class LiveNowTests(_Case):
         html = self.client.get('/iptv-output').get_data(as_text=True)
         self.assertIn('Harborview Gulls at Ironvale Bears, on now', html)
         self.assertNotIn('data-act="live-now"', html)
-        self.assertNotIn('>Go live now<', html)
+        self.assertNotIn('>Start broadcast<', html)
 
-    def test_the_iptv_output_page_follows_an_opened_game_into_its_listing(self):
+    def test_the_iptv_output_page_follows_a_started_game_into_its_listing_and_drops_stop(self):
+        """Once the game's own time on air has come, the channel plays it by itself, so Stop
+        broadcast would stop nothing and is not offered (dev/changelog/1644)."""
         self.t.sandbox_config(_feed_cfg(mode='proxy'))
         fid = self.fid()
         e, ch = self.far_game(hours=5)
@@ -791,7 +786,10 @@ class LiveNowTests(_Case):
         html = self.client.get('/iptv-output').get_data(as_text=True)
         self.assertIn('Harborview Gulls at Ironvale Bears, on now', html)
         self.assertNotIn('playing ahead of its listing', html)
-        self.assertIn('Turn off Go live now', html, 'it is still on, so it can still be turned off')
+        self.assertNotIn('Stop broadcast', html, 'its own time has come, so stopping would change nothing')
+        self.assertNotIn('Broadcasting Harborview Gulls', html)
+        db.session.expire_all()
+        self.assertIsNotNone(db.session.get(SportsEvent, e.id).live_now_until, 'the switch itself stays stored')
 
     def test_the_iptv_output_page_says_why_when_the_next_game_has_no_listing(self):
         self.t.sandbox_config(_feed_cfg(mode='proxy'))
@@ -801,9 +799,9 @@ class LiveNowTests(_Case):
         html = self.client.get('/iptv-output').get_data(as_text=True)
         # A greyed button that keeps its tap to say why, as on the league page: a tip on a
         # disabled button is out of a phone's reach.
-        self.assertRegex(html, r'<button class="btn btn-sm disabled" data-act="live-now"[^>]*aria-disabled="true" '
+        self.assertRegex(html, r'<button class="btn btn-sm disabled tip-plain" data-act="live-now"[^>]*aria-disabled="true" '
                                r'data-why="No channel&#39;s guide lists Harborview Gulls at Ironvale Bears yet')
-        self.assertNotIn('disabled>Go live now', html)
+        self.assertNotIn('disabled>Start broadcast', html)
 
     def test_the_league_page_offers_it_only_for_a_game_found_in_the_guide(self):
         self.fid()
@@ -819,8 +817,53 @@ class LiveNowTests(_Case):
         self.press(e)
         html = self.client.get(f'/sports/{self.league.id}').get_data(as_text=True)
         self.assertIn(f'data-event="{e.id}" data-on="1"', html)
-        self.assertIn('Turn off Go live now', html)
-        self.assertRegex(html, r'Go live now is on until (today|tomorrow) at [^,]+, on Ironvale Bears<')
+        self.assertIn('Stop broadcast', html)
+        self.assertRegex(html, r'Broadcasting early until (today|tomorrow) at [^,]+, on Ironvale Bears<')
+
+
+    def test_the_tooltip_says_how_far_ahead_a_channel_goes_on_air_by_itself(self):
+        """The lead in Start broadcast's and Stop broadcast's tooltips is the play's own
+        sports_before_minutes, never a typed number (dev/changelog/1644)."""
+        self.fid(BEARS)
+        e, _ch = self.far_game()
+        for minutes, words in ((90, '1 hour 30 minutes before it starts'), (0, 'when it starts')):
+            self.t.sandbox_config(_feed_cfg(mode='proxy', sports_before_minutes=minutes))
+            html = self.client.get('/iptv-output').get_data(as_text=True)
+            self.assertIn(f'data-tip="A sports channel goes on air for Harborview Gulls at Ironvale Bears by '
+                          f'itself {words}. Start broadcast puts it on air now."', html)
+            league = self.client.get(f'/sports/{self.league.id}').get_data(as_text=True)
+            self.assertIn(f'by itself {words}. Start broadcast puts it on air now."', league)
+        self.t.sandbox_config(_feed_cfg(mode='proxy', sports_before_minutes=45))
+        self.press(e)
+        html = self.client.get('/iptv-output').get_data(as_text=True)
+        self.assertIn('data-tip="Stop broadcast takes the sports channel back to its own schedule, so it goes on '
+                      'air for Harborview Gulls at Ironvale Bears 45 minutes before it starts."', html)
+
+    def test_the_league_page_offers_neither_button_once_the_games_own_time_has_come(self):
+        """Inside `sports_before_minutes` of its listing a game is on air by itself: Start
+        broadcast would start nothing, and one started earlier has no Stop (dev/changelog/1644)."""
+        self.t.sandbox_config(_feed_cfg(mode='proxy', sports_before_minutes=60))
+        self.fid()
+        near = self.event(BEARS, GULLS, self.now + timedelta(minutes=40))
+        self.listing(near, self.channel('Local 7'))
+        started = self.event(COMETS, BEARS, self.now + timedelta(hours=5))
+        self.listing(started, self.channel('Local 8'))
+        db.session.commit()
+        self.assertEqual(self.press(started).status_code, 200)
+        html = self.client.get(f'/sports/{self.league.id}').get_data(as_text=True)
+        self.assertNotIn(f'data-act="live-now" data-event="{near.id}"', html)
+        self.assertIn(f'data-act="live-now" data-event="{started.id}" data-on="1"', html)
+        db.session.expire_all()
+        started = db.session.get(SportsEvent, started.id)
+
+        def offer_at(at):
+            listings = sports_match.listing_windows([started.id], at).get(started.id, ())
+            return sports_feed.live_now_offer(started, listings, ['Ironvale Bears'], at, timedelta(hours=1),
+                                              timedelta(hours=2), ZoneInfo('America/New_York'), False)
+
+        self.assertIsNotNone(offer_at(self.now + timedelta(hours=3)), 'two hours ahead, the early start holds it')
+        self.assertIsNone(offer_at(self.now + timedelta(hours=4, minutes=30)),
+                          'half an hour before its listing, inside the hour it goes on air by itself')
 
 
 class LeagueChannelTests(_Case):
@@ -1148,6 +1191,175 @@ class PageTests(_Case):
         html = self.client.get('/').get_data(as_text=True)
         self.assertIn('not allowed to serve from', html)
         self.assertEqual(feed.bundle_facts()['recent_refused'][0]['feed_id'], feed.SPORTS_FEED_BASE + row.id)
+
+
+class NameTests(_Case):
+    """A game no guide lists that an event channel's name gives (dev/changelog/1643): its sports
+    channel plays it from the channel Record would record it from, its guide lists it at the
+    pick's times, and Go live now opens it, each saying the stream came from a channel's name."""
+
+    def named(self, event, name, start, score=50.0, account=None):
+        ch = self.channel(name, score=score, account=account)
+        db.session.add(SportsMatch(event_id=event.id, channel_id=ch.id, kind='channel_name', strength='strong',
+                                   airing='unknown', program_start_time=start, title_key=name.lower(),
+                                   reason=f'{sports_match._NAME_PREFIX}: matched on the league and both teams.'))
+        db.session.commit()
+        return ch
+
+    def fid(self, team=BEARS):
+        return feed.SPORTS_FEED_BASE + self.team_on(team).id
+
+    def test_a_game_only_a_name_gives_plays_from_that_channel_and_says_so(self):
+        fid = self.fid()
+        e = self.event(BEARS, GULLS, self.now - timedelta(minutes=30))
+        ch = self.named(e, 'PFL 01: Gulls @ Bears 7:00 PM ET', e.start_at)
+        # Asked first, so a play that would fall to the waiting screen fails here rather than
+        # making its clip.
+        self.assertEqual(getattr(feed.resolve_play(fid).member, 'id', None), ch.id)
+        resp = self.play(fid)
+        self.assertEqual(resp.status_code, 302, resp.get_data(as_text=True))
+        self.assertEqual(resp.headers['Location'], ch.stream_url)
+        label = feed.recent_redirects()[0]['label']
+        self.assertIn("Harborview Gulls at Ironvale Bears, from a channel's name", label)
+        self.assertIn(sports_feed.FROM_NAME_NOTE, label)
+
+    def test_any_listing_means_no_name_is_read(self):
+        """A weak listing is one Record will not pick from and will not pass over for a name
+        either (WHY_UNSURE), so neither does the sports channel."""
+        fid = self.fid()
+        e = self.event(BEARS, GULLS, self.now - timedelta(minutes=30))
+        self.listing(e, self.channel('Weak'), strength='weak')
+        self.named(e, 'PFL 01: Gulls @ Bears', e.start_at)
+        self.assertIn('no stream is found yet', self.nothing_on(fid))
+
+    def test_a_play_walks_on_down_the_channels_naming_it_in_records_order(self):
+        """The name with a time zone first, as event_pick() takes it, then the others."""
+        fid = self.fid()
+        e = self.event(BEARS, GULLS, self.now - timedelta(minutes=30))
+        bare = self.named(e, 'PFL 02: Gulls @ Bears', None, score=99.0)
+        clock = self.named(e, 'PFL 01: Gulls @ Bears 7:00 PM ET', e.start_at, score=10.0)
+        self.assertEqual(feed.resolve_play(fid).member.id, clock.id)
+        held = feed.resolve_play(fid, event_id=e.id, exclude_ids=frozenset({clock.id}))
+        self.assertEqual(held.member.id, bare.id)
+        done = feed.resolve_play(fid, event_id=e.id, exclude_ids=frozenset({clock.id, bare.id}))
+        self.assertIsNone(done.member)
+        self.assertIn('every channel whose name mentions Harborview Gulls at Ironvale Bears already failed',
+                      done.why_none)
+
+    def test_it_plays_from_the_window_before_its_start_to_the_picks_end_and_no_further(self):
+        fid = self.fid()
+        start = self.now + timedelta(minutes=40)
+        e = self.event(BEARS, GULLS, start)
+        ch = self.named(e, 'PFL 01: Gulls @ Bears 7:00 PM ET', start)
+        early = feed.resolve_play(fid)
+        self.assertEqual(early.member.id, ch.id)
+        self.assertRegex(early.note, r'plays from a channel whose name mentions it; it starts (Today|Tomorrow) ')
+        self.assertIsNone(feed.resolve_play(fid, now=start - timedelta(minutes=61)).member)
+        stop = start + timedelta(hours=4)
+        self.assertEqual(feed.resolve_play(fid, now=stop - timedelta(minutes=1)).member.id, ch.id)
+        self.assertIsNone(feed.resolve_play(fid, now=stop).member, 'Record calls it over at the pick\'s end')
+
+    def test_a_name_only_game_on_now_beats_another_games_tail_and_pregame(self):
+        """_pick()'s own order across both sources: on now beats running long and starting soon, so
+        a game on the air is never cut for another game's listing."""
+        fid = self.fid()
+        before = self.event(BEARS, GULLS, self.now - timedelta(hours=3, minutes=40))
+        self.listing(before, self.channel('Carried the last one', score=99.0), hours=3.5)
+        on = self.event(COMETS, BEARS, self.now - timedelta(minutes=5))
+        ch = self.named(on, 'PFL 03: Bears @ Comets 7:00 PM ET', on.start_at)
+        self.assertEqual(feed.resolve_play(fid).member.id, ch.id, 'not the tail of the game before')
+        coming = self.event(BEARS, PANTHERS, self.now + timedelta(minutes=30))
+        self.listing(coming, self.channel('Pregame', score=99.0), start=self.now + timedelta(minutes=30))
+        db.session.commit()
+        self.assertEqual(feed.resolve_play(fid).member.id, ch.id, 'not the next game\'s pregame')
+
+    def test_the_picks_end_is_records_whatever_was_on_yesterday(self):
+        """A pick's length is the league's longest listing among the games read, so the play reads
+        them over the same day back that Record does (auto_rules.PICK_LOOKBACK)."""
+        fid = self.fid()
+        old = self.event(PANTHERS, COMETS, self.now - timedelta(hours=18))
+        self.listing(old, self.channel('Yesterday'), hours=5)
+        e = self.event(BEARS, GULLS, self.now - timedelta(hours=4, minutes=30))
+        ch = self.named(e, 'PFL 01: Gulls @ Bears 7:00 PM ET', e.start_at)
+        from app import auto_rules
+        self.assertEqual(auto_rules.game_pick(e.id, self.now).event.stop, e.start_at + timedelta(hours=5))
+        self.assertEqual(feed.resolve_play(fid).member.id, ch.id)
+
+    def test_a_race_only_a_name_gives_a_time_gets_a_league_channel_and_plays(self):
+        """A field event at TheSportsDB's 00:00 placeholder that no guide lists has only the name's
+        clock to be laid out by, and the play reads it a day back from that placeholder."""
+        self.league.feed_league_channels = True
+        db.session.commit()
+        midnight = self.now.replace(hour=0, minute=0)
+        race = SportsEvent(tsdb_id=7998, league_id=self.league.id, name='Grand Prix', start_at=midnight,
+                           local_date=midnight.date())
+        db.session.add(race)
+        db.session.flush()
+        start = max(self.now - timedelta(minutes=30), midnight + timedelta(minutes=1))
+        ch = self.named(race, 'PFL GP: Grand Prix 3:00 PM ET', start)
+        self.assertEqual(sports_feed.place_league_events(self.league, self.now), 1)
+        db.session.commit()
+        self.assertEqual(db.session.get(SportsEvent, race.id).feed_number, 1)
+        row = SportsFeedChannel.query.filter_by(league_id=self.league.id, number=1).one()
+        self.assertIn('Pretend League 1', [s['name'] for s in self.streams()])
+        self.assertEqual(feed.resolve_play(feed.SPORTS_FEED_BASE + row.id).member.id, ch.id)
+
+    def test_the_guide_lists_it_at_the_picks_times_and_says_where_it_plays_from(self):
+        row = self.team_on(BEARS)
+        start = self.now + timedelta(hours=2)
+        e = self.event(BEARS, GULLS, start)
+        clock = start + timedelta(minutes=15)
+        self.named(e, 'PFL 01: Gulls @ Bears 7:15 PM ET', clock)
+        fid = feed.SPORTS_FEED_BASE + row.id
+        xml = self.get('/xmltv.php').get_data(as_text=True)
+        stop = clock + timedelta(hours=4)
+        self.assertIn(f'<programme start="{clock:%Y%m%d%H%M%S} +0000" stop="{stop:%Y%m%d%H%M%S} +0000" '
+                      f'channel="{fid}"><title>Harborview Gulls at Ironvale Bears</title>', xml)
+        self.assertIn('No guide lists this, so ChannelBin plays it from the channel whose name mentions it.', xml)
+        when = sports_feed.next_game_words(e, clock, self.now, ZoneInfo('America/New_York'), False)
+        self.assertIn(f'Next: {when}', xml)
+        self.assertIn('ChannelBin plays it from a channel whose name mentions it, since no guide lists it.', xml)
+
+    def test_the_guide_says_when_its_only_channel_is_on_an_account_the_output_cannot_use(self):
+        self.team_on(BEARS)
+        e = self.event(BEARS, GULLS, self.now + timedelta(hours=2))
+        self.named(e, 'PFL 01: Gulls @ Bears 7:00 PM ET', e.start_at)
+        self.t.sandbox_config(_feed_cfg(accounts=[self.account.id + 50]))
+        xml = self.get('/xmltv.php').get_data(as_text=True)
+        self.assertIn('No stream it can play: no guide lists this, and the 1 channel whose name mentions it is on '
+                      'an account that is blocked', xml)
+
+    def test_go_live_now_opens_it_until_the_picks_end(self):
+        fid = self.fid()
+        start = self.now + timedelta(hours=5)
+        e = self.event(BEARS, GULLS, start)
+        ch = self.named(e, 'PFL 01: Gulls @ Bears 7:00 PM ET', start)
+        self.nothing_on(fid)
+        resp = self.client.put(f'/api/sports/events/{e.id}/live-now', json={'on': True})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        db.session.expire_all()
+        self.assertEqual(db.session.get(SportsEvent, e.id).live_now_until, start + timedelta(hours=4))
+        play = feed.resolve_play(fid)
+        self.assertEqual(play.member.id, ch.id)
+        self.assertRegex(play.note, r'^broadcasting early; no guide lists it, so it plays from a channel whose name')
+
+    def test_start_broadcast_is_refused_when_every_channel_naming_it_is_off_limits(self):
+        self.fid()
+        e = self.event(BEARS, GULLS, self.now + timedelta(hours=5))
+        self.named(e, 'PFL 01: Gulls @ Bears 7:00 PM ET', e.start_at)
+        self.t.sandbox_config(_feed_cfg(accounts=[self.account.id + 50]))
+        resp = self.client.put(f'/api/sports/events/{e.id}/live-now', json={'on': True})
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn('Every channel whose name mentions Harborview Gulls at Ironvale Bears is on an account',
+                      resp.get_json()['error'])
+
+    def test_the_iptv_output_page_shows_it_on_now_with_where_it_plays_from(self):
+        self.team_on(BEARS)
+        e = self.event(BEARS, GULLS, self.now - timedelta(minutes=30))
+        self.named(e, 'PFL 01: Gulls @ Bears 7:00 PM ET', e.start_at)
+        html = self.client.get('/iptv-output').get_data(as_text=True)
+        self.assertIn('No guide lists this, so ChannelBin plays it from the channel whose name mentions it.', html)
+        self.assertNotIn('no channel to show', html)
 
 
 class MatchReaderTests(_Case):

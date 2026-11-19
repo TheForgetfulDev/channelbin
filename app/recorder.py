@@ -872,8 +872,10 @@ def _busy_channel_ids(exclude_recording_id: int) -> set:
     return {r[0] for r in rows}
 
 
-def _busy_account_channel_ids(members, exclude_recording_id: int) -> set:
-    """Of `members`, the channel ids whose account has no free connection slot right now.
+def _busy_account_channel_ids(members, exclude_recording_id: int) -> tuple:
+    """(the channel ids of `members` whose account has no connection slot a recording could
+    take right now, the ones whose account has one only by cutting off an IPTV player on the
+    output feed) - connection_limits.seat_standing(), the answer the output's own pick reads.
 
     The account-level sibling of the busy-channel rule above, and the same shape: prefer
     a member the recording can start on immediately, fall back to one it cannot when
@@ -882,16 +884,32 @@ def _busy_account_channel_ids(members, exclude_recording_id: int) -> set:
     it costs capture time, because the start waits for a slot instead of connecting. So a
     group spanning several accounts rolls over to an idle one rather than queueing behind
     a busy one, and waiting is what is left when every eligible member is on a full
-    account (dev/changelog/855).
+    account (dev/changelog/855). An account an IPTV player holds sits between the two: the
+    recording connects at once there, but cuts the player off, so an empty account is taken
+    first (dev/changelog/1642).
 
     The recording's own slot is discounted: at failover it already holds one on its
     current account, and a same-account swap keeps that slot rather than competing for it.
     """
     from . import connection_limits as connlim
-    full = connlim.accounts_without_free_recording_slot(
-        {ch.account_id for ch in members},
-        exclude_holder=('recording', exclude_recording_id))
-    return {ch.id for ch in members if ch.account_id in full}
+    standing = connlim.seat_standing({ch.account_id for ch in members}, 'recording',
+                                     exclude_holder=('recording', exclude_recording_id))
+    full = {ch.id for ch in members if standing.get(ch.account_id) == connlim.SEAT_NONE}
+    viewer = {ch.id for ch in members
+              if standing.get(ch.account_id) == connlim.SEAT_BY_CUTTING_VIEWER}
+    return full, viewer
+
+
+def _viewer_account_note(best, took: bool, skipped) -> str:
+    """The member-selection event's clause about IPTV players on the output feed: the
+    connection it takes from one, or the members it passed over so as not to, or ''."""
+    if took:
+        return (f' - no member on an account with a connection nobody is using, so it takes '
+                f'the one an IPTV player is watching on "{best.account.name}"')
+    if skipped:
+        return (' - passed over member(s) on an account an IPTV player is watching on, so '
+                'as not to cut it off: ' + ', '.join(f'"{ch.name}"' for ch in skipped))
+    return ''
 
 
 def start_recording(app, recording_id: int):
@@ -1011,10 +1029,20 @@ def start_recording(app, recording_id: int):
             # Two preferences, relaxed one at a time and both applied HERE, after the
             # format filter - so neither can empty the candidate list ahead of the
             # format lock's own zero-survivors override (dev/changelog/754).
-            busy_account = _busy_account_channel_ids(members, recording_id)
+            busy_account, viewer_account = _busy_account_channel_ids(members, recording_id)
             best = pick_best_member(members, latest_by_channel,
-                                    exclude_ids=busy | busy_account,
+                                    exclude_ids=busy | busy_account | viewer_account,
                                     streak_threshold=streak_threshold)
+            if best is not None and viewer_account and is_streaking(best, streak_threshold):
+                # Sparing an IPTV player never sends a recording to a feed the health checks
+                # say is down: the recording always wins (DESIGN-output-feed.md 4.4).
+                best = None
+            if best is None:
+                # Nothing on an empty account. Cut off an IPTV player before waiting: the
+                # recording is what the app is for (DESIGN-output-feed.md 4.4).
+                best = pick_best_member(members, latest_by_channel,
+                                        exclude_ids=busy | busy_account,
+                                        streak_threshold=streak_threshold)
             if best is None:
                 # Nothing on an account with a free slot. Take a free *channel* on a
                 # full account and wait for the slot rather than handing off a live
@@ -1029,11 +1057,15 @@ def start_recording(app, recording_id: int):
             # read the same way by the note and by the event's extra_data.
             took_busy = best is not None and best.id in busy
             took_busy_account = best is not None and best.id in busy_account
+            took_viewer_account = best is not None and best.id in viewer_account
             if best is not None:
                 from .accounts import normalize_url
                 skipped_busy = [ch for ch in members if ch.id in busy and ch.id != best.id]
                 skipped_busy_account = [ch for ch in members if ch.id in busy_account
                                         and ch.id not in busy and ch.id != best.id]
+                skipped_viewer_account = [] if took_busy_account else [
+                    ch for ch in members if ch.id in viewer_account
+                    and ch.id not in busy and ch.id != best.id]
                 if took_busy:
                     busy_note = (' - channel is busy with another recording but no free '
                                  'active channel exists; taking it (same-channel handoff)')
@@ -1048,6 +1080,8 @@ def start_recording(app, recording_id: int):
                 elif skipped_busy_account:
                     busy_note += (' - rolled over to a free account, past: '
                                   + ', '.join(f'"{ch.name}"' for ch in skipped_busy_account))
+                busy_note += _viewer_account_note(best, took_viewer_account,
+                                                  skipped_viewer_account)
                 if skipped_blocked:
                     busy_note += (' - skipped member(s) on a blocked account: '
                                   + ', '.join(f'"{ch.name}" ({ch.account.name})'
@@ -1095,6 +1129,9 @@ def start_recording(app, recording_id: int):
                                    'took_busy_account': took_busy_account,
                                    'skipped_busy_account_channel_ids': [
                                        ch.id for ch in skipped_busy_account],
+                                   'took_viewer_account': took_viewer_account,
+                                   'skipped_viewer_account_channel_ids': [
+                                       ch.id for ch in skipped_viewer_account],
                                    'skipped_blocked_channel_ids': [
                                        ch.id for ch in skipped_blocked]})
                     if override_detail and not repeat_selection:
@@ -2569,12 +2606,14 @@ def _members_near(channel, members) -> tuple:
 
 
 def _pick_by_tiers(members, latest_by_channel, stay_put, busy, busy_account, demoted,
-                   streak_threshold, near=()):
+                   streak_threshold, near=(), viewer_account=frozenset()):
     """The failover's preference tiers, best-first; the first that yields a member wins.
-    The inner three are the long-standing busy cascade - prefer a member whose account has
-    a free slot, then any free member, then knowingly take the best busy one rather than
-    abort (busy-member skip rule; no handoff fires mid-recording, so both recordings share
-    the feed's provider connection).
+    The inner ones are the long-standing busy cascade - prefer a member whose account has
+    a slot nobody is using, then one whose slot an IPTV player on the output feed is using
+    (`viewer_account`, which the move cuts off - dev/changelog/1642), then any free member,
+    then knowingly take the best busy one rather than abort (busy-member skip rule; no
+    handoff fires mid-recording, so both recordings share the feed's provider connection). The
+    tier that spares a player never yields a member on a failing streak.
 
     A demote pass wraps a second round outside them: every tier is tried against the
     not-yet-demoted members first, and only then re-tried with the demoted ones allowed
@@ -2591,11 +2630,17 @@ def _pick_by_tiers(members, latest_by_channel, stay_put, busy, busy_account, dem
     best = None
     for preferred in ([demoted, frozenset()] if demoted else [frozenset()]):
         base = set(stay_put) | set(preferred)
-        for tier in (base | busy | busy_account, base | busy, base):
+        tiers = [base | busy | busy_account | viewer_account, base | busy | busy_account,
+                 base | busy, base]
+        for tier in [t for i, t in enumerate(tiers) if t not in tiers[:i]]:
+            # The tier that spares an IPTV player never prefers a feed on a failing streak, as
+            # the backend preference never does: the recording always wins.
+            spares_viewer = bool(viewer_account) and tier is tiers[0]
             for avoid in (*near, frozenset()):
                 best = pick_best_member(members, latest_by_channel, exclude_ids=tier | avoid,
                                         streak_threshold=streak_threshold)
-                if best is not None and avoid and is_streaking(best, streak_threshold):
+                if (best is not None and (avoid or spares_viewer)
+                        and is_streaking(best, streak_threshold)):
                     best = None
                 if best is not None:
                     break
@@ -2631,8 +2676,9 @@ def switch_choices(recording_id: int) -> list:
     members = recording_members(rec.group.memberships)
     account_ids = {ch.account_id for ch in members}
     blocked = blocked_account_ids(account_ids)
-    full = connlim.accounts_without_free_recording_slot(
-        account_ids, exclude_holder=('recording', recording_id))
+    standing = connlim.seat_standing(account_ids, 'recording',
+                                     exclude_holder=('recording', recording_id))
+    full = {a for a, s in standing.items() if s == connlim.SEAT_NONE}
     latest = _latest_tests_by_channel([ch.id for ch in members])
     pin = recording_format_pin(recording_id)
     current = rec.channel
@@ -2663,6 +2709,10 @@ def switch_choices(recording_id: int) -> list:
             ok, why = True, f'Records at {format_label(key)}.'
         if ok and ch.id in state.demoted_member_ids:
             why += ' Moved off earlier in this recording for stalling.'
+        if (ok and standing.get(ch.account_id) == connlim.SEAT_BY_CUTTING_VIEWER
+                and (current is None or ch.account_id != current.account_id)):
+            why += (f' An IPTV player is watching on "{ch.account.name}"; switching cuts it off '
+                    f'unless it can move to another channel.')
         out.append(SwitchChoice(ch, ok, why, warn))
     return out
 
@@ -2695,11 +2745,12 @@ def block_move_preview(recording_id: int, pending: dict):
     members, _ = _pin_eligible_members(selection.members, recording_format_pin(recording_id),
                                        latest)
     busy = _busy_channel_ids(recording_id)
-    busy_account = _busy_account_channel_ids(members, recording_id)
+    busy_account, viewer_account = _busy_account_channel_ids(members, recording_id)
     stay_put = {current.id} | {ch.id for ch in members if ch.account_id == current.account_id}
     streak = load_config().get('channel_testing', {}).get(
         'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
-    best = _pick_by_tiers(members, latest, stay_put, busy, busy_account, frozenset(), streak)
+    best = _pick_by_tiers(members, latest, stay_put, busy, busy_account, frozenset(), streak,
+                          viewer_account=viewer_account)
     return {'to': best, 'held': best is not None and best.id in busy_account}
 
 
@@ -2810,7 +2861,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
             pin_override = False
             demoted = frozenset()
             busy = _busy_channel_ids(recording_id)
-            busy_account = _busy_account_channel_ids(members, recording_id)
+            busy_account, viewer_account = _busy_account_channel_ids(members, recording_id)
             if best is None:
                 target = db.session.get(Channel, target_channel_id)
                 target_name = target.name if target is not None else f'channel {target_channel_id}'
@@ -2857,7 +2908,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
             # into that refusal while an idle account sits a row lower (dev/changelog/855).
             # Applied after both format filters, so it cannot pre-empt their own
             # zero-survivors overrides.
-            busy_account = _busy_account_channel_ids(members, recording_id)
+            busy_account, viewer_account = _busy_account_channel_ids(members, recording_id)
             demoted = state.demoted_member_ids if demote else frozenset()
             # Excluded from every tier on the demote path: moving to the member we are already
             # on is not a move. Nothing needs this off the demote path, where the current
@@ -2882,10 +2933,12 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
             near, near_login = (((), frozenset()) if (demote or block_move)
                                 else _members_near(old_channel, members))
             best = _pick_by_tiers(members, latest_by_channel, stay_put, busy, busy_account,
-                                  demoted, streak_threshold, near=near)
+                                  demoted, streak_threshold, near=near,
+                                  viewer_account=viewer_account)
             if near and best is not None:
                 plain = _pick_by_tiers(members, latest_by_channel, stay_put, busy,
-                                       busy_account, demoted, streak_threshold)
+                                       busy_account, demoted, streak_threshold,
+                                       viewer_account=viewer_account)
                 if plain is not None and plain.id != best.id:
                     passed_near = plain
                     passed_shares = ('its account' if plain.account_id == old_channel.account_id
@@ -2893,6 +2946,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
                                      else 'its provider')
         took_busy = best is not None and best.id in busy
         took_busy_account = best is not None and best.id in busy_account
+        took_viewer_account = best is not None and best.id in viewer_account
         took_demoted = best is not None and best.id in demoted
         if best is None:
             # Never reached on a manual move: its pick was resolved above.
@@ -2916,6 +2970,12 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         skipped_busy = [ch for ch in members if ch.id in busy and ch.id != best.id]
         skipped_busy_account = [ch for ch in members if ch.id in busy_account
                                 and ch.id not in busy and ch.id != best.id]
+        # A same-account move keeps the seat the recording holds and cuts nobody off.
+        cross = old_channel is None or best.account_id != old_channel.account_id
+        took_viewer_account = took_viewer_account and cross
+        skipped_viewer_account = [] if (manual or took_busy_account) else [
+            ch for ch in members if ch.id in viewer_account and ch.id not in busy
+            and ch.id != best.id and ch.id not in stay_put]
 
         # Cross-account switch: move the connection seat. The acquire can refuse rather
         # than exceed the target account's limit (dev/changelog/854), and the move is one
@@ -2980,6 +3040,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         elif skipped_busy_account:
             busy_note += (' - rolled over to a free account, past: '
                           + ', '.join(f'"{ch.name}"' for ch in skipped_busy_account))
+        busy_note += _viewer_account_note(best, took_viewer_account, skipped_viewer_account)
         override_note = ''
         if selection is not None and selection.override:
             override_note = (f' - no member matches the locked format '
@@ -3048,6 +3109,9 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
                        'took_busy_account': took_busy_account,
                        'skipped_busy_account_channel_ids': [
                            ch.id for ch in skipped_busy_account],
+                       'took_viewer_account': took_viewer_account,
+                       'skipped_viewer_account_channel_ids': [
+                           ch.id for ch in skipped_viewer_account],
                        'format_pin': list(pin) if pin else None,
                        'pin_override': pin_override,
                        # True = a voluntary stall-rate move, so from_channel_id was
@@ -3152,7 +3216,22 @@ def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int,
     abuse takes down every channel on it, including the recording already running
     legitimately. That is the clause CLAUDE.md principle 2 already carried - complete the
     recording, "never by hammering a provider hard enough to risk the account".
+
+    An IPTV player it cuts off that can play from another channel (a group, a sports channel)
+    is moved there rather than ended - but only once this returns, whatever it returns: the
+    recording takes the seat first and never waits on the move, and a move can never take back a
+    seat being freed for the recording (output_feed.move_preempted, dev/changelog/1642).
     """
+    movers = []
+    try:
+        return _acquire_with_preemption(app, recording_id, account_id, acquire, movers)
+    finally:
+        if movers:
+            from . import output_feed
+            output_feed.move_preempted(app, movers, recording_id)
+
+
+def _acquire_with_preemption(app, recording_id: int, account_id: int, acquire, movers: list) -> bool:
     _preempt_sync_for_recording(recording_id, account_id)
 
     from . import connection_limits as connlim
@@ -3169,7 +3248,7 @@ def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int,
     if viewers:
         from . import output_feed
         for holder_account_id in dict.fromkeys(a for _, a in viewers):
-            output_feed.preempt_for_account(app, holder_account_id, recording_id)
+            output_feed.preempt_for_account(app, holder_account_id, recording_id, movers=movers)
             log.warning('Recording %d: preempted an IPTV player on account %d%s',
                         recording_id, holder_account_id,
                         '' if holder_account_id == account_id

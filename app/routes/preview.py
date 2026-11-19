@@ -21,12 +21,20 @@ PLAYLIST_MIMETYPE = 'application/vnd.apple.mpegurl'
 SEGMENT_MIMETYPE = 'video/mp2t'
 
 
-def session_urls(session_id: str) -> dict:
+def session_urls(session_id: str, round_no: int = None) -> dict:
+    """A feed session's playlist names the round it is on (`round_no`): the player attaches to one
+    round at a time, and a playlist fetch for a round that has ended is a 404."""
+    playlist = (url_for('preview.preview_playlist', session_id=session_id, round=round_no)
+                if round_no is not None else url_for('preview.preview_playlist', session_id=session_id))
     return {
         'status_url': url_for('preview.preview_status', session_id=session_id),
-        'playlist_url': url_for('preview.preview_playlist', session_id=session_id),
+        'playlist_url': playlist,
         'stop_url': url_for('preview.preview_stop', session_id=session_id),
     }
+
+
+def _urls(session) -> dict:
+    return session_urls(session.id, session.round_no if session.source == preview.SOURCE_FEED else None)
 
 
 @preview_bp.route('/api/channels/<int:channel_id>/preview', methods=['POST'])
@@ -36,7 +44,26 @@ def start_channel_preview(channel_id):
         session = preview.start_preview(channel_id, reencode=bool(body.get('reencode')))
     except preview.PreviewRefused as exc:
         return jsonify({'error': exc.message}), exc.status
-    return jsonify({'success': True, **session.to_dict(), **session_urls(session.id)})
+    return jsonify({'success': True, **session.to_dict(), **_urls(session)})
+
+
+@preview_bp.route('/api/feed/<int:feed_id>/preview', methods=['POST'])
+def start_feed_preview(feed_id):
+    """Preview one of ChannelBin's own channels on the IPTV output - a group, a sports channel, an
+    Up next channel - as an IPTV player gets it (dev/changelog/1645). The feed id is checked by the
+    play itself: one the output does not serve is a 404, one with nothing to play names why."""
+    from .. import output_feed
+    body = request.get_json(silent=True) or {}
+    kind, _row_id = output_feed.decode_feed_id(feed_id)
+    if kind == output_feed.KIND_CHANNEL:
+        # A plain channel plays what its provider sends; its own preview is the one to use.
+        return jsonify({'error': 'That is one of your IPTV provider\'s channels. Preview it from its '
+                                 'channel page.'}), 400
+    try:
+        session = preview.start_feed_preview(feed_id, reencode=bool(body.get('reencode')))
+    except preview.PreviewRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    return jsonify({'success': True, **session.to_dict(), **_urls(session)})
 
 
 @preview_bp.route('/api/preview/reencode')
@@ -103,7 +130,7 @@ def preview_status(session_id):
     session = preview.get_session(session_id)
     if session is None:
         return jsonify({'error': 'No such preview'}), 404
-    return jsonify({'success': True, **session.to_dict(), **session_urls(session.id)})
+    return jsonify({'success': True, **session.to_dict(), **_urls(session)})
 
 
 @preview_bp.route('/api/preview/<session_id>/stop', methods=['POST'])
@@ -118,7 +145,7 @@ def preview_stop(session_id):
 
 @preview_bp.route('/api/preview/<session_id>/index.m3u8')
 def preview_playlist(session_id):
-    path = preview.touch_playlist(session_id)
+    path = preview.touch_playlist(session_id, request.args.get('round', type=int))
     if path is None:
         return jsonify({'error': 'No such preview, or it has stopped'}), 404
     resp = send_file(path, mimetype=PLAYLIST_MIMETYPE, conditional=False)

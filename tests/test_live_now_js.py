@@ -1,5 +1,5 @@
-"""static/js/live-now.js::goLiveNow(), Go live now's one handler on the IPTV Output page and a
-league page (dev/changelog/1530), driven in jsdom over the shipped util.js. Turning it on asks
+"""static/js/live-now.js::goLiveNow(), Start broadcast's one handler on the IPTV Output page and a
+league page (dev/changelog/1530, named so since 1644), driven in jsdom over the shipped util.js. Turning it on asks
 first and names the game's start and every channel it plays on; turning it off does not ask; a
 game with nothing to open says why and sends nothing. No dev/docs/BUGS.md entry: a feature.
 
@@ -35,10 +35,10 @@ class GoLiveNowScriptTests(unittest.TestCase):
 
     def test_turning_it_on_asks_with_the_start_and_the_channels_then_puts_once(self):
         on = self.obs['on']
-        self.assertEqual(on['modal']['title'], 'Go live now')
+        self.assertEqual(on['modal']['title'], 'Start broadcast')
         self.assertEqual(on['modal']['paras'], ['Gulls at Bears is scheduled to start today at 7:00 PM.'])
         self.assertEqual(on['modal']['list'], ['Ironvale Bears', 'Pretend League 3'])
-        self.assertEqual(on['modal']['buttons'], ['Cancel', 'Go live now'])
+        self.assertEqual(on['modal']['buttons'], ['Cancel', 'Start broadcast'])
         self.assertEqual(on['calls'], [{'url': URL.format(7), 'method': 'PUT', 'body': {'on': True}}])
         self.assertTrue(on['result'])
         self.assertIn('until 12:30 AM', on['toast']['text'])

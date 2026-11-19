@@ -1573,7 +1573,7 @@ ServingChoice = collections.namedtuple('ServingChoice', 'member selection')
 def serving_member(group, latest_by_channel=None,
                    streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
                    blocked_account_ids=frozenset(), members=None,
-                   exclude_ids=frozenset()) -> ServingChoice:
+                   exclude_ids=frozenset(), seat_standing=None) -> ServingChoice:
     """The member `group` would record from right now - format lock filters, health score
     ranks (DESIGN-channel-groups-model.md 5, dev/changelog/753).
 
@@ -1583,9 +1583,19 @@ def serving_member(group, latest_by_channel=None,
     have picked - a row that says one feed while Record starts another is a disagreement
     the user sees directly.
 
-    `app/recorder.py::start_recording` deliberately does NOT call this. It layers
-    busy-channel and busy-account exclusions between the filter and the ranking, which no
-    display surface has and which can only be resolved against a live recording set.
+    `app/recorder.py::start_recording` deliberately does NOT call this. It layers a
+    busy-channel exclusion between the filter and the ranking, which no display surface has
+    and which can only be resolved against a live recording set. Its busy-account step reads
+    the same answer `seat_standing` carries here (connection_limits.seat_standing()), so the
+    output feed's live pick, which passes it, prefers the account a recording would
+    (dev/changelog/1642). A display surface passes none: it names the member a recording would
+    start from with every account free, and a row that changed whenever an IPTV player tuned in
+    would be a row nobody could explain.
+
+    `seat_standing` ({account_id: connection_limits.SEAT_*}) makes the ranking prefer a member
+    on an account with a connection free, then one only an IPTV player is using, before the
+    rest - relaxed one step at a time, never left empty. Applied after the format lock, so it
+    cannot empty the list ahead of the lock's zero-survivors override.
 
     `latest_by_channel` is load bearing rather than a tie-break: a member's format is read
     from its latest health check, so omitting the map leaves every format unknown and the
@@ -1610,9 +1620,30 @@ def serving_member(group, latest_by_channel=None,
         members = unblocked or members
     selection = format_eligible_members(group, members, latest_by_channel or {})
     return ServingChoice(
-        pick_best_member(selection.members, latest_by_channel, exclude_ids=exclude_ids,
-                         streak_threshold=streak_threshold),
+        pick_by_seat_standing(selection.members, latest_by_channel, exclude_ids=exclude_ids,
+                              streak_threshold=streak_threshold, seat_standing=seat_standing),
         selection)
+
+
+def pick_by_seat_standing(members, latest_by_channel=None, exclude_ids=frozenset(),
+                          streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD, seat_standing=None):
+    """pick_best_member() preferring, in connection_limits.SEAT_STANDINGS order, a member whose
+    account answers better in `seat_standing` - the best member on an account with a connection
+    free, else the best one only an IPTV player is using, else the best of all. An account the
+    map does not name is not held against its members."""
+    if seat_standing:
+        from .connection_limits import SEAT_STANDINGS
+        for i in range(1, len(SEAT_STANDINGS)):
+            worse = set(SEAT_STANDINGS[i:])
+            off = {ch.id for ch in members if seat_standing.get(ch.account_id) in worse}
+            if not off:
+                break
+            best = pick_best_member(members, latest_by_channel, exclude_ids=set(exclude_ids) | off,
+                                    streak_threshold=streak_threshold)
+            if best is not None:
+                return best
+    return pick_best_member(members, latest_by_channel, exclude_ids=exclude_ids,
+                            streak_threshold=streak_threshold)
 
 
 def blocked_account_ids_now() -> set:

@@ -21,7 +21,7 @@ import app.output_feed as feed  # noqa: E402
 import app.output_feed_view as view  # noqa: E402
 from app import db  # noqa: E402
 from app.config import load_config  # noqa: E402
-from app.database import (ChannelEvent, EPGEntry, FEED_PLAY_ENDED, FEED_PLAY_REFUSED,  # noqa: E402
+from app.database import (ChannelEvent, EPGEntry, FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED,  # noqa: E402
                           OUTPUT_FEED_SWITCHED, OutputFeedPlay)
 
 SECRET = 'sofa-remote-42'
@@ -501,7 +501,7 @@ class RecentPlaysTests(_PageCase):
     def test_a_line_reads_in_the_names_the_user_knows(self):
         self.seed_plays(1, 1)
         recent = _region(self.page(), 'of-recent')
-        self.assertIn('Played Alpha for 10m', recent)
+        self.assertRegex(recent, r'Played <span>Alpha</span> for 10m')
         self.assertIn('Nothing to play: refused 000.', recent)
         self.assertIn('Asked 3 times, last at', recent)
         self.assertNotIn('Too old to show.', recent)
@@ -522,6 +522,63 @@ class RecentPlaysTests(_PageCase):
         # A page past the end, or a kind that is not one, lands on something real.
         self.assertIn('Ended line 000.', _region(self.page('?plays=nonsense&page=x'), 'of-recent'))
         self.assertIn('refused 000', _region(self.page('?page=99'), 'of-recent'))
+
+
+class RecentPlaysLinkTests(_PageCase):
+    """A Recent plays line links the channel it played and names its account, linked too, from
+    the ids the line kept (dev/changelog/1638). What is gone since reads as text."""
+
+    def add_play(self, kind, **fields):
+        now = datetime.utcnow()
+        db.session.add(OutputFeedPlay(kind=kind, at=now, first_at=now,
+                                      feed_id=feed.feed_id_for_channel(self.alpha.id),
+                                      label=f'channel {self.alpha.id} (Alpha)', client='192.168.1.23',
+                                      seconds=600, **fields))
+        db.session.commit()
+        return _region(self.page(), 'of-recent')
+
+    def acct_pill(self, account):
+        return f'<a class="ch-pill acct-pill" href="/accounts/{account.id}">'
+
+    def test_an_ended_play_links_its_channel_and_its_account(self):
+        recent = self.add_play(FEED_PLAY_ENDED, channel_id=self.alpha.id, channel_name='Alpha',
+                               account_id=self.account.id)
+        self.assertRegex(recent, r'Played <a class="name-link" href="/channels/%d">Alpha</a>'
+                                 r'<a class="ch-pill acct-pill" href="/accounts/%d">.*?Acct</a> for 10m'
+                         % (self.alpha.id, self.account.id))
+
+    def test_a_redirect_links_its_channel_and_its_account(self):
+        recent = self.add_play(FEED_PLAY_REDIRECTED, channel_id=self.beta.id, channel_name='Beta',
+                               account_id=self.other.id)
+        self.assertRegex(recent, r'To <a class="name-link" href="/channels/%d">Beta</a>'
+                                 r'<a class="ch-pill acct-pill" href="/accounts/%d">.*?Other</a>\. ChannelBin'
+                         % (self.beta.id, self.other.id))
+
+    def test_a_deleted_channel_is_text_and_its_account_still_named(self):
+        # A channel's delete clears the id from the lines naming it (detach_channel_references).
+        recent = self.add_play(FEED_PLAY_ENDED, channel_id=None, channel_name='Gone channel',
+                               account_id=self.account.id)
+        self.assertIn('Played <span>Gone channel</span>', recent)
+        self.assertNotIn('href="/channels/', recent)
+        self.assertIn(self.acct_pill(self.account), recent)
+
+    def test_an_account_no_longer_there_draws_no_pill(self):
+        recent = self.add_play(FEED_PLAY_ENDED, channel_id=self.alpha.id, channel_name='Alpha',
+                               account_id=99999)
+        self.assertIn(f'<a class="name-link" href="/channels/{self.alpha.id}">Alpha</a> for 10m', recent)
+        self.assertNotIn('acct-pill', recent)
+
+    def test_the_waiting_screen_is_neither_a_link_nor_an_account(self):
+        recent = self.add_play(FEED_PLAY_ENDED, channel_id=None, channel_name=feed.SCREEN_NAME,
+                               account_id=None)
+        self.assertIn(f'Played <span>{feed.SCREEN_NAME}</span> for 10m', recent)
+        self.assertNotIn('acct-pill', recent)
+        self.assertNotIn('href="/channels/', recent)
+
+    def test_a_refusal_names_no_channel(self):
+        recent = self.add_play(FEED_PLAY_REFUSED, message='Nothing to play.', count=2)
+        self.assertIn('Asked 2 times, last at', recent)
+        self.assertNotIn('name-link', recent)
 
 
 class SettingsPageTests(_PageCase):

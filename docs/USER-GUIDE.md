@@ -294,10 +294,21 @@ differently.
 ChannelBin checks your guide again about a minute after any of these changes.
 
 **Sports channels in an IPTV player.** With the [IPTV output](#watching-your-channels-in-an-iptv-player)
-on, a followed team or league can have a channel of its own that plays whichever of your
-channels has the game. Between games it shows a waiting screen with the next game. **Go live
-now** on a game opens it on those channels early, and turns itself off afterwards. In Redirect
+on, a followed team or league can have a channel of its own that plays the game from the same
+channel Record or an auto-record rule would record it from, once your guide lists the game (a game
+that only a channel's name mentions is recorded but not played yet). Between games it shows a waiting screen with the next game. **Start
+broadcast** on a game puts it on air on those channels early, and stops by itself afterwards; **Stop
+broadcast** takes it back to its own time, which is the "start early by" minutes before the game. In Redirect
 mode the waiting screen ends on its own and you tune in again when the game is on.
+
+**Channel it would use.** Beside Record on a league's page, and beside Start broadcast on the IPTV
+Output page, this button shows which of your channels ChannelBin would record a game from, and
+play it from on its sports channel, if the game started right now. When both are the same
+channel, or nothing on your IPTV output would play the game, it takes you to the recording's
+channel page and says so there. When they differ, or there is
+something to say (the IPTV output may not use that account, only a replay is left, a recording
+is already scheduled somewhere else), it shows both, each with its account, and why. It is
+greyed out until your guide lists the game.
 
 **If a sport is not matching, please tell me.** Matching depends on how each provider's guide
 words each sport, and I can only see my own providers. A league whose wording ChannelBin does
@@ -447,14 +458,24 @@ refresh. To keep a channel in your TV Guide but off the player, turn its switch 
 page's channel list; turn it back on and the player gets the same channel it had before.
 
 A recording always wins. In the default **Proxy** mode ChannelBin holds the provider connection
-for the IPTV player, and when a recording needs it the player is cut and the Alerts page names the recording
-that took it; the player tunes in again on its own once a connection is free. **Redirect** mode sends
+for the IPTV player, and when a recording needs it a group or sports channel moves to another of its
+channels that has a connection free. With nowhere to go, or on any other channel, the player is cut and
+the Alerts page names the recording that took it; the player tunes in again on its own once a
+connection is free. **Redirect** mode sends
 the IPTV player straight to the provider instead - no failover, and ChannelBin cannot see when it
 stops, so tell it how many connections recordings should leave alone, per account, on the
 IPTV Output page. **Mixed** mode plays channel groups and sports channels through ChannelBin and
 sends every other channel straight to the provider. The page's **Watching now** card shows who is playing what, with a way to
 stop a play, and **Recent plays** keeps 30 days of plays that ended or were refused, each with
 its reason.
+
+To see what a player would get without opening one, press **Preview** on a row of the page's channel
+list, on a sports channel in a league's **On your IPTV output** card, or on a channel group's own
+page. It plays the IPTV output's own stream right in the page, waiting screen and Up next picture
+included, and moves over by itself when the game comes on or the play switches channel. A preview is
+a real play: it is listed in Watching now as "ChannelBin preview", it counts toward "IPTV players at
+once", and a recording takes its connection like any other. A group's Preview works before the group
+is in the TV Guide.
 
 The Dashboard's **Watching now** section shows the same plays at a glance. The setup steps and the three modes in more detail are in the
 [README](../README.md#iptv-output).

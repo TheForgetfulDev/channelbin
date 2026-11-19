@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import beta_mark, page_about, account_pill %}
+{% from "_macros.html" import beta_mark, page_about, account_pill, preview_btn %}
 {% block title %}IPTV Output - ChannelBin{% endblock %}
 
 {#  The IPTV output's own page (mockup 53, dev/docs/DESIGN-output-feed.md 8, dev/changelog/1526):
@@ -36,7 +36,7 @@
 {% call page_about() %}
   <p>An IPTV player (like TiviMate) can connect to ChannelBin as if it were an IPTV provider. Everything it plays still comes from your own IPTV provider. What the player gets is your TV Guide: the same channels and channel groups, in the same order, with the same listings. A group plays as one channel and moves to another of its channels if the one playing dies.</p>
   <p>This page is where you find the details you would enter into your IPTV player, see and manage what channels and categories are offered, see who is watching, and more.</p>
-  <p>Note: A recording always wins. If ChannelBin needs the connection to your IPTV provider to complete a recording and someone is streaming from that account, the stream is cut so the recording can run.</p>
+  <p>Note: A recording always wins. If ChannelBin needs the connection to your IPTV provider to complete a recording and someone is streaming from that account, the recording takes the connection. A group or sports channel moves to another of its channels that has a connection free; anything else, or one with nowhere to go, is cut so the recording can run.</p>
 {% endcall %}
 
 <div class="gd-statezone" id="of-state" data-state="{{ state }}" data-watching="{{ watching | length }}">
@@ -123,9 +123,9 @@
           {% for s in watching %}
           <tr>
             <td data-label="IPTV player" class="rl-when"><span class="day">{{ s.client }}</span></td>
-            <td data-label="Channel" class="rl-prog">{% if s.row_url %}<a class="t of-link" href="{{ s.row_url }}">{{ s.name }}</a>{% else %}<span class="t">{{ s.name }}</span>{% endif %}<span class="s">{{ s.kind_text }}</span></td>
+            <td data-label="Channel" class="rl-prog">{% if s.row_url %}<a class="t name-link" href="{{ s.row_url }}">{{ s.name }}</a>{% else %}<span class="t">{{ s.name }}</span>{% endif %}<span class="s">{{ s.kind_text }}</span></td>
             <td data-label="Program" class="rl-prog">{% if s.showing %}<span class="t">The coming games</span>{% elif s.waiting %}<span class="t">{{ s.waiting_text }}</span>{% elif s.program %}<span class="t">{{ s.program }}</span>{% if s.program_times %}<span class="s">{{ s.program_times }}</span>{% endif %}{% else %}<span class="sp-none">No listing in the guide right now</span>{% endif %}</td>
-            <td data-label="Playing from" class="rl-prog of-plays">{% if s.showing %}<span class="t">The Up next picture</span><span class="s tip-plain" data-tip="ChannelBin's own picture of the coming games. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;.">Not counted against the limit</span>{% elif s.waiting %}<span class="t">The waiting screen</span><span class="s tip-plain" data-tip="ChannelBin's own picture of what is on next. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;.{% if redirect %} In redirect mode it stops when the game comes on, and the player tunes in again to watch it.{% else %} The game starts here by itself when it comes on.{% endif %}">Not counted against the limit</span>{% else %}<a class="of-link" href="{{ s.channel_url }}">{{ s.channel_name }}</a>{{ acct(s.account) }}{% endif %}{% if s.from_screen %}<span class="s">{{ s.from_screen }}</span>{% endif %}{% if s.moves %}<span class="s tip-plain" data-tip="{{ s.moves_tip }}">Moved to another channel {{ s.moves_text }}</span>{% endif %}{% if s.notes %}<span class="s text-warning">{{ s.notes }}</span>{% endif %}{% if s.reserve_note %}<span class="s text-warning">{{ s.reserve_note }}</span>{% endif %}</td>
+            <td data-label="Playing from" class="rl-prog of-plays">{% if s.showing %}<span class="t">The Up next picture</span><span class="s tip-plain" data-tip="ChannelBin's own picture of the coming games. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;.">Not counted against the limit</span>{% elif s.waiting %}<span class="t">The waiting screen</span><span class="s tip-plain" data-tip="ChannelBin's own picture of what is on next. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;.{% if redirect %} In redirect mode it stops when the game comes on, and the player tunes in again to watch it.{% else %} The game starts here by itself when it comes on.{% endif %}">Not counted against the limit</span>{% else %}<a class="name-link" href="{{ s.channel_url }}">{{ s.channel_name }}</a>{{ acct(s.account) }}{% endif %}{% if s.from_screen %}<span class="s">{{ s.from_screen }}</span>{% endif %}{% if s.moves %}<span class="s tip-plain" data-tip="{{ s.moves_tip }}">Moved to another channel {{ s.moves_text }}</span>{% endif %}{% if s.notes %}<span class="s text-warning">{{ s.notes }}</span>{% endif %}{% if s.reserve_note %}<span class="s text-warning">{{ s.reserve_note }}</span>{% endif %}</td>
             <td data-label="Status">{% if s.starting %}<span class="badge b-sched tip-plain" data-tip="The stream has been asked for and nothing has reached the IPTV player yet.">Connecting</span>{% elif s.showing %}<span class="badge b-running tip-plain" data-tip="An Up next channel: ChannelBin's own picture of the coming games.">Up next</span>{% elif s.waiting %}<span class="badge b-sched tip-plain" data-tip="The sports channel has no game to play right now, so the IPTV player is shown what is on next.">Waiting screen</span>{% else %}<span class="badge b-running"><span class="pulse"></span>Watching</span>{% endif %}</td>
             <td data-label="For" class="num">{{ '-' if s.starting else s.elapsed }}</td>
             <td data-label="Sent" class="num">{{ s.sent }}</td>
@@ -157,28 +157,31 @@
         </div>
       </div>
       <div class="table-scroll"><table class="tbl tbl-cards rl-tbl">
-        <thead><tr><th class="tip-plain" data-tip="The channel number the IPTV player shows.&#10;It follows the TV Guide's order, counting only what is on the output, so hiding a channel moves the ones after it up.">#</th><th>Channel</th><th class="tip-plain" data-tip="The folder the IPTV player files it under.&#10;It is your IPTV provider's own category; a group takes the category of the channel it would play.">Category</th><th class="tip-plain" data-tip="What a play would come from if the IPTV player tuned in right now.&#10;It can be a different channel the next time.">Plays from</th><th>On the output</th></tr></thead>
+        <thead><tr><th class="tip-plain" data-tip="The channel number the IPTV player shows.&#10;It follows the TV Guide's order, counting only what is on the output, so hiding a channel moves the ones after it up.">#</th><th>Channel</th><th class="tip-plain" data-tip="The folder the IPTV player files it under.&#10;It is your IPTV provider's own category; a group takes the category of the channel it would play.">Category</th><th class="tip-plain" data-tip="What a play would come from if the IPTV player tuned in right now.&#10;It can be a different channel the next time.">Plays from</th><th>On the output</th><th></th></tr></thead>
         <tbody id="of-rows" data-per-page="{{ channels_per_page }}">
           {% for r in rows %}
           <tr{{ ' class="of-off"' | safe if not r.on else '' }}{{ ' hidden' if loop.index > channels_per_page else '' }} data-feed="{{ r.feed_id }}" data-name="{{ r.name }}" data-hay="{{ r.hay }}" data-cat="{{ r.category }}" data-state="{{ r.state }}" data-problem="{{ 1 if r.problem else 0 }}" data-watching="{{ r.watching }}" data-up-next="{{ 1 if r.is_up_next else 0 }}">
             <td data-label="#" class="of-num">{{ r.num }}</td>
-            <td data-label="Channel" class="rl-prog"><a class="t of-link" href="{{ r.url }}">{{ r.name }}</a><span class="s">{{ r.sub }}</span></td>
+            <td data-label="Channel" class="rl-prog"><a class="t name-link" href="{{ r.url }}">{{ r.name }}</a><span class="s">{{ r.sub }}</span></td>
             <td data-label="Category" class="rl-where">{{ r.category }}</td>
             <td data-label="Plays from" class="rl-prog of-plays">
               {%- if r.problem %}<span class="text-warning">{{ r.problem }}</span>
               {%- elif r.is_sports %}{% if r.sports_now %}<span class="t">{{ r.sports_now }}, {{ r.sports_when }}</span>{% else %}<span class="sp-none">Nothing on right now</span>{% endif %}<span class="s">{{ r.note }}</span>
-              {%- if r.live %}{% set lv = r.live %}<span class="of-live">
-                {%- if lv.on %}<span class="s">Go live now is on for {{ lv.game }} until {{ lv.until }}.</span><button class="btn btn-sm" data-act="live-now" data-event="{{ lv.event }}" data-on="1">Turn off Go live now</button>
-                {%- elif lv.why %}<button class="btn btn-sm disabled" data-act="live-now" data-event="{{ lv.event }}" data-on="0" aria-disabled="true" data-why="{{ lv.why }}">Go live now</button>
-                {%- else %}<button class="btn btn-sm" data-act="live-now" data-event="{{ lv.event }}" data-on="0" data-message="{{ lv.message }}" data-channels="{{ lv.channels | tojson | forceescape }}">Go live now</button>
-                {%- endif %}</span>{% endif %}
+              {%- if r.live or r.channel_now %}<span class="of-live">
+                {%- if r.live %}{% set lv = r.live %}
+                {%- if lv.on %}<span class="s">Broadcasting {{ lv.game }} early, until {{ lv.until }}.</span><button class="btn btn-sm tip-plain" data-act="live-now" data-event="{{ lv.event }}" data-on="1" data-tip="{{ lv.tip }}">Stop broadcast</button>
+                {%- elif lv.why %}<button class="btn btn-sm disabled tip-plain" data-act="live-now" data-event="{{ lv.event }}" data-on="0" aria-disabled="true" data-why="{{ lv.why }}" data-tip="{{ lv.tip }}">Start broadcast</button>
+                {%- else %}<button class="btn btn-sm tip-plain" data-act="live-now" data-event="{{ lv.event }}" data-on="0" data-message="{{ lv.message }}" data-channels="{{ lv.channels | tojson | forceescape }}" data-tip="{{ lv.tip }}">Start broadcast</button>
+                {%- endif %}{% endif %}
+                {%- if r.channel_now %}{% set cn = r.channel_now %}<button class="btn btn-sm{{ ' disabled' if cn.why else '' }}" data-act="channel-now" data-event="{{ cn.event }}"{% if cn.why %} aria-disabled="true" data-why="{{ cn.why }}"{% endif %}>Channel it would use</button>{% endif %}</span>{% endif %}
               {%- elif r.is_up_next %}<span class="t">ChannelBin's own picture</span><span class="s">{{ r.note }}</span>
-              {%- elif r.plays %}{% if r.plays.name %}<a class="of-link" href="{{ r.plays.url }}">{{ r.plays.name }}</a>{% endif %}{{ acct(r.plays.account) }}{% if r.note %}<span class="s">{{ r.note }}</span>{% endif %}
+              {%- elif r.plays %}{% if r.plays.name %}<a class="name-link" href="{{ r.plays.url }}">{{ r.plays.name }}</a>{% endif %}{{ acct(r.plays.account) }}{% if r.note %}<span class="s">{{ r.note }}</span>{% endif %}
               {%- endif %}{% if r.how and not r.problem %}<span class="s tip-plain" data-tip="{{ r.how_tip }}">{{ r.how }}</span>{% endif %}</td>
             <td data-label="On the output" class="of-sw">{{ switch('row', r.feed_id, r.on, r.name ~ ' on the IPTV output', not r.switchable, r.switch_tip) }}</td>
+            <td data-label="" class="of-prev">{{ preview_btn(r.name, feed=r.preview.feed, channel=r.preview.channel, why=r.preview.why) }}</td>
           </tr>
           {% endfor %}
-          <tr id="of-none" hidden><td colspan="5" class="rl-where">No channel matches. Clear the search or pick another filter.</td></tr>
+          <tr id="of-none" hidden><td colspan="6" class="rl-where">No channel matches. Clear the search or pick another filter.</td></tr>
         </tbody></table></div>
       <div class="of-pager" id="of-chan-pager"{{ ' hidden' if rows | length <= channels_per_page else '' }}><span class="of-pager-n" id="of-chan-n">1-{{ [channels_per_page, rows | length] | min }} of {{ rows | length }}</span>
         <button class="btn btn-sm" data-act="page" data-dir="-1" disabled>{{ icon('back') }}Previous</button>
@@ -207,8 +210,10 @@
             <td data-label="When" class="rl-when"><span class="day">{{ p.when }}</span></td>
             <td data-label="IPTV player" class="rl-where">{{ p.client }}</td>
             <td data-label="Asked for" class="rl-prog"><span class="t">{{ p.name }}</span></td>
-            <td data-label="What happened" class="rl-prog">
-              <span class="badge {{ p.badge[0] }}">{{ p.badge[1] }}</span> {{ p.text }}<span class="s">{{ p.detail }}</span></td>
+            <td data-label="What happened" class="rl-prog of-plays">
+              <span class="badge {{ p.badge[0] }}">{{ p.badge[1] }}</span> {{ p.text }}<span class="s">
+              {%- if p.played %}{{ p.played.lead }} {% if p.played.channel.url %}<a class="name-link" href="{{ p.played.channel.url }}">{{ p.played.channel.name }}</a>{% else %}<span>{{ p.played.channel.name }}</span>{% endif %}{{ acct(p.played.account) }}{{ p.played.tail }}
+              {%- else %}{{ p.detail }}{% endif %}</span></td>
           </tr>
           {% endfor %}
         </tbody></table></div>
@@ -279,8 +284,8 @@
         <select data-setting-path="integrations.output_feed.mode" data-label="How the IPTV player gets the stream" aria-label="How the IPTV player gets the stream">{% for value, label in modes %}<option value="{{ value }}"{{ ' selected' if value == mode else '' }}>{{ label }}</option>{% endfor %}</select>
         {% endcall %}
         {{ number_setting('xmltv_days', 'Days of guide it sends', 'How far ahead the guide the IPTV player downloads reaches.') }}
-        {{ number_setting('sports_before_minutes', 'Sports channels: start early by (minutes)', 'A sports channel plays the channel listing its game this long before the listing starts, so tuning in early gets the pregame show. 0 starts at the listing.') }}
-        {{ number_setting('sports_after_minutes', 'Sports channels: keep playing after (minutes)', 'And this long after the listing ends, because games run long. 0 stops at the listing\'s end. A play already running is never cut.') }}
+        {{ number_setting('sports_before_minutes', 'Sports channels: start early by (minutes)', 'A sports channel plays the channel listing its game this long before the listing starts, so tuning in early gets the pregame show. A game no guide lists, played from a channel whose name mentions it, starts this long before the time that name gives. 0 starts at the listing.') }}
+        {{ number_setting('sports_after_minutes', 'Sports channels: keep playing after (minutes)', 'And this long after the listing ends, because games run long. A game played from a channel\'s name has no listing to run past, so it stops where a recording of it would. 0 stops at the listing\'s end. A play already running is never cut.') }}
         {% if relays_some %}
         {{ number_setting('max_viewers', 'IPTV players at once', 'One more than this is refused, and the refusal says so. ' ~ ('In mixed mode only plays through ChannelBin count: a channel sent straight to your IPTV provider is never seen. ' if mixed else '') ~ 'A player on a sports channel\'s waiting screen is not counted until its game comes on, and one on an Up next channel is not counted at all.') }}
         {{ number_setting('reserve_seconds', 'Seconds behind live', 'How much of the stream ChannelBin holds before the IPTV player gets it. A short dropout plays through without the picture freezing.') }}
@@ -295,6 +300,9 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='js/live-preview.js') }}"
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.min.js') }}"></script>
 <script src="{{ url_for('static', filename='js/live-now.js') }}"></script>
+<script src="{{ url_for('static', filename='js/channel-now.js') }}"></script>
 <script src="{{ url_for('static', filename='js/iptv-output.js') }}"></script>
 {% endblock %}

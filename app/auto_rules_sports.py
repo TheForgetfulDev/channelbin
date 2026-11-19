@@ -181,9 +181,10 @@ class GameIndex:
     longest: dict = field(default_factory=dict)        # {league id: its longest strong listing}
 
     @classmethod
-    def load(cls, league_ids, now, horizon_days=21, lookback=LOOKBACK):
+    def load(cls, league_ids, now, horizon_days=21, lookback=LOOKBACK, held=True):
         """The games of `league_ids` from `lookback` ago to `horizon_days` ahead, their live guide
-        and channel-name matches, and the recordings linked to them. A fixed handful of queries.
+        and channel-name matches, and the recordings linked to them (`held` False leaves those out,
+        for a reader that only asks what a game would be taken from). A fixed handful of queries.
         A league page's Record reads back a day, since that page keeps a game all its day."""
         out = cls(now=now)
         league_ids = sorted({i for i in league_ids if i})
@@ -268,7 +269,8 @@ class GameIndex:
             if m.event_id not in out.reasons:
                 out.reasons[m.event_id] = m.reason
         out._name_kept_copies(on_copies)
-        out._load_held()
+        if held:
+            out._load_held()
         return out
 
     def _name_kept_copies(self, on_copies: list):
@@ -409,7 +411,7 @@ def event_pick(games, game):
     no listing of this game to go by, and NASCAR's 00:00 placeholders and a name with a bare clock
     land there too."""
     from .sports_times import GO_GUIDE
-    named = sorted(games.named_by.get(game.id, ()), key=lambda n: (n.start is None, -n.score, n.channel_id))
+    named = named_order(games, game)
     if not named:
         return None, 'No event channel names it.'
     best = named[0]
@@ -430,6 +432,44 @@ def event_pick(games, game):
         start, source = game.start, START_FROM_TSDB
     length = max(games.longest.get(game.league_id, timedelta(0)), DEFAULT_GAME_LENGTH)
     return EventPick(game=game, named=best, start=start, stop=start + length, source=source), ''
+
+
+def named_order(games, game) -> list:
+    """The strong name matches for `game` in the order they are taken: a name that gives a time
+    zone first, then health. event_pick() takes the first; a sports channel's play walks on past
+    one it cannot use (auto_rules.game_sources())."""
+    return sorted(games.named_by.get(game.id, ()), key=lambda n: (n.start is None, -n.score, n.channel_id))
+
+
+def name_pick(games, game):
+    """The EventPick a game is taken from when the guide has no listing of it at all, or None:
+    any listing is the search's to decide, even a weak one (design 10). The one condition
+    auto_rules.game_sources()' PICK_EVENT answer and the sports channels on the IPTV output read
+    (dev/changelog/1643)."""
+    if game.id in games.listed:
+        return None
+    return event_pick(games, game)[0]
+
+
+@dataclass(frozen=True)
+class NameSource:
+    """A game no guide lists, as the sports channels on the IPTV output read it: its event pick,
+    and every channel naming it in named_order(), the first being the pick's."""
+    pick: EventPick
+    names: tuple
+
+
+def name_sources(league_ids, now, lookback=LOOKBACK) -> dict:
+    """{SportsEvent id: NameSource} for every game of `league_ids` that only an event channel's
+    name gives (name_pick()), read in one GameIndex load: a fixed handful of queries whatever is
+    stored. What a sports channel's guide, play and Start broadcast read for the games no guide lists."""
+    games = GameIndex.load(league_ids, now, lookback=lookback, held=False)
+    out = {}
+    for game in games.games.values():
+        pick = name_pick(games, game)
+        if pick is not None:
+            out[game.id] = NameSource(pick, tuple(named_order(games, game)))
+    return out
 
 
 def covers(window_start, window_stop, start, stop) -> bool:
@@ -455,16 +495,21 @@ def keepers(programs, games_of, replays=False) -> set:
     With `replays`, the order over the known replays only, by channels and start, since no replay
     is at the start: what a league page's Record picks for a game whose live airing is not in the
     guide or is over (dev/changelog/1539). A rule never asks for that."""
-    best = {}
+    return {ranked[0].identity for ranked in ranked_programs(programs, games_of, replays).values()}
+
+
+def ranked_programs(programs, games_of, replays=False) -> dict:
+    """{game id: its programs among `programs`, best first} in keepers()' order, which is the
+    first of each. The rest are what a sports channel's play falls back to once every channel of
+    the keeper has failed it (auto_rules.game_sources())."""
+    ranked = {}
     for p in programs:
         game, airing = games_of.get(p.identity, (None, None))
         if game is None or (airing == SPORTS_AIRING_REPLAY) != replays:
             continue
         near = not replays and near_start(game, p.lead.start)
-        rank = (not near, -len(p.showings), p.lead.start, p.identity)
-        if game.id not in best or rank < best[game.id][0]:
-            best[game.id] = (rank, p.identity)
-    return {identity for _rank, identity in best.values()}
+        ranked.setdefault(game.id, []).append(((not near, -len(p.showings), p.lead.start, p.identity), p))
+    return {gid: [p for _rank, p in sorted(found, key=lambda r: r[0])] for gid, found in ranked.items()}
 
 
 def first_airing_held(held_list, spoken, lib_by_id) -> Held | None:

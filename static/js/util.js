@@ -108,6 +108,14 @@ function counted(n, one, many) {
   return `${nf(n)} ${plural(n, one, many)}`;
 }
 
+// 'a', 'a and b', 'a, b and c' - the JS half of app/fmt_utils.py::join_labels(): repeats dropped,
+// order kept, empty in and empty string out.
+function joinLabels(labels) {
+  const list = [...new Set(labels)];
+  if (list.length < 2) return list.join('');
+  return `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+}
+
 function fmtDur(s, withSeconds = true) {
   s = Math.floor(Math.max(0, s || 0));
   const h = Math.floor(s / 3600);
@@ -474,6 +482,15 @@ function icon(name, cls = '') {
   const classes = cls ? `icon ${cls}` : 'icon';
   return `<svg class="${escHtml(classes)}" data-icon="${name}" aria-hidden="true">`  // icon-ok: the registry's own markup
     + `<use href="${escHtml(_iconMeta.url)}#i-${name}"></use></svg>`;
+}
+
+// duplicated from templates/_macros.html::account_pill - a dialog drawn in JS has no Jinja.
+// `a` is {name, color, url}: a link to the account page when `url` is given, and a plain pill
+// when it is not (a pill inside a radio label, where a link would steal the click).
+function accountPill(a) {
+  const inner = `<span class="acct-dot" style="background: ${escHtml(a.color || 'var(--text-faint)')}"></span>${escHtml(a.name)}`;
+  return a.url ? `<a class="ch-pill acct-pill" href="${escHtml(a.url)}">${inner}</a>`
+    : `<span class="ch-pill acct-pill">${inner}</span>`;
 }
 
 // The label a post-processing chain badges as while it is parked waiting for another

@@ -224,9 +224,13 @@
     {% if is_stored %}
     <button class="btn btn-sm" data-act="guide-toggle">{{ 'Remove from Guide' if group.in_guide else '+ Add to Guide' }}</button>
     {% endif %}
+    {#- Watch the group as the IPTV output would play it, in the TV Guide or not (dev/changelog/1645).
+        Desktop only here; the phone's overflow sheet gets the menu item below. #}
+    {% if preview_feed_id is not none %}{{ m.preview_btn(group.name, feed=preview_feed_id, cls='gd-phone-hide') }}{% endif %}
     <span class="menu-wrap">
       <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
       <div class="menu" id="gd-kebab">
+        {% if preview_feed_id is not none %}{{ m.preview_btn(group.name, feed=preview_feed_id, menu=true, cls='gd-phone-only') }}{% endif %}
         {% if is_stored and not is_system %}
         <button class="menu-item" data-act="rename">Rename</button>
         {% endif %}
@@ -628,6 +632,8 @@ window.GROUP_DETAIL = {
 <script src="{{ url_for('static', filename='js/group-delete.js') }}"></script>
 {# Ahead of group-detail.js, which builds its filter bar at load (DESIGN.md 3.11). #}
 <script src="{{ url_for('static', filename='js/filter-bar.js') }}"></script>
+<script src="{{ url_for('static', filename='js/live-preview.js') }}"
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.min.js') }}"></script>
 <script src="{{ url_for('static', filename='js/group-detail.js') }}"></script>
 {% if whatson %}
 {# The What's On card: the TV Guide's own grid in its `schedules` embed mode

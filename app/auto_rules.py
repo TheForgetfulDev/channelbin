@@ -1778,6 +1778,30 @@ class SeatChoice:
                 f'choice and waits for a connection. Tried {said}{more}')
 
 
+def seat_order(program, tiers=None) -> list:
+    """`program`'s showings in the order they are tried: the lead, then one showing per channel
+    group not yet named, a group sorting with the passed health tier since it picks its own
+    member by health, then single channels by health tier (app/seat_moves.py: latest check
+    passed, never checked, latest check failed), the simulcast order (3.7) within each. The one
+    order for a recording moving off a full account (seat_choice()) and for a sports channel's
+    play walking past a channel it cannot use (game_sources()). `tiers`, when handed a dict, is
+    filled with the single channels' tiers. One query, and none for a program of one showing."""
+    from .seat_moves import TIER_PASSED, health_tiers
+    lead, out, groups = program.lead, [], {program.lead.group_id} - {None}
+    for s in program.showings[1:]:
+        if s.group_id is not None:
+            if s.group_id in groups:
+                continue
+            groups.add(s.group_id)
+        out.append(s)
+    found = health_tiers([s.channel_id for s in out if s.group_id is None]) if out else {}
+    if tiers is not None:
+        tiers.update(found)
+    # Stable, so the simulcast order holds inside each tier.
+    out.sort(key=lambda s: TIER_PASSED if s.group_id is not None else found[s.channel_id])
+    return [lead] + out
+
+
 def seat_choice(program, profile_choice, cfg) -> SeatChoice:
     """The showing of `program` to record from, with its plan. The lead, unless its plan says
     its account has no connection in the window (NO_SEAT_WARNINGS); then the program's other
@@ -1798,6 +1822,7 @@ def seat_choice(program, profile_choice, cfg) -> SeatChoice:
     One planner pass for a lead with a seat. The planner reads only (dev/changelog/1157)."""
     from .channel_groups import DEFAULT_FAILING_STREAK_THRESHOLD
     from .routes import recordings as rec_routes
+    from .seat_moves import move_allowed
 
     def plan_of(s):
         return rec_routes._plan_bulk_schedule([(s.entry_id, s.group_id)], profile_choice, cfg,
@@ -1809,7 +1834,6 @@ def seat_choice(program, profile_choice, cfg) -> SeatChoice:
     others = program.showings[1:]
     if why is None or not others:
         return SeatChoice(lead, plan, lead)
-    from .seat_moves import TIER_PASSED, health_tiers, move_allowed
     profile_id = plan['_create'].get('profile_id')
     profile = db.session.get(RecordingProfile, profile_id) if profile_id is not None else None
     if not move_allowed(cfg, profile):
@@ -1821,23 +1845,9 @@ def seat_choice(program, profile_choice, cfg) -> SeatChoice:
     full = rows.get(planned_on, (None, 0))[0]
     streak = cfg.get('channel_testing', {}).get('failing_streak_threshold',
                                                 DEFAULT_FAILING_STREAK_THRESHOLD)
-
-    def account(s):
-        return rows.get(s.channel_id, (None, 0))[0]
-
-    candidates, groups = [], {lead.group_id} - {None}
-    for s in others:
-        if s.group_id is not None:
-            if s.group_id in groups:
-                continue
-            groups.add(s.group_id)
-        elif account(s) == full:
-            continue
-        candidates.append(s)
-    tiers = health_tiers([s.channel_id for s in candidates if s.group_id is None])
-    # A group picks its own member by health, so it sorts with the passed tier. Stable, so the
-    # simulcast order holds inside each tier.
-    candidates.sort(key=lambda s: TIER_PASSED if s.group_id is not None else tiers[s.channel_id])
+    tiers = {}
+    candidates = [s for s in seat_order(program, tiers)[1:]
+                  if s.group_id is not None or rows.get(s.channel_id, (None, 0))[0] != full]
     refused = [(lead, why)]
     for s in candidates[:MAX_SEAT_TRIES - 1]:
         alt = plan_of(s)
@@ -1880,12 +1890,15 @@ def _event_program(pick):
     """An event pick as the judge reads a program: one showing, on the event channel, at the start
     the rule stands behind. Its identity is the game's title at that start, with no episode, so the
     repeat check never reads it and retrack never follows it."""
-    tkey = title_key(pick.game.title)
-    showing = _Showing(entry_id=0, channel_id=pick.named.channel_id, channel_name=pick.named.channel_name,
-                       group_id=None, group_name=None, title=pick.game.title, sub_title='',
-                       title_key=tkey, episode_raw='', start=pick.start, stop=pick.stop,
-                       score=pick.named.score)
-    return _Program(identity=(tkey, '', pick.start), showings=[showing])
+    return _Program(identity=(title_key(pick.game.title), '', pick.start), showings=[_event_showing(pick, pick.named)])
+
+
+def _event_showing(pick, named):
+    """One channel naming an event pick's game, as a showing at the pick's start and end."""
+    return _Showing(entry_id=0, channel_id=named.channel_id, channel_name=named.channel_name,
+                    group_id=None, group_name=None, title=pick.game.title, sub_title='',
+                    title_key=title_key(pick.game.title), episode_raw='', start=pick.start, stop=pick.stop,
+                    score=named.score)
 
 
 def recordable_pick(games, game, state, ctx):
@@ -1941,15 +1954,57 @@ PICK_LOOKBACK = timedelta(days=1)
 
 
 def game_pick(event_id, now=None, cfg=None):
-    """The GamePick for one stored event, or None when it is not stored. The same order a rule for
-    its league would use, over the same search: the Programs search narrowed to the event
-    (`f.event`), grouped into programs, and of the game's listings not yet over, the keeper
-    (auto_rules_sports.keepers()) - the live airing near the game's believed start, then the one
-    most channels carry, then the earliest. With no live one left, the same order over its
-    replays, which a rule never records; with no listing at all, event_pick(). Reads only; the
-    route that records it re-asks this, never the page."""
-    from .auto_rules_sports import GameIndex, Scope, event_pick, keepers
-    from .channel_search import GRAIN_AIRINGS, DimensionFilter, SearchContext, SearchState
+    """The GamePick for one stored event, or None when it is not stored: game_sources()'s pick."""
+    found = game_sources(event_id, now, cfg)
+    return None if found is None else found.pick
+
+
+
+def _held(showings, listings) -> list:
+    """The showings that are one of `listings`, (channel id, guide start) pairs a play holds. A
+    group's showing is the one member listing the search kept for it (the `grpdedup` collapse),
+    which may be a member whose match is weak where another member's is strong, so a group counts
+    when any member of it is one. One query, and none with no group."""
+    from .database import ChannelGroupMember
+    group_ids = sorted({s.group_id for s in showings if s.group_id is not None})
+    members = {}
+    if group_ids:
+        for gid, cid in db.session.query(ChannelGroupMember.group_id, ChannelGroupMember.channel_id).filter(
+                ChannelGroupMember.group_id.in_(group_ids)):
+            members.setdefault(gid, set()).add(cid)
+    return [s for s in showings if (s.channel_id, s.start) in listings
+            or any((cid, s.start) in listings for cid in members.get(s.group_id, ()))]
+
+@dataclass
+class GameSources:
+    """A game's pick and every showing it may be taken from, in the order to try them: the
+    picked listing's showings first, in the order seat_choice() tries them (seat_order()), then
+    the game's other listings in keepers' order, each the same way. A recording never leaves its
+    listing; a sports channel's play walks on past it when every showing of it fails."""
+    pick: GamePick
+    sources: list = field(default_factory=list)
+
+
+def game_sources(event_id, now=None, cfg=None, listings=None):
+    """The one answer to "which channel does ChannelBin take this game from", for Record, for a
+    rule's order and for a sports channel on the IPTV output (dev/changelog/1637), or None when
+    the event is not stored. The same order a rule for its league would use, over the same
+    search: the Programs search narrowed to the event (`f.event`), grouped into programs, and of
+    the game's listings the keeper (auto_rules_sports.keepers()) - the live airing near the
+    game's believed start, then the one most channels carry, then the earliest - and within it a
+    channel group before a single channel, then health (_programs()).
+
+    Which listings count: those not yet over, else `listings`, a set of (channel id, listing
+    start) a sports channel's play holds (sports_feed.NowPlaying.listings), ended ones
+    included, since a game running long keeps its listing. With no live listing left, Record
+    takes the same order over its replays, which a rule never records and a play never plays;
+    with no listing at all, auto_rules_sports.name_pick(): Record takes its channel, and a sports
+    channel's play walks every channel naming the game in the same order (dev/changelog/1643).
+
+    Reads only: no seat, no admission ticket, no row, so a page can ask it for "now". The
+    route that records re-asks this, never the page."""
+    from .auto_rules_sports import GameIndex, Scope, name_pick, named_order, ranked_programs
+    from .channel_search import GRAIN_AIRINGS, DimensionFilter, SearchContext, SearchState, default_standing_for
     from .config import load_config
     from .database import SportsEvent
     now = now or datetime.utcnow()
@@ -1959,16 +2014,25 @@ def game_pick(event_id, now=None, cfg=None):
     games = GameIndex.load([event.league_id], now, lookback=PICK_LOOKBACK)
     game = games.games.get(event.id)
     if game is None:
-        return GamePick(PICK_NONE, why=WHY_UNKNOWN)
+        return GameSources(GamePick(PICK_NONE, why=WHY_UNKNOWN))
     state = SearchState(grain=GRAIN_AIRINGS,
                         filters=(DimensionFilter('event', (str(event.tsdb_id),)),))
+    if listings is not None:
+        state = replace(state, standing=default_standing_for(GRAIN_AIRINGS) | {'showpast'})
     entries, wins = _search_rule(state, SimpleNamespace(ctx=SearchContext.build(cfg or load_config())))
     if entries is None:
         # More listings of one game than a rule may act on, which a rule's search is refused for
         # too. Not seen on any real guide.
         log.warning('Record: %s has more than %d listings, too many to pick from', game.title, MAX_SHOWINGS)
-        return GamePick(PICK_NONE, game=game, why=WHY_TOO_MANY)
-    showings = _showings([e for e in entries if e.stop is not None and e.stop > now], wins)
+        return GameSources(GamePick(PICK_NONE, game=game, why=WHY_TOO_MANY))
+    if listings is None:
+        entries = [e for e in entries if e.stop is not None and e.stop > now]
+    else:
+        starts = {start for _channel, start in listings}
+        entries = [e for e in entries if e.start in starts]
+    showings = _showings(entries, wins)
+    if listings is not None:
+        showings = _held(showings, listings)
     slots = _Slots()
     for s in showings:
         slots.add(s.title_key, s.start, s.episode_raw)
@@ -1981,23 +2045,33 @@ def game_pick(event_id, now=None, cfg=None):
             games_of[p.identity] = found
             mine.append(p)
     for kind, replays in ((PICK_LIVE, False), (PICK_REPLAY, True)):
-        keep = keepers(mine, games_of, replays=replays)
-        if keep:
-            program = next(p for p in mine if p.identity in keep)
+        if replays and listings is not None:
+            break
+        ranked = ranked_programs(mine, games_of, replays=replays).get(game.id)
+        if ranked:
+            program = ranked[0]
             same = [p for p in mine if (games_of[p.identity][1] == SPORTS_AIRING_REPLAY) == replays]
             widest = max(same, key=lambda p: (len(p.showings), -p.lead.start.timestamp()))
-            return GamePick(kind, game=game, showing=program.lead, program=program,
+            pick = GamePick(kind, game=game, showing=program.lead, program=program,
                             channels=len(program.showings),
                             airing=games_of[program.identity][1],
                             wider=widest if len(widest.showings) > len(program.showings) else None)
+            return GameSources(pick, [s for p in ranked for s in seat_order(p)])
+    if listings is not None:
+        return GameSources(GamePick(PICK_NONE, game=game, why=WHY_UNSURE if game.id in games.listed
+                                    else WHY_UNLISTED))
     if game.id in games.listed:
-        return GamePick(PICK_NONE, game=game, why=WHY_UNSURE if showings else WHY_ENDED)
-    pick, _why = event_pick(games, game)
+        return GameSources(GamePick(PICK_NONE, game=game, why=WHY_UNSURE if showings else WHY_ENDED))
+    pick = name_pick(games, game)
     if pick is not None:
         if pick.stop <= now:
-            return GamePick(PICK_NONE, game=game, why=WHY_ENDED)
-        return GamePick(PICK_EVENT, game=game, event=pick)
-    return GamePick(PICK_NONE, game=game, why=WHY_NO_START if games.named_by.get(game.id) else WHY_UNLISTED)
+            return GameSources(GamePick(PICK_NONE, game=game, why=WHY_ENDED))
+        # Record takes the pick's channel; a play walks on down every channel naming the game
+        # (dev/changelog/1643).
+        return GameSources(GamePick(PICK_EVENT, game=game, event=pick),
+                           [_event_showing(pick, n) for n in named_order(games, game)])
+    return GameSources(GamePick(PICK_NONE, game=game,
+                                why=WHY_NO_START if games.named_by.get(game.id) else WHY_UNLISTED))
 
 
 #: How far an event pick's start may now read from where its recording sits before the rule says

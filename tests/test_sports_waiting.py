@@ -25,14 +25,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support import clips  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
-from tests.support.seed import make_account, make_channel  # noqa: E402
+from tests.support.seed import make_account, make_channel, make_guide_match  # noqa: E402
 
 import app.connection_limits as connlim  # noqa: E402
 import app.output_feed as feed  # noqa: E402
 import app.sports_screen as ss  # noqa: E402
 from app import db, sports_feed  # noqa: E402
 from app.database import (Alert, OutputFeedPlay, SportsEvent, SportsFeedChannel,  # noqa: E402
-                          SportsFollow, SportsLeague, SportsMatch)
+                          SportsFollow, SportsLeague)
 
 _HAVE_FFMPEG = shutil.which('ffmpeg') is not None
 USER, PASS = 'tv', 'tv-secret'
@@ -138,9 +138,7 @@ class _Waiting(unittest.TestCase):
         ch = make_channel(account or self.account, name=name, pace_realtime=True)
         ch.stream_url = os.path.join(self.media, 'game.ts')
         db.session.flush()
-        db.session.add(SportsMatch(event_id=self.event.id, channel_id=ch.id, kind='guide', strength='strong',
-                                   airing='first', program_start_time=start,
-                                   program_stop_time=start + timedelta(hours=3), title_key='g', reason='r'))
+        make_guide_match(self.event, ch, start, title='g', reason='r')
         db.session.commit()
         return ch
 
@@ -240,7 +238,7 @@ class WaitingScreenTests(_Waiting):
         self.assertIsNone(line.channel_id)
         self.assertIn('Watched only the waiting screen', line.message)
         html = self.client.get('/iptv-output').get_data(as_text=True)
-        self.assertIn('Played the waiting screen for', html)
+        self.assertIn('Played <span>the waiting screen</span> for', html)
 
     def test_a_screen_that_cannot_be_made_is_refused_by_name(self):
         with mock.patch.object(ss, 'render_clip', side_effect=ss.ClipFailed('the folder is gone')):
@@ -723,6 +721,14 @@ class TurnedOffTests(_Waiting):
     def test_following_other_teams_only_cuts_it(self):
         s, proc = self._on_game()
         resp = self.client.put(f'/api/sports/leagues/{self.league.id}/following', json={'team_ids': [102]})
+        self.assertEqual(resp.get_json()['cut'], 1)
+        self.assert_cut(s, proc)
+
+    def test_following_other_teams_from_add_league_cuts_it(self):
+        """dev/changelog/1641: Add league or team replaces the follow, so it can stop a channel too."""
+        s, proc = self._on_game()
+        resp = self.client.post('/api/sports/leagues', json={'tsdb_id': self.league.tsdb_id, 'team_ids': [102]})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
         self.assertEqual(resp.get_json()['cut'], 1)
         self.assert_cut(s, proc)
 

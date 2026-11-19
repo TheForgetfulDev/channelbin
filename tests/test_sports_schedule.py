@@ -53,7 +53,8 @@ class SportsCase(unittest.TestCase):
     def add_league(self, tsdb_id=LEAGUE_ID, **kw):
         payload = {'tsdb_id': tsdb_id, 'name': kw.get('name', 'Pretend League'), 'sport': kw.get('sport', 'Pretend Ball'),
                    'season': '2099', 'terms': ['Pretend League']}
-        return sports_data.follow_league(payload, kw.get('team'))
+        team = kw.get('team')
+        return sports_data.follow_league(payload, [team['team_id']] if team else None, [team] if team else None)
 
     def drain(self, start=None, step_seconds=120, limit=60):
         """Run the worker until nothing is due, moving the clock past each wait."""
@@ -483,6 +484,165 @@ class ReviewedFailureTests(SportsCase):
         self.assertIsNone(SportsTeam.query.filter_by(tsdb_id=77).first())
 
 
+
+class SeveralTeamsTests(SportsCase):
+    """dev/changelog/1641: Add league or team follows several teams of one league, replacing what the
+    person followed in it, and a league already here is answered from what is stored with no call."""
+
+    def lookup(self, **body):
+        return self.client.post('/api/sports/lookup', json=body)
+
+    def clear_pace(self):
+        state = db.session.get(SportsState, 1)
+        if state is not None:
+            state.last_call_at = state.next_call_at = None
+            state.backoff_seconds = 0
+            db.session.commit()
+
+    def search(self, team_id, name, league=LEAGUE_ID, league_name='Pretend League'):
+        self.fake.team_search[name.lower()] = [team_row(team_id, name, league=league, league_name=league_name)]
+        self.clear_pace()
+        return self.lookup(text=name)
+
+    def follow(self, **body):
+        return self.client.post('/api/sports/leagues', json={'tsdb_id': LEAGUE_ID, **body})
+
+    def follows(self, rule=0):
+        db.session.expire_all()
+        league = SportsLeague.query.filter_by(tsdb_id=LEAGUE_ID).one()
+        return sorted(f.team_tsdb_id for f in SportsFollow.query.filter_by(league_id=league.id, rule_id=rule))
+
+    def seed_game(self, league_id, home=11, away=12):
+        start = datetime.utcnow() + timedelta(days=1)
+        db.session.add(SportsEvent(tsdb_id=500 + home, league_id=league_id, name='Reds vs Blues', start_at=start,
+                                   local_date=start.date(), home_team_id=home, away_team_id=away,
+                                   home_name='Pretendville Reds', away_name='Pretendville Blues'))
+        db.session.commit()
+
+    def test_several_checked_teams_are_followed_in_one_request(self):
+        self.search(11, 'Pretendville Reds')
+        self.search(12, 'Pretendville Blues')
+        r = self.follow(team_ids=[12, 11])
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(self.follows(), [11, 12])
+        self.assertEqual(sorted(t.full_name for t in SportsTeam.query.filter(SportsTeam.tsdb_id.in_([11, 12]))),
+                         ['Pretendville Blues', 'Pretendville Reds'])
+
+    def test_following_replaces_the_persons_follow_and_keeps_a_rules(self):
+        league_id = self.add_league()
+        db.session.add(SportsFollow(league_id=league_id, team_tsdb_id=13, rule_id=99))
+        db.session.commit()
+        self.search(11, 'Pretendville Reds')
+        self.follow(team_ids=[11])
+        self.assertEqual(self.follows(), [11], 'the whole-league follow was replaced, not added to')
+        self.assertEqual(self.follows(rule=99), [13])
+        self.follow(team_ids=[])
+        self.assertEqual(self.follows(), [0])
+
+    def test_a_team_nobody_checked_or_stored_is_refused_and_the_follow_stands(self):
+        self.add_league()
+        r = self.follow(team_ids=[77])
+        self.assertEqual(r.status_code, 409)
+        self.assertIn('has not checked team 77 in the Pretend League', r.get_json()['error'])
+        self.assertEqual(self.follows(), [0])
+
+    def test_a_team_checked_in_another_league_is_refused(self):
+        self.add_league()
+        self.search(21, 'Elsewhere Owls', league=FIELD_LEAGUE_ID, league_name='Other League')
+        r = self.follow(team_ids=[21])
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(self.follows(), [0])
+
+    def test_a_league_already_here_takes_its_stored_teams_with_no_fresh_check(self):
+        league_id = self.add_league()
+        self.seed_game(league_id)
+        calls = len(self.fake.calls)
+        r = self.follow(team_ids=[11, 12])
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(self.follows(), [11, 12])
+        self.assertEqual(len(self.fake.calls), calls)
+
+    def test_bad_team_ids_are_refused(self):
+        self.add_league()
+        for bad in ([0, 11], [-4], ['11'], [True], 11):
+            r = self.follow(team_ids=bad)
+            self.assertEqual(r.status_code, 400, bad)
+        self.assertEqual(self.follows(), [0])
+
+    def test_a_league_here_is_answered_from_what_is_stored_with_no_call(self):
+        league_id = self.add_league()
+        self.seed_game(league_id)
+        self.lookup(text=str(FIELD_LEAGUE_ID))  # a call just went out, so the next one would be refused
+        calls = len(self.fake.calls)
+        for body in ({'tsdb_id': LEAGUE_ID}, {'text': str(LEAGUE_ID)}):
+            r = self.lookup(**body)
+            self.assertEqual(r.status_code, 200, body)
+            data = r.get_json()
+            self.assertEqual(data['league']['name'], 'Pretend League')
+            self.assertEqual(data['here']['id'], league_id)
+            self.assertTrue(data['here']['whole'])
+            self.assertEqual([t['id'] for t in data['here']['teams']], [12, 11])
+        self.assertEqual(len(self.fake.calls), calls)
+
+    def test_a_team_search_says_what_is_followed_in_its_league(self):
+        self.assertIsNone(self.search(11, 'Pretendville Reds').get_json()['here'], 'a league not here')
+        self.follow(team_ids=[11])
+        here = self.search(12, 'Pretendville Blues').get_json()['here']
+        self.assertEqual(here['chosen'], [11])
+        self.assertFalse(here['whole'])
+        self.assertEqual(here['chosen_names'], {'11': 'Pretendville Reds'})
+
+    def test_change_teams_refuses_a_team_nobody_checked_or_stored(self):
+        league_id = self.add_league()
+        r = self.client.put(f'/api/sports/leagues/{league_id}/following', json={'team_ids': [999999]})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn('has not checked team 999999 in the Pretend League', r.get_json()['error'])
+        self.search(21, 'Elsewhere Owls', league=FIELD_LEAGUE_ID, league_name='Other League')
+        r = self.client.put(f'/api/sports/leagues/{league_id}/following', json={'team_ids': [21]})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn('Elsewhere Owls plays in the Other League, not the Pretend League', r.get_json()['error'])
+        self.assertEqual(self.follows(), [0])
+
+    def test_a_choice_from_several_says_what_is_followed_in_its_league(self):
+        league_id = self.add_league()
+        self.fake.team_search['reds'] = [team_row(11, 'Pretendville Reds'), team_row(12, 'Reds Reserves')]
+        self.clear_pace()
+        choices = self.lookup(text='Reds').get_json()['choices']
+        self.assertEqual([c['here']['id'] for c in choices], [league_id, league_id])
+        self.assertTrue(choices[0]['here']['whole'])
+
+    def test_change_teams_stores_the_name_of_a_team_just_found(self):
+        league_id = self.add_league()
+        self.search(14, 'Pretendville Greens')
+        r = self.client.put(f'/api/sports/leagues/{league_id}/following', json={'team_ids': [14]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.follows(), [14])
+        self.assertEqual(SportsTeam.query.filter_by(tsdb_id=14).one().full_name, 'Pretendville Greens')
+
+    def test_the_add_list_says_what_is_followed_in_each_league_here(self):
+        nfl = 4391
+        league_id = self.add_league(tsdb_id=nfl, name='NFL', sport='American Football')
+        shipped = lambda: {s['tsdb_id']: s['following'] for s in sports_view.add_dialog_config()['shipped']}  # noqa: E731
+        self.assertEqual(shipped()[nfl], 'Following all games')
+        self.assertIsNone(shipped()[4387], 'a league never here shows its sport')
+        sports_data.set_following(league_id, [11, 12])
+        self.assertEqual(shipped()[nfl], 'Following 2 teams')
+        sports_data.stop_following(league_id)
+        self.assertEqual(shipped()[nfl], 'Not followed')
+        db.session.add(SportsFollow(league_id=league_id, team_tsdb_id=0, rule_id=99))
+        db.session.commit()
+        self.assertEqual(shipped()[nfl], 'Followed by a rule')
+
+    def test_change_teams_shows_for_a_league_followed_by_team_before_its_games(self):
+        league_id = self.add_league(team={'team_id': 77, 'team': 'Early Team'})
+        rows = {r['id']: r for r in sports_view.list_context()['rows']}
+        self.assertTrue(rows[league_id]['has_teams'])
+        self.assertIn('data-act="teams"', self.client.get(f'/sports/{league_id}').get_data(as_text=True))
+        self.assertEqual(rows[league_id]['dialog']['chosen_names'], {77: 'Early Team'})
+        sports_data.set_following(league_id, [])
+        rows = {r['id']: r for r in sports_view.list_context()['rows']}
+        self.assertFalse(rows[league_id]['has_teams'], 'a league followed whole with no games has no teams to pick')
+
 class CadenceTests(unittest.TestCase):
     NOW = datetime(2099, 3, 2, 12, 0)
     SET = {'horizon_days': 21}
@@ -685,7 +845,7 @@ class AddingALeagueTests(SportsCase):
         self.assertFalse(body.get('best_match'))
         self.assertEqual([c[0] for c in self.fake.calls], ['lookupteam'])
         # Following it needs no second call: the team row was the check of its league.
-        r = self.client.post('/api/sports/leagues', json={'tsdb_id': LEAGUE_ID, 'team_id': 11})
+        r = self.client.post('/api/sports/leagues', json={'tsdb_id': LEAGUE_ID, 'team_ids': [11]})
         self.assertEqual(r.status_code, 200)
         self.assertEqual([c[0] for c in self.fake.calls], ['lookupteam'])
         self.assertEqual(SportsLeague.query.count(), 1)
@@ -819,13 +979,22 @@ class AddingALeagueTests(SportsCase):
     def test_following_one_team_from_a_search(self):
         self.fake.team_search['pretendville reds'] = [team_row(11, 'Pretendville Reds', 'Reds')]
         self.post(text='Pretendville Reds')
-        self.client.post('/api/sports/leagues', json={'tsdb_id': LEAGUE_ID, 'team_id': 11})
+        self.client.post('/api/sports/leagues', json={'tsdb_id': LEAGUE_ID, 'team_ids': [11]})
         league = SportsLeague.query.filter_by(tsdb_id=LEAGUE_ID).one()
         self.assertEqual([f.team_tsdb_id for f in SportsFollow.query.filter_by(league_id=league.id)], [11])
         self.assertEqual(SportsTeam.query.filter_by(tsdb_id=11).one().full_name, 'Pretendville Reds')
 
+    def seed_teams(self, league_id, *pairs):
+        """Stored games between these teams, so a follow may name them (sports_data.known_team_ids())."""
+        start = datetime.utcnow() + timedelta(days=1)
+        for n, (home, away) in enumerate(pairs):
+            db.session.add(SportsEvent(tsdb_id=700 + n, league_id=league_id, name='x', start_at=start,
+                                       local_date=start.date(), home_team_id=home, away_team_id=away))
+        db.session.commit()
+
     def test_changing_teams_makes_no_calls(self):
         league_id = self.add_league()
+        self.seed_teams(league_id, (11, 12))
         calls = len(self.fake.calls)
         r = self.client.put(f'/api/sports/leagues/{league_id}/following', json={'team_ids': [11, 12]})
         self.assertTrue(r.get_json()['success'])
@@ -839,6 +1008,7 @@ class AddingALeagueTests(SportsCase):
         """dev/docs/BUGS.md 2026-11-15 @ 12:58:58 PM: a repeated id broke the follow's unique key
         and answered 500 with nothing saved."""
         league_id = self.add_league()
+        self.seed_teams(league_id, (11, 12))
         r = self.client.put(f'/api/sports/leagues/{league_id}/following', json={'team_ids': [11, 11, 12]})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(sorted(f.team_tsdb_id for f in SportsFollow.query.all()), [11, 12])
@@ -860,7 +1030,7 @@ class AddingALeagueTests(SportsCase):
         names = [s['name'] for s in shipped]
         self.assertEqual(names, ['English Premier League', 'Formula 1', 'NASCAR Cup Series', 'NBA', 'NFL', 'NHL'])
         self.assertEqual(names, sorted(names, key=str.lower))
-        self.assertFalse(any(s['followed'] for s in shipped))
+        self.assertTrue(all(s['following'] is None for s in shipped))
         self.assertEqual(SportsFollow.query.count(), 0)
 
     def test_stop_and_delete_routes_answer_404_for_a_league_gone(self):

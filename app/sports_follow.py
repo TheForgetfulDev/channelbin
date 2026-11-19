@@ -14,7 +14,8 @@ What is never moved:
   sports_window_start/stop. A recording whose window is not that one is left as it is, and its page
   says the game moved;
 - a recording made from no guide listing of the game (an event channel's name: its window is
-  TheSportsDB's already);
+  the pick's already), except that a rule's one already under way ends later when TheSportsDB moves
+  the game later after its start (sports_times.name_late, dev/changelog/1643);
 - the program times, which the game's link (sports_data.recording_matches) and retrack key on.
 
 A recording already under way keeps its start, whatever TheSportsDB does: its end only ever moves
@@ -185,6 +186,13 @@ def follow(recording_ids=None, now: datetime = None) -> dict:
             db.session.rollback()
             log.error('Recording %d: could not bring its end to its game\'s time', rec.id, exc_info=True,
                       extra={'recording_id': rec.id})
+    for rec in ctx.named_running:
+        try:
+            _follow_named(rec, ctx, run, counts)
+        except Exception:
+            db.session.rollback()
+            log.error('Recording %d: could not bring its end to its game\'s time', rec.id, exc_info=True,
+                      extra={'recording_id': rec.id})
     for second in ctx.orphans:
         try:
             if _owned_second(second) and _remove_second(second.id, None, '', run):
@@ -244,24 +252,35 @@ class _Context:
                                   .filter(SportsEvent.tsdb_id.in_(set(self.game_of.values())))):
                 games[event.tsdb_id] = _Game(_snap(event), SimpleNamespace(name=league.name, tsdb_id=league.tsdb_id))
         self.games = games
-        followed = [_snap(r) for r in recs if self.game_of.get(r.id) in games
-                    and _from_listing(r, games[self.game_of[r.id]])]
+        followed, unlisted = [], []
+        for r in recs:
+            if self.game_of.get(r.id) not in games:
+                continue
+            if _from_listing(r, games[self.game_of[r.id]]):
+                followed.append(_snap(r))
+            elif (r.status in WINDOW_OPEN_STATUSES and _running_kind(r) == KIND_RULE):
+                unlisted.append(_snap(r))
         self.primaries = [r for r in followed if r.status == REC_STATUS_SCHEDULED]
         self.running = [r for r in followed if r.status in WINDOW_OPEN_STATUSES]
-        ids = [r.id for r in followed]
+        ids = [r.id for r in followed + unlisted]
         # A recording can carry more than one ledger row (a rule edited since); the SCHEDULED one is
         # the rule's window.
-        self.ledger = {}
+        self.ledger, from_name = {}, set()
         if ids:
             for m in RuleMatch.query.filter(RuleMatch.recording_id.in_(ids),
                                             RuleMatch.action_taken == RULE_MATCH_SCHEDULED):
                 self.ledger.setdefault(m.recording_id, []).append((m.rec_start_time, m.rec_stop_time))
+                if m.sports_event_tsdb_id is not None and m.sports_event_tsdb_id == self.game_of.get(m.recording_id):
+                    from_name.add(m.recording_id)
+        # A rule's recording from an event channel's name, under way: its ledger row is anchored on
+        # the game itself (RuleMatch.sports_event_tsdb_id), the one fact that says so.
+        self.named_running = [r for r in unlisted if r.id in from_name]
         self.seconds = {}
         primary_ids = [r.id for r in self.primaries]
         if primary_ids:
             for s in Recording.query.filter(Recording.sports_cover_for_id.in_(primary_ids)):
                 self.seconds.setdefault(s.sports_cover_for_id, []).append(_snap(s))
-        every = followed + [s for group in self.seconds.values() for s in group]
+        every = followed + self.named_running + [s for group in self.seconds.values() for s in group]
         self.profiles = {p.id: (timedelta(minutes=p.pre_padding_minutes or 0), timedelta(minutes=p.post_padding_minutes or 0))
                          for p in RecordingProfile.query.filter(RecordingProfile.id.in_(
                              {r.profile_id for r in every if r.profile_id is not None}))} if every else {}
@@ -410,6 +429,36 @@ def _follow_running(rec, ctx, run, counts):
             counts['kept'] += 1
 
 
+def _follow_named(rec, ctx, run, counts):
+    """A rule's recording from an event channel's name, under way: its end moves later by what
+    sports_times.name_late() says, from the end its pick gave it (the program stop and its padding),
+    so a second pass lands on the same end and never adds the delay twice. Its start stays."""
+    from .sports_times import name_late
+    game = ctx.games[ctx.game_of[rec.id]]
+    if rec.stop_time <= run.now:
+        return
+    late = name_late(game.event, rec.program_start_time)
+    if not late:
+        return
+    pad = padding(rec, KIND_RULE, ctx.profiles, ctx.stored)
+    stop = rec.program_stop_time + pad[1] + late
+    if stop <= rec.stop_time:
+        return
+    start = rec.scheduled_start_time or rec.start_time
+    ev = game.event
+    why = (f'TheSportsDB now has the game at {run.clock(ev.start_at)}, later than the '
+           f"{run.clock(rec.program_start_time)} the recording started from, and it changed that after the "
+           f'recording had started, so it should end about {counted(_minutes(late), "minute")} later.')
+    if not _owned_running(rec, ctx):
+        if _kept_new(rec.id, (start, stop)):
+            _note_kept(rec.id, KIND_RULE, game, run, None, (start, stop), why=why)
+            counts['kept'] += 1
+        return
+    if _extend(rec.id, KIND_RULE, start, rec.stop_time, stop, pad, game, run, None, why=why):
+        counts['extended'] += 1
+        _rearm_stop(rec.id, stop)
+
+
 def _kept(event) -> bool:
     from .sports_match import kept_start
     return kept_start(event)
@@ -555,13 +604,13 @@ def _kept_new(rec_id, want) -> bool:
     return (extra.get('new_start'), extra.get('new_stop')) != (iso_seconds_or_none(want[0]), iso_seconds_or_none(want[1]))
 
 
-def _note_kept(rec_id, kind, game, run, raw, want):
+def _note_kept(rec_id, kind, game, run, raw, want, why=None):
     rec = db.session.get(Recording, rec_id)
     listing = _listing_of(rec) if rec is not None else None
     db.session.rollback()
     if listing is None:
         return
-    why = _why(game, run, raw, listing)
+    why = why or _why(game, run, raw, listing)
     # A Record recording with no window of ChannelBin's was saved at other times, changed since, or
     # made before ChannelBin kept the window it gave one; the sentence names all three, since a row
     # cannot tell which.
@@ -595,16 +644,17 @@ def _late_why(game, run, raw, listing) -> str:
     return _why(game, run, raw, listing)
 
 
-def _extend(rec_id, kind, start, old_stop, new_stop, pad, game, run, raw) -> bool:
+def _extend(rec_id, kind, start, old_stop, new_stop, pad, game, run, raw, why=None) -> bool:
     """Move a running recording's end later, with ChannelBin's own record of its window, in one unit.
     The window it was planned for moves too (scheduled_stop_time): the end is a new plan, and a
-    capture that ran to it is not one that ran over."""
+    capture that ran to it is not one that ran over. `why` is said in place of the listing's
+    reason, for a recording made from no listing."""
     rec = db.session.get(Recording, rec_id)
     listing = _listing_of(rec) if rec is not None else None
     db.session.rollback()
     if listing is None:
         return False
-    why = _late_why(game, run, raw, listing)
+    why = why or _late_why(game, run, raw, listing)
     bump = _collision(rec_id, start, new_stop, exclude=rec_id) + _handoff_ahead(rec_id, new_stop, run)
     clock = run.clock
 

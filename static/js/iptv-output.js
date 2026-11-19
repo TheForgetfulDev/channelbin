@@ -320,6 +320,8 @@
     else if (act === 'power') guarded(setPower)(t.dataset.to);
     else if (act === 'stop') stopPlay(t);
     else if (act === 'live-now') goLiveNow(t).then((changed) => { if (changed) refresh(); });
+    else if (act === 'channel-now') channelNow(t, e);
+    else if (act === 'preview') previewFrom(t);
     else if (act === 'tab') { view.tab = t.dataset.tab; applyTab(); }
     else if (act === 'show') { view.show = t.dataset.show; view.page = 1; applyFilter(); }
     else if (act === 'page') { view.page += Number(t.dataset.dir); applyFilter(); }

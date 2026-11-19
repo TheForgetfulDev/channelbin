@@ -31,6 +31,7 @@ const respond = (status, body) => Promise.resolve({
 });
 const posted = [];   // [url, parsed JSON body or null]
 let reencodeAnswer = { success: true, available: true, reason: '' };
+let feedStatus = [];
 let nextSid = 1;
 const sessions = {};
 w.fetch = (url, opts = {}) => {
@@ -48,6 +49,18 @@ w.fetch = (url, opts = {}) => {
     });
   }
   if (url === '/api/preview/reencode') return respond(200, reencodeAnswer);
+  // A feed preview (dev/changelog/1645): its status walks the rounds staged in feedStatus.
+  if (url === '/api/feed/1000000001/preview') {
+    return respond(200, { success: true, session_id: 'f1', source: 'feed', state: 'STARTING', round: 0,
+      now_playing: 'the waiting screen', transcode_audio: true, reencode: false,
+      status_url: '/api/preview/f1/status', playlist_url: '/api/preview/f1/index.m3u8?round=0',
+      stop_url: '/api/preview/f1/stop' });
+  }
+  if (url === '/api/preview/f1/status') {
+    const st = feedStatus.length > 1 ? feedStatus.shift() : feedStatus[0];
+    return respond(200, { success: true, session_id: 'f1', source: 'feed', elapsed_seconds: 3,
+      playlist_url: `/api/preview/f1/index.m3u8?round=${st.round}`, ...st });
+  }
   const m = url.match(/^\/api\/preview\/(s\d+)\/status$/);
   if (m) return respond(200, { success: true, session_id: m[1], state: 'READY', elapsed_seconds: 2 });
   if (url.endsWith('/stop')) return respond(200, { success: true, stopped: true });
@@ -156,6 +169,33 @@ third.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferAddCod
 third.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferAddCodecError', error: { message: "Failed to execute 'addSourceBuffer' on 'MediaSource': The type provided ('video/mp4;codecs=hvc1.1.6.L93.B0') is unsupported." } });
 await settle();
 out.noGpu = view();
+d.querySelector('.modal .modal-close').click();
+await settle();
+
+// A feed preview: round 1 on the waiting screen, then the output moves to the game - a mark ends
+// round 1 (STARTING) and round 2 is READY on the game's channel. The player lets go of round 1 and
+// attaches to round 2 with a decoder of its own.
+feedStatus = [
+  { state: 'STARTING', round: 1, now_playing: 'the waiting screen' },
+  { state: 'READY', round: 1, now_playing: 'the waiting screen' },
+  { state: 'STARTING', round: 1, now_playing: 'the waiting screen' },
+  { state: 'READY', round: 2, now_playing: '"Local game"' },
+];
+const madeBefore = hlsMade.length;
+w.openLivePreview({ feedId: 1000000001, channelName: 'Ironvale Bears' });
+await settle();                            // STARTING round 1: the first connect
+out.feedConnecting = view();
+tick(1000); await settle();                // READY round 1 -> attach
+const r1 = hlsMade[hlsMade.length - 1];
+d.querySelector('.modal video').dispatchEvent(new w.Event('playing'));
+out.feedRound1 = { ...view(), url: r1 && r1.url, made: hlsMade.length - madeBefore,
+  posted: posted.filter(([u]) => u.startsWith('/api/feed/')).map(([u]) => u) };
+tick(3000); await settle();                // STARTING: round 1 is let go
+out.feedSwitching = { ...view(), r1Destroyed: r1 && r1.destroyed, made: hlsMade.length - madeBefore };
+tick(1000); await settle();                // READY round 2 -> attach again
+const r2 = hlsMade[hlsMade.length - 1];
+d.querySelector('.modal video').dispatchEvent(new w.Event('playing'));
+out.feedRound2 = { ...view(), url: r2 && r2.url, made: hlsMade.length - madeBefore };
 d.querySelector('.modal .modal-close').click();
 
 process.stdout.write(JSON.stringify(out));

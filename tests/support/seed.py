@@ -16,7 +16,7 @@ from app.database import (
     M3uAccount, Channel, ChannelGroup, ChannelGroupMember, ChannelTest,
     Recording, RecordingEvent, RecordingSegment, EPGEntry, OnDemandTestJob,
     EpgSource, EpgSourceSubscription, EPG_SOURCE_PROVIDER, EPG_SOURCE_URL,
-    RECORDING_ABORTED,
+    RECORDING_ABORTED, SportsMatch,
 )
 
 # Every Recording.status the state machine can persist (see Recording model comment).
@@ -227,6 +227,25 @@ def make_epg_entry(channel, title='Test Program', offset_minutes=0, duration_min
     db.session.flush()
     return entry
 
+
+
+def make_guide_match(event, channel, start=None, hours=3.0, title='PFL Football', **fields):
+    """A guide match of `event` on `channel` and the listing it was matched on, as the matcher
+    leaves them. A sports channel's play takes its channel from the Programs search over the
+    listings (auto_rules.game_sources(), dev/changelog/1637), so a match with no listing behind it
+    is one nothing plays. The listing is made once per channel and start. `fields` override the
+    match's own columns."""
+    start = start or event.start_at
+    row = dict(kind='guide', strength='strong', airing='first', title_key=title.lower(), program_title=title,
+               reason='Matched on the league and both teams.')
+    row.update(fields)
+    match = SportsMatch(event_id=event.id, channel_id=channel.id, program_start_time=start,
+                        program_stop_time=start + timedelta(hours=hours), **row)
+    db.session.add(match)
+    if row['kind'] == 'guide' and EPGEntry.query.filter_by(channel_id=channel.id, start_time=start).first() is None:
+        make_epg_entry(channel, title=title, start_time=start, duration_minutes=int(hours * 60))
+    db.session.flush()
+    return match
 
 def seed_all():
     """Build one-of-everything and commit. Returns a Seeded namespace.

@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {# _record_modal.html calls csrf_field() unqualified, so it has to be in this template's namespace. #}
-{% from '_macros.html' import beta_mark, csrf_field, record_dialog_config %}
+{% from '_macros.html' import beta_mark, csrf_field, preview_btn, record_dialog_config %}
 {% from '_game_times.html' import game_times_rows %}
 {% block title %}{{ league.name }} - Sports Schedules - ChannelBin{% endblock %}
 
@@ -115,7 +115,7 @@
             {% for g in games %}
             <tr>
               <td data-label="When" class="rl-when"><span class="day">{{ g.day }}</span>{% if g.guide_time %}<span class="sp-two">{{ g.guide_time }} <span class="sp-src">your guide</span></span><span class="sp-two text-warning">{{ g.time or 'Time not listed' }} <span class="sp-src">TheSportsDB</span></span>{% else %}{{ g.time or 'Time not listed' }}{% endif %}</td>
-              <td data-label="{{ one | capitalize }}" class="rl-prog"><span class="t">{{ g.game }}</span>{% for n in g.notes %}<span class="sp-note">{{ n }}</span>{% endfor %}{% set h = g.held or g.replay_held or g.failed %}{% if h %}<span class="sp-held"><span class="badge {{ h.badge }}">{% if h.pulse %}<span class="pulse"></span>{% elif h.mark %}{{ icon('record') }}{% endif %}{{ h.text }}</span></span><span class="s">{{ h.sub }}</span>{% endif %}{% if g.live and g.live.on %}<span class="s">Go live now is on until {{ g.live.until }}, on {{ g.live.channels | join(', ') }}</span>{% endif %}</td>
+              <td data-label="{{ one | capitalize }}" class="rl-prog"><span class="t">{{ g.game }}</span>{% for n in g.notes %}<span class="sp-note">{{ n }}</span>{% endfor %}{% set h = g.held or g.replay_held or g.failed %}{% if h %}<span class="sp-held"><span class="badge {{ h.badge }}">{% if h.pulse %}<span class="pulse"></span>{% elif h.mark %}{{ icon('record') }}{% endif %}{{ h.text }}</span></span><span class="s">{{ h.sub }}</span>{% endif %}{% if g.live and g.live.on %}<span class="s">Broadcasting early until {{ g.live.until }}, on {{ g.live.channels | join(', ') }}</span>{% endif %}</td>
               <td data-label="Venue" class="rl-where">{{ g.where or '-' }}</td>
               <td data-label="Where it&rsquo;s on" class="rl-prog">{% if g.guide.open %}<button class="sp-onguide" data-act="listings" data-event="{{ g.id }}" data-name="{{ g.game }}" data-names-only="{{ 1 if g.guide.names_only else 0 }}">{{ g.guide.text }}</button>{% else %}<span class="sp-none">{{ g.guide.text }}</span>{% endif %}<span class="s{{ ' text-warning' if g.guide_time else '' }}">{% if g.guide_time %}At {{ g.guide_time }} in your guide, not TheSportsDB's {{ g.time }}{% else %}{{ g.guide.sub }}{% endif %}</span>{% if g.guide.also %}<span class="s">{{ g.guide.also }}</span>{% endif %}</td>
               <td data-label="" class="sp-kebab"><span class="sp-acts">
@@ -130,6 +130,10 @@
                   {% if h.can_stop %}<div class="sep"></div><button class="menu-item danger" data-act="stop-rec" data-rec="{{ h.id }}" data-rec-name="{{ h.name }}">Stop recording</button>{% endif %}
                 </div></span>
                 {%- elif g.record %}<button class="btn btn-sm{{ ' disabled' if g.record.why else '' }}" data-act="record" data-event="{{ g.id }}"{% if g.record.why %} aria-disabled="true" data-why="{{ g.record.why }}"{% endif %}>{{ icon('record') }}{{ g.record.label }}</button>{% endif -%}
+                {#- What it would record and play from if it started now (dev/changelog/1639): asked on
+                    click, never per row, and only once the guide has found the game. -#}
+                {%- set cn_why = '' if g.guide.open else g.guide.text ~ ', so there is no channel to show.' %}
+                <button class="btn btn-sm{{ ' disabled' if cn_why else '' }}" data-act="channel-now" data-event="{{ g.id }}"{% if cn_why %} aria-disabled="true" data-why="{{ cn_why }}"{% endif %}>Channel it would use</button>
                 <span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
                 <div class="menu pop-left">
                   {% if g.search and g.search.url %}<a class="menu-item" href="{{ g.search.url }}">Search programs {{ icon('forward') }}</a>{% elif g.search %}<button class="menu-item disabled" data-act="search-why" data-why="{{ g.search.why }}" aria-disabled="true">Search programs</button>{% endif %}
@@ -137,7 +141,8 @@
                   {% if g.failed %}<a class="menu-item" href="{{ g.failed.url }}">{{ g.failed.link }} {{ icon('forward') }}</a>{% endif %}
                   {% if g.search %}<div class="sep"></div>{% endif %}
                   <button class="menu-item" data-act="listings" data-event="{{ g.id }}" data-name="{{ g.game }}" data-names-only="{{ 1 if g.guide.names_only else 0 }}"{{ ' disabled' if not g.guide.open else '' }}>{{ 'Event channels naming it' if g.guide.names_only else 'Listings on your guide' }}</button>
-                  {% if g.live %}{% set lv = g.live %}<button class="menu-item" data-act="live-now" data-event="{{ lv.event }}" data-on="{{ 1 if lv.on else 0 }}" data-message="{{ lv.message }}" data-channels="{{ lv.channels | tojson | forceescape }}"{% if lv.why %} data-why="{{ lv.why }}"{% endif %}>{{ 'Turn off Go live now' if lv.on else 'Go live now' }}</button>{% endif %}
+                  <button class="menu-item{{ ' disabled' if cn_why else '' }}" data-act="channel-now" data-event="{{ g.id }}"{% if cn_why %} aria-disabled="true" data-why="{{ cn_why }}"{% endif %}>Channel it would use</button>
+                  {% if g.live %}{% set lv = g.live %}<button class="menu-item tip-plain" data-act="live-now" data-event="{{ lv.event }}" data-on="{{ 1 if lv.on else 0 }}" data-message="{{ lv.message }}" data-channels="{{ lv.channels | tojson | forceescape }}"{% if lv.why %} data-why="{{ lv.why }}"{% endif %} data-tip="{{ lv.tip }}">{{ 'Stop broadcast' if lv.on else 'Start broadcast' }}</button>{% endif %}
                   <a class="menu-item" href="{{ g.tsdb_url }}" target="_blank" rel="noopener">View on TheSportsDB {{ icon('forward') }}</a>
                 </div></span></span></td>
             </tr>
@@ -155,7 +160,7 @@
   <div class="card" data-section="feed" id="sp-feed">
     <div class="card-head"><h2>On your IPTV output</h2></div>
     <div class="card-body">
-      <p class="card-note">ChannelBin can serve its own sports channels to your IPTV player through the IPTV output: one for a team, or numbered channels that carry every {{ one }} in the league. Each has a guide of its {{ many }} from TheSportsDB and plays whichever of your channels lists the {{ one }} in its own guide, from a little before its listing starts to a while after it ends, so tuning in early or to a {{ one }} running long still finds it on. How long before and after is in the IPTV output's settings. They are for watching: they are not in the TV Guide and nothing records from them. Its Up next channel is ChannelBin's own picture of the coming {{ many }} and where each is on. There is one for everything you follow too, on the <a href="{{ url_for('iptv_output.page') }}">IPTV Output</a> page.</p>
+      <p class="card-note">ChannelBin can serve its own sports channels to your IPTV player through the IPTV output: one for a team, or numbered channels that carry every {{ one }} in the league. Each has a guide of its {{ many }} from TheSportsDB and plays the {{ one }} from the same one of your channels a recording of it would use, from a little before its listing starts to a while after it ends, so tuning in early or to a {{ one }} running long still finds it on. How long before and after is in the IPTV output's settings. They are for watching: they are not in the TV Guide and nothing records from them. Its Up next channel is ChannelBin's own picture of the coming {{ many }} and where each is on. There is one for everything you follow too, on the <a href="{{ url_for('iptv_output.page') }}">IPTV Output</a> page.</p>
       {% if not feed.feed_on %}
       <div class="notice notice-info"><div><strong>The IPTV output is off.</strong> What you switch on here is saved, and appears in your IPTV player once the output is turned on, on the <a href="{{ url_for('iptv_output.page') }}">IPTV Output</a> page.</div></div>
       {% endif %}
@@ -179,13 +184,14 @@
       {% if feed.show_up_next or feed.show_league or feed.page_teams %}
       <div class="table-scroll">
         <table class="tbl tbl-cards rl-tbl">
-          <thead><tr><th>Channel</th><th>What it carries</th><th>On the output</th></tr></thead>
+          <thead><tr><th>Channel</th><th>What it carries</th><th>On the output</th><th></th></tr></thead>
           <tbody>
             {% if feed.show_up_next %}
             <tr>
               <td data-label="Channel" class="rl-prog"><span class="t">{{ feed.up_next_name }}</span></td>
               <td data-label="What it carries" class="rl-prog">ChannelBin's own picture of the coming {{ many }}: when each one is and where it is on, a new page every 10 seconds.<span class="s">It plays no stream from your IPTV provider.</span></td>
               <td data-label="On the output"><label class="switch"><input type="checkbox" data-act="up-next" data-league="{{ league.id }}" aria-label="{{ feed.up_next_name }} on the IPTV output"{{ ' checked' if feed.up_next_on else '' }}><span class="knob"></span></label></td>
+              <td data-label="" class="sp-kebab">{{ preview_btn(feed.up_next_name, feed=feed.up_next_feed_id, why='' if feed.up_next_feed_id is not none else 'Switch it on once to preview it.') }}</td>
             </tr>
             {% endif %}
             {% if feed.show_league %}
@@ -193,6 +199,11 @@
               <td data-label="Channel" class="rl-prog"><span class="t">{{ league.name }} 1{% if feed.numbered > 1 %} to {{ league.name }} {{ feed.numbered }}{% endif %}</span></td>
               <td data-label="What it carries" class="rl-prog">Every {{ one }} in the league, spread over as many channels as it takes for none to overlap.<span class="s">A {{ one }} keeps the channel it is given.</span></td>
               <td data-label="On the output"><label class="switch"><input type="checkbox" data-act="feed-channel" data-team="0" aria-label="{{ league.name }} league channels on the IPTV output"{{ ' checked' if feed.league_on else '' }}><span class="knob"></span></label></td>
+              <td data-label="" class="sp-kebab">
+                {%- if feed.numbered_feeds | length > 1 %}<span class="menu-wrap"><button class="btn btn-sm" data-menu>{{ icon('preview') }}Preview {{ icon('dropdown') }}</button>
+                <div class="menu pop-left">{% for n in feed.numbered_feeds %}{{ preview_btn(n.name, feed=n.feed_id, menu=true, label=n.name) }}{% endfor %}</div></span>
+                {%- elif feed.numbered_feeds %}{{ preview_btn(feed.numbered_feeds[0].name, feed=feed.numbered_feeds[0].feed_id) }}
+                {%- else %}{{ preview_btn(league.name, feed=0, why=('No ' ~ one ~ ' has been given a numbered channel yet, so there is nothing to preview.') if feed.league_on else 'Switch the league channels on to preview them.') }}{% endif %}</td>
             </tr>
             {% endif %}
             {% for t in feed.page_teams %}
@@ -200,6 +211,7 @@
               <td data-label="Channel" class="rl-prog"><span class="t">{{ t.name }}</span></td>
               <td data-label="What it carries" class="rl-prog">Every {{ t.name }} {{ one }}.</td>
               <td data-label="On the output"><label class="switch"><input type="checkbox" data-act="feed-channel" data-team="{{ t.id }}" aria-label="{{ t.name }} on the IPTV output"{{ ' checked' if t.on else '' }}><span class="knob"></span></label></td>
+              <td data-label="" class="sp-kebab">{{ preview_btn(t.name, feed=t.feed_id or 0, why='' if t.feed_id else 'Switch it on to preview it.') }}</td>
             </tr>
             {% endfor %}
           </tbody>
@@ -340,6 +352,9 @@ const GUIDE_CONFIG = {
 };
 </script>
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>
+<script src="{{ url_for('static', filename='js/live-preview.js') }}"
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.min.js') }}"></script>
 <script src="{{ url_for('static', filename='js/live-now.js') }}"></script>
+<script src="{{ url_for('static', filename='js/channel-now.js') }}"></script>
 <script src="{{ url_for('static', filename='js/sports.js') }}"></script>
 {% endblock %}

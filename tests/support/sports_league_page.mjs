@@ -1,5 +1,6 @@
 /* Drives the REAL Sports Schedules league page (static/js/sports.js over the markup the app rendered)
-   in jsdom and prints what it observed as JSON: the listings dialog's closed groups, event channels and Wrong match,
+   in jsdom and prints what it observed as JSON: the listings dialog's closed groups, event channels, their
+   channel and account links, and Wrong match,
    and the Matching card's names, categories and skip words (mockups 51, 59). Called by
    tests/test_sports_league_matches.py, which owns every assertion - this file only reports. Faked:
    fetch (answers per request) and swapFromServer. The page also carries the shared record dialog
@@ -10,7 +11,7 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 const [, , DIR, REPO] = process.argv;
 const HTML = fs.readFileSync(`${DIR}/league.html`, 'utf8');
 const LISTINGS = JSON.parse(fs.readFileSync(`${DIR}/listings.json`, 'utf8'));
-const JS = ['util.js', 'sports.js'].map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
+const JS = ['util.js', 'live-preview.js', 'sports.js'].map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
 const wait = (ms = 15) => new Promise((r) => setTimeout(r, ms));
 
 const errors = [];
@@ -41,7 +42,8 @@ w.fetch = (url, opts = {}) => {
 };
 w.eval(JS[0]);
 w.eval('window.SWAPS = 0; swapFromServer = function () { SWAPS += 1; return Promise.resolve(); };');
-w.eval(JS[1]);
+w.eval(JS[1]);   // live-preview.js: the dialogs' Preview buttons (dev/changelog/1645)
+w.eval(JS[2]);
 
 const click = async (el) => { el.dispatchEvent(new w.MouseEvent('click', { bubbles: true })); await wait(); };
 const out = { errors };
@@ -73,8 +75,18 @@ out.skipped_hidden = { button: skipToggle().textContent.trim(), rows: skippedRow
 await click(groups()[0].querySelector('[data-toggle]'));
 out.opened_channels = groups()[0].querySelectorAll('.sp-chan').length;
 out.opened_expanded = groups()[0].querySelector('[data-toggle]').getAttribute('aria-expanded');
-out.channel_buttons = Array.from(groups()[0].querySelectorAll('.sp-chan button')).map((b) => ({
+const linked = (row) => {
+  const a = row.querySelector('.sp-cname a.name-link');
+  const pill = row.querySelector('.sp-cname a.ch-pill.acct-pill');
+  return { name: a && a.textContent, href: a && a.getAttribute('href'),
+    account: pill && pill.textContent, account_href: pill && pill.getAttribute('href') };
+};
+out.channel_links = Array.from(groups()[0].querySelectorAll('.sp-chan')).map(linked);
+out.channel_buttons = Array.from(groups()[0].querySelectorAll('.sp-chan button[data-wrong]')).map((b) => ({
   text: b.textContent.trim(), plain: b.className === 'btn btn-sm' }));
+// Each channel's Preview (dev/changelog/1645): the channel id it would play, beside Wrong match.
+out.channel_previews = Array.from(groups()[0].querySelectorAll('.sp-chan [data-act="preview"]'))
+  .map((b) => ({ channel: b.dataset.channel, name: b.dataset.name }));
 await click(groups()[0].querySelector('.sp-chan [data-wrong="1"]'));
 await wait(30);
 await click(groups()[0].querySelector('.sp-gact [data-wrong="1"]'));
@@ -84,7 +96,9 @@ out.still_open_after_reload = groups()[0].classList.contains('open');
 const enames = () => Array.from(d.querySelectorAll('.modal:not([id]) .sp-ename'));
 out.names = enames().map((r) => ({ text: r.querySelector('.sp-cname').firstChild.textContent.trim(),
   why: r.querySelector('.sp-why').textContent, badge: (r.querySelector('.badge') || {}).textContent || null,
-  button: r.querySelector('button').textContent.trim() }));
+  button: r.querySelector('button[data-wrong]').textContent.trim(),
+  preview: (r.querySelector('[data-act="preview"]') || { dataset: {} }).dataset.channel || null }));
+out.name_links = enames().map(linked);
 out.names_heading = (d.querySelector('.modal:not([id]) .sp-h3') || {}).textContent || null;
 const beforeName = requests.length;
 await click(enames()[0].querySelector('[data-wrong="1"]'));

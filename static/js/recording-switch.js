@@ -11,17 +11,13 @@
   const esc = escHtml;
   const band = (s) => (s == null ? 'hb-none' : s >= 90 ? 'hb-great' : s >= 80 ? 'hb-good' : s >= 50 ? 'hb-fair' : 'hb-poor');
 
-  function acctPill(a) {
-    return `<span class="ch-pill acct-pill"><span class="acct-dot" style="background: ${esc(a.color || 'var(--text-faint)')}"></span>${esc(a.name)}</span>`;
-  }
-
   function choiceRow(c) {
     const score = c.score == null
       ? '<span class="h-mini hb-none tip-plain" data-tip="Never tested.">-</span>'
       : `<span class="h-mini ${band(c.score)} tip-plain" data-tip="Lifetime health score ${c.score} of 100.">${c.score}</span>`;
     return `<label class="fp-radio${c.ok ? '' : ' sw-off'}">
       <div class="sw-row"><input type="radio" name="sw-member" value="${c.channel_id}"${c.ok ? '' : ' disabled'}>
-        <span class="sw-name">${esc(c.name)}</span>${acctPill(c.account)}${score}</div>
+        <span class="sw-name">${esc(c.name)}</span>${accountPill({ name: c.account.name, color: c.account.color })}${score}</div>
       <span class="sw-why${c.warn ? ' warn' : ''}">${esc(c.why)}</span>
     </label>`;
   }

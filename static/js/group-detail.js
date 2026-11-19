@@ -2667,6 +2667,10 @@
       // The phone's chrome. Every one of these is a rearrangement of a control the desktop
       // already has, so none of them reaches a route of its own.
       case 'overflow': openOverflow(); return;
+      // The overflow sheet's copy carries only data-act, so the kebab's own row names the group.
+      case 'preview':
+        previewFrom(el && el.dataset.feed ? el : document.querySelector('#gd-kebab [data-act="preview"]'));
+        return;
       case 'bulk-sheet': openBulkSheet(); return;
       case 'select-done': setSelecting(false); return;
       case 'select-all-visible': {

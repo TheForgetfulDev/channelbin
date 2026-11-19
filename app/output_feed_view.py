@@ -118,7 +118,7 @@ _NO_SPORTS = (None, None, None, None)
 
 def _sports_programs(rows, now: datetime, days: int, after, blocked=frozenset(), allowed=None) -> tuple:
     """({sports row id: (the game on now, the last one that ended no more than `after` ago, the
-    next one, the first one opened with Go live now), each or None}, {event id: [names of the
+    next one, the first one started early with Start broadcast), each or None}, {event id: [names of the
     sports channels carrying it]}), from guide_programs' two queries. Never playing_now() per row.
     `blocked` and `allowed` are the account ids a play drops, so a game's description counts the
     channels a tune-in could really use, as the guide the feed sends does."""
@@ -127,7 +127,7 @@ def _sports_programs(rows, now: datetime, days: int, after, blocked=frozenset(),
     names = {r.row.row.id: r.name for r in sports}
     out, carrying = {}, {}
     for program in sports_feed.guide_programs([r.row for r in sports], now - after, days,
-                                               blocked=blocked, allowed=allowed):
+                                               blocked=blocked, allowed=allowed, asked_at=now):
         on_now, ended, following, opened = out.get(program.row_id, _NO_SPORTS)
         if program.event is not None:
             carrying.setdefault(program.event.id, []).append(names[program.row_id])
@@ -145,15 +145,17 @@ def _sports_programs(rows, now: datetime, days: int, after, blocked=frozenset(),
 
 def _sports_tuned(entry: tuple, now: datetime, window: tuple) -> tuple:
     """(program, phase) a tune-in to a sports channel plays now by its guide's times, the same
-    order sports_feed.playing_now() takes listings in: a game opened with Go live now, then on
+    order sports_feed.playing_now() takes listings in: a game started early with Start broadcast, then on
     now, then a game that may be running long, then the next game's early start; a game outside
-    its own time counts only when a guide lists it, since playing_now() has nothing to play
-    otherwise. (None, '') when the channel has nothing near. The guide's times stand in for the
+    its own time counts only when a guide lists it or a channel's name gives it (Program.playable),
+    since playing_now() has nothing to play otherwise, and runs long only when a guide lists it,
+    since a game taken from a name ends at its pick's end. (None, '') when the channel has nothing
+    near. The guide's times stand in for the
     listings' here, so this is what the row says, not a play."""
     from .sports_feed import PHASE_AFTER, PHASE_BEFORE, PHASE_LIVE_NOW, PHASE_ON
     before, after = window
     on_now, ended, following, opened = entry
-    if opened is not None and opened.listed:
+    if opened is not None and opened.playable:
         # Opened early, it holds the channel; once its time comes it reads as any game does, as
         # the play's own label does (playing_now relabels only the time before its listing).
         if now < opened.start:
@@ -163,7 +165,7 @@ def _sports_tuned(entry: tuple, now: datetime, window: tuple) -> tuple:
         return on_now, PHASE_ON
     if ended is not None and ended.listed and now < ended.stop + after:
         return ended, PHASE_AFTER
-    if following is not None and following.listed and following.start - before <= now:
+    if following is not None and following.playable and following.start - before <= now:
         return following, PHASE_BEFORE
     return None, ''
 
@@ -178,7 +180,7 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
             'is_sports': row.kind == output_feed.KIND_SPORTS,
             'is_up_next': row.kind == output_feed.KIND_UP_NEXT,
             'on': row.offered, 'switchable': True, 'switch_tip': '', 'problem': '',
-            'plays': None, 'note': '', 'sub': KIND_TEXT[row.kind], 'live': None,
+            'plays': None, 'note': '', 'sub': KIND_TEXT[row.kind], 'live': None, 'channel_now': None,
             'watching': watching.get(row.feed_id, 0), 'how': '', 'how_tip': ''}
     if output_feed.mode_of(fcfg) == output_feed.MODE_MIXED:
         if row.kind == output_feed.KIND_UP_NEXT:
@@ -247,13 +249,16 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
 
         def offer(program):
             return live_now_offer(program.event, program.listings, carrying.get(program.event.id, ()),
-                                  now, window[1], tz, h24, blocked=blocked, allowed=allowed)
+                                  now, window[0], window[1], tz, h24, blocked=blocked, allowed=allowed,
+                                  named=program.named)
 
-        # Turn off stays on the row for as long as the game it opened is what the row shows.
+        # Stop broadcast stays on the row while the game it started is what the row shows, until
+        # the game's own time on air comes (live_now_offer() is None from then).
         if tuned is not None and tuned.event is not None and live_now_on(tuned.event, now):
             view['live'] = offer(tuned)
         if phase == PHASE_LIVE_NOW:
-            view['sports_when'] = 'playing ahead of its listing'
+            view['sports_when'] = ('playing ahead of its start' if tuned.named is not None
+                                   else 'playing ahead of its listing')
             view['note'] = tuned.description
         elif phase == PHASE_ON:
             view['sports_when'] = 'on now'
@@ -275,6 +280,14 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
                 view['live'] = offer(following)
         else:
             raise ValueError(f'Unknown play phase "{phase}"')
+        # Channel it would use (dev/changelog/1639), for the game the row names: asked on click,
+        # and only once a guide lists the game or a channel's name gives it (dev/changelog/1643).
+        shown = tuned if tuned is not None else following
+        if shown is not None and shown.event is not None:
+            view['channel_now'] = {'event': shown.event.id, 'why': '' if shown.playable else (
+                f"No channel's guide lists {shown.title} yet, and it is not one Record would take from a "
+                "channel's name either, so there is no channel to show. ChannelBin looks again after each "
+                'guide update.')}
         if row.left_out:
             # Not a fault: a tune-in from a player that kept it still plays (dev/changelog/1621).
             view['note'] = (f'Not in the channel list right now: {row.left_out}. It comes back as the same '
@@ -292,6 +305,14 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
             view['switch_tip'] = 'Follow something in its league again in Sports Schedules to bring it back.'
     else:
         raise ValueError(f'Unknown feed row kind "{row.kind}"')
+    # Preview (dev/changelog/1645): a provider's channel previews as itself; ChannelBin's own channels
+    # play as a player gets them, a group whether or not it is on the output. A group or an Up next
+    # channel that cannot play says why instead; a sports channel always has its waiting screen.
+    if row.kind == output_feed.KIND_CHANNEL:
+        view['preview'] = {'channel': row.row.id, 'feed': None, 'why': ''}
+    else:
+        why = view['problem'] if row.kind in (output_feed.KIND_GROUP, output_feed.KIND_UP_NEXT) else ''
+        view['preview'] = {'channel': None, 'feed': row.feed_id, 'why': why}
     view['hay'] = ' '.join(x for x in (row.name, row.category,
                                         (view['plays'] or {}).get('name', '')) if x).lower()
     return view
@@ -372,8 +393,10 @@ def _waiting_text(s) -> str:
     return f'{game}. {why}' if why else game
 
 
-def _recent(args, mode: str, by_feed: dict, now, tz, h24) -> dict:
-    """One page of Recent plays and the chips' counts: two queries."""
+def _recent(args, mode: str, by_feed: dict, accounts: dict, now, tz, h24) -> dict:
+    """One page of Recent plays and the chips' counts: two queries. A line that names the channel it
+    played links it and its account from the ids the line kept: a channel deleted since has had its
+    id cleared (detach_channel_references) and reads as text, as does an account no longer there."""
     from . import db
     since = now - timedelta(days=output_feed.PLAY_LOG_DAYS)
     counts = dict(db.session.query(OutputFeedPlay.kind, db.func.count(OutputFeedPlay.id))
@@ -409,6 +432,13 @@ def _recent(args, mode: str, by_feed: dict, now, tz, h24) -> dict:
     def clock(dt):
         return format_local(dt, 'clock', tz=tz, h24=h24)
 
+    def played(play, lead, tail):
+        return {'lead': lead, 'tail': tail,
+                'channel': {'name': play.channel_name or '-',
+                            'url': (url_for('channels.channel_detail', channel_id=play.channel_id)
+                                    if play.channel_id is not None else '')},
+                'account': accounts.get(play.account_id) if play.account_id is not None else None}
+
     lines = []
     for play in found:
         row = by_feed.get(play.feed_id)
@@ -417,18 +447,18 @@ def _recent(args, mode: str, by_feed: dict, now, tz, h24) -> dict:
         text = (play.message or '').replace(f' for {play.label}', '')
         line = {'kind': play.kind, 'when': f'{day_label(play.at, now, tz)}, {clock(play.at)}',
                 'client': play.client or '-', 'name': row.name if row else play.label,
-                'text': text}
+                'text': text, 'detail': '', 'played': None}
         if play.kind == FEED_PLAY_ENDED:
             line['badge'] = ('b-abort', 'Ended')
-            line['detail'] = (f'Played {play.channel_name or "-"} for {fmt_duration(play.seconds)}'
-                              + (f', moved to another channel {_times(play.moves)}' if play.moves else ''))
+            line['played'] = played(play, 'Played', f' for {fmt_duration(play.seconds)}'
+                                    + (f', moved to another channel {_times(play.moves)}' if play.moves else ''))
         elif play.kind == FEED_PLAY_REFUSED:
             line['badge'] = ('b-warn', 'Refused')
             line['detail'] = (f'Asked {play.count} times, last at {clock(play.at)}'
                               if play.count > 1 else 'Asked once')
         elif play.kind == FEED_PLAY_REDIRECTED:
             line['badge'] = ('b-sched', 'Sent to the provider')
-            line['detail'] = f'To {play.channel_name or "-"}. ChannelBin cannot see when it stopped.'
+            line['played'] = played(play, 'To', '. ChannelBin cannot see when it stopped.')
         else:
             raise ValueError(f'Unknown play kind "{play.kind}"')
         lines.append(line)
@@ -555,7 +585,7 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
         'watching': _watching(sessions, by_feed, accounts, sports, now, tz, h24, window),
         'at_limit': sum(1 for s in sessions if s.counted) >= max_viewers,
         'max_viewers': max_viewers,
-        'recent': _recent(args, mode, by_feed, now, tz, h24),
+        'recent': _recent(args, mode, by_feed, accounts, now, tz, h24),
         'accounts': _accounts(rows, sessions, accounts, cfg, fcfg),
         'feedcfg': fcfg,
         'modes': MODE_LABELS, 'mode_help': MODE_HELP[mode],

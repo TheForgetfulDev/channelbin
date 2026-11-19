@@ -328,6 +328,58 @@ class ListingsAndWrongMatchTests(LeaguePageCase):
         self.assertEqual((data['listings'], data['channels']), (4, 4))
         self.assertEqual(data['tsdb_url'], 'https://www.thesportsdb.com/event/7001')
 
+    def test_each_channel_links_to_its_page_and_names_its_account(self):
+        """The dialog links every channel and the account it is on (dev/changelog/1638)."""
+        league, (soon_ev, _), ch, soon = seed_league()
+        other = make_account(name='Second login', color='#a1b2c3')
+        on_other = make_channel(other, name='Elsewhere', category_name='PFL Package')
+        named = make_channel(other, name='NEXT | PFL: GULLS @ BEARS', category_name='US| PPV')
+        db.session.flush()
+        add_match(soon_ev, ch[0], soon)
+        add_match(soon_ev, on_other, soon)
+        add_name(soon_ev, named)
+        db.session.commit()
+        data = self.client.get(f'/api/sports/events/{soon_ev.id}/listings').get_json()
+        rows = {c['name']: c for g in data['groups'] for c in g['channels']}
+        self.assertEqual(rows['Elsewhere']['url'], f'/channels/{on_other.id}')
+        self.assertEqual(rows['Elsewhere']['account'], {'id': other.id, 'name': 'Second login', 'color': '#a1b2c3',
+                                                        'url': f'/accounts/{other.id}'})
+        self.assertEqual(rows['Local 0']['account']['id'], ch[0].account_id)
+        self.assertEqual(rows['Local 0']['account']['url'], f'/accounts/{ch[0].account_id}')
+        name = data['names'][0]
+        self.assertEqual((name['url'], name['account']['name'], name['account']['url']),
+                         (f'/channels/{named.id}', 'Second login', f'/accounts/{other.id}'))
+
+    def test_the_accounts_cost_no_query_per_channel(self):
+        """CLAUDE.md, no hidden I/O in per-row loops: the account comes in the same query as its channel,
+        so the dialog runs as many statements for six channels on six accounts as for one."""
+        from tests.support.iocount import IOCounter, all_engines
+        league, (soon_ev, _), ch, soon = seed_league()
+        add_match(soon_ev, ch[0], soon)
+        add_name(soon_ev, ch[1])
+        db.session.commit()
+        event_id = soon_ev.id
+
+        def count():
+            db.session.remove()
+            with IOCounter(all_engines()) as c:
+                r = self.client.get(f'/api/sports/events/{event_id}/listings')
+            self.assertEqual(r.status_code, 200)
+            return c.queries, r.get_json()
+
+        small, data = count()
+        self.assertEqual(len(data['names']), 1)
+        soon_ev = db.session.get(SportsEvent, event_id)
+        for i in range(5):
+            acc = make_account(name=f'Login {i}')
+            add_match(soon_ev, make_channel(acc, name=f'Wide {i}', category_name='PFL Package'), soon)
+            add_name(soon_ev, make_channel(acc, name=f'NEXT {i} | PFL: GULLS @ BEARS', category_name='US| PPV'))
+        db.session.commit()
+        large, data = count()
+        self.assertEqual(sum(len(g['channels']) for g in data['groups']), 6)
+        self.assertEqual(len(data['names']), 6)
+        self.assertEqual(large, small)
+
     def test_wrong_match_marks_only_that_events_rows_and_undo_clears_it(self):
         league, (soon_ev, later_ev), ch, soon = seed_league()
         mine = add_match(soon_ev, ch[0], soon)
@@ -481,6 +533,19 @@ class NamesAndCategoriesTests(LeaguePageCase):
         self.assertEqual(SportsMatch.query.count(), 1)
 
 
+class ListingsDialogWrapTests(unittest.TestCase):
+    def test_every_channel_row_wraps_its_name_rather_than_widening_the_dialog(self):
+        """dev/docs/BUGS.md 2026-11-19 @ 02:12:07 AM: a listing's channel named in one unbroken run pushed the
+        dialog 130px past a 375px phone. jsdom computes no layout, so the rule itself is what is held."""
+        import re
+        with open(os.path.join(REPO, 'static', 'css', 'style.css'), encoding='utf-8') as fh:
+            css = fh.read()
+        rule = re.search(r'(?m)^\.sp-chan \.sp-cname \{([^}]*)\}', css)
+        self.assertIsNotNone(rule, 'no rule for .sp-chan .sp-cname')
+        self.assertIn('min-width: 0', rule.group(1))
+        self.assertIn('overflow-wrap: anywhere', rule.group(1))
+
+
 @unittest.skipIf(shutil.which('node') is None or not os.path.isdir(JSDOM), 'node or jsdom not installed')
 class LeaguePageScriptTests(unittest.TestCase):
     @classmethod
@@ -518,6 +583,7 @@ class LeaguePageScriptTests(unittest.TestCase):
             cls.match_ids = [m.id for m in SportsMatch.query.filter_by(kind='guide').order_by(SportsMatch.id)]
             cls.name_id = SportsMatch.query.filter_by(kind='channel_name').one().id
             cls.league_id = league.id
+            cls.linked = ([(c.id, c.name, c.account_id) for c in ch[:3]], (slot.id, slot.name, slot.account_id))
         finally:
             t.cleanup()
         with tempfile.TemporaryDirectory() as tmp:
@@ -550,6 +616,12 @@ class LeaguePageScriptTests(unittest.TestCase):
         self.assertEqual(self.obs['channel_buttons'], [{'text': 'Wrong match', 'plain': True}] * 3)
         self.assertTrue(self.obs['still_open_after_reload'])
 
+    def test_every_listed_channel_has_a_preview_of_itself(self):
+        """dev/changelog/1645: the channels whose guide lists the game can be watched from the dialog."""
+        listed, _slot = self.linked
+        self.assertEqual(self.obs['channel_previews'],
+                         [{'channel': str(cid), 'name': name} for cid, name, _acct in listed])
+
     def test_wrong_match_sends_one_channel_or_the_whole_group(self):
         posts = self.obs['wrong_posts']
         self.assertEqual(len(posts), 2)
@@ -559,10 +631,22 @@ class LeaguePageScriptTests(unittest.TestCase):
 
     def test_event_channels_follow_the_groups_with_their_own_wrong_match(self):
         self.assertEqual(self.obs['names_heading'], 'Event channels 1')
+        slot_id = self.linked[1][0]
         self.assertEqual(self.obs['names'], [{'text': 'NEXT | PFL: GULLS @ BEARS | US: PPV 2',
                                               'why': 'Matched on the league and both teams in it.',
-                                              'badge': 'Live', 'button': 'Wrong match'}])
+                                              'badge': 'Live', 'button': 'Wrong match',
+                                              'preview': str(slot_id)}])
         self.assertEqual(self.obs['name_posts'], [{'match_ids': [self.name_id], 'wrong': True}])
+
+    def test_every_channel_links_its_page_and_names_its_account_linked(self):
+        """dev/changelog/1638: a listing's channel and an event channel each link to the channel page,
+        with the account it is on beside it, linked to the account page."""
+        listed, (slot_id, slot_name, slot_acct) = self.linked
+        self.assertEqual(self.obs['channel_links'], [
+            {'name': name, 'href': f'/channels/{cid}', 'account': 'Test M3U', 'account_href': f'/accounts/{acct}'}
+            for cid, name, acct in listed])
+        self.assertEqual(self.obs['name_links'], [
+            {'name': slot_name, 'href': f'/channels/{slot_id}', 'account': 'Slots', 'account_href': f'/accounts/{slot_acct}'}])
 
     def test_names_are_removed_added_and_a_suggestion_accepted(self):
         puts = [p['body']['terms'] for p in self.obs['term_puts']]

@@ -778,6 +778,13 @@ def _apply_league(row, league, answer, offset, now):
     _record_outcome(row, SPORTS_FETCH_OK, '', now)
 
 
+def known_team_ids(league_id: int) -> set:
+    """The teams ChannelBin knows play in this league: those in its stored games, and those followed
+    in it already. A follow may name one of these without a fresh lookup."""
+    followed = {t for (t,) in db.session.query(SportsFollow.team_tsdb_id).filter_by(league_id=league_id) if t}
+    return set(_league_team_ids(league_id)) | followed
+
+
 def _league_team_ids(league_id: int) -> list:
     rows = (db.session.query(SportsEvent.home_team_id, SportsEvent.away_team_id)
             .filter(SportsEvent.league_id == league_id).distinct().all())
@@ -1283,10 +1290,32 @@ def ensure_worker():
         schedule_sports_worker(app)
 
 
+def _add_team_rows(teams):
+    """A `SportsTeam` row for each checked team ChannelBin has never stored, so a team followed before
+    its league's schedule arrives has its name. Inside the caller's commit unit."""
+    ids = [t['team_id'] for t in teams]
+    have = {i for (i,) in db.session.query(SportsTeam.tsdb_id).filter(SportsTeam.tsdb_id.in_(ids))} if ids else set()
+    for team in teams:
+        if team['team_id'] not in have:
+            db.session.add(SportsTeam(tsdb_id=team['team_id'], full_name=team['team'], names=json.dumps([team['team']])))
+            have.add(team['team_id'])
+
+
+def _replace_follow(league: SportsLeague, team_ids: list, now: datetime):
+    """The person's follow of `league` becomes exactly these teams, or the whole league with none. A
+    rule's follow is the rule's, and stays. Inside the caller's commit unit."""
+    SportsFollow.query.filter_by(league_id=league.id, rule_id=0).delete(synchronize_session=False)
+    for team_id in (team_ids or [0]):
+        db.session.add(SportsFollow(league_id=league.id, team_tsdb_id=int(team_id), rule_id=0, created_at=now))
+    _enqueue_league(league, now)
+
+
 @retry_on_locked()
-def follow_league(payload: dict, team: dict = None) -> int:
-    """Add a checked league, or follow one already here. With `team`, follows just that team unless
-    the league is already followed whole. Returns the league's id."""
+def follow_league(payload: dict, team_ids: list = None, checked: list = None) -> int:
+    """Add a checked league, or follow one already here: just `team_ids`, or the whole league with
+    none. What a person follows in the league is replaced, so the dialog's ticked list is the follow
+    (dev/changelog/1641). `checked` are teams a lookup just found ({'team_id', 'team'}), stored so a
+    team with no game here yet has its name. Returns the league's id."""
     now = datetime.utcnow()
     league = SportsLeague.query.filter_by(tsdb_id=payload['tsdb_id']).first()
     if league is None:
@@ -1296,37 +1325,23 @@ def follow_league(payload: dict, team: dict = None) -> int:
                               created_at=now)
         db.session.add(league)
         db.session.flush()
-    if team:
-        if SportsTeam.query.filter_by(tsdb_id=team['team_id']).first() is None:
-            db.session.add(SportsTeam(tsdb_id=team['team_id'], full_name=team['team'],
-                                      names=json.dumps([team['team']])))
-        whole = SportsFollow.query.filter_by(league_id=league.id, team_tsdb_id=0, rule_id=0).first()
-        wanted = None if whole else team['team_id']
-    else:
-        wanted = 0
-    if wanted is not None:
-        if wanted == 0:
-            SportsFollow.query.filter_by(league_id=league.id, rule_id=0).delete(synchronize_session=False)
-        if SportsFollow.query.filter_by(league_id=league.id, team_tsdb_id=wanted, rule_id=0).first() is None:
-            db.session.add(SportsFollow(league_id=league.id, team_tsdb_id=wanted, rule_id=0, created_at=now))
-    _enqueue_league(league, now)
+    _add_team_rows(checked or [])
+    _replace_follow(league, team_ids, now)
     db.session.commit()
     return league.id
 
 
 @retry_on_locked()
-def set_following(league_id: int, team_ids: list = None) -> bool:
+def set_following(league_id: int, team_ids: list = None, checked: list = None) -> bool:
     """A person's follow of this league, in one commit: the whole league with no `team_ids`, or just
     those teams. It costs no calls beyond the league's own, since a team is listed by its league's
-    round. Returns False when the league is gone."""
+    round. `checked` are teams a lookup just found ({'team_id', 'team'}), stored so a team with no
+    game here yet has its name. Returns False when the league is gone."""
     league = db.session.get(SportsLeague, league_id)
     if league is None:
         return False
-    now = datetime.utcnow()
-    SportsFollow.query.filter_by(league_id=league_id, rule_id=0).delete(synchronize_session=False)
-    for team_id in (team_ids or [0]):
-        db.session.add(SportsFollow(league_id=league_id, team_tsdb_id=int(team_id), rule_id=0, created_at=now))
-    _enqueue_league(league, now)
+    _add_team_rows(checked or [])
+    _replace_follow(league, team_ids, datetime.utcnow())
     db.session.commit()
     return True
 

@@ -235,6 +235,19 @@ class PagesTests(_Leagues, unittest.TestCase):
         self.assertEqual((later[0].where, later[0].where_short), ('On TSN 4 and 1 more channel', 'TSN 4 +1'))
         self.assertEqual((later[1].where, later[1].where_short), (un.NOT_IN_GUIDE, un.NOT_IN_GUIDE_SHORT))
 
+    def test_a_game_only_a_channels_name_gives_is_on_that_channel(self):
+        """The channel Record would take for a game no guide lists (dev/changelog/1643)."""
+        from app import sports_match
+        ev = self.game(self.nhl, 3, 1)
+        ch = make_channel(make_account('Events', max_connections=1), name='NHL 01: Gulls @ Bears 7:00 PM ET')
+        db.session.add(SportsMatch(event_id=ev.id, channel_id=ch.id, kind='channel_name', strength='strong',
+                                   airing='unknown', program_start_time=ev.start_at, title_key='n',
+                                   reason=f'{sports_match._NAME_PREFIX}: matched.'))
+        db.session.commit()
+        hero = self.rotation(self.nhl.id).pages[0].game
+        self.assertEqual((hero.where, hero.where_short),
+                         ('On NHL 01: Gulls @ Bears 7:00 PM ET', 'NHL 01: Gulls @ Bears 7:00 PM ET'))
+
     def test_the_pages_are_a_fixed_number_of_queries_whatever_is_drawn(self):
         from sqlalchemy import event
         from sqlalchemy.engine import Engine
