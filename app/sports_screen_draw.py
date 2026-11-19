@@ -55,6 +55,8 @@ DRIFT_FRAMES = 30 * FPS
 LOOP_UNIT = 16
 #: The loop with no ticker: about 30 s, a whole number of LOOP_UNITs.
 PLAIN_LOOP_FRAMES = 57 * LOOP_UNIT
+#: An Up next page is up this long, a whole number of LOOP_UNITs: 10.13 s (dev/changelog/1614).
+PAGE_FRAMES = 19 * LOOP_UNIT
 #: The checkered flag of a field event moves 60 px/s; one tile is 60 px.
 FLAG_TILE = 60
 FLAG_PX = 2
@@ -445,8 +447,14 @@ def _solo_title(cv: _Canvas, text: str, top: int) -> int:
     return round(top + lh * len(lines))
 
 
+#: Where an Up next stripe's "where" text ends: short of the right end's colored block.
+BAND_WHERE_RIGHT = 1560
+BAND_WHERE_W = 330
+
+
 def _band(cv: _Canvas, top: int, game, ends, when: str):
-    """One `.d7-band`: a later game as an edge-to-edge stripe in its two teams' colors."""
+    """One `.d7-band`: a later game as an edge-to-edge stripe in its two teams' colors. On an Up
+    next page the name gives up its right end to where the game is on."""
     left, right = (hex_rgb(c) for c in ends)
     stops = [(0, left), (.17, left), (.1715, BAND_MID), (.8285, BAND_MID), (.83, right), (1, right)]
     cv.img.paste(gradient((W, 72), 100, stops), (0, top))
@@ -458,8 +466,13 @@ def _band(cv: _Canvas, top: int, game, ends, when: str):
         else:
             badge_disc(cv, cx, cy, side, inner=60, border=5, ring=3, code_size=20, drop=False)
     f, when = fit_line(when, 700, 34, 400 - 34 - 16, 26)
-    cv.text((330 + 34, _baseline(cy - sum(f.getmetrics()) / 2, f)), when, f, SOFT)
-    f, name = fit_line(game.name, 600, 36, 860 - 20, 28)
+    cv.text((330 + 34, _baseline(cy - sum(f.getmetrics()) / 2, f)), when, f, LIVE if game.live else SOFT)
+    name_w = 860 - 20
+    if game.where_short:
+        fw, where = fit_line(game.where_short, 600, 28, BAND_WHERE_W, 22)
+        cv.text((BAND_WHERE_RIGHT, _baseline(cy - sum(fw.getmetrics()) / 2, fw)), where, fw, SOFT, anchor='rs')
+        name_w = BAND_WHERE_RIGHT - fw.getlength(where) - 40 - 730
+    f, name = fit_line(game.name, 600, 36, name_w, 28)
     cv.text((730, _baseline(cy - sum(f.getmetrics()) / 2, f)), name, f, WHITE)
 
 
@@ -522,9 +535,16 @@ def still(screen) -> tuple:
         if game.venue:
             fv, venue = fit_line(game.venue, 400, 32, W - 320, 26)
             cv.text((W / 2, _baseline(top + 4, fv)), venue, fv, WHITE, anchor='ms', alpha=217)
+            top += 4 + sum(fv.getmetrics())
+        if game.where:
+            # An Up next page's hero says where the game is on, between the venue and the stripes.
+            fw, where = fit_line(game.where, 700, 34, W - 320, 26)
+            cv.text((W / 2, _baseline(min(top + 16, 596 - sum(fw.getmetrics())), fw)), where, fw, SOFT,
+                    anchor='ms', shadow=True)
         cv.shadow_pass()
         if screen.later:
-            fl, label = fit_line(f'Later on {screen.channel}'.upper(), 700, 30, W - 220, 22, spacing_em=.1)
+            label = screen.later_label or f'Later on {screen.channel}'
+            fl, label = fit_line(label.upper(), 700, 30, W - 220, 22, spacing_em=.1)
             cv.text((110, _baseline(636, fl)), label, fl, LATER, spacing=.1 * fl.size)
             for i, later in enumerate(screen.later[:3]):
                 ends = ((later.away.colors[0], later.home.colors[0]) if not later.field
@@ -709,3 +729,87 @@ def still_graph() -> str:
 def layer_inputs(spec: dict) -> list:
     """The image paths filtergraph() reads, in its input order after the bleed picture."""
     return [spec[k] for k in ('crawl', 'flag', 'sweep') if k in spec]
+
+
+# ---------------------------------------------------------------------------
+# An Up next channel: its pages, one after another, looped
+# ---------------------------------------------------------------------------
+
+def rotation_pages(pages) -> tuple:
+    """The pages a Rotation's clip runs through: its own, repeated until the loop is at least
+    PLAIN_LOOP_FRAMES, so a one-page channel's drift goes round at its usual pace."""
+    pages = tuple(pages)
+    if not pages:
+        raise ValueError('An Up next picture needs at least one page')
+    reps = max(1, math.ceil(PLAIN_LOOP_FRAMES / (len(pages) * PAGE_FRAMES)))
+    return pages * reps
+
+
+def rotation_layers(pages, folder: str) -> dict:
+    """Write an Up next clip's pictures into `folder`: each page's bleed picture, the flag strip
+    when a page is a field event's, the sweep. Returns what rotation_graph() needs."""
+    shown = rotation_pages(pages)
+    frames = PAGE_FRAMES * len(shown)
+    out = {'frames': frames, 'bases': [], 'flag_pages': []}
+    drawn = {}
+    for i, page in enumerate(shown):
+        if page not in drawn:
+            picture, _left = still(page)
+            drawn[page] = os.path.join(folder, f'page{len(drawn)}.png')
+            _bleed(picture).save(drawn[page])
+        out['bases'].append(drawn[page])
+        if _field_hero(page):
+            out['flag_pages'].append(i)
+    if out['flag_pages']:
+        skip = (FLAG_TILE - MY % FLAG_TILE) % FLAG_TILE
+        flag = _checker((CW + FLAG_TILE, skip + MY + 60), FLAG_TILE // 2, alpha=230)
+        flag = flag.crop((0, skip, CW + FLAG_TILE, skip + MY + 60))
+        out['flag'] = os.path.join(folder, 'flag.png')
+        flag.save(out['flag'])
+        cycles = max(1, round(frames * FLAG_PX / FLAG_TILE))
+        out['flag_step'] = FLAG_TILE * cycles / frames
+    band = gradient((W, H), 100, [(0, 0), (.4, 0), (.5, 28), (.6, 0), (1, 0)], mode='L')
+    box = band.getbbox()
+    band = band.crop(box)
+    sweep = Image.new('RGBA', band.size, WHITE + (0,))
+    sweep.putalpha(band)
+    out['sweep'] = os.path.join(folder, 'sweep.png')
+    sweep.save(out['sweep'])
+    out['sweep_left'] = box[0]
+    out['shimmer_period'] = _cycles(frames, SHIMMER_FRAMES)
+    out['drift_period'] = _cycles(frames, DRIFT_FRAMES)
+    return out
+
+
+def rotation_inputs(spec: dict) -> list:
+    """The image paths rotation_graph() reads, in its input order: each page, then the flag when
+    there is one, then the sweep."""
+    return list(spec['bases']) + ([spec['flag']] if 'flag' in spec else []) + [spec['sweep']]
+
+
+def rotation_graph(spec: dict) -> str:
+    """The filter_complex for `spec` (rotation_layers()): each page held for PAGE_FRAMES and the
+    pages joined in order, then one drift and one shimmer over the whole loop, so the motion runs
+    on across a page turn and the loop's seam is the clip's own. A field event's page has the
+    moving flag over it while it is up."""
+    pages = len(spec['bases'])
+    # Each page a finite loop of its one frame. concat's output is set back to 1/FPS before its
+    # frames are numbered: in its own time base the numbers land at the clip's first instant,
+    # and the encode's -r then fills all of it with the last page (measured, ffmpeg 7.1).
+    parts = [f'[{i}:v]format=yuv420p,loop=loop={PAGE_FRAMES - 1}:size=1,settb=1/{FPS},setpts=N[p{i}]'
+             for i in range(pages)]
+    joined = ''.join(f'[p{i}]' for i in range(pages))
+    parts.append(f'{joined}concat=n={pages}:v=1:a=0,settb=1/{FPS},setpts=N[b0]' if pages > 1 else '[p0]null[b0]')
+    cur, n = 'b0', pages
+    if 'flag' in spec:
+        parts.append(_still_input(n, 'yuva420p') + '[fl]')
+        on = '+'.join(f'between(n,{i * PAGE_FRAMES},{(i + 1) * PAGE_FRAMES - 1})' for i in spec['flag_pages'])
+        parts.append(f"[{cur}][fl]overlay=x='floor(mod(n*{spec['flag_step']:.6f},{FLAG_TILE}))-{FLAG_TILE}':"
+                     f"y=0:eval=frame:enable='{on}'[b1]")
+        cur, n = 'b1', n + 1
+    parts.append(_still_input(n, 'yuva420p') + '[sw]')
+    parts.append(f"[{cur}]crop=w={W}:h={H}:x='{drift_expr(0, spec['drift_period'])}':"
+                 f"y='{drift_expr(1, spec['drift_period'])}':exact=1[d]")
+    parts.append(f"[d][sw]overlay=x='{sweep_expr(spec['sweep_left'], spec['shimmer_period'])}':y=0:"
+                 f"eval=frame[v]")
+    return ';\n'.join(parts)

@@ -121,6 +121,10 @@ KIND_LABELS = {
 #   yields to sync and to a rebuild, which rewrite the listings it reads, to maintenance,
 #   whose EPG cleanup deletes them, and to itself. Nothing yields to it but maintenance: it is
 #   a few seconds per league and queues itself again when refused (DESIGN-sports-data.md 6.6).
+# - **Up next** - making the Up next channels' pictures ahead (app/sports_up_next.py). It is CPU
+#   work, an encode of about 14 s for four pages at a low priority, and a few reads, so it yields
+#   only to itself: the next run is five minutes away, and two at once would make one clip twice.
+#   Nothing yields to it.
 # - **Maintenance** yields to everything but the ledger, itself included. It is the most
 #   deferrable work in the app (pruning, retention, WAL reporting) and the heaviest per run,
 #   because EPG cleanup drags a `programs` index update and compaction behind it.

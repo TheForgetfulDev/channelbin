@@ -23,6 +23,10 @@ dvr.log.*
 # (dev/changelog/994).
 channelbin-support-*.zip
 
+# A build stamp is written inside the image from the CHANNELBIN_BUILD build argument, never
+# copied in: one left in a checkout would stamp a release image (dev/changelog/1622).
+app/BUILD_STAMP
+
 # --- Recordings and scratch output ---
 /dvr/
 epg.xml

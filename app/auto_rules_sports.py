@@ -5,8 +5,8 @@ A rule is still a Programs search. Naming a league or team adds three things on 
 of which can only add a recording or add information, never take one away on a time it cannot
 stand behind:
 
-* **One recording per game.** Among a game's first airings the listing most channels carry is
-  judged first, and another listing of the same game is `skipped_existing` only while a
+* **One recording per game.** Among a game's first airings the listing near the game's believed
+  start, then the one most channels carry, is judged first, and another listing of the same game is `skipped_existing` only while a
   recording of the game covers that listing's air time. A listing outside it - a wrong time, a
   game that runs past it - is scheduled as well, saying why.
 * **Skip game replays** (opt-in). A listing every one of whose matches says replay is skipped
@@ -31,12 +31,18 @@ from .database import (
     SPORTS_MATCH_KIND_GUIDE, SPORTS_MATCH_STRONG, Channel, ChannelGroup, RecordingSports, SportsEvent, SportsLeague,
     SportsMatch, SportsTeam,
 )
-from .sports_match import _offered, combined_airing
+from .fmt_utils import counted
+from .sports_match import NOT_RACES, _offered, combined_airing, event_session, normalize, session_of
 
 #: How much of a listing may fall before a recording of the same game and still count as
 #: covered: the pregame slot a channel lists at 8:00 for an 8:15 kickoff. A listing starting
 #: earlier than that, or ending after the recording, is not covered and is recorded as well.
 PREGAME_SLACK = timedelta(minutes=30)
+#: A listing starting within this of the start the matcher believes for a game is picked over a
+#: listing further off, however many channels carry that one: the pregame slot still counts as
+#: the game, and a listing 95 minutes off is the guide still listing a moved game's old time
+#: (dev/changelog/1625).
+PICK_NEAR = timedelta(minutes=30)
 #: How far ahead the alert looks: a game this close with nothing to record it from will be
 #: missed unless a person does something (dev/changelog/923: alerts are for real problems).
 ALERT_AHEAD = timedelta(hours=6)
@@ -49,7 +55,7 @@ DEFAULT_GAME_LENGTH = timedelta(hours=4)
 
 #: Where an event pick's start came from, every value named where it is read.
 START_FROM_NAME = 'name'          # the clock in the channel's name, which carries a time zone
-START_FROM_TSDB = 'tsdb'          # TheSportsDB's start, in a league whose times match the guide
+START_FROM_TSDB = 'tsdb'          # TheSportsDB's start, in a league that goes by it (app/sports_times.py)
 
 
 @dataclass
@@ -72,6 +78,26 @@ class Game:
     round: int | None
     postponed: bool
     matchup: bool
+    # The start the matcher believes (SportsEvent.guide_start): which listing is the game when the
+    # guide lists it at more than one time (keepers()).
+    guide_start: datetime | None = None
+    # The old time the guide still lists for a game TheSportsDB moved (SportsEvent.guide_behind_start).
+    guide_behind_start: datetime | None = None
+    # Practice, qualifying or a shootout: recorded by a rule only when it asks (Scope.sessions,
+    # dev/changelog/1633). A sprint is a race.
+    session: bool = False
+
+
+def game_windows(game, start, stop, rule, now) -> list:
+    """sports_times.windows() for a listing of `game`, which is a Game, not a SportsEvent: the times
+    the league's answer to which time a game goes by gives the listing (dev/changelog/1630)."""
+    from types import SimpleNamespace
+    from .sports_times import event_windows
+    as_event = SimpleNamespace(start_at=game.start, guide_start=game.guide_start,
+                               guide_behind_start=game.guide_behind_start, previous_start=game.previous_start,
+                               start_changed_at=game.start_changed_at, home_team_id=game.home_id,
+                               away_team_id=game.away_id, postponed=game.postponed)
+    return event_windows(start, stop, as_event, rule, now)
 
 
 @dataclass
@@ -118,9 +144,14 @@ class Scope:
     # Records from event channels (DESIGN-sports-data.md 10, dev/changelog/1491). Without it, a game
     # only an event channel names is one this rule cannot record, and the alert says so.
     event_channels: bool = False
+    # Practice, qualifying and shootouts are its games too (dev/changelog/1633). Without it a session
+    # is not one of the rule's games: no expected line, no alert, and a listing of one its search
+    # finds is judged as a listing of no game and still recorded. No channel's name is read for a
+    # session, so it is never recorded from an event channel either way.
+    sessions: bool = False
 
     def covers(self, game: Game) -> bool:
-        if game.league_id != self.league_id:
+        if game.league_id != self.league_id or (game.session and not self.sessions):
             return False
         return not self.team_id or self.team_id in (game.home_id, game.away_id)
 
@@ -145,7 +176,8 @@ class GameIndex:
     named: set = field(default_factory=set)            # events an event channel's name names
     named_by: dict = field(default_factory=dict)       # {event id: [Named]} strong, recordable
     held: dict = field(default_factory=dict)           # {event id: [Held]}
-    trusted: dict = field(default_factory=dict)        # {league id: its start times can be believed}
+    rules: dict = field(default_factory=dict)          # {league id: sports_times.Rule, which time it goes by}
+    now: datetime = None
     longest: dict = field(default_factory=dict)        # {league id: its longest strong listing}
 
     @classmethod
@@ -153,7 +185,7 @@ class GameIndex:
         """The games of `league_ids` from `lookback` ago to `horizon_days` ahead, their live guide
         and channel-name matches, and the recordings linked to them. A fixed handful of queries.
         A league page's Record reads back a day, since that page keeps a game all its day."""
-        out = cls()
+        out = cls(now=now)
         league_ids = sorted({i for i in league_ids if i})
         if not league_ids:
             return out
@@ -170,13 +202,15 @@ class GameIndex:
                 local_date=e.local_date, previous_start=e.previous_start,
                 start_changed_at=e.start_changed_at, venue=e.venue or '', city=e.city or '',
                 season=e.season or '', round=e.round, postponed=bool(e.postponed),
-                matchup=bool(e.home_team_id or e.away_team_id))
+                matchup=bool(e.home_team_id or e.away_team_id), guide_start=e.guide_start,
+                guide_behind_start=e.guide_behind_start, session=event_session(e).kind in NOT_RACES)
         out.by_tsdb = {g.tsdb_id: g for g in out.games.values()}
         if not out.games:
             return out
-        from .sports_match import league_trusted
-        out.trusted = {lg.id: league_trusted(lg) for lg in
-                       SportsLeague.query.filter(SportsLeague.id.in_(league_ids))}
+        from .sports_times import Rules
+        rules = Rules()
+        out.rules = {lg_id: rules.of(tsdb_id) for lg_id, tsdb_id in
+                     db.session.query(SportsLeague.id, SportsLeague.tsdb_id).filter(SportsLeague.id.in_(league_ids))}
         ids = sorted(out.games)
         rows = db.session.query(
             SportsMatch.event_id, SportsMatch.channel_id, SportsMatch.kind, SportsMatch.program_start_time,
@@ -370,21 +404,30 @@ class EventPick:
 def event_pick(games, game):
     """(EventPick or None, why not). The channel is the healthiest that names the game, preferring
     one whose name gives a time zone; the start is that clock, else TheSportsDB's start in a league
-    whose times match the guide. With neither there is no start to stand behind (design 10):
-    NASCAR's 00:00 placeholders and a name with a bare clock land there."""
+    that goes by it or covers both, once within its wait (app/sports_times.py, dev/changelog/1630).
+    With neither there is no start to stand behind (design 10): a league that goes by the guide has
+    no listing of this game to go by, and NASCAR's 00:00 placeholders and a name with a bare clock
+    land there too."""
+    from .sports_times import GO_GUIDE
     named = sorted(games.named_by.get(game.id, ()), key=lambda n: (n.start is None, -n.score, n.channel_id))
     if not named:
         return None, 'No event channel names it.'
     best = named[0]
+    rule = games.rules.get(game.league_id)
     if best.start is not None:
         start, source = best.start, START_FROM_NAME
-    elif (game.start is not None and games.trusted.get(game.league_id)
-          and (game.matchup or (game.start.hour, game.start.minute) != (0, 0))):
-        start, source = game.start, START_FROM_TSDB
+    elif game.start is None or not (game.matchup or (game.start.hour, game.start.minute) != (0, 0)):
+        return None, ('An event channel names it, but its name gives no time zone and TheSportsDB gives no '
+                      'time for it, so there is no start to stand behind.')
+    elif rule is None or rule.go_by == GO_GUIDE:
+        return None, ('An event channel names it, but its name gives no time zone, and this league goes by '
+                      'your guide, which has no listing of it, so there is no start to stand behind.')
+    elif games.now is not None and games.now < game.start - rule.wait:
+        return None, (f"An event channel names it, but its name gives no time zone, and this league goes by "
+                      f"TheSportsDB's time only from {counted(rule.wait_hours, 'hour')} before a game, so there "
+                      f"is no start to stand behind yet.")
     else:
-        return None, ('An event channel names it, but its name gives no time zone and TheSportsDB\'s '
-                      'times for this league have not matched your guide often enough to rely on, so '
-                      'there is no start to stand behind.')
+        start, source = game.start, START_FROM_TSDB
     length = max(games.longest.get(game.league_id, timedelta(0)), DEFAULT_GAME_LENGTH)
     return EventPick(game=game, named=best, start=start, stop=start + length, source=source), ''
 
@@ -397,18 +440,28 @@ def covers(window_start, window_stop, start, stop) -> bool:
     return window_start <= start + PREGAME_SLACK and window_stop >= stop
 
 
+def near_start(game, start) -> bool:
+    """A listing starting within PICK_NEAR of the start the matcher believes for the game. False
+    for a game with no believed start, which leaves every listing equal here."""
+    gs = getattr(game, 'guide_start', None)
+    return gs is not None and start is not None and abs(start - gs) <= PICK_NEAR
+
+
 def keepers(programs, games_of, replays=False) -> set:
     """The identity of each game's keeper among `programs`: of the listings that are not a known
-    replay, the one carried on the most channels, then the earliest. `games_of` is
-    {identity: (Game, airing)}. With `replays`, the same order over the known replays only: what
-    a league page's Record picks for a game whose live airing is not in the guide or is over
-    (dev/changelog/1539). A rule never asks for that."""
+    replay, one starting near the game's believed start (near_start()), then the one carried on
+    the most channels, then the earliest. One channel listing a moved game at its new time beats
+    14 still listing the old one (dev/changelog/1625). `games_of` is {identity: (Game, airing)}.
+    With `replays`, the order over the known replays only, by channels and start, since no replay
+    is at the start: what a league page's Record picks for a game whose live airing is not in the
+    guide or is over (dev/changelog/1539). A rule never asks for that."""
     best = {}
     for p in programs:
         game, airing = games_of.get(p.identity, (None, None))
         if game is None or (airing == SPORTS_AIRING_REPLAY) != replays:
             continue
-        rank = (-len(p.showings), p.lead.start, p.identity)
+        near = not replays and near_start(game, p.lead.start)
+        rank = (not near, -len(p.showings), p.lead.start, p.identity)
         if game.id not in best or rank < best[game.id][0]:
             best[game.id] = (rank, p.identity)
     return {identity for _rank, identity in best.values()}
@@ -428,7 +481,8 @@ def scope_of(rule) -> Scope | None:
         return None
     return Scope(league_id=rule.sports_league_id, team_id=rule.sports_team_tsdb_id or None,
                  skip_replays=bool(rule.sports_skip_replays),
-                 event_channels=bool(rule.sports_event_channels))
+                 event_channels=bool(rule.sports_event_channels),
+                 sessions=bool(rule.sports_sessions))
 
 
 def about_text(rule) -> str | None:
@@ -462,10 +516,29 @@ def team_names(team_ids) -> dict:
     return {i: out.get(i) or f'Team #{i}' for i in ids}
 
 
+def _field_names(league_ids=None):
+    """(league id, name) of the stored events between no teams, one query."""
+    q = db.session.query(SportsEvent.league_id, SportsEvent.name).filter(
+        SportsEvent.home_team_id == 0, SportsEvent.away_team_id == 0)
+    if league_ids is not None:
+        q = q.filter(SportsEvent.league_id.in_(sorted(league_ids)))
+    return q.distinct()
+
+
+def is_session_name(name) -> bool:
+    return session_of(normalize(name)).kind in NOT_RACES
+
+
+def league_has_sessions(league_id) -> bool:
+    """Whether a league's stored events include practice, qualifying or a shootout, which is when a
+    rule about it is offered the choice to record them (dev/changelog/1633)."""
+    return bool(league_id) and any(is_session_name(n) for _lid, n in _field_names([league_id]))
+
+
 def dialog_leagues() -> list:
     """What the rule dialog offers: every league on Sports Schedules and the teams its stored games
-    name, read from the games since lookup_all_teams is unusable on the free key (design 2). Two
-    queries."""
+    name, read from the games since lookup_all_teams is unusable on the free key (design 2), and
+    whether its events include sessions (league_has_sessions). Three queries."""
     leagues = SportsLeague.query.order_by(SportsLeague.name).all()
     teams = {}
     for lid, hid, hname, aid, aname in db.session.query(
@@ -474,7 +547,8 @@ def dialog_leagues() -> list:
         for tid, tname in ((hid, hname), (aid, aname)):
             if tid and tname:
                 teams.setdefault(lid, {})[tid] = tname
-    return [{'id': lg.id, 'name': lg.name,
+    with_sessions = {lid for lid, name in _field_names() if is_session_name(name)}
+    return [{'id': lg.id, 'name': lg.name, 'sessions': lg.id in with_sessions,
              'teams': sorted(({'id': t, 'name': n} for t, n in teams.get(lg.id, {}).items()),
                              key=lambda t: t['name'].lower())}
             for lg in leagues]

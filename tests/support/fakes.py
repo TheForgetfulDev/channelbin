@@ -14,6 +14,24 @@ each used to spell it (dev/changelog/1246).
 import errno
 import os
 import signal
+from unittest import mock
+
+
+def fake_http_response(content_type='image/png', body=b'\x89PNG-fake-bytes', status=200):
+    """What `requests.get(..., stream=True)` hands back, for a test that patches it: a context
+    manager (MagicMock, so `with requests.get(...) as resp:` works and its close is countable
+    through __exit__), headers, raise_for_status and iter_content. Shared by the logo cache's
+    tests and the IPTV output's logo route tests, which both go through
+    app/logo_cache.py::download_logo."""
+    resp = mock.MagicMock()
+    resp.__enter__.return_value = resp
+    resp.__exit__.return_value = False
+    resp.headers = {'Content-Type': content_type}
+    resp.raise_for_status = mock.Mock()
+    if status >= 400:
+        resp.raise_for_status.side_effect = Exception(f'HTTP {status}')
+    resp.iter_content = lambda chunk_size=65536: [body]
+    return resp
 
 
 def stale_stat(paths):

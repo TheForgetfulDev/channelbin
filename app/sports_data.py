@@ -489,7 +489,11 @@ def _parse_rows(rows: list, league: SportsLeague) -> tuple:
 
 def _store_parsed(league: SportsLeague, parsed: list, now: datetime):
     """Write each parsed event over its stored copy, or as a new one. Being in an answer is what
-    clears a game's missing mark."""
+    clears a game's missing mark. A game that had started when TheSportsDB first moved it keeps the
+    start it had before then as its previous one, whatever moves follow: a delay entered in steps
+    (8:00, 9:00, 10:00, 10:30) would otherwise stop reading as a started game once the steps passed
+    OFF_LIMIT, and be shifted forward over the game on the air (dev/changelog/1632)."""
+    from .sports_match import kept_start
     ids = [e['tsdb_id'] for e in parsed]
     existing = {e.tsdb_id: e for e in SportsEvent.query.filter(SportsEvent.tsdb_id.in_(ids)).all()} if ids else {}
     for fields in parsed:
@@ -498,7 +502,8 @@ def _store_parsed(league: SportsLeague, parsed: list, now: datetime):
             event = SportsEvent(tsdb_id=fields['tsdb_id'], league_id=league.id, first_seen=now)
             db.session.add(event)
         elif (fields['start_at'] and event.start_at and fields['start_at'] != event.start_at):
-            event.previous_start = event.start_at
+            if not kept_start(event):
+                event.previous_start = event.start_at
             event.start_changed_at = now
         for key, value in fields.items():
             setattr(event, key, value)
@@ -983,6 +988,11 @@ def tick(now: datetime = None) -> str:
                 return 'waiting'
             if state.last_call_at and (now - state.last_call_at).total_seconds() < MIN_WAIT_SECONDS:
                 return 'waiting'
+        # A followed game near its time is read every 30 minutes, so a move entered during it is seen
+        # (app/sports_reads.py, dev/changelog/1632). Before the pick, so a read it brings forward is the
+        # call this tick makes.
+        from .sports_reads import arm_guarded
+        arm_guarded(now, cfg)
         due = _due_query(now).first()
         db.session.rollback()  # holds no read transaction across the outbound call
         if due is None or due.rank >= QUEUE_RANK_TEAM:

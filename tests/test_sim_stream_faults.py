@@ -28,7 +28,7 @@ from sim.stream_faults import LiveFaults, epoch_ns  # noqa: E402
 
 from tests.support.sim_streams import (AUDIO_PID, VIDEO_PID, first_pcr_seconds,  # noqa: E402
                                        library, live_ids, origin, pcrs, pes_dts, read_for,
-                                       read_stream, stream_world, video_seconds, wait_until,
+                                       read_stream, read_until, stream_world, video_seconds, wait_until,
                                        whole_packets)
 
 HERE = pathlib.Path(__file__).resolve()
@@ -432,11 +432,22 @@ class TimelineFaultTests(_Faulted):
     moment."""
     backend = {'burst_seconds': 20.0}
 
+    def read_burst(self) -> bytes:
+        """The burst read whole: until its audio, which every fault here leaves flowing, has
+        covered all but half a second of it, however slowly it arrives (dev/docs/BUGS.md
+        2026-11-17 03:01 PM). A step over a second is a fault's jump, not time read."""
+        want = self.backend['burst_seconds'] - 0.5
+
+        def covered(data):
+            return sum(g for g in steps(pes_dts(data, AUDIO_PID)) if g <= 1) >= want
+        _, data = read_until(self.url, covered, at_least=0.5)
+        return data
+
     def test_video_stops_while_audio_flows(self):
         """dev/changelog/1209 and 1199: the video withheld for 12 s, past the 10 s at which
         ffmpeg's -dts_delta_threshold closes a gap; audio and the tables carry on."""
         self.sim.inject('video_stops', self.label, start=at(-15), end=at(-3))
-        _, data = read_for(self.url, 0.5)
+        data = self.read_burst()
         video, audio = pes_dts(data, VIDEO_PID), pes_dts(data, AUDIO_PID)
         self.assertAlmostEqual(max(steps(video)), 12.0, delta=0.2)
         self.assertLess(max(steps(audio)), 0.4)     # as without the fault: a PES is 0.36 s
@@ -449,7 +460,7 @@ class TimelineFaultTests(_Faulted):
         """dev/changelog/1410: not video_stops, whose PMT goes on declaring a track it leaves
         empty. A connection already open keeps its own stream."""
         self.sim.inject('no_video_track', self.label, start=at(-1), end=at(60))
-        _, data = read_for(self.url, 0.5)
+        data = self.read_burst()
         self.assertEqual(pes_dts(data, VIDEO_PID), [])
         self.assertGreater(span(pes_dts(data, AUDIO_PID)), 1)
         streams, pcr_pid, _ = sim_ts.programs(data)
@@ -459,7 +470,7 @@ class TimelineFaultTests(_Faulted):
     def test_connecting_while_the_video_is_out_gets_audio_only(self):
         """dev/changelog/1210: a restart that lands during the outage."""
         self.sim.inject('video_stops', self.label, start=at(-40), end=at(20))
-        _, data = read_for(self.url, 0.5)
+        data = self.read_burst()
         self.assertEqual(pes_dts(data, VIDEO_PID), [])
         self.assertGreater(span(pes_dts(data, AUDIO_PID)), 19)
 
@@ -482,7 +493,7 @@ class TimelineFaultTests(_Faulted):
 
     def test_timestamp_jump_moves_every_timestamp_from_its_start(self):
         self.sim.inject('timestamp_jump', self.label, start=at(-10), seconds=30)
-        _, data = read_for(self.url, 0.5)
+        data = self.read_burst()
         gaps = steps(pcrs(data))
         big = [g for g in gaps if g > 1]
         self.assertEqual(len(big), 1)
@@ -491,7 +502,7 @@ class TimelineFaultTests(_Faulted):
 
     def test_pts_wrap_falls_where_it_is_put(self):
         self.sim.inject('pts_wrap', self.label, wrap_at=at(-10))
-        _, data = read_for(self.url, 0.5)
+        data = self.read_burst()
         clock = pcrs(data)
         backwards = [i for i, (a, b) in enumerate(zip(clock, clock[1:])) if b < a]
         self.assertEqual(len(backwards), 1)

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import page_about %}
+{% from "_macros.html" import beta_mark, page_about %}
 {% block title %}EPG Manager - ChannelBin{% endblock %}
 
 {#  EPG Manager (dev/changelog/1325): the tools that work across every account's guide.
@@ -40,7 +40,7 @@
 </style>
 
 <div class="page-head">
-  <h1>EPG Manager</h1>
+  <h1>EPG Manager {{ beta_mark('EPG Manager') }}</h1>
   <button type="button" class="btn btn-primary" data-act="epg-scan"{% if running %} disabled{% endif %}>{{ 'Scanning...' if running else 'Scan now' }}</button>
 </div>
 {% call page_about() %}

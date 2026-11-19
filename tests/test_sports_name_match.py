@@ -555,6 +555,42 @@ class RaceTests(NameCase):
         self.run_match()
         self.assertEqual(self.named(self.final), [])
 
+    def test_a_session_is_never_matched_by_a_name_and_a_bare_name_on_its_day_matches_nothing(self):
+        """Practice and qualifying are matched by guide listings that name them, never by a channel's
+        name; a name that does not name the race on a day that also holds a session is as likely the
+        session (dev/changelog/1633)."""
+        named = self.race('Harborview 500', FACEOFF + timedelta(days=5), self.cup)
+        quali = self.race('Harborview 500 Qualifying', FACEOFF + timedelta(days=5, hours=-3), self.cup)
+        self.channel('Pretend Cup Series: Harborview 500 Qualifying @ Nov 13 11:00 AM :MAX US 06')
+        self.channel('Pretend Cup Series @ Nov 13 11:00 AM :MAX US 07')
+        self.channel('Pretend Cup Series: Harborview 500 @ Nov 13 2:00 PM :MAX US 05')
+        self.run_match()
+        self.assertEqual(self.named(quali), [])
+        (m,) = self.named(named)
+        self.assertEqual(m.strength, SPORTS_MATCH_STRONG)
+        self.assertIn('it names this race', m.reason)
+
+    def test_a_sprint_is_matched_by_a_name_that_names_the_sprint_and_not_the_race(self):
+        """A sprint is a race and a rule counts it, so an event channel can record it."""
+        race = self.race('Harborview 500', FACEOFF + timedelta(days=5), self.cup)
+        sprint = self.race('Harborview 500 Sprint', FACEOFF + timedelta(days=4), self.cup)
+        self.channel('Pretend Cup Series: Harborview 500 Sprint @ Nov 12 2:00 PM :MAX US 05')
+        self.run_match()
+        (m,) = self.named(sprint)
+        self.assertEqual(m.strength, SPORTS_MATCH_STRONG)
+        self.assertEqual(self.named(race), [])
+
+    def test_an_onboard_or_driver_feed_is_not_the_race(self):
+        """A race's side feeds are named for it and dated like the main one on prod (`Live | Onboard |
+        Formel 1 ... Grand Prix | ...`); the main feed is what is recorded and played (dev/docs/BUGS.md
+        2026-11-18 @ 09:04:05 AM)."""
+        for name in ('Live | Onboard | Pretend Cup Series Championship Race | Nov 8 14:30 | PPV 61',
+                     'Pretend Cup Series Championship Race Driver Tracker @ Nov 8 14:30 :MAX US 06',
+                     'Pretend Cup Series Pit Lane: Championship Race @ Nov 8 14:30 :MAX US 07'):
+            self.channel(name)
+        self.run_match()
+        self.assertEqual(self.named(self.final), [])
+
     def test_a_race_name_with_no_date_is_not_matched(self):
         self.channel('Pretend Cup Series Championship Race | 8K EXCLUSIVE')
         self.run_match()

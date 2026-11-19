@@ -1,6 +1,6 @@
 /* Drives the REAL Sports Schedules league page (static/js/sports.js over the markup the app rendered)
    in jsdom and prints what it observed as JSON: the listings dialog's closed groups, event channels and Wrong match,
-   and the Matching card's names and categories (mockup 51). Called by
+   and the Matching card's names, categories and skip words (mockups 51, 59). Called by
    tests/test_sports_league_matches.py, which owns every assertion - this file only reports. Faked:
    fetch (answers per request) and swapFromServer. The page also carries the shared record dialog
    (#record-modal and #active-rec-modal, hidden, each with an id), so a dialog this drives is a .modal with no id. */
@@ -59,6 +59,16 @@ out.group_buttons = groups().map((g) => {
   return b ? { text: b.textContent.trim(), danger: b.classList.contains('btn-danger') } : null;
 });
 out.intro = d.querySelector('.modal:not([id]) .sp-dialog-body').textContent.replace(/\s+/g, ' ');
+
+// The Skipped section (mockup 59, dev/changelog/1634): behind Show, which turns into Hide.
+const skipToggle = () => d.querySelector('.modal:not([id]) [data-skipped]');
+const skippedRows = () => Array.from(d.querySelectorAll('.modal:not([id]) .sp-skipped'));
+out.skipped_closed = { button: skipToggle().textContent.trim(), rows: skippedRows().length };
+await click(skipToggle());
+out.skipped_open = { button: skipToggle().textContent.trim(), expanded: skipToggle().getAttribute('aria-expanded'),
+  rows: skippedRows().map((r) => ({ title: r.querySelector('.sp-gtitle').textContent, why: r.querySelector('.sp-why').textContent })) };
+await click(skipToggle());
+out.skipped_hidden = { button: skipToggle().textContent.trim(), rows: skippedRows().length };
 
 await click(groups()[0].querySelector('[data-toggle]'));
 out.opened_channels = groups()[0].querySelectorAll('.sp-chan').length;
@@ -121,6 +131,28 @@ late.dispatchEvent(new w.Event('change', { bubbles: true }));
 await wait(30);
 out.settling = { restored: late.checked === was, toast: d.getElementById('app-toast').textContent,
   puts: sent((r) => r.method === 'PUT' && /\/categories$/.test(r.path)).length };
+
+// The words and lengths (mockup 59, dev/changelog/1634): each change is one request, then a swap.
+const beforeSkips = requests.length;
+await click(d.querySelector('[data-act="remove-skip"][data-word="pre game"]'));
+await wait(30);
+const skipForm = d.querySelector('form[data-act="add-skip"]');
+skipForm.querySelector('[name="word"]').value = '  Gameday ';
+skipForm.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+await wait(30);
+const len = d.querySelector('input[data-skip-length="game"]');
+len.value = '75';
+len.dispatchEvent(new w.Event('change', { bubbles: true }));
+await wait(30);
+len.value = '';
+len.dispatchEvent(new w.Event('change', { bubbles: true }));
+await wait(30);
+await click(d.querySelector('[data-act="restore-skips"]'));
+await wait(30);
+out.restore_confirm = d.querySelector('.modal:not([id]) .modal-body').textContent.replace(/\s+/g, ' ').trim();
+await click(Array.from(d.querySelectorAll('.modal:not([id]) .modal-foot button')).find((b) => b.textContent.trim() === 'Restore defaults'));
+await wait(30);
+out.skip_requests = requests.slice(beforeSkips).filter((r) => r.method !== 'GET').map((r) => ({ method: r.method, path: r.path, body: r.body }));
 
 await click(d.querySelector('[data-act="remove-team-name"]'));
 await wait(30);

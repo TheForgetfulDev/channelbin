@@ -19,26 +19,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.support.fakes import fake_http_response  # noqa: E402
 from app import db  # noqa: E402
 from app.database import Channel  # noqa: E402
 from app.logo_cache import (  # noqa: E402
     resolve_logo_url, run_logo_cache_batch, delete_cached_logos, get_logo_cache_dir,
 )
 import app.logo_cache as logo_cache_mod  # noqa: E402
-
-
-def _fake_response(content_type='image/png', body=b'\x89PNG-fake-bytes', status=200):
-    # MagicMock, not Mock: _fetch_one_logo does `with requests.get(...) as resp:`, which
-    # needs __enter__/__exit__ - mirrors requests.Response's own context-manager support.
-    resp = mock.MagicMock()
-    resp.__enter__.return_value = resp
-    resp.__exit__.return_value = False
-    resp.headers = {'Content-Type': content_type}
-    resp.raise_for_status = mock.Mock()
-    if status >= 400:
-        resp.raise_for_status.side_effect = Exception(f'HTTP {status}')
-    resp.iter_content = lambda chunk_size=65536: [body]
-    return resp
 
 
 class ResolveLogoUrlTests(unittest.TestCase):
@@ -86,7 +73,7 @@ class EligibilityTests(unittest.TestCase):
 
     def _run(self):
         with mock.patch.object(logo_cache_mod, 'load_config', return_value=self.cfg), \
-             mock.patch.object(logo_cache_mod.requests, 'get', return_value=_fake_response()):
+             mock.patch.object(logo_cache_mod.requests, 'get', return_value=fake_http_response()):
             return run_logo_cache_batch(limit=50)
 
     def test_channel_not_in_guide_or_group_is_never_fetched(self):
@@ -134,7 +121,7 @@ class ChangeDetectionTests(unittest.TestCase):
     def _run(self, response=None):
         with mock.patch.object(logo_cache_mod, 'load_config', return_value=self.cfg), \
              mock.patch.object(logo_cache_mod.requests, 'get',
-                               return_value=response or _fake_response()):
+                               return_value=response or fake_http_response()):
             return run_logo_cache_batch(limit=50)
 
     def test_already_cached_unchanged_url_is_not_refetched(self):
@@ -160,7 +147,7 @@ class ChangeDetectionTests(unittest.TestCase):
         acct = seed.make_account()
         ch = seed.make_channel(acct, logo_url='http://provider.test/broken.png', in_guide=True)
         db.session.commit()
-        broken = _fake_response(status=500)
+        broken = fake_http_response(status=500)
         self.assertEqual(self._run(response=broken), 1)  # one attempt, records the failure
         db.session.refresh(ch)
         self.assertIsNone(ch.logo_cache_path)
@@ -173,7 +160,7 @@ class ChangeDetectionTests(unittest.TestCase):
         acct = seed.make_account()
         ch = seed.make_channel(acct, logo_url='http://provider.test/error.html', in_guide=True)
         db.session.commit()
-        html_resp = _fake_response(content_type='text/html')
+        html_resp = fake_http_response(content_type='text/html')
         self.assertEqual(self._run(response=html_resp), 1)
         db.session.refresh(ch)
         self.assertIsNone(ch.logo_cache_path)
@@ -187,7 +174,7 @@ class ChangeDetectionTests(unittest.TestCase):
         acct = seed.make_account()
         ch = seed.make_channel(acct, logo_url='http://provider.test/evil.svg', in_guide=True)
         db.session.commit()
-        svg_resp = _fake_response(content_type='image/svg+xml',
+        svg_resp = fake_http_response(content_type='image/svg+xml',
                                    body=b'<svg onload="alert(1)"></svg>')
         self.assertEqual(self._run(response=svg_resp), 1)
         db.session.refresh(ch)
@@ -201,14 +188,14 @@ class ChangeDetectionTests(unittest.TestCase):
         acct = seed.make_account()
         seed.make_channel(acct, logo_url='http://provider.test/a.html', in_guide=True)
         db.session.commit()
-        rejected = _fake_response(content_type='text/html')
+        rejected = fake_http_response(content_type='text/html')
         self._run(response=rejected)
         rejected.__exit__.assert_called_once()
 
         acct2 = seed.make_account()
         seed.make_channel(acct2, logo_url='http://provider.test/b.png', in_guide=True)
         db.session.commit()
-        accepted = _fake_response(content_type='image/png')
+        accepted = fake_http_response(content_type='image/png')
         self._run(response=accepted)
         accepted.__exit__.assert_called_once()
 

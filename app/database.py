@@ -192,6 +192,18 @@ RECORDING_SPORTS_REMOVED            = 'RECORDING_SPORTS_REMOVED'
 # keeps its slot, since TheSportsDB never moves one (DESIGN-sports-data.md 10, dev/changelog/1491);
 # `extra['reason']` is `renamed` or `start`.
 RECORDING_RULE_GAME_CHANGED         = 'RECORDING_RULE_GAME_CHANGED'
+# ChannelBin moved an automated recording of a game (a rule's, or one a league page's Record made)
+# to the window the league's answer to which time a game goes by gives it, or back to the
+# listing's when the two times agree again (app/sports_follow.py, dev/changelog/1631). Holds both
+# windows and both starts.
+RECORDING_SPORTS_RETIMED            = 'RECORDING_SPORTS_RETIMED'
+# The game's time moved, and this automated recording was left where it is: a person set its
+# times, so it is theirs (app/sports_follow.py). `extra['reason']` names why.
+RECORDING_SPORTS_TIME_KEPT          = 'RECORDING_SPORTS_TIME_KEPT'
+# Cover both with the two starts too far apart for one recording: ChannelBin scheduled, moved or
+# removed the second recording, the one in case the other time is right (Recording.sports_cover_for_id).
+# On both recordings; `extra['kind']` is `added`, `moved` or `removed`.
+RECORDING_SPORTS_SECOND             = 'RECORDING_SPORTS_SECOND'
 # Timeline damage found in the concatenated .ts (gaps/missing frames that break player
 # seeking) - logged when post_process.reencode_mode='damaged' decides to re-encode.
 SEEK_DAMAGE_DETECTED   = 'SEEK_DAMAGE_DETECTED'
@@ -538,6 +550,9 @@ EVENT_LABELS = {
     RECORDING_SPORTS_LINKED: 'Matched to a TheSportsDB event',
     RECORDING_SPORTS_REMOVED: 'TheSportsDB match removed',
     RECORDING_RULE_GAME_CHANGED: 'Event channel changed, recording stayed',
+    RECORDING_SPORTS_RETIMED: "Moved to the game's time",
+    RECORDING_SPORTS_TIME_KEPT: 'Game moved, recording stayed',
+    RECORDING_SPORTS_SECOND: 'Second recording of the game',
     SEEK_DAMAGE_DETECTED: 'Gaps found in the file',
     MIXED_FRAME_RATE_DETECTED: 'Frame rate changed',
     FORMAT_NORMALIZE_NEEDED: 'Format needs evening out',
@@ -1033,7 +1048,10 @@ class Recording(db.Model):
     # recording, which is a new plan rather than drift; the RECORDING_EDITED event holds
     # the previous times (dev/changelog/471). Auto-record retrack re-baselines them the same
     # way when it moves a still-SCHEDULED rule recording with its program, and its
-    # RECORDING_RULE_RETRACKED event holds the previous times (dev/changelog/1188).
+    # RECORDING_RULE_RETRACKED event holds the previous times (dev/changelog/1188). The sports
+    # follower moves scheduled_stop_time with stop_time when it moves a running automated
+    # recording's end later for a game that runs late, and RECORDING_SPORTS_RETIMED holds the old
+    # end (dev/changelog/1632).
     scheduled_start_time = db.Column(db.DateTime)
     scheduled_stop_time  = db.Column(db.DateTime)
     # naive UTC; the EPG program's own air time, snapshotted at creation (None for manual
@@ -1053,6 +1071,23 @@ class Recording(db.Model):
     # that changes the name clears it, and the join clears it once the file is written. It is
     # the recorded fact that the name is the template's, so a typed name is never rewritten.
     sports_name_template = db.Column(db.Text)
+    # TheSportsDB's event id when a league page's Record made this recording, set by
+    # routes/recordings.py::new_recording_json only after sports_view.record_mark() or event_record_check() says
+    # the listing or event pick is that game's (app/sports_times.py, dev/changelog/1630). Set
+    # whether or not the person edited the times: it records where the recording came from, not
+    # whose times it holds. NULL for every other recording.
+    sports_record_tsdb_id = db.Column(db.Integer)
+    # The window ChannelBin gave a recording a league page's Record made, when the person saved the
+    # times Record worked out for it: the recording follows the game's time only while its window
+    # is still this one, so a window a person set is never moved (app/sports_follow.py,
+    # dev/changelog/1631). NULL when the person changed the times, and for every other recording;
+    # a rule's recording keeps the same fact in RuleMatch.rec_start_time/rec_stop_time.
+    sports_window_start = db.Column(db.DateTime)
+    sports_window_stop = db.Column(db.DateTime)
+    # The recording this one is the second of: Cover both with the two starts too far apart for one
+    # recording, so ChannelBin records the other start too, in case it is the right one. Written only
+    # by app/sports_follow.py, which removes this recording when it is no longer needed.
+    sports_cover_for_id = db.Column(db.Integer, index=True)
 
     # ── Describing the recording to something outside this app ────────────────
     # The program's synopsis, genre and content rating, copied off its epg_entries row.
@@ -3396,6 +3431,25 @@ class SportsFeedChannel(db.Model):
     created_at   = db.Column(db.DateTime, default=datetime.utcnow)
 
 
+class SportsUpNextChannel(db.Model):
+    """An Up next channel on the output feed: ChannelBin's own picture of the coming games, a page
+    every 10 s (app/sports_up_next.py, dev/changelog/1614). `league_id` 0 is the one for everything
+    followed, so the UNIQUE holds it to one row (a NULL would not: SQLite treats NULLs as distinct),
+    and for that reason the column carries no foreign key. A league's row is deleted only with its
+    league; its id, less output_feed.UP_NEXT_FEED_BASE, is its feed id, which an IPTV player caches,
+    so AUTOINCREMENT keeps a deleted row's id from being issued again. The everything row's feed id
+    is UP_NEXT_FEED_BASE itself, whatever its row id, so it has one before the row exists.
+
+    `enabled` is a person's switch, written only by sports_up_next.set_up_next()."""
+    __tablename__ = 'sports_up_next_channels'
+    __table_args__ = (db.UniqueConstraint('league_id', name='uq_sports_up_next_league'),
+                      {'sqlite_autoincrement': True})
+    id         = db.Column(db.Integer, primary_key=True)
+    league_id  = db.Column(db.Integer, nullable=False)
+    enabled    = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
 # What one row of the IPTV output's play log is (OutputFeedPlay.kind).
 FEED_PLAY_ENDED      = 'ended'        # a relayed play that ran and stopped; `reason` says why
 FEED_PLAY_REFUSED    = 'refused'      # a play that never started; `message` says why
@@ -3530,11 +3584,18 @@ class SportsEvent(db.Model):
     missing_since    = db.Column(db.DateTime)
     previous_start   = db.Column(db.DateTime)
     start_changed_at = db.Column(db.DateTime)
-    # What the guide says the start is (7): for a matchup the start most of its channels list, for
-    # a field event its earliest race row. NULL until the matcher has found the event in the guide.
-    # Shown beside start_at when the two disagree, and never written into it.
+    # The start the matcher gives the game from the guide (7): for a matchup the listed start that
+    # sports_match._guide_start() ranks first, for a field event its earliest race row, and
+    # TheSportsDB's own start while guide_behind_start is set. NULL until the matcher has found the
+    # event in the guide. Shown beside start_at when the two disagree, and never written into it.
     guide_start      = db.Column(db.DateTime)
     guide_channels   = db.Column(db.Integer)
+    # The start the guide still lists after TheSportsDB moved the game and the guide did not follow:
+    # its listings sit at TheSportsDB's previous start and none at the new one. guide_start is then
+    # TheSportsDB's start, which wins, and a sports channel plays those listings moved by
+    # guide_start - guide_behind_start (dev/changelog/1623). NULL otherwise. Written only by
+    # app/sports_match.py, in the same commit as guide_start.
+    guide_behind_start = db.Column(db.DateTime)
     # Which of the league's numbered feed channels carries this event, NULL until it is placed.
     # Written only by app/sports_feed.py::place_league_events(), which moves a placed game only off a
     # collision: TheSportsDB moving it onto another game's time on the same number by more than
@@ -3721,6 +3782,9 @@ class AutoRule(db.Model):
                                       server_default=db.text('0'))
     # Record a game from an event channel when the guide has no listing of it.
     sports_event_channels = db.Column(db.Boolean, nullable=False, default=False,
+                                      server_default=db.text('0'))
+    # Practice, qualifying and shootouts are its games too; a sprint is a race (dev/changelog/1633).
+    sports_sessions       = db.Column(db.Boolean, nullable=False, default=False,
                                       server_default=db.text('0'))
 
 

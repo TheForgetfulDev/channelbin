@@ -853,6 +853,10 @@ def _run(trigger, rule_ids):
             p = prepared[rid]
             outcomes[rid] = (_guarded(rid, p.revision, _judge_rule, p, run)
                              if isinstance(p, _Prepared) else p)
+        # A rule schedules a game at its listing's times; its window then follows the time the
+        # league goes by, in the same run (dev/changelog/1631).
+        from .sports_follow import follow_guarded
+        follow_guarded()
     refresh_guide_alert(now, reach)
     log.info('Auto-record rules evaluated (%s): %s', trigger,
              ', '.join(f'#{o.rule_id} scheduled {o.scheduled}'
@@ -1414,7 +1418,8 @@ class _Judge:
 
     def games_first(self, programs):
         """For a rule that names a league: each game's keeper - of its listings that are not a
-        known replay, the one most channels carry - is judged before the game's other listings,
+        known replay, the one near the game's believed start, then the one most channels carry
+        (auto_rules_sports.keepers()) - is judged before the game's other listings,
         so they find it scheduled and are covered by it (auto_rules_sports, dev/changelog/1490).
         Everything else keeps its start order. A rule that names nothing is returned as it is."""
         if self.games is None:
@@ -1472,7 +1477,9 @@ class _Judge:
         """One recording per game, for a rule that names a league (DESIGN-autoschedule.md §3.3's
         stated exception): a listing of a game a recording already covers - scheduled, recording,
         recorded, or this rule's pick a person cancelled (R6) - is not recorded again. Only while
-        that recording's window covers this listing: a wrong time never costs a recording."""
+        that recording's window covers this listing, at its own times or at the times its league's
+        answer to which time a game goes by gives it (dev/changelog/1630): a time nobody chose never
+        costs a recording."""
         if self.games is None:
             return None
         from .auto_rules_sports import PREGAME_SLACK, covers
@@ -1480,11 +1487,19 @@ class _Judge:
         if game is None:
             return None
         lead = program.lead
+        # The listing at its own times, and at the times the league's answer gives it: a league
+        # page's Record goes by that answer, so its recording of the game may start at TheSportsDB's
+        # time rather than this listing's (dev/changelog/1630).
+        from .auto_rules_sports import game_windows
+        rule = self.games.rules.get(game.league_id)
+        spans = [(lead.start, lead.stop)]
+        if rule is not None and self.games.now is not None:
+            spans += game_windows(game, lead.start, lead.stop, rule, self.games.now)
         for h in self.games.held.get(game.id, ()):
             rec = self.run.lib_by_id.get(h.recording_id)
             if rec is None or rec.status not in self.index.spoken:
                 continue
-            if covers(rec.start, rec.stop, lead.start, lead.stop):
+            if any(covers(rec.start, rec.stop, a, b) for a, b in spans):
                 where = f' on {h.where}' if h.where else ''
                 return (RULE_MATCH_SKIPPED_EXISTING,
                         f'Same game, covered by the recording of "{h.title or rec.name}"{where}, '
@@ -1907,7 +1922,9 @@ WHY_TOO_MANY = 'too_many'   # more listings than MAX_SHOWINGS
 class GamePick:
     """What a league page's Record records for one game: a showing (live or replay), an event
     channel's pick, or nothing and why. `channels` is how many showings the picked listing has,
-    the number its order ranked on."""
+    the number its order ranked on. `wider` is a listing on more channels that was passed over
+    because it starts away from the game's believed start (auto_rules_sports.near_start()), for
+    the dialog to say why it lost; None when the pick has the most channels."""
     kind: str
     game: object = None
     showing: '_Showing' = None
@@ -1916,6 +1933,7 @@ class GamePick:
     airing: str = ''
     event: object = None
     why: str = ''
+    wider: '_Program' = None
 
 
 #: A league page keeps a game all its day (sports_view), so its pick reads back that far.
@@ -1926,9 +1944,10 @@ def game_pick(event_id, now=None, cfg=None):
     """The GamePick for one stored event, or None when it is not stored. The same order a rule for
     its league would use, over the same search: the Programs search narrowed to the event
     (`f.event`), grouped into programs, and of the game's listings not yet over, the keeper
-    (auto_rules_sports.keepers()) - the live airing most channels carry, then the earliest. With
-    no live one left, the same order over its replays, which a rule never records; with no listing
-    at all, event_pick(). Reads only; the route that records it re-asks this, never the page."""
+    (auto_rules_sports.keepers()) - the live airing near the game's believed start, then the one
+    most channels carry, then the earliest. With no live one left, the same order over its
+    replays, which a rule never records; with no listing at all, event_pick(). Reads only; the
+    route that records it re-asks this, never the page."""
     from .auto_rules_sports import GameIndex, Scope, event_pick, keepers
     from .channel_search import GRAIN_AIRINGS, DimensionFilter, SearchContext, SearchState
     from .config import load_config
@@ -1953,7 +1972,8 @@ def game_pick(event_id, now=None, cfg=None):
     slots = _Slots()
     for s in showings:
         slots.add(s.title_key, s.start, s.episode_raw)
-    scope = Scope(league_id=event.league_id)
+    # The person picked this event, a session or not (dev/changelog/1633).
+    scope = Scope(league_id=event.league_id, sessions=True)
     games_of, mine = {}, []
     for p in _programs(showings, slots):
         found = games.program_game(p, scope)
@@ -1964,9 +1984,12 @@ def game_pick(event_id, now=None, cfg=None):
         keep = keepers(mine, games_of, replays=replays)
         if keep:
             program = next(p for p in mine if p.identity in keep)
+            same = [p for p in mine if (games_of[p.identity][1] == SPORTS_AIRING_REPLAY) == replays]
+            widest = max(same, key=lambda p: (len(p.showings), -p.lead.start.timestamp()))
             return GamePick(kind, game=game, showing=program.lead, program=program,
                             channels=len(program.showings),
-                            airing=games_of[program.identity][1])
+                            airing=games_of[program.identity][1],
+                            wider=widest if len(widest.showings) > len(program.showings) else None)
     if game.id in games.listed:
         return GamePick(PICK_NONE, game=game, why=WHY_UNSURE if showings else WHY_ENDED)
     pick, _why = event_pick(games, game)
@@ -2843,6 +2866,7 @@ class RuleValues:
     sports_team_tsdb_id: int | None = None
     sports_skip_replays: bool = False
     sports_event_channels: bool = False
+    sports_sessions: bool = False
 
 
 def _flag(raw) -> bool:
@@ -2852,7 +2876,7 @@ def _flag(raw) -> bool:
 
 
 def _read_sports(data: dict, existing) -> tuple:
-    """(league id, team id, skip replays, event channels) from a create or edit body. A body that
+    """(league id, team id, skip replays, event channels, sessions) from a create or edit body. A body that
     says nothing about them keeps what the rule has - the Programs search's Save to rule sends only
     the search. A league must be on Sports Schedules; a team must play in it, as its stored games
     say, since that is the only team list the free key gives (DESIGN-sports-data.md 2)."""
@@ -2874,7 +2898,7 @@ def _read_sports(data: dict, existing) -> tuple:
     league_id = whole(keep('sports_league_id', None), 'The league')
     team_id = whole(keep('sports_team_tsdb_id', None), 'The team')
     if league_id is None:
-        return None, None, False, False
+        return None, None, False, False, False
     if db.session.get(SportsLeague, league_id) is None:
         raise RuleError('That league is no longer on Sports Schedules.')
     # Only a team being chosen now is checked against the stored games: off-season, retention
@@ -2886,7 +2910,7 @@ def _read_sports(data: dict, existing) -> tuple:
             or_(SportsEvent.home_team_id == team_id, SportsEvent.away_team_id == team_id)).first() is None:
         raise RuleError('That team has no games stored for this league. Pick it again from the list.')
     return (league_id, team_id, _flag(keep('sports_skip_replays', False)),
-            _flag(keep('sports_event_channels', False)))
+            _flag(keep('sports_event_channels', False)), _flag(keep('sports_sessions', False)))
 
 
 def read_rule_values(data: dict, existing: AutoRule | None = None) -> RuleValues:
@@ -2924,13 +2948,14 @@ def read_rule_values(data: dict, existing: AutoRule | None = None) -> RuleValues
     limit_window = opt_int('limit_window_hours', 'The limit\'s window', 1)
     if (limit_count is None) != (limit_window is None):
         raise RuleError('Set both halves of "at most X within Y hours", or neither.')
-    league_id, team_id, skip_replays, event_channels = _read_sports(data, existing)
+    league_id, team_id, skip_replays, event_channels, sessions = _read_sports(data, existing)
     return RuleValues(name=name, search_params=params, profile_id=profile_id,
                       skip_repeats=bool(skip), limit_count=limit_count,
                       limit_window_hours=limit_window,
                       max_upcoming=opt_int('max_upcoming', 'The cap', 0),
                       sports_league_id=league_id, sports_team_tsdb_id=team_id,
-                      sports_skip_replays=skip_replays, sports_event_channels=event_channels)
+                      sports_skip_replays=skip_replays, sports_event_channels=event_channels,
+                      sports_sessions=sessions)
 
 
 def _apply_sports(rule, values, now) -> bool:
@@ -2941,6 +2966,7 @@ def _apply_sports(rule, values, now) -> bool:
     rule.sports_team_tsdb_id = values.sports_team_tsdb_id
     rule.sports_skip_replays = values.sports_skip_replays
     rule.sports_event_channels = values.sports_event_channels
+    rule.sports_sessions = values.sports_sessions
     db.session.flush()
     return set_rule_follow(rule.id, values.sports_league_id, values.sports_team_tsdb_id, now)
 
@@ -3075,7 +3101,8 @@ def unmatched_events(rule, values: RuleValues) -> Unmatched:
     """The rule's upcoming SCHEDULED event-channel picks that `values` would no longer make
     (DESIGN-sports-data.md 10, dev/changelog/1491): every one when recording from event channels is
     turned off or the league changes, and a game the newly named team does not play in when the team
-    changes. Asked about exactly as a changed search's are (§8, dev/changelog/1203); never dropped
+    changes. Turning sessions off leaves none: no session is ever an event-channel pick, since no
+    channel's name is read for one (dev/changelog/1633). Asked about exactly as a changed search's are (§8, dev/changelog/1203); never dropped
     unasked. Reads only."""
     from .database import SportsEvent
     from .tz_utils import format_local, get_display_tz, is_24h
@@ -3192,6 +3219,9 @@ def update_rule(rule_id: int, values: RuleValues, unmatched=None):
     _start_sports_worker(followed)
     for rid in result[0]:
         unschedule_recording(rid)
+        # Cover both's second recording goes with its first (dev/changelog/1631).
+        from .sports_follow import drop_seconds_of
+        drop_seconds_of(rid)
     _clear_rule_alerts(rule_id)
     return result
 
@@ -3289,6 +3319,9 @@ def delete_rule(rule_id: int, cancel_scheduled: bool):
         return None
     for rid in result[0]:
         unschedule_recording(rid)
+        # Cover both's second recording goes with its first (dev/changelog/1631).
+        from .sports_follow import drop_seconds_of
+        drop_seconds_of(rid)
     _clear_rule_alerts(rule_id)
     _guide_alert_after_a_rule_left()
     return result

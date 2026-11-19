@@ -362,3 +362,9 @@
     {%- endfor %}
   },
 {%- endmacro %}
+
+{#- A page still being built: the blue Beta pill in its title and on its menu item, with what
+    it means on hover (mockup 59, dev/changelog/1635). One sentence for every such page. -#}
+{% macro beta_mark(page) -%}
+<span class="badge b-sched tip-plain beta-mark" data-tip="{{ page }} is in beta. Still being built. Some parts do not work yet, and how it works may change often.">Beta</span>
+{%- endmacro %}

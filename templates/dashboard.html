@@ -376,15 +376,20 @@
         <span>Tuned in</span><span>Played</span><span>When</span><span>IPTV player</span><span></span><span></span>
       </div>
       <div class="dash-rows">
-        {#- The one redirect-mode play ChannelBin can see: a sports channel's waiting screen,
-            which is its own stream in this mode too (dev/changelog/1534). -#}
+        {#- The redirect-mode plays ChannelBin can see: its own pictures, a sports channel's
+            waiting screen and an Up next channel, its own stream in this mode too
+            (dev/changelog/1534, 1614). -#}
         {% for s in feed.live %}
         <div class="drow st-live">
           <span class="d-title">
             <span class="d-name">{{ s.label }}</span>
+            {%- if s.showing %}
+            <span class="d-meta">ChannelBin's own picture of the coming games</span>
+            {%- else %}
             <span class="d-meta">on the waiting screen{% if s.waiting_for %}, waiting for {{ s.waiting_for }}{% endif %} &middot; it stops when the game comes on</span>
+            {%- endif %}
           </span>
-          <span class="d-cell d-badge">{{ m.status_badge('b-sched', 'WAITING SCREEN') }}</span>
+          <span class="d-cell d-badge">{{ m.status_badge('b-running', 'UP NEXT') if s.showing else m.status_badge('b-sched', 'WAITING SCREEN') }}</span>
           <span class="d-cell"><span class="d-k">When</span>{{ s.started_at | local_time_only }}</span>
           <span class="d-cell"><span class="d-k">IPTV player</span>{{ s.client }}</span>
           <span class="d-cell"></span>
@@ -416,19 +421,21 @@
       </div>
       <div class="dash-rows">
         {% for s in feed.live + feed.ended %}
-        {#- A play on a sports channel's waiting screen has no channel to link to. -#}
+        {#- A play of ChannelBin's own picture has no channel to link to. -#}
         <div class="drow{{ ' st-live' if s.state != 'STOPPED' else '' }}"{% if s.channel_id is not none %} data-href="{{ url_for('channels.channel_detail', channel_id=s.channel_id) }}"{% endif %}>
           <span class="d-title">
             <span class="d-name">{{ s.label }}</span>
             <span class="d-meta">
-              {%- if s.waiting %}on the waiting screen{% if s.waiting_for %}, waiting for {{ s.waiting_for }}{% endif %} &middot; not counted against the limit
+              {%- if s.showing %}ChannelBin's own picture of the coming games &middot; not counted against the limit
+              {%- elif s.waiting %}on the waiting screen{% if s.waiting_for %}, waiting for {{ s.waiting_for }}{% endif %} &middot; not counted against the limit
               {%- elif s.state != 'STOPPED' %}playing {{ s.channel_name }}
               {%- else %}{{ s.reason_text }}{% if s.detail %} {{ s.detail }}{% endif %}{% endif -%}
               {%- if s.failovers %} &middot; moved {{ s.failovers | length }}x{% endif -%}
             </span>
           </span>
           <span class="d-cell d-badge">
-            {%- if s.waiting %}{{ m.status_badge('b-sched', 'WAITING SCREEN') }}
+            {%- if s.showing %}{{ m.status_badge('b-running', 'UP NEXT') }}
+            {%- elif s.waiting %}{{ m.status_badge('b-sched', 'WAITING SCREEN') }}
             {%- elif s.state != 'STOPPED' %}{{ m.status_badge('b-running', 'WATCHING', pulse=true) }}
             {%- else %}{{ m.status_badge('b-abort', 'ENDED') }}{% endif -%}
           </span>

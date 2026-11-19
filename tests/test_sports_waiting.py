@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -588,7 +589,7 @@ class RedirectModeWaitingTests(_Waiting):
         self.play()
         html = self.client.get('/iptv-output').get_data(as_text=True)
         self.assertIn('Waiting screen', html)
-        self.assertIn('The one play it can see is a sports channel', html)
+        self.assertIn("The plays it can see are its own pictures, a sports channel's waiting screen", html)
         self.assertIn('stops when the game comes on', html)
         dash = self.client.get('/').get_data(as_text=True)
         self.assertIn('WAITING SCREEN', dash)
@@ -794,6 +795,43 @@ class AdoptClaimTests(unittest.TestCase):
         self.assertIsNone(feed._adopt(session, proc))
         self.assertIsNotNone(proc.wait(timeout=5))
         self.assertIsNone(session.proc)
+
+    def test_a_finish_that_lands_as_ffmpeg_is_adopted_still_stops_the_play(self):
+        """dev/docs/BUGS.md 2026-11-17: _adopt() put the reader on the session and started it
+        after letting go of the lock. A _finish() in between read a reader not yet started, its
+        join raised, and the play stayed live with nothing able to stop it: the waiting screen's
+        game coming on as the IPTV player closed, seen once in a full suite run."""
+        session = feed.RelaySession(id='y', feed_id=2, label='l', client='c', group_id=None, channel_id=1,
+                                    channel_name='n', account_id=1, ring=feed.Ring(feed.READ_CHUNK, 0))
+        proc = subprocess.Popen(['sleep', '30'], stdout=subprocess.PIPE)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        raised = []
+
+        def finish():
+            try:
+                feed._finish(session, feed.REASON_SHUTDOWN)
+            except Exception as exc:  # noqa: BLE001 - what the test is looking for
+                raised.append(exc)
+
+        real = threading.Thread
+
+        class FinishFirst(real):
+            """Starts a _finish() of the play and gives it every chance to run before the
+            reader starts."""
+            def start(self):
+                if self.name == 'relay-y':
+                    self.finisher = real(target=finish)
+                    self.finisher.start()
+                    self.finisher.join(0.3)
+                super().start()
+
+        with mock.patch.object(feed.threading, 'Thread', FinishFirst):
+            reader = feed._adopt(session, proc)
+        if reader is not None:
+            reader.finisher.join(10)
+        self.assertEqual(raised, [])
+        self.assertFalse(session.live, 'the play is stopped, not left live')
+        self.assertIsNotNone(proc.wait(timeout=5))
 
 
 if __name__ == '__main__':

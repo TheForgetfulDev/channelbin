@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import func, or_
 
-from . import db, sports_match
+from . import db, sports_match, sports_skips
 from .database import (
     SPORTS_FETCH_CAPPED, SPORTS_FETCH_CAPPED_PAST, SPORTS_FETCH_EMPTY, SPORTS_FETCH_OK, SPORTS_FETCH_RATE_LIMITED, SPORTS_FETCH_REFUSED,
     SPORTS_FETCH_SHRUNK, SPORTS_KIND_EVENT, SPORTS_KIND_LEAGUE, SPORTS_KIND_NEXT, SPORTS_KIND_ROUND, SPORTS_KIND_SEARCH,
@@ -19,6 +19,7 @@ from .database import (
     SPORTS_AIRING_UNKNOWN, SPORTS_MATCH_STRONG, EPGEntry, SportsEvent, SportsFetch, SportsFollow, SportsLeague, SportsLeagueCategory, SportsState, SportsTeam,
 )
 from .config import load_config
+from .sports_times import Rules
 from .fmt_utils import counted, fmt_duration_phrase, plural
 from .sports_data import (
     MISSING_KEEP_DAYS, ONE_GAME_KINDS, ROUND_ROW_CAP, SHIPPED_LEAGUES, search_parts, _settings, capped_spans, event_game_name, event_shape_is_matchup,
@@ -57,8 +58,9 @@ RESULTS = {
     SPORTS_FETCH_CAPPED: ('b-warn', f'Cut at {ROUND_ROW_CAP}'),
     SPORTS_FETCH_CAPPED_PAST: ('b-warn', f'Cut at {ROUND_ROW_CAP}'),
 }
-SECTIONS = ('about', 'upcoming', 'feed', 'matching', 'updates')
-SECTION_NAMES = {'about': 'This league', 'upcoming': 'Upcoming games', 'feed': 'On your IPTV output',
+SECTIONS = ('about', 'times', 'upcoming', 'feed', 'matching', 'updates')
+SECTION_NAMES = {'about': 'This league', 'times': 'Game time settings', 'upcoming': 'Upcoming games',
+                 'feed': 'On your IPTV output',
                  'matching': 'Matching your guide',
                  'updates': 'Schedule updates'}
 SECTIONS_PREF_KEY = 'sports_league_sections'
@@ -126,7 +128,9 @@ def _when_text(day: str, clock: str) -> str:
     return f'{day} {clock}' if clock else day
 
 
-def _game_row(event, now, tz, h24) -> dict:
+def _game_row(event, rule, now, tz, h24) -> dict:
+    """One game's row. `rule` is its league's answer to which time a game goes by
+    (app/sports_times.py), which the note on a game the guide is behind on names."""
     day, clock = event_when(event, now, tz, h24)
     matchup = event_shape_is_matchup(event)
     game = event_game_name(event)
@@ -138,6 +142,36 @@ def _game_row(event, now, tz, h24) -> dict:
         was_day, was_clock = day_label(event.previous_start, now, tz), format_local(
             event.previous_start, 'clock', tz=tz, h24=h24)
         notes.append(f'Moved from {_when_text(was_day, was_clock)}')
+    if sports_match.kept_start(event):
+        from .sports_times import GO_GUIDE, running_late
+        started = format_local(event.guide_start, 'clock', tz=tz, h24=h24)
+        # A started game keeps its start (dev/changelog/1626), races too, and one moved later ends
+        # later by the move (dev/changelog/1632).
+        note = f'It had already started when TheSportsDB moved it, so it keeps its {started} start'
+        late = running_late(event)
+        if late and rule.go_by != GO_GUIDE:
+            note += (f'. Sports channels and automated recordings run '
+                     f'{counted(int(late.total_seconds() // 60), "minute")} later to match')
+        notes.append(note)
+    elif matchup and event.guide_behind_start is not None:
+        # The guide did not follow TheSportsDB's move (dev/changelog/1623); what follows is the
+        # league's answer to which time a game goes by (dev/changelog/1630).
+        from .sports_times import GO_BOTH, GO_GUIDE, GO_TSDB, acts, tsdb_start
+        listed = format_local(event.guide_behind_start, 'clock', tz=tz, h24=h24)
+        on = f' on {counted(event.guide_channels, "channel")}' if event.guide_channels else ''
+        who = 'Sports channels and Record on this page'
+        if rule.go_by == GO_GUIDE:
+            then = f'{who} go by the listing'
+        elif not acts(event.guide_behind_start, tsdb_start(event), rule, now):
+            then = (f"{who} go by the listing until {counted(rule.wait_hours, 'hour')} before it, then "
+                    + ("by TheSportsDB's time" if rule.go_by == GO_TSDB else 'cover both times'))
+        elif rule.go_by == GO_TSDB:
+            then = f"{who} go by TheSportsDB's time"
+        elif rule.go_by == GO_BOTH:
+            then = f'{who} cover both times'
+        else:
+            raise ValueError(f'unknown answer {rule.go_by!r}')
+        notes.append(f'The guide still lists it at the old time, {listed}{on}. {then}')
     if event.missing_since is not None:
         notes.append(f"Not in TheSportsDB's latest answer since {date_label(to_local(event.missing_since, tz).date(), now, tz)}")
     return {'day': day, 'time': clock, 'game': game, 'notes': notes,
@@ -278,7 +312,7 @@ def _banner(statuses, fetches_by_league, follows, state, settings, now, tz, h24)
                 'sub': 'Its last update came back different from what was stored. Nothing was deleted.',
                 'settings': False}
     return {'tone': 'ok', 'title': f'Schedules are up to date, {settings["horizon_days"]} days ahead.',
-            'sub': f'The next update is {_next_update(rows, now, tz, h24).lower()}. A schedule normally costs a few calls a day.',
+            'sub': f'The next update is {_next_update(rows, now, tz, h24).lower()}. A schedule normally costs a few calls a day, plus one every 30 minutes around each game being recorded or played.',
             'settings': False}
 
 
@@ -299,6 +333,7 @@ def list_context() -> dict:
     from .database import AutoRule
     rule_names = dict(db.session.query(AutoRule.id, AutoRule.name).filter(AutoRule.sports_league_id.isnot(None)))
 
+    rules = Rules()
     rows = []
     for league in leagues:
         lfollows = follows.get(league.id, [])
@@ -312,7 +347,7 @@ def list_context() -> dict:
         first = mine[0] if mine else None
         nxt = None
         if first is not None:
-            nxt = _game_row(first, now, tz, h24)
+            nxt = _game_row(first, rules.of(league.tsdb_id), now, tz, h24)
         rows.append({
             'id': league.id, 'name': league.name, 'status': status, 'badge': badge, 'label': label,
             'edge': edge, 'rank': rank, 'tip': tip, 'followed': bool(lfollows),
@@ -331,6 +366,7 @@ def list_context() -> dict:
     rows.sort(key=lambda r: (r['next_sort'], r['name']))
     followed = sum(1 for r in rows if r['followed'])
     return {
+        'times': default_times_card(leagues, rules, h24),
         'rows': rows, 'followed': followed, 'not_followed': len(rows) - followed,
         'upcoming_total': sum(r['count'] for r in rows),
         'banner': _banner([r['status'] for r in rows], fetches, follows, db.session.get(SportsState, 1),
@@ -642,6 +678,7 @@ def _feed_page(feed: dict, league, q: str, page: int, link) -> dict:
     here = pages[page - 1]
     return {'q': q, 'page': page, 'filterable': len(teams) > PAGE_SIZE or bool(needle),
             'show_league': feed['whole'] and (not needle or needle in league.name.casefold()),
+            'show_up_next': feed['followed'] and (not needle or needle in feed['up_next_name'].casefold()),
             'page_teams': here,
             'pager': _pager(page, len(pages), here[0]['name'], here[-1]['name'], lambda n: link(feed_page=n)) if here else None}
 
@@ -678,7 +715,9 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED, page: int = 1, fee
     scope = SCOPE_ALL if scope == SCOPE_ALL and picked_teams else SCOPE_FOLLOWED
     shown = all_events if (scope == SCOPE_ALL or not picked_teams) else mine
     feed_q = (feed_q or '').strip()[:FEED_FILTER_MAX]
-    paged = day_pages([(_game_row(e, now, tz, h24), e) for e in shown], lambda pair: pair[0]['day'])
+    rules = Rules(cfg)
+    rule = rules.of(league.tsdb_id)
+    paged = day_pages([(_game_row(e, rule, now, tz, h24), e) for e in shown], lambda pair: pair[0]['day'])
     page = _clamp(page, len(paged))
     here = paged[page - 1]
     where = {'scope': scope, 'page': page, 'feed_page': feed_page or 1, 'feed_q': feed_q}
@@ -740,10 +779,12 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED, page: int = 1, fee
         'scope_urls': {SCOPE_FOLLOWED: link(scope=SCOPE_FOLLOWED, page=1), SCOPE_ALL: link(scope=SCOPE_ALL, page=1)},
         'one': one, 'many': many,
         'trust': _trust_text(league), 'upcoming_note': _upcoming_note(league, many, settings['horizon_days']),
+        'times': times_card(league, one, many, rules, settings['history_keep_days'],
+                            min((f.created_at for f in follows if f.created_at), default=None), now, h24),
         'match_note': _match_note(state, sum(1 for e in all_events if (counts.get(e.id) or {}).get('channels')),
                                   len(all_events), one, many, now, tz, h24),
         'match_waiting': bool(state and (state.match_note or '').startswith(('Waiting', 'The last run'))),
-        'matching': _matching_context(league, now),
+        'matching': _matching_context(league, now, cfg, one),
         'picked_teams': picked_teams, 'scope': scope,
         'mine_total': len(mine), 'all_total': len(all_events),
         'follow_text': _follow_text(league, person, teams, many) if person else 'Nothing',
@@ -756,7 +797,7 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED, page: int = 1, fee
         'rule_follows': rule_follows,
         'feed': feed,
         'can_change_teams': any(event_shape_is_matchup(e) for e in all_events),
-        'section_names': {**SECTION_NAMES, 'upcoming': f'Upcoming {many}'},
+        'section_names': {**SECTION_NAMES, 'upcoming': f'Upcoming {many}', 'times': f'{one.capitalize()} time settings'},
         'league_url': f'https://www.thesportsdb.com/league/{league.tsdb_id}',
     }
 
@@ -798,12 +839,91 @@ def _trust_text(league) -> tuple:
     sample, agreed = league.trust_sample or 0, league.trust_agreed or 0
     if not sample:
         return 'Not measured yet', ''
-    text = f'Match your guide on {agreed} of the last {counted(sample, "event")}'
+    text = f'Matched your guide on {agreed} of the last {counted(sample, "event")}'
     if sports_match.league_trusted(league):
         return text, ''
     if sample < sports_match.TRUST_MIN_SAMPLE:
         return text, 'Too few checked yet to rely on'
     return text, 'Not enough to rely on'
+
+
+def _record_notice(league, one, many, keep_days, followed_since, now) -> dict:
+    """{tone, text, asks}: the measured record on a league's Game time settings card, as advice on
+    which answer to pick (app/sports_times.py, sports_match.league_trusted()). `asks` is the case of
+    a league followed (`followed_since`, its current follow) longer than the history is kept with fewer than 10
+    measured: it plays too rarely ever to reach 10, so the card asks the person to choose, and the
+    ask goes once they have."""
+    sample, agreed = league.trust_sample or 0, league.trust_agreed or 0
+    need = sports_match.TRUST_MIN_SAMPLE
+    if not sample:
+        return {'tone': 'info', 'asks': False,
+                'text': (f'Not measured yet. ChannelBin checks each {one} against your guide after the next guide '
+                         "update, and says here how often TheSportsDB's times agree with it.")}
+    if sports_match.league_trusted(league):
+        return {'tone': 'ok', 'asks': False,
+                'text': (f"TheSportsDB's times matched your guide, within 5 minutes, on {agreed} of the last {sample} "
+                         f'{many}, so going by TheSportsDB is a safe choice here.')}
+    if sample < need:
+        old = followed_since is not None and followed_since < now - timedelta(days=keep_days)
+        if old:
+            verb = 'race' if one == 'race' else 'play'
+            return {'tone': 'warn', 'asks': True,
+                    'text': (f'{counted(sample, one, many)} checked. ChannelBin needs {need} before it relies on '
+                             f'these times, and this {"series" if one == "race" else "league"} does not {verb} often '
+                             'enough to get there, so choose below which time it goes by.')}
+        return {'tone': 'info', 'asks': False,
+                'text': (f'{counted(sample, one, many)} checked so far, and {agreed} matched your guide. ChannelBin '
+                         f"needs {need} before it can say how far TheSportsDB's times can be relied on here.")}
+    return {'tone': 'warn', 'asks': False,
+            'text': (f"TheSportsDB's times matched your guide on only {agreed} of the last {sample} {many}. Cover "
+                     'both is the safer choice here: it records from the earlier start to the later end.')}
+
+
+def wait_example(hours: int, h24: bool) -> tuple:
+    """('8:15 PM on Sunday', '8:15 PM on Saturday'): a game, and when it starts going by
+    TheSportsDB's time, for the wait row's worked example. A plain clock and weekday in the display
+    clock format: an example, not a real time, so no timezone applies."""
+    game = datetime(2026, 11, 22, 20, 15)  # a Sunday
+
+    def clock(at):
+        return at.strftime('%H:%M') if h24 else f'{at.hour % 12 or 12}:{at.minute:02d} {"AM" if at.hour < 12 else "PM"}'
+    at = game - timedelta(hours=hours)
+    day = 'the Sunday' if at.date() == game.date() else at.strftime('%A')
+    return f'{clock(game)} on Sunday', f'{clock(at)} on {day}'
+
+
+def times_card(league, one, many, rules, keep_days, followed_since, now, h24) -> dict:
+    """What a league page's Game time settings card draws (app/sports_times.py, mockup 58): the
+    league's own answers, the default beside them, the answer in force, and the measured record."""
+    from .sports_times import GO, GO_BY_LABELS, MAX_COVER_BOTH_MINUTES, MAX_WAIT_HOURS
+    rule = rules.of(league.tsdb_id)
+    record = _record_notice(league, one, many, keep_days, followed_since, now)
+    sunday, example = wait_example(rule.wait_hours, h24)
+    return {'heading': f'{one.capitalize()} time settings', 'own': rule.own, 'rule': rule,
+            'default': rules.default, 'labels': GO_BY_LABELS, 'record': record,
+            'show_record': not (record['asks'] and not rule.uses_default), 'sunday': sunday, 'example': example,
+            'max_cover_both': MAX_COVER_BOTH_MINUTES, 'max_wait': MAX_WAIT_HOURS, 'go': GO}
+
+
+def default_times_card(leagues, rules, h24) -> dict:
+    """Sports Schedules' Game time settings card: the default every league goes by, and the leagues
+    with their own choice named beside it."""
+    from .sports_times import GO, GO_BY_LABELS, MAX_COVER_BOTH_MINUTES, MAX_WAIT_HOURS
+    by_tsdb = {str(lg.tsdb_id): lg.name for lg in leagues}
+    named = []
+    for tsdb_id, own in sorted(rules.overrides().items(), key=lambda kv: by_tsdb.get(kv[0], kv[0]).lower()):
+        if tsdb_id not in by_tsdb:
+            continue
+        bits = ([GO_BY_LABELS[own['go_by']]] if 'go_by' in own else []) + (
+            [f"up to {counted(own['cover_both_minutes'], 'minute')}"] if 'cover_both_minutes' in own else []) + (
+            [f"from {counted(own['wait_hours'], 'hour')} before"] if 'wait_hours' in own else [])
+        named.append(f'{by_tsdb[tsdb_id]} ({", ".join(bits)})')
+    sunday, example = wait_example(rules.default.wait_hours, h24)
+    return {'rule': rules.default, 'own': {}, 'labels': GO_BY_LABELS,
+            'overrides': (f'Leagues with their own choice: {"; ".join(named)}.' if named
+                          else 'No league has its own choice.'),
+            'sunday': sunday, 'example': example,
+            'max_cover_both': MAX_COVER_BOTH_MINUTES, 'max_wait': MAX_WAIT_HOURS, 'go': GO}
 
 
 def _upcoming_note(league, many, horizon_days) -> str:
@@ -886,7 +1006,7 @@ def _live_now(events, counts, cfg, now, tz, h24) -> dict:
     fcfg = output_feed.feed_config(cfg)
     _before, after = output_feed.sports_window(fcfg)
     blocked, allowed = blocked_account_ids_now(), output_feed.allowed_account_ids(fcfg)
-    listings = sports_match.listing_windows([e.id for e in found])
+    listings = sports_match.listing_windows([e.id for e in found], now)
     carrying = sports_feed.carriers(sports_feed.served_channels(), found)
     return {e.id: sports_feed.live_now_offer(e, listings.get(e.id, ()), [c.name for c in carrying.get(e.id, ())],
                                              now, after, tz, h24, blocked=blocked, allowed=allowed)
@@ -1046,7 +1166,7 @@ def _listings_ahead(event_ids, now) -> dict:
     return out
 
 
-def _preview_pick(event_id, listings):
+def _preview_pick(event, listings):
     """(kind, starts at) of what Record would pick for a game from its strong listings ahead, in
     auto_rules_sports.keepers()'s own order: the button's label. The dialog's pick is
     auto_rules.game_pick(), which runs the same order over the Programs search."""
@@ -1059,7 +1179,7 @@ def _preview_pick(event_id, listings):
             p = progs.setdefault((tkey, ep, start), {'channels': set(), 'airings': []})
             p['channels'].add(cid)
             p['airings'].append(airing)
-    stub = SimpleNamespace(id=event_id)
+    stub = SimpleNamespace(id=event.id, guide_start=event.guide_start)
     programs = [SimpleNamespace(identity=k, showings=sorted(v['channels']), lead=SimpleNamespace(start=k[2]))
                 for k, v in progs.items()]
     games_of = {k: (stub, sports_match.combined_airing(v['airings'])) for k, v in progs.items()}
@@ -1082,8 +1202,9 @@ def pick_why(why, one, guide_end, now, tz) -> str:
     if why == ar.WHY_NO_START:
         return (f"This {one} has no listing in your guide, only an event channel whose name mentions it, and there "
                 "is no start time ChannelBin can stand behind: the channel's name gives no time zone, and "
-                "TheSportsDB's times for this league have not matched your guide often enough to rely on. Event "
-                'channels naming it shows the channel, if you want to schedule it by hand.')
+                f"TheSportsDB gives no time to go by, or this league's {one} time settings say not to go by it "
+                f'(it goes by your guide, or the {one} is further off than it waits). Event channels naming it '
+                'shows the channel, if you want to schedule it by hand.')
     if why == ar.WHY_UNLISTED:
         return f'This {one} is not in your guide yet, so there is nothing to record.{reach} ChannelBin looks again after each guide update.'
     if why == ar.WHY_UNKNOWN:
@@ -1150,9 +1271,62 @@ def _length_words(length: timedelta) -> str:
     return ' '.join(parts) or 'no time at all'
 
 
-def _pick_notice(pick, event, league, one, many, now, tz, h24) -> dict:
+def _goes_by_words(league, rule) -> str:
+    """'NBA goes by TheSportsDB, the default for every league,': the clause a notice leads its
+    times with (app/sports_times.py)."""
+    from .sports_times import GO_BOTH, GO_GUIDE, GO_TSDB
+    verb = {GO_TSDB: "goes by TheSportsDB", GO_GUIDE: 'goes by your guide', GO_BOTH: 'covers both times'}[rule.go_by]
+    return f'{league.name} {verb}, the default for every league,' if rule.uses_default else f'{league.name} {verb},'
+
+
+def listing_times(event, league, rule, start, stop, one, now, tz, h24) -> tuple:
+    """((start, stop), sentence): the times a league page's Record gives the listing it picked, by
+    the league's answer to which time a game goes by, and the sentence saying so. Under Cover both
+    with the two starts too far apart to cover in one, the times are the listing's and the sentence
+    says ChannelBin schedules a second recording at TheSportsDB's time (dev/changelog/1630). Saved at
+    these times, the recording follows the game's time from then on (app/sports_follow.py,
+    dev/changelog/1631), and every sentence that acts on TheSportsDB says so."""
+    from .sports_times import GO_BOTH, GO_GUIDE, GO_TSDB, AGREE, OFF_LIMIT, acts, listed_start, tsdb_start, windows
+    clock = (lambda dt: format_local(dt, 'clock', tz=tz, h24=h24))
+    as_listed = "The times are the listing's."
+    tsdb, listed = tsdb_start(event), listed_start(event)
+    if tsdb is None or listed is None or abs(tsdb - start) <= AGREE or abs(start - listed) > OFF_LIMIT:
+        return (start, stop), as_listed
+    wins = windows(start, stop, listed, tsdb, rule, now)
+    both = f'TheSportsDB has the {one} at {clock(tsdb)} and the listing starts at {clock(start)}.'
+    if rule.go_by == GO_GUIDE:
+        return wins[0], f"TheSportsDB has the {one} at {clock(tsdb)}. {_goes_by_words(league, rule)} so the recording keeps the listing's times."
+    if not acts(listed, tsdb, rule, now):
+        away = min(tsdb, listed) - now
+        far = (counted(round(away / timedelta(days=1)), 'day') if away >= timedelta(hours=48)
+               else _length_words(away))
+        then = ("moves it to TheSportsDB's time" if rule.go_by == GO_TSDB else 'widens it to cover both')
+        return wins[0], (f"{both} {league.name} goes by TheSportsDB's time only from "
+                         f"{counted(rule.wait_hours, 'hour')} before a {one}, and this one is {far} away, so the "
+                         f"recording keeps the listing's times for now. If the two still differ then, ChannelBin "
+                         f"{then}, unless you change its times below.")
+    goes = _goes_by_words(league, rule)
+    follows = f' If either time changes before the {one}, the recording follows, unless you change its times below.'
+    if rule.go_by == GO_TSDB:
+        w_start, w_stop = wins[0]
+        end = (f'ends with the listing, at {clock(w_stop)}' if w_stop == stop
+               else f'ends {_length_words(w_stop - stop)} after the listing, at {clock(w_stop)}')
+        return wins[0], f'{both} {goes} so the recording starts at {clock(w_start)} and {end}.{follows}'
+    if rule.go_by != GO_BOTH:
+        raise ValueError(f'unknown answer {rule.go_by!r}')
+    if len(wins) == 1:
+        return wins[0], f'{both} {goes} so the recording runs from {clock(wins[0][0])} to {clock(wins[0][1])}.{follows}'
+    return wins[0], (f"TheSportsDB has the {one} at {clock(tsdb)}, {_length_words(abs(tsdb - start))} from the "
+                     f"listing's {clock(start)}. That is more than the {rule.cover_both_minutes}-minute "
+                     f"limit for covering both in one recording, so this recording keeps the listing's times and "
+                     f"ChannelBin schedules a second one at {clock(tsdb)}, in case TheSportsDB is right. Change the "
+                     f"times below and it records only the times you set.")
+
+
+def _pick_notice(pick, event, league, one, many, now, tz, h24, times_text="The times are the listing's.") -> dict:
     """{tone, strong, text}: the record dialog's one notice, saying which listing Record picked and
-    why. Every GamePick kind that records is named."""
+    why. Every GamePick kind that records is named. `times_text` is listing_times()'s sentence for a
+    live pick."""
     from . import auto_rules as ar
     from .auto_rules_sports import START_FROM_NAME
     from .database import SPORTS_AIRING_FIRST
@@ -1177,27 +1351,27 @@ def _pick_notice(pick, event, league, one, many, now, tz, h24) -> dict:
         what = 'the live airing' if pick.airing == SPORTS_AIRING_FIRST else 'the listing'
         doubt = ('' if pick.airing == SPORTS_AIRING_FIRST
                  else ' Your guide does not say yet whether it is live or a replay.')
-        differs = ''
-        if event.start_at is not None and event_shape_is_matchup(event) and abs(event.start_at - s.start) >= timedelta(minutes=1):
-            differs = f" TheSportsDB lists {clock(event.start_at)}; the recording follows the listing."
         total = max(c.get('channels') or 0, pick.channels)
-        if pick.channels == total:
+        passed = ''
+        if pick.wider is not None:
+            carried = f'{what} at the {one}\'s start, on {pick.channels} of the {total} channels with this {one}'
+            passed = (f' {counted(len(pick.wider.showings), "channel")} list it at {clock(pick.wider.lead.start)} '
+                      f'instead, too far from {clock(event.guide_start)}, when ChannelBin believes it starts.')
+        elif pick.channels == total:
             carried = (f'{what}, on the one channel with this {one}' if total == 1
                        else f'{what}, on all {total} channels with this {one}')
         else:
             carried = f'{what} most of your channels carry ({pick.channels} of the {total} channels with this {one})'
         return {'tone': 'info', 'strong': 'ChannelBin picked this listing.',
-                'text': (f'It is {carried}, recorded from {source}. An auto-record rule for this league would pick '
-                         f"the same one.{doubt} The times are the listing's.{differs}")}
+                'text': (f'It is {carried}, recorded from {source}.{passed} An auto-record rule for this league would pick '
+                         f"the same one.{doubt} {times_text}")}
     if pick.kind == ar.PICK_EVENT:
         ep = pick.event
         if ep.source == START_FROM_NAME:
             start = f'Its name gives the start, {clock(ep.start)} {_day_words(ep.start, now, tz)},'
         else:
-            sample, agreed = league.trust_sample or 0, league.trust_agreed or 0
             start = (f"Its name gives no time zone, so the start is TheSportsDB's ({clock(ep.start)} "
-                     f'{_day_words(ep.start, now, tz)}), which matched your guide on {agreed} of the last '
-                     f'{sample} {many},')
+                     f"{_day_words(ep.start, now, tz)}), which {league.name} goes by,")
         return {'tone': 'warn', 'strong': "From an event channel's name.",
                 'text': (f'This {one} has no listing in your guide yet. "{ep.named.said_by}" mentions it, so '
                          f'Record uses {_record_channel_words(ep.named)}. {start} and it records for {_length_words(ep.stop - ep.start)}, '
@@ -1251,12 +1425,23 @@ def record_offer(event_id, cfg=None) -> tuple:
         if choice.moved:
             moved = choice
             pick = replace(pick, showing=choice.showing)
-    notice = _pick_notice(pick, event, league, one, many, now, tz, h24)
+    times, times_text = None, "The times are the listing's."
+    if pick.kind == ar.PICK_LIVE:
+        from .sports_times import Rules
+        times, times_text = listing_times(event, league, Rules(cfg).of(league.tsdb_id), pick.showing.start,
+                                          pick.showing.stop, one, now, tz, h24)
+    notice = _pick_notice(pick, event, league, one, many, now, tz, h24, times_text)
     if moved is not None:
         notice = {**notice, 'text': f'{notice["text"]} {moved.sentence()}'}
     if pick.kind in (ar.PICK_LIVE, ar.PICK_REPLAY):
-        return {'success': True, 'kind': pick.kind, 'epg_id': pick.showing.entry_id,
-                'group_id': pick.showing.group_id, 'notice': notice, 'search_url': search_url(event)}, 200
+        iso = (lambda dt: dt.strftime('%Y-%m-%dT%H:%M:%S'))
+        out = {'success': True, 'kind': pick.kind, 'epg_id': pick.showing.entry_id, 'sports_event_id': event.id,
+               'group_id': pick.showing.group_id, 'notice': notice, 'search_url': search_url(event)}
+        if times is not None:
+            # The dialog's times before the profile's padding: the listing's own, or where the
+            # league's answer moves them (listing_times()).
+            out['times'] = {'start_time': iso(times[0]), 'stop_time': iso(times[1])}
+        return out, 200
     if pick.kind != ar.PICK_EVENT:
         raise ValueError(f'a GamePick kind record_offer does not name: {pick.kind!r}')
     ep = pick.event
@@ -1295,14 +1480,28 @@ def event_record_check(event_id, channel_id):
         return None, ('The event channel naming this game changed since the dialog opened. Close it and press '
                       'Record again.')
     return SimpleNamespace(channel_id=channel_id, start_time=ep.start, stop_time=ep.stop, title=pick.game.title,
-                           sub_title=None, description=None, category=None, rating=None), None
+                           sub_title=None, description=None, category=None, rating=None,
+                           sports_event_tsdb_id=event.tsdb_id), None
+
+
+def record_mark(event_id, entry):
+    """TheSportsDB's id for the game when `entry` is a listing the matcher found for it and nobody
+    marked wrong, else None: what Recording.sports_record_tsdb_id holds for a league page's Record
+    on a listing (dev/changelog/1630). One query. The page's event id is never taken on trust."""
+    from .database import SPORTS_MATCH_KIND_GUIDE, SportsMatch
+    row = (db.session.query(SportsEvent.tsdb_id)
+           .join(SportsMatch, SportsMatch.event_id == SportsEvent.id)
+           .filter(SportsEvent.id == event_id, SportsMatch.kind == SPORTS_MATCH_KIND_GUIDE,
+                   SportsMatch.channel_id == entry.channel_id, SportsMatch.program_start_time == entry.start_time,
+                   SportsMatch.rejected_at.is_(None)).first())
+    return row[0] if row is not None else None
 
 
 def _record_button(event, c, listings, games, guide_end, one, now, tz) -> dict:
     """{label} for a Record that records, or {label, why} for a greyed one."""
     from . import auto_rules as ar
     from .auto_rules_sports import event_pick
-    kind, start = _preview_pick(event.id, listings)
+    kind, start = _preview_pick(event, listings)
     if kind is not None:
         label = 'Record the replay' if kind == ar.PICK_REPLAY else 'Record'
         return {'label': f'{label} now' if start <= now else label, 'replay': kind == ar.PICK_REPLAY}
@@ -1321,10 +1520,11 @@ def _record_button(event, c, listings, games, guide_end, one, now, tz) -> dict:
     return {'label': 'Record', 'why': pick_why(why, one, guide_end, now, tz)}
 
 
-def _matching_context(league, now: datetime) -> dict:
-    """The Matching your guide card: the league's names, a known name it lacks, and its categories with
-    how many channels each has now. A category gone from every account is kept and says so (5.2). A
-    Replays-only category says how many coming games it lists at their own start."""
+def _matching_context(league, now: datetime, cfg: dict, one: str) -> dict:
+    """The Matching your guide card: the league's names, a known name it lacks, its categories with
+    how many channels each has now, and the words and lengths that keep a listing out. A category gone
+    from every account is kept and says so (5.2). A Replays-only category says how many coming games
+    it lists at their own start."""
     counts = sports_match.category_counts()
     cats = SportsLeagueCategory.query.filter_by(league_id=league.id).order_by(SportsLeagueCategory.category_name).all()
     live = (sports_match.replay_category_live_games(league.id, now)
@@ -1335,6 +1535,60 @@ def _matching_context(league, now: datetime) -> dict:
         'teams': sports_match.team_names_context(league.id),
         'categories': [{'name': c.category_name, 'channels': counts.get(c.category_name, 0),
                         'replay': c.is_replay, 'live_games': live.get(c.category_name, 0)} for c in cats],
+        'skips': skips_context(league, cfg, one),
+    }
+
+
+def skips_context(league, cfg: dict, one: str) -> dict:
+    """The words and lengths at the end of Matching your guide (mockup 59, dev/changelog/1634). Which
+    list is the page's own noun's (_noun): a game's for a league of games, the race list for races and
+    any other field event. The page carries the list it shows, and its changes are written to that one.
+    The session length shows only for a league whose events include sessions, as a rule's Practice and
+    qualifying switch does (dev/changelog/1633)."""
+    from .auto_rules_sports import league_has_sessions
+    skips = sports_skips.SkipRules(cfg).of(league.tsdb_id)
+    game = one == 'game'
+    kind = sports_skips.KIND_GAME if game else sports_skips.KIND_RACE
+    a_one = f'an {one}' if one[:1] in 'aeiou' else f'a {one}'
+    if game:
+        lengths = [(sports_skips.LENGTH_GAME, 'Shortest game listing (minutes)',
+                    'A listing shorter than this is never the game, even when it names both teams: a 30-minute '
+                    'show about it often does.')]
+        shows, space = 'a pre-game show, a highlights show or a betting show', ('pre game', 'Pregame')
+    elif kind == sports_skips.KIND_RACE:
+        lengths = [(sports_skips.LENGTH_RACE, f'Shortest {one} listing (minutes)',
+                    f'A listing shorter than this is never the {one}: a one-hour wrap-up show names it too.')]
+        if one == 'race':
+            shows, space = "a highlights show, a pre-race show or a driver's onboard camera", ('pre race', 'Prerace')
+        else:
+            shows, space = 'a highlights show or a preview', ('best of', 'Bestof')
+        if league_has_sessions(league.id):
+            lengths.append((sports_skips.LENGTH_SESSION, 'Shortest practice, qualifying or sprint listing (minutes)',
+                            'Sessions run shorter than races, so they get their own limit. A pre-show a few minutes '
+                            'long stays out.'))
+    else:
+        raise ValueError(f'unknown list {kind!r}')
+    def quoted(words):
+        return ', '.join(f'"{w}"' for w in words)
+    changes = []
+    if skips.added:
+        changes.append(f'added {quoted(skips.added)}')
+    if skips.removed:
+        changes.append(f'removed {quoted(skips.removed)}')
+    names = {sports_skips.LENGTH_GAME: 'game', sports_skips.LENGTH_RACE: one,
+             sports_skips.LENGTH_SESSION: 'practice, qualifying or sprint'}
+    for length in sports_skips.LENGTHS:
+        if length in skips.own_minutes:
+            changes.append(f'the shortest {names[length]} listing set to {skips.own_minutes[length]} minutes')
+    own = sports_skips.LEAGUE_WORDS.get(str(league.tsdb_id))
+    return {
+        'game': game, 'one': one, 'a_one': a_one, 'kind': kind, 'shows': shows, 'space': space,
+        'words': list(skips.words(kind)),
+        'lengths': [{'key': key, 'label': label, 'desc': desc, 'value': skips.own_minutes.get(key, ''),
+                     'default': sports_skips.BUILTIN_MINUTES[key]} for key, label, desc in lengths],
+        'max_minutes': sports_skips.MAX_MINUTES, 'max_word': sports_skips.MAX_WORD,
+        'own_note': (f'{quoted(own["words"])} are built in for {league.name} only: {own["why"]}' if own else ''),
+        'changes': '; '.join(changes), 'changed': skips.changed,
     }
 
 
@@ -1361,6 +1615,25 @@ def _differs(minutes: int, later: bool) -> str:
     else:
         amount = counted(minutes, 'minute')
     return f'{amount} {"after" if later else "before"} the guide'
+
+
+def _cover_pair(rec, tz, h24):
+    """{label, before, other_id, after} for a recording that is one of Cover both's two (app/sports_follow.py,
+    dev/changelog/1631), or None. One query."""
+    from .database import Recording
+    clock = (lambda dt: format_local(dt, 'day_datetime', tz=tz, h24=h24))
+    if rec.sports_cover_for_id is not None:
+        return {'label': 'Second recording',
+                'before': "ChannelBin's second recording of this game, at TheSportsDB's time, in case it is right. ",
+                'other_id': rec.sports_cover_for_id, 'after': " records the listing's time. This one is removed if "
+                'the two times come back together.'}
+    other = (db.session.query(Recording.id, Recording.start_time).filter(Recording.sports_cover_for_id == rec.id)
+             .order_by(Recording.id.desc()).first())
+    if other is None:
+        return None
+    return {'label': 'Second recording', 'before': "TheSportsDB has this game at another time, too far from the "
+            "listing's for one recording, so ", 'other_id': other.id,
+            'after': f' records it there too, from {clock(other.start_time)}, in case it is right.'}
 
 
 def recording_context(rec, now, tz, h24, cfg=None):
@@ -1395,7 +1668,12 @@ def recording_context(rec, now, tz, h24, cfg=None):
                 'reason': link.reason,
                 'tsdb_url': f'https://www.thesportsdb.com/event/{link.tsdb_event_id}',
                 'art': _artwork(rec, link, cfg, now, tz, h24),
-                'file_name': _future_file_name(rec, link, tz)}
+                'file_name': _future_file_name(rec, link, tz),
+                # ChannelBin moves it with the game (app/sports_follow.py): a rule's, a Record one saved
+                # at Record's times, and Cover both's second.
+                'follows': (rec.rule_id is not None or rec.sports_cover_for_id is not None
+                            or (rec.sports_record_tsdb_id is not None and rec.sports_window_start is not None)),
+                'pair': _cover_pair(rec, tz, h24)}
     note = _unlinked_note(rec)
     if _name_waiting(rec):
         waiting = ('Its name has TheSportsDB fields, which fill in if the game is matched before its '

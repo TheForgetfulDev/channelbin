@@ -545,6 +545,13 @@ sports_data:                             # the schedules on the Sports Schedules
   horizon_days: 21                       # how far ahead a schedule is kept
   history_keep_days: 30                  # how long a past game is kept
   download_images: true                  # a matched recording's poster and background, for media servers
+  game_times:                            # which time a game goes by when TheSportsDB and the guide disagree
+    go_by: tsdb                          # tsdb, guide or both (cover both times)
+    cover_both_minutes: 90               # under both: starts this far apart or closer are one recording
+    wait_hours: 24                       # go by the listing until this close to a game
+    leagues: {}                          # TheSportsDB league id -> its own answers, set on its league page
+  skip_words:                            # words and lengths that keep a listing from counting as a game or race
+    leagues: {}                          # TheSportsDB league id -> its added/removed words and lengths, set on its league page
 
 auto_scheduling:                         # auto-record rules
   default_max_upcoming: 10               # per-rule cap on scheduled recordings when a rule sets none; 0 = uncapped

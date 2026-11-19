@@ -103,7 +103,7 @@ class NoManualEditTests(_Base, unittest.TestCase):
         self.assertNotEqual(self.obs['stop'], self.obs['openedStop'])
 
     def test_note_explains_the_padding_only(self):
-        self.assertIn('ends 15 min late', self.obs['noteText'])
+        self.assertIn('ends this recording 15 minutes later', self.obs['noteText'])
         self.assertNotIn('left as entered', self.obs['noteText'])
         self.assertTrue(self.obs['noteVisible'])
 
@@ -125,7 +125,7 @@ class HandTypedStartSurvivesProfileChangeTests(_Base, unittest.TestCase):
     def test_note_explains_the_field_was_kept(self):
         self.assertIn('start time', self.obs['noteText'])
         self.assertIn('left as entered', self.obs['noteText'])
-        self.assertIn('ends 15 min late', self.obs['noteText'])
+        self.assertIn('ends this recording 15 minutes later', self.obs['noteText'])
 
 
 class BothHandEditedTests(_Base, unittest.TestCase):

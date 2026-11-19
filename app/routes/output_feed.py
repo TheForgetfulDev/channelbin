@@ -15,8 +15,9 @@ call and six catalog actions at add time, accepts `[]` for the VOD and series on
 calls get.php, and builds `/live/<user>/<pass>/<id>.ts` against the address it was given.
 """
 import logging
+import os
 
-from flask import Blueprint, Response, g, jsonify, redirect, request
+from flask import Blueprint, Response, g, jsonify, redirect, request, send_from_directory
 
 from .. import output_feed
 from ..config import load_config
@@ -68,7 +69,7 @@ def player_api():
     if action == _ACTION_CATEGORIES:
         return jsonify(output_feed.category_payload(output_feed.catalog(g.cfg)))
     if action == _ACTION_STREAMS:
-        return jsonify(output_feed.live_streams_payload(output_feed.catalog(g.cfg), _base_url()))
+        return jsonify(output_feed.live_streams_payload(output_feed.catalog(g.cfg), _base_url(), g.feed_cfg))
     if action in _EMPTY_ACTIONS:
         return jsonify([])
     log.info('Output feed: unknown player_api action %r from %s answered empty', action,
@@ -90,6 +91,38 @@ def xmltv():
     # streamed after the request ends has no session to read it with.
     body = ''.join(output_feed.xmltv_lines(rows, g.cfg))
     return Response(body, mimetype='application/xml')
+
+
+#: How long an IPTV player may keep a logo before asking again. A channel's logo seldom
+#: changes, and every ask of an uncached one is a fetch from the provider's logo host.
+_LOGO_MAX_AGE = 24 * 3600
+
+
+@output_feed_bp.route('/logo/<username>/<password>/<int:channel_id>')
+def logo(username, password, channel_id):
+    """One channel's logo for the IPTV player (output_feed.logo_url): the logo cache's copy
+    when there is one, else the provider's logo fetched for this request through the same
+    downloader the cache uses, so it works with the logo cache off (its default) and with the
+    password gate on. The provider's URL never reaches the player (dev/changelog/1618)."""
+    from ..logo_cache import download_logo, get_logo_cache_dir
+    channel = output_feed.logo_channel(channel_id)
+    if channel is None:
+        return jsonify({'error': 'No such channel on the IPTV output'}), 404
+    if channel.logo_cache_path:
+        cache_dir = get_logo_cache_dir(g.cfg)
+        if os.path.isfile(os.path.join(cache_dir, channel.logo_cache_path)):
+            resp = send_from_directory(cache_dir, channel.logo_cache_path, max_age=_LOGO_MAX_AGE)
+            resp.headers['X-Content-Type-Options'] = 'nosniff'
+            return resp
+    if not channel.logo_url:
+        return jsonify({'error': 'The channel has no logo'}), 404
+    got = download_logo(channel.logo_url, g.cfg, f'IPTV output (logo for channel {channel.id})')
+    if got is None:
+        return jsonify({'error': 'The channel\'s logo could not be fetched'}), 404
+    body, content_type = got
+    return Response(body, mimetype=content_type,
+                    headers={'Cache-Control': f'max-age={_LOGO_MAX_AGE}',
+                             'X-Content-Type-Options': 'nosniff'})
 
 
 @output_feed_bp.route('/live/<username>/<password>/<int:feed_id>.ts')

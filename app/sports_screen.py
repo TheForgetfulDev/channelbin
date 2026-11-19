@@ -165,6 +165,12 @@ class Game:
     #: None for a field event, such as a race: no sides to draw.
     away: Optional[Side] = None
     home: Optional[Side] = None
+    #: Where it is on, for an Up next page (app/sports_up_next.py): the hero's line under the
+    #: venue and the right end of a stripe. '' on a waiting screen, which is the channel it is on.
+    where: str = ''
+    where_short: str = ''
+    #: Started and not over: a stripe says "On now" in the live color.
+    live: bool = False
 
     @property
     def field(self) -> bool:
@@ -198,6 +204,17 @@ class Screen:
     later: tuple = ()
     #: The channel's games are field events, for the hero with no game to show.
     field: bool = False
+    #: The label over the stripes; '' is "Later on <channel>", the waiting screen's.
+    later_label: str = ''
+
+
+@dataclass(frozen=True)
+class Rotation:
+    """An Up next channel's picture (app/sports_up_next.py, dev/changelog/1614): its pages in
+    order, each drawn as a waiting screen is and up for sports_screen_draw.PAGE_FRAMES, the whole
+    looped. A hash of it keys its clip, as a Screen's does."""
+    channel: str
+    pages: tuple
 
 
 def _cap(text: str) -> str:
@@ -317,7 +334,7 @@ def _side(name: str, team, colors: tuple, cfg: dict, badges: dict) -> Side:
     return Side(name or (team.full_name if team else '') or code, code, colors, badges.get(url) if url else None)
 
 
-def _game(event, teams: dict, cfg: dict, now: datetime, tz, h24: bool, badges: dict) -> Game:
+def game_of(event, teams: dict, cfg: dict, now: datetime, tz, h24: bool, badges: dict) -> Game:
     from .sports_data import event_game_name, event_shape_is_matchup
     from .sports_view import event_when
     day, clock = event_when(event, now, tz, h24)
@@ -357,7 +374,7 @@ def screen_for(served, playing, now: datetime, cfg: dict, *, mode: str, before_m
              if team_ids else {})
     one = _noun(served.league, ordered)[0]
     badges = {}
-    games = [_game(e, teams, cfg, now, tz, h24, badges) for e in ordered[:SCREEN_GAMES_DRAWN]]
+    games = [game_of(e, teams, cfg, now, tz, h24, badges) for e in ordered[:SCREEN_GAMES_DRAWN]]
     team_name = served.name if served.is_team else None
     if team_name is not None:
         team = teams.get(served.row.team_tsdb_id)
@@ -402,37 +419,52 @@ MAKE_TIMEOUT_SECONDS = 180
 #: play while the moving clip is made (a whole number of draw.LOOP_UNITs).
 STILL_FRAMES = 64
 
-_CLIP_RE = re.compile(r'^(\d+)-([0-9a-f]{20})(?:-still)?\.ts$')
+#: A clip's file: its owner (a sports channel's row id, or "u" and an Up next channel's number,
+#: up_next_owner()), its key, and "-still" for the quick still.
+_CLIP_RE = re.compile(r'^(u?)(\d+)-([0-9a-f]{20})(?:-still)?\.ts$')
 
 
-def unread_badges(screen: Screen) -> list:
-    """[(team name, code)] for each side of `screen`'s game whose downloaded badge cannot be read
-    as a picture, so the screen draws the code in its place."""
+def unread_badges(screen) -> list:
+    """[(team name, code)] for each side drawn big on `screen` (a Screen, or each page of a
+    Rotation) whose downloaded badge cannot be read as a picture, so the screen draws the code in
+    its place."""
     from .sports_screen_draw import badge_problem
-    if screen.game is None or screen.game.field:
-        return []
-    return [(side.name, side.code) for side in (screen.game.away, screen.game.home)
-            if side.badge and badge_problem(side.badge)]
+    out = []
+    for page in pages_of(screen):
+        if page.game is None or page.game.field:
+            continue
+        out += [(side.name, side.code) for side in (page.game.away, page.game.home)
+                if side.badge and badge_problem(side.badge) and (side.name, side.code) not in out]
+    return out
 
 
 class ClipFailed(Exception):
     """A clip could not be made. The message names why, for a log line or a surface."""
 
 
-def clip_key(screen: Screen) -> str:
-    """A hash of everything drawn: the words, the names, the colors, the layout, and each badge
-    file as it is on disk now, so a stale clip is never served and a day word that changes at
-    midnight is simply a new key."""
+def pages_of(screen) -> tuple:
+    """The pages a clip draws: a Rotation's, or a waiting Screen as its one page."""
+    return screen.pages if isinstance(screen, Rotation) else (screen,)
+
+
+def clip_key(screen) -> str:
+    """A hash of everything drawn, of a Screen or a Rotation: the words, the names, the colors,
+    the layout, and each badge file as it is on disk now, so a stale clip is never served and a
+    day word that changes at midnight is simply a new key."""
     import hashlib
+    from .sports_screen_draw import PAGE_FRAMES
     parts = [f'layout {LAYOUT_VERSION}', repr(screen)]
-    for game in ([screen.game] if screen.game else []) + list(screen.later):
-        for side in (game.away, game.home):
-            if side is not None and side.badge:
-                try:
-                    st = os.stat(side.badge)
-                    parts.append(f'{side.badge} {st.st_size} {int(st.st_mtime)}')
-                except OSError:
-                    parts.append(f'{side.badge} gone')
+    if isinstance(screen, Rotation):
+        parts.append(f'page {PAGE_FRAMES}')
+    for page in pages_of(screen):
+        for game in ([page.game] if page.game else []) + list(page.later):
+            for side in (game.away, game.home):
+                if side is not None and side.badge:
+                    try:
+                        st = os.stat(side.badge)
+                        parts.append(f'{side.badge} {st.st_size} {int(st.st_mtime)}')
+                    except OSError:
+                        parts.append(f'{side.badge} gone')
     return hashlib.sha256('\n'.join(parts).encode()).hexdigest()[:20]
 
 
@@ -441,15 +473,30 @@ def clip_dir(cfg: dict) -> str:
     return image_dir(cfg, SPORTS_SCREENS)
 
 
-def clip_path(cfg: dict, row_id: int, key: str, still: bool = False) -> str:
-    """Where a clip of channel row `row_id` is kept: the row id first, so a channel's clips can be
-    found without reading them."""
-    return os.path.join(clip_dir(cfg), f'{int(row_id)}-{key}{"-still" if still else ""}.ts')
+def up_next_owner(number: int) -> str:
+    """The owner part of an Up next channel's clip names: "u" and its feed number less
+    output_feed.UP_NEXT_FEED_BASE (0 for the one for everything followed)."""
+    return f'u{int(number)}'
 
 
-def ready_clip(cfg: dict, row_id: int, screen: Screen, still: bool = False) -> Optional[str]:
-    """The made clip of `screen`, or None. Marks it asked for, which is what keeps it from the
-    prune."""
+def _owner(owner) -> str:
+    """A clip's owner as its file name spells it: a sports channel's row id, or up_next_owner()."""
+    if isinstance(owner, str):
+        if not re.fullmatch(r'u\d+', owner):
+            raise ValueError(f'Not a clip owner: "{owner}"')
+        return owner
+    return str(int(owner))
+
+
+def clip_path(cfg: dict, row_id, key: str, still: bool = False) -> str:
+    """Where a clip of `row_id` is kept (a sports channel's row id, or up_next_owner()): the owner
+    first, so a channel's clips can be found without reading them."""
+    return os.path.join(clip_dir(cfg), f'{_owner(row_id)}-{key}{"-still" if still else ""}.ts')
+
+
+def ready_clip(cfg: dict, row_id, screen, still: bool = False) -> Optional[str]:
+    """The made clip of `screen` (a Screen or a Rotation), or None. Marks it asked for, which is
+    what keeps it from the prune."""
     path = clip_path(cfg, row_id, clip_key(screen), still)
     try:
         os.utime(path)
@@ -463,11 +510,11 @@ _making = {}        # clip path -> threading.Event set when its one maker finish
 _procs = set()      # every make's ffmpeg while it runs, for stop_makes()
 
 
-def make_clip(cfg: dict, row_id: int, screen: Screen, *, still: bool = False,
+def make_clip(cfg: dict, row_id, screen, *, still: bool = False,
               background: bool = False) -> str:
     """The clip of `screen`, made now unless it already is, and its path. One maker per clip at a
     time: a second caller waits for the first's and gets its answer. `background` runs ffmpeg at
-    a low priority, for clips made ahead. Raises ClipFailed, naming why, when none can be made.
+    a low priority, for a clip made behind a play's quick still. Raises ClipFailed, naming why, when none can be made.
     Never call it holding a lock or inside a retry_on_locked unit: it spawns ffmpeg and waits."""
     path = ready_clip(cfg, row_id, screen, still)
     if path:
@@ -482,7 +529,7 @@ def make_clip(cfg: dict, row_id: int, screen: Screen, *, still: bool = False,
         done.wait(MAKE_TIMEOUT_SECONDS + 30)
         if os.path.exists(path):
             return path
-        raise ClipFailed(f'the waiting screen for {screen.channel} could not be made (see the log)')
+        raise ClipFailed(f'the picture for {screen.channel} could not be made (see the log)')
     try:
         render_clip(cfg, screen, path, still=still, background=background)
     finally:
@@ -492,9 +539,16 @@ def make_clip(cfg: dict, row_id: int, screen: Screen, *, still: bool = False,
     return path
 
 
-def render_clip(cfg: dict, screen: Screen, path: str, *, still: bool = False, background: bool = False):
-    """Make the clip of `screen` at `path`, uncached: make_clip() is the cache's way in, and
-    dev/tools/sports_screen.py renders a sample with this. Raises ClipFailed."""
+def _what(screen) -> str:
+    """What a clip is called in a log line or a ClipFailed."""
+    return (f'the Up next picture for {screen.channel}' if isinstance(screen, Rotation)
+            else f'the waiting screen for {screen.channel}')
+
+
+def render_clip(cfg: dict, screen, path: str, *, still: bool = False, background: bool = False):
+    """Make the clip of `screen`, a Screen or a Rotation, at `path`, uncached: make_clip() is the
+    cache's way in, and dev/tools/sports_screen.py renders a sample with this. A Rotation's quick
+    still is its first page. Raises ClipFailed."""
     import shutil
     import tempfile
     from . import sports_screen_draw as draw
@@ -506,9 +560,13 @@ def render_clip(cfg: dict, screen: Screen, path: str, *, still: bool = False, ba
     except OSError as exc:
         raise ClipFailed(f'the waiting screen folder {folder} cannot be written ({exc.strerror or exc})') from exc
     started = time.monotonic()
+    what = _what(screen)
     try:
         if still:
-            pictures, graph, frames = draw.still_layers(screen, work), draw.still_graph(), STILL_FRAMES
+            pictures, graph, frames = draw.still_layers(pages_of(screen)[0], work), draw.still_graph(), STILL_FRAMES
+        elif isinstance(screen, Rotation):
+            spec = draw.rotation_layers(screen.pages, work)
+            pictures, graph, frames = draw.rotation_inputs(spec), draw.rotation_graph(spec), spec['frames']
         else:
             spec = draw.layers(screen, work)
             pictures, graph, frames = [spec['base']] + draw.layer_inputs(spec), draw.filtergraph(spec), spec['frames']
@@ -527,8 +585,7 @@ def render_clip(cfg: dict, screen: Screen, path: str, *, still: bool = False, ba
             code = proc.wait(timeout=MAKE_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             terminate_or_kill(proc)
-            raise ClipFailed(f'making the waiting screen for {screen.channel} took longer than '
-                             f'{MAKE_TIMEOUT_SECONDS} s and was stopped')
+            raise ClipFailed(f'making {what} took longer than {MAKE_TIMEOUT_SECONDS} s and was stopped')
         finally:
             with _making_lock:
                 _procs.discard(proc)
@@ -536,17 +593,22 @@ def render_clip(cfg: dict, screen: Screen, path: str, *, still: bool = False, ba
                 terminate_or_kill(proc)
         if code != 0 or not os.path.getsize(part):
             cause = stderr_cause(read_stderr_tail(stderr_path)) or f'ffmpeg exited with code {code}'
-            raise ClipFailed(f'ffmpeg could not make the waiting screen for {screen.channel}: {cause}')
+            raise ClipFailed(f'ffmpeg could not make {what}: {cause}')
         os.replace(part, path)
-        log.info('Made the %swaiting screen for %s (%s, %s mode): %d frames, %s, in %.1f s (%.1f s drawing)',
-                 'still ' if still else '', screen.channel, screen.state, screen.mode, frames,
-                 fmt_bytes(os.path.getsize(path)), time.monotonic() - started, drawn)
+        if isinstance(screen, Rotation):
+            log.info('Made the %sUp next picture for %s (%s): %d frames, %s, in %.1f s (%.1f s drawing)',
+                     'still ' if still else '', screen.channel, counted(len(screen.pages), 'page'), frames,
+                     fmt_bytes(os.path.getsize(path)), time.monotonic() - started, drawn)
+        else:
+            log.info('Made the %swaiting screen for %s (%s, %s mode): %d frames, %s, in %.1f s (%.1f s drawing)',
+                     'still ' if still else '', screen.channel, screen.state, screen.mode, frames,
+                     fmt_bytes(os.path.getsize(path)), time.monotonic() - started, drawn)
     except ClipFailed as exc:
         log.warning('%s', exc)
         raise
     except (OSError, ValueError) as exc:
-        log.warning('The waiting screen for %s could not be made: %s', screen.channel, exc)
-        raise ClipFailed(f'the waiting screen for {screen.channel} could not be made: {exc}') from exc
+        log.warning('%s could not be made: %s', _cap(what), exc)
+        raise ClipFailed(f'{what} could not be made: {exc}') from exc
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -580,15 +642,17 @@ def discard_clip(path: str) -> bool:
 def prune_clips(cfg: dict, keep=(), now: datetime = None) -> int:
     """Delete the clips nothing has asked for in CLIP_KEEP, except `keep` (the paths live
     sessions play), every clip of a channel row that no longer exists, and a make's leftovers an
-    hour old. Returns how many files went. One query."""
+    hour old. Returns how many files went. Two queries."""
     import shutil
-    from .database import SportsFeedChannel
+    from .database import SportsFeedChannel, SportsUpNextChannel
     folder = clip_dir(cfg)
     try:
         names = os.listdir(folder)
     except FileNotFoundError:
         return 0
     rows = {i for (i,) in SportsFeedChannel.query.with_entities(SportsFeedChannel.id).all()}
+    # An Up next clip's number is its feed number: 0 for everything followed, else its row id.
+    up_next = {0} | {i for (i,) in SportsUpNextChannel.query.with_entities(SportsUpNextChannel.id).all()}
     keep = set(keep)
     now_ts = time.time() if now is None else (now - datetime(1970, 1, 1)).total_seconds()
     gone = 0
@@ -605,7 +669,7 @@ def prune_clips(cfg: dict, keep=(), now: datetime = None) -> int:
         found = _CLIP_RE.match(name)
         if found is None or path in keep:
             continue
-        if int(found.group(1)) in rows and age <= CLIP_KEEP.total_seconds():
+        if int(found.group(2)) in (up_next if found.group(1) else rows) and age <= CLIP_KEEP.total_seconds():
             continue
         try:
             os.unlink(path)

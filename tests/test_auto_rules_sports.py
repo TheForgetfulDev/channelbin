@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
-from app import admission, auto_rules, db, sports_data, sports_match  # noqa: E402
+from app import admission, auto_rules, db, sports_data, sports_match, sports_times  # noqa: E402
 from app.alerts import AUTO_RULE_GAME_UNLISTED  # noqa: E402
 from app.database import (  # noqa: E402
     Alert, AutoRule, REC_STATUS_FAILED, RECORDING_RULE_GAME_CHANGED, RULE_MATCH_SCHEDULED,
@@ -262,6 +262,51 @@ class OneRecordingPerGameTests(_Case):
             self.assertEqual(row.action_taken, RULE_MATCH_SKIPPED_EXISTING)
             self.assertTrue(row.detail.startswith('Same game, covered by the recording of '
                                                   '"PFL Football: Gulls at Bears"'), row.detail)
+
+    def test_a_record_made_at_thesportsdbs_time_covers_the_games_earlier_listing(self):
+        """A league page's Record goes by the league's answer, so its recording of Texans at Colts starts
+        at TheSportsDB's 8:15 PM, not the 7:00 PM listing. A rule must count that as the game, not
+        record it again from a listing worded otherwise (review of dev/changelog/1630)."""
+        kickoff = _at(3)
+        g = self.game(start=kickoff)
+        early = kickoff - timedelta(minutes=75)
+        g.guide_start = early
+        self.listing(g, [self.channel('Sports 1')], 'PFL Football: Gulls at Bears', early, minutes=300)
+        rec = seed.make_recording(status='SCHEDULED', name='Gulls at Bears', start_time=kickoff,
+                                  stop_time=early + timedelta(minutes=375), sports_record_tsdb_id=g.tsdb_id)
+        db.session.flush()
+        db.session.add(RecordingSports(recording_id=rec.id, tsdb_event_id=g.tsdb_id, league_name=self.league.name,
+                                       event_name=g.name, strength=SPORTS_MATCH_STRONG, airing=SPORTS_AIRING_FIRST,
+                                       reason='x', linked_at=datetime.utcnow(), updated_at=datetime.utcnow()))
+        db.session.commit()
+        rid = self.rule(sports_league_id=self.league.id)
+        self.evaluate(rid)
+        self.assertEqual(self.recordings(rid), [])
+        row = self.ledger(rid)[('PFL Football: Gulls at Bears', early)]
+        self.assertEqual(row.action_taken, RULE_MATCH_SKIPPED_EXISTING, row.detail)
+
+    def test_a_listing_at_the_believed_start_is_judged_first_and_the_old_time_still_recorded(self):
+        """The guide lists a moved game at its new time on fewer channels than its old time: of
+        the listings near the believed start, the one on the most channels is the keeper, so a
+        pregame listing it covers is covered, and the listing at the old time, which it does not
+        cover, is still recorded (dev/changelog/1625; 2026-11-17's Mavericks-Warriors, KFAA at
+        8:00 and ESPN's 14 at 9:35). With the old order the old time was the keeper and all
+        three were recorded."""
+        g = self.game()
+        g.guide_start = self.kickoff
+        db.session.commit()
+        self.listing(g, [self.channel('KFAA'), self.channel('KFAA 2')], 'PFL Football: Gulls at Bears', self.kickoff)
+        self.listing(g, [self.channel('Deportes')], 'Futbol PFL: Gulls vs. Bears', self.kickoff - timedelta(minutes=15),
+                     minutes=180)
+        self.listing(g, [self.channel(f'Wide {i}') for i in range(3)], 'PFL Primetime: Gulls at Bears',
+                     self.kickoff + timedelta(minutes=95))
+        rid = self.rule(sports_league_id=self.league.id)
+        self.evaluate(rid)
+        self.assertEqual(sorted(r.program_title for r in self.recordings(rid)),
+                         ['PFL Football: Gulls at Bears', 'PFL Primetime: Gulls at Bears'])
+        spanish = self.ledger(rid)[('Futbol PFL: Gulls vs. Bears', self.kickoff - timedelta(minutes=15))]
+        self.assertEqual(spanish.action_taken, RULE_MATCH_SKIPPED_EXISTING)
+        self.assertIn('"PFL Football: Gulls at Bears"', spanish.detail)
 
     def test_a_rule_that_names_nothing_records_every_listing_as_before(self):
         self.mnf()
@@ -558,7 +603,10 @@ class EventChannelTests(_EventCase):
         self.evaluate(rid)
         self.assertEqual(self.recordings(rid), [])
 
-    def test_a_bare_clock_in_a_league_not_trusted_is_not_scheduled(self):
+    def test_a_bare_clock_in_a_league_that_goes_by_the_guide_is_not_scheduled(self):
+        """With no listing, a league that goes by the guide has no start to go by (dev/changelog/1630)."""
+        # A wait that covers the kickoff, so only the answer stands in the way.
+        sports_times.set_league(self.league.tsdb_id, {'go_by': sports_times.GO_GUIDE, 'wait_hours': 48})
         g = self.game()
         self.named(g, self.channel('PFL | 01 - Gulls at Bears 8pm'))
         rid = self.event_rule()
@@ -569,8 +617,20 @@ class EventChannelTests(_EventCase):
             ctx = auto_rules_view.page_context(rid)
         self.assertEqual(ctx['sports']['rows'][0]['rule']['badge'][1], 'Not scheduled')
 
-    def test_a_bare_clock_in_a_trusted_league_is_scheduled_at_thesportsdbs_time_unconfirmed(self):
-        self.trust()
+    def test_a_bare_clock_further_off_than_the_wait_is_not_scheduled_yet(self):
+        """The kickoff is 30 hours off and the wait 24: TheSportsDB's time may still change."""
+        g = self.game()
+        self.named(g, self.channel('PFL | 01 - Gulls at Bears 8pm'))
+        rid = self.event_rule()
+        self.evaluate(rid)
+        self.assertEqual(self.recordings(rid), [])
+        from app.auto_rules_sports import GameIndex, event_pick
+        games = GameIndex.load([self.league.id], datetime.utcnow())
+        self.assertIn('only from 24 hours before a game', event_pick(games, games.games[g.id])[1])
+
+    def test_a_bare_clock_is_scheduled_at_thesportsdbs_time_unconfirmed_whatever_the_trust(self):
+        """The league's answer decides, not its measured trust: none measured here (dev/changelog/1630)."""
+        sports_times.set_league(self.league.tsdb_id, {'wait_hours': 48})
         g = self.game()
         self.named(g, self.channel('PFL | 01 - Gulls at Bears 8pm'))
         rid = self.event_rule()
@@ -767,7 +827,8 @@ class EventAlertTests(_EventCase):
 
     def test_a_name_the_rule_cannot_record_from_does_not_hold_the_alert_back(self):
         """With the option on, only a channel the rule would actually record from holds it back: not
-        a weak name, and not a bare clock in a league whose times are not trusted."""
+        a weak name, and not a bare clock in a league that goes by the guide."""
+        sports_times.set_league(self.league.tsdb_id, {'go_by': sports_times.GO_GUIDE})
         soon = self.game(start=_at(3), tsdb_id=7400)
         self.named(soon, self.channel('PFL maybe'), start=soon.start_at, strength=SPORTS_MATCH_WEAK)
         self.named(soon, self.channel('PFL | 01 8pm'))
@@ -844,3 +905,81 @@ class EventSearchChangeTests(_EventCase):
         self.assertEqual([r['id'] for r in found.recordings], [rec_id])
         self.assertEqual(auto_rules.unmatched_by_search(rid, 'grain=airings&q=Bears').recordings, [],
                          'a text change does not apply to an event channel')
+
+
+# ---------------------------------------------------------------------------
+# Practice, qualifying and shootouts (dev/changelog/1633)
+# ---------------------------------------------------------------------------
+
+class SessionRuleTests(_EventCase):
+    """A session is one of a rule's games only when the rule asks for sessions; a sprint is a race."""
+
+    def setUp(self):
+        super().setUp()
+        self.series = SportsLeague(tsdb_id=9003, name='Pretend Stock Car Series', sport='Motorsport',
+                                   match_terms=json.dumps(['PSCS']))
+        db.session.add(self.series)
+        db.session.commit()
+
+    def event(self, name, start, tsdb_id):
+        e = SportsEvent(tsdb_id=tsdb_id, league_id=self.series.id, name=name, season='2099', round=21,
+                        start_at=start, local_date=start.date())
+        db.session.add(e)
+        db.session.commit()
+        return e
+
+    def alerts(self, rid):
+        db.session.expire_all()
+        return Alert.query.filter_by(alert_type=AUTO_RULE_GAME_UNLISTED, source=f'auto-rule:{rid}:game',
+                                     dismissed_at=None).all()
+
+    def series_rule(self, **kw):
+        kw.setdefault('sports_league_id', self.series.id)
+        kw.setdefault('sports_event_channels', True)
+        return self.rule('grain=airings&q=PSCS', name='PSCS weekends', **kw)
+
+    def test_a_session_nothing_lists_raises_no_alert_unless_the_rule_asks_for_sessions(self):
+        self.event('Harbor Grand Prix Qualifying', _at(3), 7301)
+        off = self.series_rule()
+        on = self.series_rule(sports_sessions=True)
+        self.evaluate(off)
+        self.evaluate(on)
+        self.assertEqual(self.alerts(off), [])
+        self.assertEqual(len(self.alerts(on)), 1)
+        self.assertIn('Harbor Grand Prix Qualifying', self.alerts(on)[0].body)
+
+    def test_a_race_nothing_lists_raises_the_alert_either_way(self):
+        """Control: the switch leaves races, and a sprint, as they were."""
+        self.event('Harbor Grand Prix Sprint', _at(3), 7302)
+        rid = self.series_rule()
+        self.evaluate(rid)
+        self.assertEqual(len(self.alerts(rid)), 1)
+
+    def test_the_switch_is_saved_and_a_body_that_says_nothing_keeps_it(self):
+        rid = self.series_rule(sports_sessions=True)
+        rule = db.session.get(AutoRule, rid)
+        self.assertTrue(rule.sports_sessions)
+        self.assertTrue(auto_rules.read_rule_values({'name': 'Renamed'}, existing=rule).sports_sessions)
+        self.assertFalse(auto_rules.read_rule_values({'sports_sessions': False}, existing=rule).sports_sessions)
+        self.assertFalse(auto_rules.read_rule_values({'sports_league_id': None}, existing=rule).sports_sessions,
+                         'naming nothing turns it off')
+
+    def test_a_league_pages_record_picks_a_sessions_listing(self):
+        """The person picked the event, so a session is a game there whatever any rule says."""
+        quali = self.event('Harbor Grand Prix Qualifying', self.kickoff, 7306)
+        self.listing(quali, [self.channel('Motor 1')], 'Live PSCS Harbor GP: Qualifying', self.kickoff, minutes=120)
+        pick = auto_rules.game_pick(quali.id)
+        self.assertEqual(pick.kind, auto_rules.PICK_LIVE)
+
+    def test_the_dialog_and_the_page_offer_the_switch_only_for_a_league_with_sessions(self):
+        from app.auto_rules_sports import dialog_leagues, league_has_sessions
+        self.event('Harbor Grand Prix Practice 1', self.kickoff, 7307)
+        self.game()
+        offered = {lg['id']: lg['sessions'] for lg in dialog_leagues()}
+        self.assertEqual((offered[self.series.id], offered[self.league.id]), (True, False))
+        self.assertTrue(league_has_sessions(self.series.id))
+        self.assertFalse(league_has_sessions(self.league.id))
+        series_page = self.t.client.get(f'/rules/{self.series_rule()}').get_data(as_text=True)
+        football_page = self.t.client.get(f'/rules/{self.rule(sports_league_id=self.league.id)}').get_data(as_text=True)
+        self.assertIn('Practice and qualifying', series_page)
+        self.assertNotIn('Practice and qualifying', football_page)

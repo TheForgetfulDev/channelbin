@@ -616,8 +616,9 @@ def dashboard():
     if output_feed.is_enabled(feed_cfg):
         redirect = output_feed.mode_of(feed_cfg) == output_feed.MODE_REDIRECT
         feed = {'mode': output_feed.mode_of(feed_cfg),
-                # In redirect mode the one play ChannelBin sees is a waiting screen.
-                'live': [s.to_dict() for s in output_feed.live_sessions() if not redirect or s.waiting],
+                # In redirect mode the plays ChannelBin sees are its own pictures: a waiting
+                # screen, an Up next channel.
+                'live': [s.to_dict() for s in output_feed.live_sessions() if not redirect or s.own_picture],
                 'ended': [s.to_dict() for s in output_feed.recent_ended()][:5],
                 # Proxy mode redirects nothing; a tune-in kept from before a change of mode is
                 # still on the IPTV Output page's Recent plays.

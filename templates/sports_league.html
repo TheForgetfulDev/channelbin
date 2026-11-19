@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {# _record_modal.html calls csrf_field() unqualified, so it has to be in this template's namespace. #}
-{% from '_macros.html' import csrf_field, record_dialog_config %}
+{% from '_macros.html' import beta_mark, csrf_field, record_dialog_config %}
+{% from '_game_times.html' import game_times_rows %}
 {% block title %}{{ league.name }} - Sports Schedules - ChannelBin{% endblock %}
 
 {#  One league (dev/docs/DESIGN-sports-data.md 11, mockup 50): the rule page's shell. Everything in
@@ -19,7 +20,7 @@
 </div>
 {% endif %}{% endmacro %}
 <div class="page-head">
-  <h1>Sports Schedules</h1>
+  <h1>Sports Schedules {{ beta_mark('Sports Schedules') }}</h1>
   <a href="{{ url_for('sports.sports_page') }}" class="btn">{{ icon('back') }} All Leagues</a>
 </div>
 
@@ -85,6 +86,15 @@
     </div>
   </div>
 
+  <div class="card" data-section="times" id="sp-times" data-gt-url="{{ url_for('sports.set_league_game_times', league_id=league.id) }}">
+    <div class="card-head"><h2>{{ times.heading }}</h2></div>
+    <div class="card-body">
+      <p class="card-note">When TheSportsDB and your guide list a {{ one }} at different times, this decides which one ChannelBin goes by. The sports channels on your IPTV output and Record on this page follow it. A recording you schedule from the TV Guide or by hand keeps the times you give it.</p>
+      {% if times.show_record %}<div class="notice notice-{{ times.record.tone }}" id="sp-times-record"><div><strong>Start times.</strong> {{ times.record.text }}</div></div>{% endif %}
+      {{ game_times_rows(times, true, one) }}
+    </div>
+  </div>
+
   <div class="card" data-section="upcoming" id="sp-upcoming">
     <div class="card-head"><h2>Upcoming {{ many }}{% if games_total %} <span class="cnt">{{ games_total }}</span>{% endif %}</h2></div>
     <div class="card-body">
@@ -145,7 +155,7 @@
   <div class="card" data-section="feed" id="sp-feed">
     <div class="card-head"><h2>On your IPTV output</h2></div>
     <div class="card-body">
-      <p class="card-note">ChannelBin can serve its own sports channels to your IPTV player through the IPTV output: one for a team, or numbered channels that carry every {{ one }} in the league. Each has a guide of its {{ many }} from TheSportsDB and plays whichever of your channels lists the {{ one }} in its own guide, from a little before its listing starts to a while after it ends, so tuning in early or to a {{ one }} running long still finds it on. How long before and after is in the IPTV output's settings. They are for watching: they are not in the TV Guide and nothing records from them.</p>
+      <p class="card-note">ChannelBin can serve its own sports channels to your IPTV player through the IPTV output: one for a team, or numbered channels that carry every {{ one }} in the league. Each has a guide of its {{ many }} from TheSportsDB and plays whichever of your channels lists the {{ one }} in its own guide, from a little before its listing starts to a while after it ends, so tuning in early or to a {{ one }} running long still finds it on. How long before and after is in the IPTV output's settings. They are for watching: they are not in the TV Guide and nothing records from them. Its Up next channel is ChannelBin's own picture of the coming {{ many }} and where each is on. There is one for everything you follow too, on the <a href="{{ url_for('iptv_output.page') }}">IPTV Output</a> page.</p>
       {% if not feed.feed_on %}
       <div class="notice notice-info"><div><strong>The IPTV output is off.</strong> What you switch on here is saved, and appears in your IPTV player once the output is turned on, on the <a href="{{ url_for('iptv_output.page') }}">IPTV Output</a> page.</div></div>
       {% endif %}
@@ -166,11 +176,18 @@
       </div>
       {% endif %}
       <div id="sp-feed-list">
-      {% if feed.show_league or feed.page_teams %}
+      {% if feed.show_up_next or feed.show_league or feed.page_teams %}
       <div class="table-scroll">
         <table class="tbl tbl-cards rl-tbl">
           <thead><tr><th>Channel</th><th>What it carries</th><th>On the output</th></tr></thead>
           <tbody>
+            {% if feed.show_up_next %}
+            <tr>
+              <td data-label="Channel" class="rl-prog"><span class="t">{{ feed.up_next_name }}</span></td>
+              <td data-label="What it carries" class="rl-prog">ChannelBin's own picture of the coming {{ many }}: when each one is and where it is on, a new page every 10 seconds.<span class="s">It plays no stream from your IPTV provider.</span></td>
+              <td data-label="On the output"><label class="switch"><input type="checkbox" data-act="up-next" data-league="{{ league.id }}" aria-label="{{ feed.up_next_name }} on the IPTV output"{{ ' checked' if feed.up_next_on else '' }}><span class="knob"></span></label></td>
+            </tr>
+            {% endif %}
             {% if feed.show_league %}
             <tr>
               <td data-label="Channel" class="rl-prog"><span class="t">{{ league.name }} 1{% if feed.numbered > 1 %} to {{ league.name }} {{ feed.numbered }}{% endif %}</span></td>
@@ -245,13 +262,39 @@
       <p class="sp-hint">None added.</p>
       {% endif %}
       <div class="sp-catbar"><button class="btn btn-sm" data-act="tie">{{ icon('add') }}Add a category</button></div>
+      {#- The words and lengths that keep a listing out (app/sports_skips.py, mockup 59, dev/changelog/1634).
+          Every control saves at once; sports.js then swaps the page, so this is their one renderer. -#}
+      {% set sk = matching.skips %}
+      <div id="sp-skips" data-skip-kind="{{ sk.kind }}">
+        <h3 class="sp-h3">Listings that are never {{ sk.a_one }}</h3>
+        <p class="sp-hint sp-hint-top">A listing whose title says one of these is never counted as {{ sk.a_one }}{% if sk.lengths | length > 1 %} or a practice, qualifying or sprint{% endif %}, even when it names {{ 'the league and both teams' if sk.game else 'the series on the ' ~ sk.one ~ "'s day" }}: {{ sk.shows }} names {{ 'both teams' if sk.game else 'the ' ~ sk.one }} too. The same words keep an event channel's name from counting. Each is read as whole words, ignoring case, accents and punctuation, and a space also matches none, so "{{ sk.space[0] }}" catches "{{ sk.space[1] }}" too.{% if sk.own_note %} {{ sk.own_note }}{% endif %}</p>
+        <div class="sp-terms" id="sp-skipwords">
+          {% for w in sk.words %}<span class="chip sp-term">{{ w }}<button class="chip-x" data-act="remove-skip" data-word="{{ w }}" aria-label="Remove {{ w }}">{{ icon('close') }}</button></span>{% endfor %}
+          <form class="sp-addterm" data-act="add-skip"><input class="form-control" name="word" maxlength="{{ sk.max_word }}" placeholder="Add a word" aria-label="Add a word that keeps a listing from counting as {{ sk.a_one }}"><button class="btn btn-sm" type="submit">{{ icon('add') }}Add</button></form>
+        </div>
+        <h3 class="sp-h3">Shortest listing</h3>
+        <div class="card-settings">
+          {% for l in sk.lengths %}
+          <div class="frow"><div class="fl"><div class="fl-label"><span class="fl-name">{{ l.label }}</span></div>
+            <div class="fl-desc">{{ l.desc }}</div>
+            <div class="fl-default">Default: <code>{{ l.default }} minutes</code>. Leave it empty to use it.</div>
+          </div><div class="fr-side"><div class="fr-ctl">
+            <input type="number" min="0" max="{{ sk.max_minutes }}" data-skip-length="{{ l.key }}" aria-label="{{ l.label }}" value="{{ l.value }}" placeholder="{{ l.default }}">
+          </div></div></div>
+          {% endfor %}
+        </div>
+        <div class="sp-skipbar">
+          <span class="sp-hint">{% if sk.changed %}Changed from ChannelBin's defaults: {{ sk.changes }}.{% else %}These are ChannelBin's defaults for {{ league.name }}.{% endif %} The listings dialog of each {{ sk.one }} names the listings these kept out.</span>
+          {% if sk.changed %}<button class="btn btn-sm" data-act="restore-skips">Restore defaults</button>{% endif %}
+        </div>
+      </div>
     </div>
   </div>
 
   <div class="card" data-section="updates">
     <div class="card-head"><h2>Schedule updates</h2></div>
     <div class="card-body">
-      <p class="card-note">ChannelBin keeps this schedule current with a few calls to TheSportsDB a day, each one asking for about a week of {{ many }}, which TheSportsDB calls a round. These are the latest, so you can see what it asked for and what came back.</p>
+      <p class="card-note">ChannelBin keeps this schedule current with a few calls to TheSportsDB a day, each one asking for about a week of {{ many }}, which TheSportsDB calls a round. A game a rule or Record is recording, or a sports channel is playing, is also asked for every 30 minutes from 2 hours before it until it ends, so a change made during it is seen. These are the latest, so you can see what it asked for and what came back.</p>
       {% if updates %}
       <div class="table-scroll">
         <table class="tbl tbl-cards rl-tbl">

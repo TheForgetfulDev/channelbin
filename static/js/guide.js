@@ -1929,9 +1929,13 @@ function applyProfilePadding() {
   }
 
   if (note) {
+    const span = (m) => [Math.floor(m / 60) ? counted(Math.floor(m / 60), 'hour') : '', m % 60 ? counted(m % 60, 'minute') : '']
+      .filter(Boolean).join(' ');
     const paddingParts = [];
-    if (!_modalStartEdited && preMin > 0) paddingParts.push(`starts ${preMin} min early`);
-    if (!_modalStopEdited && postMin > 0) paddingParts.push(`ends ${postMin} min late`);
+    if (!_modalStartEdited && preMin > 0) paddingParts.push(`starts this recording ${span(preMin)} earlier`);
+    if (!_modalStopEdited && postMin > 0) {
+      paddingParts.push(`${paddingParts.length ? 'ends it' : 'ends this recording'} ${span(postMin)} later`);
+    }
     const keptParts = [];
     if (_modalStartEdited) keptParts.push('start time');
     if (_modalStopEdited) keptParts.push('stop time');
@@ -1939,7 +1943,7 @@ function applyProfilePadding() {
     const sentences = [];
     if (paddingParts.length) {
       const profName = sel.options[sel.selectedIndex].text;
-      sentences.push(`"${profName}" profile padding applied: ${paddingParts.join(' and ')}.`);
+      sentences.push(`Your recording profile, "${profName}", ${paddingParts.join(' and ')}. The times above include it.`);
     }
     if (keptParts.length) {
       const verb = keptParts.length > 1 ? 'were' : 'was';
@@ -2103,8 +2107,12 @@ function openModal(prog, ch, opts = {}) {
   _modalNameEdited = false;
   _modalNameProg = null;
 
-  const startSrc = isEdit ? prog.recording_start_time : prog.start_time;
-  const stopSrc  = isEdit ? prog.recording_stop_time  : prog.stop_time;
+  // opts.times: a league page's Record gives the listing the times its league's answer to which
+  // time a game goes by moves it to (sports_view.listing_times(), dev/changelog/1630). The program
+  // keeps its own, which the dialog's heading and the suggested name read.
+  const times = (!isEdit && opts.times) || null;
+  const startSrc = isEdit ? prog.recording_start_time : (times ? times.start_time : prog.start_time);
+  const stopSrc  = isEdit ? prog.recording_stop_time  : (times ? times.stop_time : prog.stop_time);
 
   document.getElementById('modal-name').value       = prog.suggested_name || prog.title;
   document.getElementById('modal-name-template').value = isEdit ? '' : (prog.suggested_name_template || '');
@@ -2142,8 +2150,8 @@ function openModal(prog, ch, opts = {}) {
       const note = document.getElementById('modal-padding-note');
       if (note) note.style.display = 'none';
     } else {
-      _modalBaseStartIso = prog.start_time;
-      _modalBaseStopIso  = prog.stop_time;
+      _modalBaseStartIso = times ? times.start_time : prog.start_time;
+      _modalBaseStopIso  = times ? times.stop_time : prog.stop_time;
       _modalPaddingApplicable = true;
       const defaultProfileId = (ch && ch.default_profile_id != null) ? String(ch.default_profile_id) : '';
       profileSel.value = GUIDE_CONFIG.profiles[defaultProfileId] ? defaultProfileId : '';

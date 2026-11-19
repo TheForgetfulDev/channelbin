@@ -8,6 +8,28 @@ handles any schema/config changes), PATCH = fixes.
 
 The DB schema version (PRAGMA user_version, see app/migrations.py) is an independent
 monotonic integer and does NOT track this number.
-"""
 
-__version__ = '0.43.0'
+An in-between image (not a release) carries a build stamp, written into BUILD_STAMP next to
+this file by the Dockerfile's CHANNELBIN_BUILD build argument, and reports itself as
+`<release>+<stamp>` - semver build metadata, so it still compares equal to the release it was
+built after rather than sorting before it as a `-` pre-release would. A checkout and a
+release image have no stamp and report the bare release (dev/changelog/1622).
+
+The release number stays on its own literal line below: the release procedure and several
+dev tools find it with `^__version__\\s*=\\s*'...'`, which the `+=` line does not match.
+"""
+import os
+
+
+def _build_stamp():
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'BUILD_STAMP'),
+                  encoding='utf-8') as fh:
+            stamp = fh.read().strip()
+    except FileNotFoundError:
+        return ''
+    return '+' + stamp if stamp else ''
+
+
+__version__ = '0.44.0'
+__version__ += _build_stamp()

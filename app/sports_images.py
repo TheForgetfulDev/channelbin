@@ -138,13 +138,15 @@ def _wanting():
 
 
 def _badge_urls(cfg: dict, now: datetime) -> list:
-    """The badge addresses a waiting screen would draw now, or [] while the output feed is off:
-    nobody can tune in to a screen then. A few queries, whatever the count."""
+    """The badge addresses a waiting screen or an Up next channel that is on would draw now, or []
+    while the output feed is off: nobody can tune in to either then. A few queries, whatever the
+    count."""
     from .output_feed import feed_config, is_enabled
     if not is_enabled(feed_config(cfg)):
         return []
     from .sports_feed import screen_team_ids
-    ids = screen_team_ids(now)
+    from .sports_up_next import team_ids as up_next_team_ids
+    ids = screen_team_ids(now) | up_next_team_ids(now)
     if not ids:
         return []
     return [u for (u,) in db.session.query(SportsTeam.badge_url).filter(
@@ -335,6 +337,19 @@ def badge_path(cfg: dict, url: str):
         return None
     img = SportsImage.query.filter_by(url=url).first()
     return image_path(cfg, img.file_name) if img is not None and _file_present(cfg, img) else None
+
+
+def badge_paths(cfg: dict, urls) -> dict:
+    """{url: downloaded badge or None} for every one of `urls`, badge_path()'s answer for many at
+    once: one query whatever the count, for an Up next page drawing a dozen games."""
+    urls = {u for u in urls if u}
+    out = dict.fromkeys(urls)
+    if not urls or not enabled(cfg):
+        return out
+    for img in SportsImage.query.filter(SportsImage.url.in_(urls)).all():
+        if _file_present(cfg, img):
+            out[img.url] = image_path(cfg, img.file_name)
+    return out
 
 
 # ---------------------------------------------------------------------------

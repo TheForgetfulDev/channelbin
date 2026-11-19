@@ -101,6 +101,8 @@ RECORDING_BUCKETS = {
     dbm.RECORDING_METADATA_REFRESH_SKIPPED: 'details',
     dbm.RECORDING_METADATA_EDITED: 'details', dbm.RECORDING_SPORTS_LINKED: 'details',
     dbm.RECORDING_SPORTS_REMOVED: 'details', dbm.RECORDING_RULE_GAME_CHANGED: 'details',
+    dbm.RECORDING_SPORTS_RETIMED: 'details', dbm.RECORDING_SPORTS_TIME_KEPT: 'details',
+    dbm.RECORDING_SPORTS_SECOND: 'details',
     dbm.DIAGNOSTICS: 'tech',
 }
 

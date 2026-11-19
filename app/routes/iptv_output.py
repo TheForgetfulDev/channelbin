@@ -39,6 +39,16 @@ def set_row(feed_id):
         return jsonify({'error': 'Say whether the channel is on the output'}), 400
     on = data['on']
     kind, row_id = output_feed.decode_feed_id(feed_id)
+    if kind == output_feed.KIND_UP_NEXT:
+        from .. import sports_up_next
+        league_id = sports_up_next.league_of(row_id)
+        try:
+            done = sports_up_next.switch(league_id, on) if league_id is not None else None
+        except sports_up_next.NotFollowed as exc:
+            return jsonify({'error': str(exc)}), 409
+        if done is None:
+            return jsonify({'error': 'That Up next channel no longer exists'}), 404
+        return jsonify({'success': True, 'name': done['name'], 'on': on, 'cut': done['cut']})
     if kind == output_feed.KIND_SPORTS:
         return jsonify({'error': 'A sports channel is turned on and off on its league\'s page '
                                  'in Sports Schedules'}), 400

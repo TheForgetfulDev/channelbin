@@ -54,6 +54,13 @@ tests/test_output_feed.py:
   mode for a sports channel) has the game put on in its place when it comes on; a game that is on with no slot or seat free waits on the screen too.
   A screen that cannot be made is refused by name, with no alert: neither is a fault.
 
+* A fourth kind is an Up next channel (app/sports_up_next.py, dev/changelog/1614): ChannelBin's
+  own picture of the coming games and nothing else, so it is streamed through ChannelBin in every
+  mode, takes no provider seat and is not counted against max_viewers (STATE_SHOWING). Its clip
+  is made on tune-in, as a waiting screen's is, and a play swaps in the new one when what it
+  shows changes. Its ids start at
+  UP_NEXT_FEED_BASE; the one for everything followed is that number itself.
+
 * A channel or a group a person took off the output (`on_output`, written only by
   set_on_output with its event) is in the TV Guide and not in the feed: gone from every
   catalog answer, the numbers after it one lower, its feed id unchanged, and a play of it
@@ -101,7 +108,10 @@ STATE_STOPPED = 'STOPPED'       # ended; `reason` says why
 #: On a sports channel's waiting screen, ChannelBin's own looped clip: no game to play yet,
 #: no provider seat, and not counted against max_viewers (dev/changelog/1534).
 STATE_WAITING = 'WAITING'
-STATES = (STATE_STARTING, STATE_STREAMING, STATE_WAITING, STATE_STOPPED)
+#: On an Up next channel: ChannelBin's own looped picture of the coming games, which is all the
+#: channel ever plays. No provider seat, not counted against max_viewers (dev/changelog/1614).
+STATE_SHOWING = 'SHOWING'
+STATES = (STATE_STARTING, STATE_STREAMING, STATE_WAITING, STATE_SHOWING, STATE_STOPPED)
 
 # Why a session ended. Every terminal path names one, and REASON_TEXT is what the dashboard
 # shows for it - a stream that stops says why, or it is a number nobody can explain
@@ -126,6 +136,7 @@ REASON_ACCOUNT_OFF = 'account_off'
 REASON_SCREEN_FAILED = 'screen_failed'
 REASON_SCREEN_GONE = 'screen_gone'
 REASON_WINDOW_OPENED = 'window_opened'
+REASON_PICTURE_FAILED = 'picture_failed'
 
 #: What two of the reasons read as on a sports channel, which has no group.
 SPORTS_REASON_TEXT = {
@@ -152,6 +163,7 @@ REASON_TEXT = {
     REASON_STOPPED: 'Stopped from the IPTV Output page.',
     REASON_ACCOUNT_OFF: 'Cut - its account was switched off for the IPTV output.',
     REASON_SCREEN_FAILED: 'Cut - the waiting screen stopped playing.',
+    REASON_PICTURE_FAILED: 'Cut - the Up next picture stopped playing.',
     REASON_SCREEN_GONE: 'Cut - the sports channel is no longer on the IPTV output.',
     REASON_WINDOW_OPENED: ('Ended - the game came on. In redirect mode ChannelBin cannot tune a player in, '
                            'so the waiting screen stops and the next tune-in gets the game.'),
@@ -192,6 +204,8 @@ _REAP_INTERVAL = 0.5
 SCREEN_RECHECK_SECONDS = 30.0
 #: What a play's history calls the waiting screen, as the channel it moved from.
 SCREEN_NAME = 'the waiting screen'
+#: What a play's line in Recent plays names as what an Up next channel played.
+PICTURE_NAME = 'the Up next picture'
 
 #: The one-line body every refused credential gets, whatever the cause (section 6.1).
 AUTH_FAILED_MESSAGE = 'Invalid or missing credentials'
@@ -275,6 +289,19 @@ SETTING_BOUNDS = {
 }
 
 
+def guide_days(fcfg: dict) -> int:
+    """How many days of guide the output sends (xmltv_days, 3 when unset), held to SETTING_BOUNDS.
+    A numbered sports channel with no game inside them is left out of the channel list too
+    (dev/changelog/1621)."""
+    low, high = SETTING_BOUNDS['xmltv_days']
+    try:
+        days = int(fcfg.get('xmltv_days') or 3)
+    except (TypeError, ValueError):
+        log.warning('integrations.output_feed.xmltv_days is not a whole number (%r); using 3', fcfg.get('xmltv_days'))
+        days = 3
+    return min(high, max(low, days))
+
+
 def sports_window(fcfg: dict) -> tuple:
     """(before, after): how far ahead of a game's listing and past its end a sports channel plays
     the channel that lists it (sports_feed.playing_now, dev/changelog/1529). A missing key is 0,
@@ -302,6 +329,9 @@ def relays(fcfg: dict, feed_id: int) -> bool:
     a group and a sports channel are relayed, because failover and a waiting screen handing
     over happen during a play, where a redirected TV is out of ChannelBin's reach."""
     mode = mode_of(fcfg)
+    if decode_feed_id(feed_id)[0] == KIND_UP_NEXT:
+        # ChannelBin's own picture is the only thing an Up next channel plays, in every mode.
+        return True
     if mode == MODE_PROXY:
         return True
     if mode == MODE_REDIRECT:
@@ -414,12 +444,17 @@ def max_reserve_seconds(buffer_mb) -> int:
 KIND_CHANNEL = 'channel'
 KIND_GROUP = 'group'
 KIND_SPORTS = 'sports'
+KIND_UP_NEXT = 'up_next'
 
 #: Where sports channels' feed ids start. Channels and groups between them use every integer
 #: from 0 up and may never be renumbered (an IPTV player caches them), so the third kind takes a
 #: range they cannot reach in practice: the first channel id that would land here is
 #: 500,000,000. Below 2**31, since an Xtream client reads a stream id as a 32-bit integer.
 SPORTS_FEED_BASE = 1_000_000_000
+#: Where Up next channels' feed ids start (dev/changelog/1614): the one for everything followed
+#: is this number, a league's is this plus its row id. Leaves sports channels 500,000,000 ids,
+#: and stays below 2**31.
+UP_NEXT_FEED_BASE = 1_500_000_000
 
 
 def feed_id_for_channel(channel_id: int) -> int:
@@ -434,8 +469,16 @@ def feed_id_for_sports(row_id: int) -> int:
     return SPORTS_FEED_BASE + row_id
 
 
+def feed_id_for_up_next(number: int) -> int:
+    """`number` is sports_up_next.UpNext.number: 0 for everything followed, else a row id."""
+    return UP_NEXT_FEED_BASE + number
+
+
 def decode_feed_id(feed_id: int):
-    """(kind, row id) for a feed id - no table needed, which is the point (section 3.3)."""
+    """(kind, row id) for a feed id - no table needed, which is the point (section 3.3). An Up
+    next channel's "row id" is its number: 0 for everything followed."""
+    if feed_id >= UP_NEXT_FEED_BASE:
+        return KIND_UP_NEXT, feed_id - UP_NEXT_FEED_BASE
     if feed_id >= SPORTS_FEED_BASE:
         return KIND_SPORTS, feed_id - SPORTS_FEED_BASE
     if feed_id % 2:
@@ -449,14 +492,15 @@ def decode_feed_id(feed_id: int):
 class FeedRow:
     """One channel as the IPTV player sees it. `row` is the Channel, ChannelGroup or
     sports_feed.Served behind it, `listings_channel_id` the channel whose EPG rows fill it
-    (None for a sports channel, whose guide is its schedule), `logo_path` the app's own
-    logo route or '' (never a provider URL, which may carry credentials)."""
+    (None for a sports channel, whose guide is its schedule), `logo_channel_id` the channel
+    whose logo it shows (None when it has none, and for ChannelBin's own channels, which
+    show ChannelBin's) - see logo_url()."""
     feed_id: int
     kind: str
     num: int
     name: str
     category: str
-    logo_path: str
+    logo_channel_id: Optional[int]
     row: object = field(repr=False)
     listings_channel_id: Optional[int]
     members: list = field(default_factory=list, repr=False)
@@ -502,10 +546,50 @@ def _members_for_feed(group, blocked, allowed):
     return kept, ''
 
 
-def _logo_path(channel) -> str:
-    from .logo_cache import resolve_logo_url
-    url = resolve_logo_url(channel) if channel is not None else ''
-    return url if url.startswith('/') else ''
+def _logo_channel_id(channel) -> Optional[int]:
+    if channel is None or not (channel.logo_url or channel.logo_cache_path):
+        return None
+    return channel.id
+
+
+#: The picture ChannelBin's own channels (Up next, sports) carry. A static file, so an IPTV
+#: player fetches it with no login whether or not the password gate is on.
+OWN_LOGO_PATH = '/static/img/logo/channelbin-favicon/android-chrome-512x512.png'
+
+
+def logo_url(row: 'FeedRow', base_url: str, fcfg: dict) -> str:
+    """The logo a row lists: ChannelBin's own for its own channels, else the feed's logo route
+    for the row's channel (routes/output_feed.py::logo), which serves the cached copy or fetches
+    the provider's for it. Never the provider's URL itself, which may carry credentials, and
+    never /api/channels/<id>/logo, which the password gate keeps from an IPTV player
+    (dev/changelog/1618)."""
+    if row.kind in (KIND_UP_NEXT, KIND_SPORTS):
+        return f'{base_url}{OWN_LOGO_PATH}'
+    if row.kind in (KIND_CHANNEL, KIND_GROUP):
+        if row.logo_channel_id is None:
+            return ''
+        return (f'{base_url}/logo/{feed_username(fcfg)}/{feed_password(fcfg)}/'
+                f'{row.logo_channel_id}')
+    raise ValueError(f'unknown feed row kind {row.kind!r}')
+
+
+def logo_channel(channel_id: int):
+    """The Channel whose logo the feed's logo route may serve: one some feed row could carry,
+    a channel in the TV Guide or a member of a group that is. None otherwise, so the route
+    is never a way to make ChannelBin fetch any logo in a 100k-channel catalog."""
+    from . import db
+    from .database import Channel, ChannelGroup, ChannelGroupMember
+    channel = db.session.get(Channel, channel_id)
+    if channel is None:
+        return None
+    if channel.in_guide:  # guide-flag-read-ok: the same own-row test catalog() makes
+        return channel
+    in_guide_group = (db.session.query(ChannelGroupMember.id)
+                      .join(ChannelGroup, ChannelGroup.id == ChannelGroupMember.group_id)
+                      .filter(ChannelGroupMember.channel_id == channel_id,
+                              ChannelGroup.in_guide.is_(True))
+                      .first())
+    return channel if in_guide_group is not None else None
 
 
 def _group_lead(group, members, latest_by_channel, blocked):
@@ -526,9 +610,10 @@ def _group_lead(group, members, latest_by_channel, blocked):
 def catalog(cfg=None, everything: bool = False) -> list:
     """Every feed row in the guide's order: the in-guide channels and the in-guide groups,
     interleaved by their shared guide_sort_order (channel_groups.guide_row_sort_key), then
-    ChannelBin's own sports channels by league (sports_feed.served_channels). A fixed number
+    ChannelBin's own channels, Up next and sports, by league (_own_rows). A fixed number
     of queries whatever the guide holds: the channels, the groups with their members and
-    accounts, the members' latest health checks, the blocked accounts, the sports channels.
+    accounts, the members' latest health checks, the blocked accounts, the Up next channels, the
+    sports channels.
 
     A channel on an account the allowlist excludes is not served; a group is served even
     when nothing in it is playable right now - the play is what refuses, by name
@@ -559,7 +644,7 @@ def catalog(cfg=None, everything: bool = False) -> list:
         entries.append((guide_row_sort_key(ch), FeedRow(
             feed_id=feed_id_for_channel(ch.id), kind=KIND_CHANNEL, num=0, name=ch.name,
             category=(ch.category_name or '').strip() or UNCATEGORIZED,
-            logo_path=_logo_path(ch), row=ch, listings_channel_id=ch.id,
+            logo_channel_id=_logo_channel_id(ch), row=ch, listings_channel_id=ch.id,
             on_output=bool(ch.on_output), left_out=left_out,
             plays=None if left_out else ch)))
     for g in groups:
@@ -572,20 +657,63 @@ def catalog(cfg=None, everything: bool = False) -> list:
         entries.append((guide_row_sort_key(g), FeedRow(
             feed_id=feed_id_for_group(g.id), kind=KIND_GROUP, num=0, name=g.name,
             category=((lead.category_name or '').strip() if lead else '') or UNCATEGORIZED,
-            logo_path=_logo_path(lead), row=g,
+            logo_channel_id=_logo_channel_id(lead), row=g,
             listings_channel_id=listings.id if listings else None, members=members,
             on_output=bool(g.on_output), why_none=why, plays=plays)))
     entries.sort(key=lambda e: e[0])
-    rows = [e[1] for e in entries]
-    from . import sports_feed
-    for served in sports_feed.served_channels():
-        rows.append(FeedRow(
-            feed_id=feed_id_for_sports(served.row.id), kind=KIND_SPORTS, num=0, name=served.name,
-            category=served.league.name, logo_path='', row=served, listings_channel_id=None))
+    rows = [e[1] for e in entries] + _own_rows(everything, fcfg)
     offered = [row for row in rows if row.offered]
     for n, row in enumerate(offered, start=1):
         row.num = n
     return rows if everything else offered
+
+
+#: The category an IPTV player files the Up next channel for everything followed under.
+UP_NEXT_CATEGORY = 'ChannelBin'
+
+
+#: Why a league's numbered sports channel is not in the channel list right now (FeedRow.left_out).
+LEFT_OUT_NO_GAME = 'it has no game in the {days} of guide the output sends'
+
+
+def _own_rows(everything: bool, fcfg: dict) -> list:
+    """ChannelBin's own channels, after the guide's: the Up next channel for everything followed,
+    then each league's Up next channel ahead of its sports channels (dev/changelog/1614), leagues
+    by name. With `everything`, the Up next channels whose switch is off come too, not offered.
+    A league's numbered channel with no game in the days of guide the output sends is left out
+    (dev/changelog/1621): it is a slot for a busy day, and an IPTV player listing 31 of them with
+    nothing in their guide is a list to scroll past. Its feed id stays, so it comes back as the
+    same channel; a team's channel is always listed."""
+    from . import sports_feed, sports_up_next
+    up_next = sports_up_next.channels(everything=everything)
+    served = sports_feed.served_channels()
+    days = guide_days(fcfg)
+    with_games = sports_feed.numbered_with_games(served, datetime.utcnow(), days, sports_window(fcfg)[1])
+    no_game = LEFT_OUT_NO_GAME.format(days=counted(days, 'day'))
+    out = []
+    for ch in up_next:
+        if ch.everything:
+            out.append(FeedRow(
+                feed_id=feed_id_for_up_next(ch.number), kind=KIND_UP_NEXT, num=0, name=ch.name,
+                category=UP_NEXT_CATEGORY, logo_channel_id=None, row=ch, listings_channel_id=None,
+                on_output=ch.enabled))
+    by_league = {}
+    for ch in up_next:
+        if not ch.everything:
+            by_league.setdefault(ch.league.id, (ch.league, []))[1].append(FeedRow(
+                feed_id=feed_id_for_up_next(ch.number), kind=KIND_UP_NEXT, num=0, name=ch.name,
+                category=ch.league.name, logo_channel_id=None, row=ch, listings_channel_id=None,
+                on_output=ch.enabled, left_out=ch.left_out))
+    for one in served:
+        left_out = '' if one.is_team or one.row.id in with_games else no_game
+        by_league.setdefault(one.league.id, (one.league, []))[1].append(FeedRow(
+            feed_id=feed_id_for_sports(one.row.id), kind=KIND_SPORTS, num=0, name=one.name,
+            category=one.league.name, logo_channel_id=None, row=one, listings_channel_id=None,
+            left_out=left_out))
+    for _key, (_league, league_rows) in sorted(by_league.items(),
+                                               key=lambda kv: (kv[1][0].name.lower(), kv[0])):
+        out += league_rows
+    return out
 
 
 def categories(rows) -> list:
@@ -603,7 +731,7 @@ def category_payload(rows) -> list:
             for cid, name in categories(rows)]
 
 
-def live_streams_payload(rows, base_url: str) -> list:
+def live_streams_payload(rows, base_url: str, fcfg: dict) -> list:
     """get_live_streams: what ChannelBin's own XtreamClient reads plus what the measured
     client needs (section 3.4). `direct_source` is empty: the capture showed the client
     ignores it. `epg_channel_id` is the feed id's string, which is what xmltv.php names."""
@@ -612,7 +740,7 @@ def live_streams_payload(rows, base_url: str) -> list:
     for row in rows:
         out.append({
             'num': row.num, 'name': row.name, 'stream_type': 'live', 'stream_id': row.feed_id,
-            'stream_icon': f'{base_url}{row.logo_path}' if row.logo_path else '',
+            'stream_icon': logo_url(row, base_url, fcfg),
             'epg_channel_id': str(row.feed_id), 'added': '0', 'is_adult': '0',
             'category_id': ids[row.category], 'category_ids': [int(ids[row.category])],
             'custom_sid': '', 'tv_archive': 0, 'direct_source': '', 'tv_archive_duration': 0,
@@ -652,7 +780,7 @@ def m3u_text(rows, base_url: str, fcfg: dict) -> str:
     URL in every mode - a redirect happens on play, so no provider URL is ever listed."""
     lines = ['#EXTM3U']
     for row in rows:
-        logo = f'{base_url}{row.logo_path}' if row.logo_path else ''
+        logo = logo_url(row, base_url, fcfg)
         name = row.name.replace('\n', ' ').replace('"', "'")
         category = row.category.replace('\n', ' ').replace('"', "'")
         lines.append(f'#EXTINF:-1 tvg-id="{row.feed_id}" tvg-name="{name}" tvg-logo="{logo}" '
@@ -677,7 +805,7 @@ def xmltv_lines(rows, cfg=None, now: Optional[datetime] = None):
 
     fcfg = feed_config(cfg)
     now = now or datetime.utcnow()
-    days = int(fcfg.get('xmltv_days') or 3)
+    days = guide_days(fcfg)
     yield '<?xml version="1.0" encoding="UTF-8"?>\n'
     yield '<!DOCTYPE tv SYSTEM "xmltv.dtd">\n'
     yield '<tv generator-info-name="ChannelBin">\n'
@@ -713,15 +841,52 @@ def xmltv_lines(rows, cfg=None, now: Optional[datetime] = None):
     if sports:
         from . import sports_feed
         from .channel_groups import blocked_account_ids_now
-        for program in sports_feed.guide_programs(sports, now, days, blocked=blocked_account_ids_now(),
-                                                  allowed=allowed_account_ids(fcfg)):
+        from .tz_utils import get_display_tz, is_24h
+        programs = sports_feed.guide_programs(sports, now, days, blocked=blocked_account_ids_now(),
+                                              allowed=allowed_account_ids(fcfg))
+        for program in programs:
             yield (f'  <programme start="{_xmltv_time(program.start)}" '
                    f'stop="{_xmltv_time(program.stop)}" '
                    f'channel="{feed_id_for_sports(program.row_id)}">'
                    f'<title>{xml_escape(program.title)}</title>'
                    f'<desc>{xml_escape(program.description)}</desc>'
                    f'<category>{xml_escape(program.category)}</category></programme>\n')
+        # Between games the guide names the next one instead of leaving the player to show
+        # "No information" (dev/changelog/1621). No category: it is not a game.
+        for filler in sports_feed.guide_fillers(sports, programs, now, days, get_display_tz(), is_24h()):
+            yield (f'  <programme start="{_xmltv_time(filler.start)}" '
+                   f'stop="{_xmltv_time(filler.stop)}" '
+                   f'channel="{feed_id_for_sports(filler.row_id)}">'
+                   f'<title>{xml_escape(filler.title)}</title>'
+                   f'<desc>{xml_escape(filler.description)}</desc></programme>\n')
+    for row in rows:
+        if row.kind == KIND_UP_NEXT:
+            yield from _up_next_programs(row, now, days)
     yield '</tv>\n'
+
+
+#: An Up next channel's guide is one program after another of this length, saying what it is.
+UP_NEXT_BLOCK = timedelta(hours=2)
+
+
+def _up_next_programs(row, now: datetime, days: int):
+    """An Up next channel's <programme> lines: blocks of UP_NEXT_BLOCK on the clock's even hours
+    across the window, each naming what the channel shows. No query."""
+    ch = row.row
+    what = ('the coming games in every league you follow' if ch.everything
+            else f'the coming {ch.league.name} games')
+    desc = xml_escape(f'ChannelBin\'s own picture of {what}, with when and where each is on: a new page '
+                      'every 10 seconds. Schedule from TheSportsDB.')
+    title = xml_escape(row.name)
+    start = now.replace(minute=0, second=0, microsecond=0)
+    start -= timedelta(hours=start.hour % 2)
+    end = now + timedelta(days=days)
+    while start < end:
+        stop = start + UP_NEXT_BLOCK
+        yield (f'  <programme start="{_xmltv_time(start)}" stop="{_xmltv_time(stop)}" '
+               f'channel="{row.feed_id}"><title>{title}</title><desc>{desc}</desc>'
+               f'<category>Sports</category></programme>\n')
+        start = stop
 
 
 # ── Picking what a feed id plays ───────────────────────────────────────────────────────────
@@ -757,6 +922,9 @@ class Play:
     #: which its waiting screen is drawn from.
     served: object = field(default=None, repr=False)
     found: object = field(default=None, repr=False)
+    #: An Up next channel's play: its sports_up_next.UpNext. It plays ChannelBin's picture and
+    #: nothing else, so `member` stays None and the play is never refused for it.
+    up_next: object = field(default=None, repr=False)
 
 
 def _resolve_sports_play(feed_id: int, row_id: int, allowed, exclude_ids, event_id, now,
@@ -818,6 +986,12 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int 
     fcfg = feed_config(cfg)
     allowed = allowed_account_ids(fcfg)
     kind, row_id = decode_feed_id(feed_id)
+    if kind == KIND_UP_NEXT:
+        from .sports_up_next import channels
+        found = channels(number=row_id)
+        if not found:
+            return None
+        return Play(feed_id, f'{found[0].name} (Up next channel {row_id})', fault=False, up_next=found[0])
     if kind == KIND_SPORTS:
         return _resolve_sports_play(feed_id, row_id, allowed, exclude_ids, event_id, now,
                                     sports_window(fcfg))
@@ -1017,6 +1191,9 @@ class RelaySession:
     waiting_for: str = ''
     left_screen_at: Optional[datetime] = None
     screen_seconds: float = 0.0
+    # An Up next channel's number (sports_up_next.UpNext.number) on a play of one: its clips'
+    # owner. None for anything else.
+    up_next_number: Optional[int] = None
     # Counted against max_viewers while the play takes a slot to leave the screen for the game.
     slot_claimed: bool = False
     # Ask again now, not at the next SCREEN_RECHECK_SECONDS (recheck_waiting, Go live now).
@@ -1039,10 +1216,20 @@ class RelaySession:
         return self.state == STATE_WAITING
 
     @property
+    def showing(self) -> bool:
+        return self.state == STATE_SHOWING
+
+    @property
+    def own_picture(self) -> bool:
+        """Playing ChannelBin's own clip, a waiting screen or an Up next channel: no provider
+        bytes, so a play ChannelBin streams in every mode."""
+        return self.state in (STATE_WAITING, STATE_SHOWING)
+
+    @property
     def counted(self) -> bool:
-        """Whether the play counts against max_viewers: every live one but a play on the
-        waiting screen that is not taking a slot to leave it."""
-        return self.live and (self.state != STATE_WAITING or self.slot_claimed)
+        """Whether the play counts against max_viewers: every live one but a play of ChannelBin's
+        own picture, unless it is taking a slot to leave a waiting screen for its game."""
+        return self.live and (not self.own_picture or self.slot_claimed)
 
     def reason_text(self) -> str:
         if not self.reason:
@@ -1062,7 +1249,7 @@ class RelaySession:
             'elapsed_seconds': round(now - self.started_mono, 1) if self.started_mono else 0,
             'started_at': self.started_at, 'ended_at': self.ended_at,
             'failovers': list(self.failovers),
-            'waiting': self.waiting, 'waiting_for': self.waiting_for,
+            'waiting': self.waiting, 'waiting_for': self.waiting_for, 'showing': self.showing,
             'screen_state': self.screen_state, 'screen_held': self.screen_held,
             'left_screen_at': self.left_screen_at,
             'screen_seconds': round(self._screen_seconds(now), 1),
@@ -1177,6 +1364,8 @@ def start_session(feed_id: int, client: str, cfg=None) -> RelaySession:
     play = resolve_play(feed_id, cfg)
     if play is None:
         raise FeedRefused('No such channel on the IPTV output', 404)
+    if play.up_next is not None:
+        return start_showing(play, client, cfg)
     if play.sports and play.member is None and not play.fault:
         return start_waiting(play, client, cfg)
     if play.member is None and not play.fault:
@@ -1398,11 +1587,14 @@ def _adopt(session: RelaySession, proc: subprocess.Popen) -> Optional[threading.
             session.proc = proc
             session.reader = reader
             session.launched_mono = time.monotonic()
+            # Started before the lock goes: a reader _finish() or a swap can read is one it
+            # can join. Joining one not yet started raises, and a _finish() that raised left
+            # the play live and unstoppable (dev/docs/BUGS.md 2026-11-17).
+            reader.start()
     if not adopt:
         terminate_or_kill(proc, hard=True)
         _remove_stderr(session)
         return None
-    reader.start()
     return reader
 
 
@@ -1504,9 +1696,11 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
         _queue_play(session.app, {
             'kind': FEED_PLAY_ENDED, 'at': session.ended_at, 'first_at': session.started_at,
             'feed_id': session.feed_id, 'label': session.label, 'client': session.client,
-            # A play that only ever watched a sports channel's waiting screen played that.
+            # A play that only ever watched a sports channel's waiting screen played that, and
+            # an Up next channel's play only ever plays its picture.
             'channel_id': session.channel_id, 'channel_name': session.channel_name or (
-                SCREEN_NAME if session.sports_row_id else ''),
+                SCREEN_NAME if session.sports_row_id else PICTURE_NAME
+                if session.up_next_number is not None else ''),
             'account_id': session.account_id, 'reason': reason,
             'message': ' '.join(x for x in (session.reason_text(), detail, _screen_note(session),
                                             _moves_note(session), play_notes(session),
@@ -1571,25 +1765,32 @@ def stop_account(account_id: int, reason: str = REASON_ACCOUNT_OFF) -> int:
 
 
 def _live_sports_plays() -> list:
+    """The live plays of a sports channel or an Up next channel: the two kinds whether a follow
+    serves."""
     with _lock:
         return [s for s in _sessions.values()
-                if s.live and decode_feed_id(s.feed_id)[0] == KIND_SPORTS]
+                if s.live and decode_feed_id(s.feed_id)[0] in (KIND_SPORTS, KIND_UP_NEXT)]
+
+
+def _sports_served_ids() -> frozenset:
+    from . import sports_feed, sports_up_next
+    return frozenset([feed_id_for_sports(c.row.id) for c in sports_feed.served_channels()]
+                     + [feed_id_for_up_next(c.number) for c in sports_up_next.channels()])
 
 
 def sports_served_now() -> Optional[frozenset]:
-    """The feed ids of the sports channels served right now, for stop_unserved_sports(): read
-    before a person's act that may stop one being served. None, and no query, when no sports
-    channel is being played. Requires an app context."""
+    """The feed ids of the sports channels and Up next channels served right now, for
+    stop_unserved_sports(): read before a person's act that may stop one being served. None, and
+    no query, when neither kind is being played. Requires an app context."""
     if not _live_sports_plays():
         return None
-    from . import sports_feed
-    return frozenset(feed_id_for_sports(c.row.id) for c in sports_feed.served_channels())
+    return _sports_served_ids()
 
 
 def stop_unserved_sports(before: Optional[frozenset], reason: str = REASON_TAKEN_OFF) -> int:
-    """End every live play of a sports channel that was served `before` (sports_served_now(), read
-    before the act) and is not now, on a game or on the waiting screen, by name. How many it
-    ended. The one place a person's act that stops a sports channel being served cuts its plays:
+    """End every live play of a sports channel or an Up next channel that was served `before`
+    (sports_served_now(), read before the act) and is not now, on a game, on the waiting screen or
+    on its picture, by name. How many it ended. The one place a person's act that stops a sports channel being served cuts its plays:
     its switch going off, a follow a person changed or removed, its league deleted
     (dev/changelog/1586). Called after that act's commit, never inside it.
 
@@ -1603,11 +1804,11 @@ def stop_unserved_sports(before: Optional[frozenset], reason: str = REASON_TAKEN
     live = [s for s in _live_sports_plays() if s.feed_id in before]
     if not live:
         return 0
-    from . import sports_feed
-    served = {feed_id_for_sports(c.row.id) for c in sports_feed.served_channels()}
+    served = _sports_served_ids()
     cut = sum(1 for s in live if s.feed_id not in served and _finish(s, reason))
     if cut:
-        log.info('IPTV output: %s of a sports channel that is no longer served cut', counted(cut, 'play'))
+        log.info('IPTV output: %s of a sports or Up next channel that is no longer served cut',
+                 counted(cut, 'play'))
     return cut
 
 
@@ -1909,7 +2110,7 @@ def _check(session: RelaySession) -> None:
     if now - session.started_mono > session.max_seconds:
         _finish(session, REASON_MAX_DURATION)
         return
-    if state == STATE_WAITING:
+    if state in (STATE_WAITING, STATE_SHOWING):
         _check_waiting(session, proc, now)
         return
     rc = proc.poll() if proc is not None else None
@@ -2115,13 +2316,16 @@ def _screen_of(play: Play, cfg: dict, held: str = None):
                                     slots=int(fcfg.get('max_viewers') or 1))
 
 
+def _playing_clips() -> set:
+    with _lock:
+        return {s.screen_path for s in _sessions.values() if s.live and s.screen_path}
+
+
 def _prune_clips(cfg: dict) -> None:
     """Prune the clip folder before a make, the one thing that adds to it, keeping every clip a
     live play is on. So the folder needs no job of its own."""
-    with _lock:
-        keep = {s.screen_path for s in _sessions.values() if s.live and s.screen_path}
     try:
-        _screen_mod().prune_clips(cfg, keep=keep)
+        _screen_mod().prune_clips(cfg, keep=_playing_clips())
     except OSError as exc:
         log.warning('Could not prune the waiting-screen clips: %s', exc)
 
@@ -2139,9 +2343,12 @@ def _clip_for(cfg: dict, row_id: int, screen) -> tuple:
 
 
 def _set_screen(session: RelaySession, screen, path: str, still: bool, held: str = None) -> None:
-    key = _screen_mod().clip_key(screen)
+    ss = _screen_mod()
+    key = ss.clip_key(screen)
     with _lock:
         session.screen_path, session.screen_key, session.screen_still = path, key, still
+        if isinstance(screen, ss.Rotation):
+            return
         session.screen_state, session.screen_held = screen.state, held
         session.waiting_for = screen.game.name if screen.game is not None else ''
 
@@ -2157,9 +2364,10 @@ def _note_badges(session: RelaySession, screen) -> None:
         log.warning('Viewer %s: could not ask whether the badges of %s can be read: %s', session.id,
                     session.label, exc)
         return
+    what = 'Up next picture' if session.showing else 'waiting screen'
     for name, code in unread:
-        _note_once(session, f'The badge for {name} could not be read as a picture, so the waiting '
-                            f'screen shows "{code}" in its place.')
+        _note_once(session, f'The badge for {name} could not be read as a picture, so the {what} '
+                            f'shows "{code}" in its place.')
 
 
 def start_waiting(play: Play, client: str, cfg: dict, held: str = None) -> RelaySession:
@@ -2217,8 +2425,9 @@ def _launch_clip(session: RelaySession, path: str, cfg: dict) -> None:
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err)
     except OSError as exc:
         _remove_stderr(session)
-        log.error('Viewer %s: could not start the waiting screen: %s', session.id, exc)
-        raise FeedRefused(f'Could not start the waiting screen: {exc}', 500)
+        what = 'the Up next picture' if session.showing else 'the waiting screen'
+        log.error('Viewer %s: could not start %s: %s', session.id, what, exc)
+        raise FeedRefused(f'Could not start {what}: {exc}', 500)
     if _adopt(session, proc) is None:
         raise FeedRefused(REASON_TEXT[REASON_CLIENT_GONE], 409)
 
@@ -2258,13 +2467,18 @@ def _swap_clip(session: RelaySession, screen, path: str, still: bool, cfg: dict,
         _launch_clip(session, path, cfg)
     except FeedRefused as exc:
         if session.live:
-            _finish(session, REASON_SCREEN_FAILED, detail=exc.message)
+            _finish(session, REASON_PICTURE_FAILED if session.showing else REASON_SCREEN_FAILED,
+                    detail=exc.message)
         return False
     if old != path:
         _discard_unplayed(old)
     _note_badges(session, screen)
-    log.info('Viewer %s: the waiting screen for %s now shows %s%s%s', session.id, session.label,
-             screen.state, f' ({held})' if held else '', ', the quick still' if still else '')
+    if session.showing:
+        log.info('Viewer %s: %s now shows its new picture%s', session.id, session.label,
+                 ', the quick still' if still else '')
+    else:
+        log.info('Viewer %s: the waiting screen for %s now shows %s%s%s', session.id, session.label,
+                 screen.state, f' ({held})' if held else '', ', the quick still' if still else '')
     return True
 
 
@@ -2274,21 +2488,108 @@ def _make_moving_later(session: RelaySession, cfg: dict, screen, held: str = Non
     sports_screen's to stop (stop_makes(), from stop_all())."""
     def _make():
         ss = _screen_mod()
+        what = 'Up next picture' if session.showing else 'waiting screen'
         try:
-            path = ss.make_clip(cfg, session.sports_row_id, screen, background=True)
+            path = ss.make_clip(cfg, _clip_owner(session), screen, background=True)
         except ss.ClipFailed as exc:
-            log.warning('Viewer %s: the moving waiting screen for %s could not be made, so the still '
-                        'one stays on: %s', session.id, session.label, exc)
-            _note_once(session, f'The moving waiting screen could not be made, so the still one '
-                                f'stayed on ({exc}).')
+            log.warning('Viewer %s: the moving %s for %s could not be made, so the still one stays on: '
+                        '%s', session.id, what, session.label, exc)
+            _note_once(session, f'The moving {what} could not be made, so the still one stayed on ({exc}).')
             return
         key = ss.clip_key(screen)
         with session._swap_lock:
             with _lock:
-                current = session.waiting and session.screen_still and session.screen_key == key
+                current = session.own_picture and session.screen_still and session.screen_key == key
             if current:
                 _swap_clip(session, screen, path, False, cfg, held)
     threading.Thread(target=_make, daemon=True, name=f'relay-screen-{session.id}').start()
+
+
+def _clip_owner(session: RelaySession):
+    """Whose clips a play of ChannelBin's own picture plays: its Up next channel's, or its sports
+    channel's row."""
+    if session.up_next_number is not None:
+        return _screen_mod().up_next_owner(session.up_next_number)
+    return session.sports_row_id
+
+
+# ── An Up next channel ─────────────────────────────────────────────────────────────────────
+#
+# Always ChannelBin's own picture (app/sports_up_next.py, dev/changelog/1614), looped by the
+# same ffmpeg shape and reader as a waiting screen, so every end works as it does for a relay.
+# Its clip is made on tune-in, never ahead (dev/changelog/1615): the play starts on the quick
+# still of its first page while the moving clip is made behind it. Every SCREEN_RECHECK_SECONDS the play asks again,
+# and swaps in the new picture when what it shows has changed.
+
+def _rotation_of(play_or_ch, cfg: dict):
+    from .sports_up_next import rotations
+    ch = play_or_ch.up_next if isinstance(play_or_ch, Play) else play_or_ch
+    return rotations([ch], datetime.utcnow(), cfg)[ch.number]
+
+
+def start_showing(play: Play, client: str, cfg: dict) -> RelaySession:
+    """Start `play`, an Up next channel's, on its picture. Requires an app context. Raises
+    FeedRefused, naming why, when the picture cannot be made or played."""
+    from flask import current_app
+    ss = _screen_mod()
+    fcfg = feed_config(cfg)
+    number = play.up_next.number
+    owner = ss.up_next_owner(number)
+    try:
+        rotation = _rotation_of(play, cfg)
+        path, still = _clip_for(cfg, owner, rotation)
+    except ss.ClipFailed as exc:
+        message = f'{play.up_next.name} could not be shown: {exc}.'
+        _note_refused(play.feed_id, play.label, client, message)
+        log.warning('Viewer from %s refused: %s', client, message)
+        raise FeedRefused(message, 409)
+    session = RelaySession(
+        id=secrets.token_urlsafe(12), feed_id=play.feed_id, label=play.label, client=client,
+        group_id=None, channel_id=None, channel_name='', account_id=None,
+        ring=Ring(int(fcfg.get('buffer_mb') or 64) * 1024 * 1024, 0.0),
+        **_session_limits(cfg, fcfg), started_mono=time.monotonic(), state=STATE_SHOWING,
+        app=current_app._get_current_object(), up_next_number=number)
+    session.last_recheck_mono = session.started_mono
+    _set_screen(session, rotation, path, still)
+    with _lock:
+        _sessions[session.id] = session
+        _prune_ended_locked()
+    try:
+        _launch_clip(session, path, cfg)
+    except FeedRefused as exc:
+        _finish(session, REASON_LAUNCH_FAILED, detail=exc.message)
+        raise
+    _note_badges(session, rotation)
+    if still:
+        _make_moving_later(session, cfg, rotation)
+    _ensure_reaper()
+    log.info('Viewer %s from %s: %s on its picture (%s)%s', session.id, client, session.label,
+             counted(len(rotation.pages), 'page'), ', the quick still while the moving one is made' if still else '')
+    return session
+
+
+def _recheck_showing(session: RelaySession) -> None:
+    """An Up next play's turn to ask again: ended by name when the channel is no longer served,
+    else the new picture swapped in when what it shows has changed."""
+    from .config import load_config
+    ss = _screen_mod()
+    cfg = load_config()
+    play = resolve_play(session.feed_id, cfg)
+    if play is None or play.up_next is None:
+        _finish(session, REASON_TAKEN_OFF)
+        return
+    rotation = _rotation_of(play, cfg)
+    if ss.clip_key(rotation) == session.screen_key:
+        return
+    try:
+        path, still = _clip_for(cfg, ss.up_next_owner(session.up_next_number), rotation)
+    except ss.ClipFailed as exc:
+        log.warning('Viewer %s: %s keeps its picture, its new one could not be made: %s', session.id,
+                    session.label, exc)
+        _note_once(session, f'The Up next picture could not be redrawn, so it kept what it showed ({exc}).')
+        return
+    if _swap_clip(session, rotation, path, still, cfg) and still:
+        _make_moving_later(session, cfg, rotation)
 
 
 def recheck_waiting(held_only: bool = False) -> int:
@@ -2305,21 +2606,22 @@ def recheck_waiting(held_only: bool = False) -> int:
 
 
 def _check_waiting(session: RelaySession, proc: subprocess.Popen, now: float) -> None:
-    """The reaper's turn for a play on the waiting screen: the clip's ffmpeg is alive and
-    sending, and every SCREEN_RECHECK_SECONDS (or when asked) the play asks again on a thread of
-    its own, so a clip made on the way never holds up the reaper."""
+    """The reaper's turn for a play of ChannelBin's own clip, a waiting screen or an Up next
+    channel: the clip's ffmpeg is alive and sending, and every SCREEN_RECHECK_SECONDS (or when
+    asked) the play asks again on a thread of its own, so a clip made on the way never holds up
+    the reaper."""
+    failed = REASON_PICTURE_FAILED if session.showing else REASON_SCREEN_FAILED
     rc = proc.poll()
     if rc is not None:
         tail = read_stderr_tail(session.stderr_path)
-        _finish(session, REASON_SCREEN_FAILED,
-                detail=f'ffmpeg exited with code {rc}' + (f': {tail}' if tail else ''))
+        _finish(session, failed, detail=f'ffmpeg exited with code {rc}' + (f': {tail}' if tail else ''))
         return
     if session.last_data_mono is None:
         if now - session.launched_mono > CONNECT_TIMEOUT_SECONDS:
-            _finish(session, REASON_SCREEN_FAILED, detail='the clip sent nothing in time')
+            _finish(session, failed, detail='the clip sent nothing in time')
             return
     elif now - session.last_data_mono > session.stall_timeout:
-        _finish(session, REASON_SCREEN_FAILED, detail=f'no data for {session.stall_timeout:.0f}s')
+        _finish(session, failed, detail=f'no data for {session.stall_timeout:.0f}s')
         return
     if session.app is None:
         return
@@ -2340,9 +2642,11 @@ def _recheck(session: RelaySession) -> None:
             with session._swap_lock:
                 if session.waiting:
                     _recheck_locked(session)
+                elif session.showing:
+                    _recheck_showing(session)
     except Exception:                                   # noqa: BLE001 - one play's re-check, never the feed
-        log.exception('Viewer %s: the waiting screen could not ask again whether its game is on',
-                      session.id)
+        log.exception('Viewer %s: %s could not ask again what it shows', session.id,
+                      'the Up next channel' if session.showing else 'the waiting screen')
     finally:
         with _lock:
             session._rechecking = False

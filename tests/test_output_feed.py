@@ -406,16 +406,101 @@ class CatalogTests(_FeedCase):
         body = self.get('/xmltv.php').get_data(as_text=True)
         self.assertEqual(body.count('<title>Shared</title>'), 2)
 
-    def test_a_logo_is_the_apps_own_route_never_the_providers_url(self):
+    def test_every_channel_with_a_logo_lists_the_feeds_logo_route(self):
+        """dev/docs/BUGS.md 2026-11-17 02:38 PM, IPTV output listed no logos: a channel's logo was
+        listed only when the logo cache (off by default) held a copy, and then as a route the
+        password gate keeps from an IPTV player. Cached or not, a channel with a logo lists
+        the feed's own logo route; the provider's URL is never listed."""
         self._seed()
         self.guide_a.logo_url = 'http://provider.test/u/p/logo.png'
         self.guide_b.logo_url = 'http://provider.test/u/p/logo2.png'
         self.guide_b.logo_cache_path = 'abc.png'
+        self.m1.logo_url = 'http://provider.test/u/p/m1.png'
+        self.m2.logo_url = 'http://provider.test/u/p/m2.png'
         db.session.commit()
         rows = {r['name']: r for r in self.catalog()}
-        self.assertEqual(rows['Alpha']['stream_icon'], '')
-        self.assertEqual(rows['Beta']['stream_icon'],
-                         f'http://localhost/api/channels/{self.guide_b.id}/logo')
+        base = f'http://localhost/logo/{USER}/{PASS}'
+        self.assertEqual(rows['Alpha']['stream_icon'], f'{base}/{self.guide_a.id}')
+        self.assertEqual(rows['Beta']['stream_icon'], f'{base}/{self.guide_b.id}')
+        self.assertIn(rows['Game feeds']['stream_icon'],
+                      (f'{base}/{self.m1.id}', f'{base}/{self.m2.id}'))
+        self.assertEqual(rows['Gamma']['stream_icon'], '', 'no logo lists none, not a 404')
+        m3u = self.get('/get.php').get_data(as_text=True)
+        self.assertIn(f'tvg-logo="{base}/{self.guide_a.id}"', m3u)
+        self.assertNotIn('provider.test', m3u + str(rows))
+
+
+class LogoRouteTests(_FeedCase):
+    """The feed's logo route (routes/output_feed.py::logo, dev/docs/BUGS.md 2026-11-17 02:38 PM, IPTV
+    output listed no logos): the cached copy when there is one, else the provider's logo
+    fetched through logo_cache.download_logo, behind the feed's own credentials and not the
+    password gate."""
+
+    def setUp(self):
+        super().setUp()
+        self.ch = make_channel(self.account, name='Alpha', in_guide=True,
+                               logo_url='http://provider.test/u/p/logo.png')
+        db.session.commit()
+
+    def _get(self, channel_id, password=PASS, body=b'\x89PNG-real', content_type='image/png'):
+        from unittest import mock
+        from tests.support.fakes import fake_http_response
+        import app.logo_cache as logo_cache
+        with mock.patch.object(logo_cache.requests, 'get',
+                               return_value=fake_http_response(content_type, body)) as get:
+            resp = self.client.get(f'/logo/{USER}/{password}/{channel_id}')
+        return resp, get
+
+    def test_an_uncached_logo_is_fetched_from_the_provider_for_the_player(self):
+        resp, get = self._get(self.ch.id)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, b'\x89PNG-real')
+        self.assertEqual(resp.mimetype, 'image/png')
+        self.assertEqual(resp.headers['X-Content-Type-Options'], 'nosniff')
+        self.assertIn('max-age=', resp.headers['Cache-Control'])
+        self.assertEqual(get.call_args.args[0], 'http://provider.test/u/p/logo.png')
+
+    def test_a_cached_logo_is_served_from_the_cache_with_no_fetch(self):
+        from app.logo_cache import get_logo_cache_dir
+        cache_dir = get_logo_cache_dir(load_config())
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(os.path.join(cache_dir, f'{self.ch.id}.png'), 'wb') as f:
+            f.write(b'cached-bytes')
+        self.ch.logo_cache_path = f'{self.ch.id}.png'
+        db.session.commit()
+        resp, get = self._get(self.ch.id)
+        self.assertEqual((resp.status_code, resp.data), (200, b'cached-bytes'))
+        get.assert_not_called()
+
+    def test_it_answers_with_the_password_gate_on(self):
+        from werkzeug.security import generate_password_hash
+        self.t.app.config['AUTH'] = {'enabled': True, 'password_hash': generate_password_hash('x'),
+                                     'session_timeout_minutes': 0}
+        resp, _get = self._get(self.ch.id)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_the_wrong_password_is_the_feeds_401_and_fetches_nothing(self):
+        resp, get = self._get(self.ch.id, password='nope')
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_a_channel_no_feed_row_could_carry_is_never_fetched(self):
+        hidden = make_channel(self.account, name='Hidden', logo_url='http://provider.test/h.png')
+        member = make_channel(self.account, name='Member', logo_url='http://provider.test/m.png')
+        make_group('Grouped', members=[member])
+        db.session.commit()
+        resp, get = self._get(hidden.id)
+        self.assertEqual(resp.status_code, 404)
+        get.assert_not_called()
+        resp, get = self._get(member.id)
+        self.assertEqual(resp.status_code, 200, 'a member of an in-guide group is a feed row\'s logo')
+
+    def test_a_logo_that_is_not_a_raster_image_is_refused(self):
+        resp, _get = self._get(self.ch.id)
+        self.assertEqual(resp.status_code, 200)
+        resp, _get = self._get(self.ch.id, body=b'<svg/>', content_type='image/svg+xml')
+        self.assertEqual(resp.status_code, 404)
+        self.assertNotIn(b'<svg', resp.data)
 
 
 class SelfSyncTests(_FeedCase):
@@ -753,6 +838,11 @@ class RelayLifecycleTests(_Relay):
         return old
 
     def _assert_changed_without_a_refusal(self, old, second):
+        # _finish releases the seat before it marks the session STOPPED, so the new play can
+        # start while the old body's thread is still between the two; its teardown lock is
+        # held across both (dev/docs/BUGS.md 2026-11-18 @ 09:25:19 AM).
+        with old._teardown_lock:
+            pass
         self.assertEqual((old.live, old.reason), (False, feed.REASON_CLIENT_GONE))
         new = self._session()
         self.assertEqual(new.channel_id, second.id)
@@ -1297,7 +1387,7 @@ class MixedModeRouteTests(_Relay):
         html = unescape(self.client.get('/iptv-output').get_data(as_text=True))
         self.assertIn('Through ChannelBin', html)
         self.assertIn('Straight from your IPTV provider', html)
-        self.assertIn('In mixed mode only channel groups and sports channels play through ChannelBin', html)
+        self.assertIn('In mixed mode only channel groups, sports channels and Up next channels play through ChannelBin', html)
         self.assertIn('Recordings leave alone', html)
         self.assertIn('Current streams', html)
         self.assertIn('<option value="mixed" selected>', html)

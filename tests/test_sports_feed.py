@@ -12,9 +12,11 @@ the dashboard's refused plays. Made-up leagues and teams; a throwaway temp SQLit
 """
 import json
 import os
+import re
 import sys
 import unittest
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -23,6 +25,7 @@ from tests.support.seed import make_account, make_channel  # noqa: E402
 
 import app.output_feed as feed  # noqa: E402
 from app import db, sports_data, sports_feed, sports_match  # noqa: E402
+from app.tz_utils import to_local  # noqa: E402
 from app.database import (Alert, SportsEvent, SportsFeedChannel, SportsFollow,  # noqa: E402
                           SportsLeague, SportsMatch, SportsTeam)
 
@@ -272,7 +275,8 @@ class GuideTests(_Case):
         self.league.feed_league_channels = True
         db.session.add(SportsFeedChannel(league_id=self.league.id, number=1))
         db.session.commit()
-        self.assertNotIn('<programme', self.xml())
+        # The blocks between games are there, and carry no category; no game is.
+        self.assertNotIn('<category>', self.xml())
         race.guide_start = midnight + timedelta(hours=14)
         db.session.commit()
         self.assertIn('<title>Grand Prix</title>', self.xml())
@@ -839,7 +843,7 @@ class LeagueChannelTests(_Case):
         xml = self.get('/xmltv.php').get_data(as_text=True)
         one = feed.SPORTS_FEED_BASE + SportsFeedChannel.query.filter_by(number=1).one().id
         two = feed.SPORTS_FEED_BASE + SportsFeedChannel.query.filter_by(number=2).one().id
-        self.assertEqual(xml.count(f'channel="{one}"><title>'), 2)
+        self.assertEqual(xml.count(f'channel="{one}"><title>') - xml.count(f'channel="{one}"><title>{sports_feed.NEXT_MARK}'), 2)
         self.assertIn(f'channel="{two}"><title>Saint-Remy Comets at Northgate Panthers</title>', xml)
 
     def test_a_placed_game_never_moves_and_the_channels_only_grow(self):
@@ -1013,6 +1017,90 @@ class LeagueChannelTests(_Case):
         self.assertEqual(self.play(feed.SPORTS_FEED_BASE + rows[2]).headers['Location'], ch2.stream_url)
 
 
+class GuideWindowTests(_Case):
+    """A numbered channel with no game in the days of guide the output sends is not listed, and the
+    guide between games names the next one (dev/changelog/1621)."""
+
+    def on(self):
+        self.assertTrue(sports_feed.set_league_channels(self.league.id, True))
+
+    def busy_day(self):
+        """Three games at once five days out, one tonight: channels 1-3, only 1 inside 3 days of guide."""
+        later = self.now + timedelta(days=5)
+        tonight = self.event(BEARS, GULLS, self.now + timedelta(hours=4))
+        busy = [self.event(home, away, later) for home, away in ((BEARS, GULLS), (PANTHERS, COMETS),
+                                                                  (GULLS, COMETS))]
+        db.session.commit()
+        self.on()
+        return tonight, busy
+
+    def test_a_numbered_channel_with_no_game_in_the_guide_is_not_listed(self):
+        self.busy_day()
+        self.assertEqual([s['name'] for s in self.streams()], ['Pretend League 1'])
+        rows = {r.number: r.id for r in SportsFeedChannel.query.all()}
+        self.assertEqual(set(rows), {1, 2, 3})
+        xml = self.get('/xmltv.php').get_data(as_text=True)
+        self.assertNotIn(f'channel="{feed.SPORTS_FEED_BASE + rows[2]}"', xml)
+        # Still the same channel to a player that kept it: a tune-in gets the waiting screen's answer.
+        self.assertTrue(self.nothing_on(feed.SPORTS_FEED_BASE + rows[2]))
+
+    def test_it_comes_back_as_the_same_channel_when_the_guide_reaches_its_game(self):
+        self.busy_day()
+        cfg = _feed_cfg(xmltv_days=7)
+        self.t.sandbox_config(cfg)
+        rows = {r.number: r.id for r in SportsFeedChannel.query.all()}
+        self.assertEqual([(s['name'], s['stream_id']) for s in self.streams()],
+                         [(f'Pretend League {n}', feed.SPORTS_FEED_BASE + rows[n]) for n in (1, 2, 3)])
+
+    def test_a_team_channel_is_listed_with_no_game_at_all(self):
+        self.team_on(PANTHERS)
+        db.session.commit()
+        self.assertEqual([s['name'] for s in self.streams()], ['Northgate Panthers'])
+
+    def test_the_output_page_says_why_a_numbered_channel_is_not_listed(self):
+        self.busy_day()
+        html = self.client.get('/iptv-output').get_data(as_text=True)
+        self.assertIn('Not in the channel list right now: it has no game in the 3 days of guide the output sends.',
+                      html)
+
+    def test_the_guide_between_games_names_the_next_one_in_the_display_timezone(self):
+        tonight, _busy = self.busy_day()
+        xml = self.get('/xmltv.php').get_data(as_text=True)
+        one = feed.SPORTS_FEED_BASE + SportsFeedChannel.query.filter_by(number=1).one().id
+        blocks = re.findall(rf'<programme start="(\d+) \+0000" stop="(\d+) \+0000" channel="{one}"><title>([^<]*)</title>'
+                            rf'(?:<desc>[^<]*</desc>)(<category>)?', xml)
+        local = to_local(tonight.start_at, ZoneInfo('America/New_York'))
+        words = f'Harborview Gulls at Ironvale Bears, {local.strftime("%a %-I:%M %p %Z")}'
+        before = [b for b in blocks if b[1] <= tonight.start_at.strftime('%Y%m%d%H%M%S')]
+        self.assertTrue(before)
+        self.assertEqual({b[2] for b in before}, {f'{sports_feed.NEXT_MARK} Next: {words}'})
+        self.assertEqual({b[3] for b in before}, {''})
+        # Blocks run on the even hours, back to back from before now to the game.
+        self.assertEqual(before[-1][1], tonight.start_at.strftime('%Y%m%d%H%M%S'))
+        self.assertEqual([b[0] for b in before[1:]], [b[1] for b in before[:-1]])
+        # After tonight's game the next is past the guide's end, five days out.
+        after = [b for b in blocks if b[0] >= tonight.start_at.strftime('%Y%m%d%H%M%S') and not b[3]]
+        self.assertTrue(after)
+        self.assertRegex(after[0][2], rf'^{sports_feed.NEXT_MARK} Next: Harborview Gulls at Ironvale Bears, '
+                                      r'\w{3} \d+:\d\d [AP]M E[SD]T$')
+
+    def test_the_next_game_is_named_at_its_kickoff_when_coverage_starts_earlier(self):
+        """Sky's listing of an 8:15 PM game starts at 7:00 PM, and is the game's start in the guide."""
+        kickoff = (self.now + timedelta(hours=6)).replace(minute=15)
+        self.event(BEARS, GULLS, kickoff, guide_start=kickoff - timedelta(minutes=75))
+        db.session.commit()
+        self.on()
+        xml = self.get('/xmltv.php').get_data(as_text=True)
+        local = to_local(kickoff, ZoneInfo('America/New_York'))
+        self.assertIn(f'Next: Harborview Gulls at Ironvale Bears, {local.strftime("%a %-I:%M %p %Z")}</title>', xml)
+
+    def test_a_channel_with_nothing_scheduled_says_so(self):
+        self.team_on(PANTHERS)
+        db.session.commit()
+        xml = self.get('/xmltv.php').get_data(as_text=True)
+        self.assertIn(f'<title>{sports_feed.NEXT_MARK} No game scheduled</title>', xml)
+
+
 class PageTests(_Case):
     def test_the_league_page_offers_the_league_and_each_team_with_its_switch(self):
         self.event(BEARS, GULLS, self.now + timedelta(hours=2))
@@ -1072,7 +1160,7 @@ class MatchReaderTests(_Case):
         db.session.commit()
         self.assertEqual([(ev, ch) for ev, ch, _s, _e in sports_match.airing_now([e.id], self.now)],
                          [(e.id, good.id)])
-        self.assertEqual([c for c, _a, _s, _e in sports_match.listing_windows([e.id])[e.id]], [good.id])
+        self.assertEqual([c for c, _a, _s, _e in sports_match.listing_windows([e.id], self.now)[e.id]], [good.id])
         self.assertEqual(sports_match.airing_now([], self.now), [])
 
 

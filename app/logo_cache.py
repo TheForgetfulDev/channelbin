@@ -92,49 +92,56 @@ def _channels_needing_fetch(limit: int):
     )
 
 
-def _fetch_one_logo(channel: Channel, cache_dir: str, cfg: dict) -> None:
-    """Download channel.logo_url and update its cache columns - both outcomes (cached, or
-    tried-and-not-an-image) record logo_cache_source_url so this exact URL is not retried
-    every run; only a URL change makes it eligible again. Never raises - a bad logo for
-    one channel must not abort the batch."""
+def download_logo(url: str, cfg: dict, who: str):
+    """One channel logo from `url`: (body, content type), or None with the reason logged
+    under `who` ("Logo cache", "IPTV output"). The one downloader, so the raster allowlist,
+    the size cap and the closed response hold for the cache job and the IPTV output's logo
+    route alike. Never raises."""
     from .accounts import _request_headers
 
-    raw_url = channel.logo_url
     try:
-        with requests.get(raw_url, timeout=_FETCH_TIMEOUT_SECONDS, stream=True,
-                           headers=_request_headers(cfg)) as resp:
+        with requests.get(url, timeout=_FETCH_TIMEOUT_SECONDS, stream=True,
+                          headers=_request_headers(cfg)) as resp:
             resp.raise_for_status()
             content_type = resp.headers.get('Content-Type', '').split(';')[0].strip().lower()
-            ext = _ALLOWED_LOGO_CONTENT_TYPES.get(content_type)
-            if ext is None:
-                log.warning('Logo cache: channel %d logo_url did not return an allowed '
-                            'image type (Content-Type %r) - %s', channel.id, content_type,
-                            mask_creds(raw_url))
-                _record_logo_attempt(channel.id, raw_url, None)
-                return
-
+            if content_type not in _ALLOWED_LOGO_CONTENT_TYPES:
+                log.warning('%s: logo did not come back as an allowed image type '
+                            '(Content-Type %r) - %s', who, content_type, mask_creds(url))
+                return None
             chunks = []
             total = 0
             for chunk in resp.iter_content(chunk_size=65536):
                 total += len(chunk)
                 if total > _MAX_LOGO_BYTES:
-                    log.warning('Logo cache: channel %d logo exceeded %d bytes, skipping - %s',
-                                channel.id, _MAX_LOGO_BYTES, mask_creds(raw_url))
-                    _record_logo_attempt(channel.id, raw_url, None)
-                    return
+                    log.warning('%s: logo exceeded %d bytes, skipping - %s', who,
+                                _MAX_LOGO_BYTES, mask_creds(url))
+                    return None
                 chunks.append(chunk)
     except Exception as exc:
-        log.warning('Logo cache: fetch failed for channel %d: %s', channel.id,
-                    mask_creds(str(exc)))
+        log.warning('%s: logo fetch failed: %s', who, mask_creds(str(exc)))
+        return None
+    return b''.join(chunks), content_type
+
+
+def _fetch_one_logo(channel: Channel, cache_dir: str, cfg: dict) -> None:
+    """Download channel.logo_url and update its cache columns - both outcomes (cached, or
+    tried-and-not-an-image) record logo_cache_source_url so this exact URL is not retried
+    every run; only a URL change makes it eligible again. Never raises - a bad logo for
+    one channel must not abort the batch."""
+    raw_url = channel.logo_url
+    got = download_logo(raw_url, cfg, f'Logo cache (channel {channel.id})')
+    if got is None:
         _record_logo_attempt(channel.id, raw_url, None)
         return
+    body, content_type = got
+    ext = _ALLOWED_LOGO_CONTENT_TYPES[content_type]
 
     old_path = channel.logo_cache_path
     filename = f'{channel.id}{ext}'
     try:
         os.makedirs(cache_dir, exist_ok=True)
         with open(os.path.join(cache_dir, filename), 'wb') as f:
-            f.write(b''.join(chunks))
+            f.write(body)
     except OSError as exc:
         log.warning('Logo cache: could not write cache file for channel %d: %s',
                     channel.id, exc)

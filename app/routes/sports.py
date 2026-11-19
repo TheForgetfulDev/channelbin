@@ -5,7 +5,8 @@ import time
 
 from flask import Blueprint, abort, jsonify, render_template, request
 
-from .. import sports_data, sports_match, sports_view
+from .. import db, sports_data, sports_match, sports_skips, sports_times, sports_view
+from ..database import SportsLeague
 from ..fmt_utils import join_labels
 
 sports_bp = Blueprint('sports', __name__)
@@ -188,6 +189,29 @@ def set_feed_channel(league_id):
     return jsonify({'success': True, 'cut': _cut_unserved(before)})
 
 
+@sports_bp.route('/api/sports/up-next', methods=['PUT'])
+def set_up_next():
+    """Turn an Up next channel on the output feed on or off: a league's (`league_id`), or the one
+    for everything followed with `league_id` 0 (app/sports_up_next.py)."""
+    from .. import sports_up_next
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get('enabled'), bool):
+        return jsonify({'error': 'enabled must be true or false.'}), 400
+    try:
+        league_id = int(data.get('league_id') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'league_id must be a number.'}), 400
+    if league_id < 0:
+        return jsonify({'error': 'league_id must be a number.'}), 400
+    try:
+        done = sports_up_next.switch(league_id, data['enabled'])
+    except sports_up_next.NotFollowed as exc:
+        return jsonify({'error': str(exc)}), 409
+    if done is None:
+        return jsonify({'error': 'That league no longer exists.'}), 404
+    return jsonify({'success': True, **done})
+
+
 def _sports_served():
     """Before a person's act that can stop a sports channel being served: what is served now
     (output_feed.sports_served_now; None and no query while no sports channel is being played)."""
@@ -241,14 +265,137 @@ def set_live_now(event_id):
 @sports_bp.route('/api/sports/leagues/<int:league_id>', methods=['DELETE'])
 def delete_league(league_id):
     before = _sports_served()
+    league = db.session.get(SportsLeague, league_id)
+    tsdb_id = league.tsdb_id if league is not None else None
     try:
         deleted = sports_data.delete_league(league_id)
     except sports_data.LeagueInUse as exc:
         return jsonify({'error': str(exc)}), 409
     if not deleted:
         return jsonify({'error': 'That league no longer exists.'}), 404
+    # Its Game time settings and skip words go with it; Stop following keeps them (app/sports_times.py,
+    # app/sports_skips.py).
+    for what, forget in (('game time settings', sports_times.forget_league),
+                         ('skip words and lengths', sports_skips.forget_league)):
+        try:
+            if tsdb_id is not None and forget(tsdb_id):
+                log.info('Sports: league %s deleted, and its %s with it', tsdb_id, what)
+        except OSError as exc:
+            # The league is gone either way; left behind, its answers only name a league nobody follows.
+            log.warning('Sports: league %s deleted, but its %s could not be removed from config.yaml: %s',
+                        tsdb_id, what, exc)
     sports_data.ensure_worker()
     return jsonify({'success': True, 'cut': _cut_unserved(before)})
+
+
+# ---------------------------------------------------------------------------
+# Which time a game goes by (app/sports_times.py, dev/changelog/1630)
+# ---------------------------------------------------------------------------
+
+def _game_time_changes(data: dict, league: bool) -> dict:
+    """The submitted answers as sports_times takes them: an empty choice or box on a league page
+    is None, its default again. A number that is not a whole number is left as sent, for
+    sports_times.problem() to name."""
+    out = {}
+    for key, value in data.items():
+        if league and value in ('', None):
+            out[key] = None
+        elif key in ('cover_both_minutes', 'wait_hours') and isinstance(value, str) and value.strip().isdecimal():
+            out[key] = int(value.strip())
+        else:
+            out[key] = value
+    return out
+
+
+@sports_bp.route('/api/sports/leagues/<int:league_id>/game-times', methods=['PUT'])
+def set_league_game_times(league_id):
+    """One league's own answers to which time a game goes by; an empty one uses the default."""
+    league = db.session.get(SportsLeague, league_id)
+    if league is None:
+        return jsonify({'error': 'That league no longer exists.'}), 404
+    data = request.get_json(silent=True) or {}
+    try:
+        rule = sports_times.set_league(league.tsdb_id, _game_time_changes(data, league=True))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    log.info('Sports: %s game time settings %s', league.name, rule.own or 'back to the default')
+    return jsonify({'success': True, 'go_by': rule.go_by, 'own': rule.own})
+
+
+@sports_bp.route('/api/sports/game-times', methods=['PUT'])
+def set_default_game_times():
+    """The default every league goes by unless its own page says otherwise."""
+    data = request.get_json(silent=True) or {}
+    try:
+        rule = sports_times.set_default(_game_time_changes(data, league=False))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    log.info('Sports: default game time settings: go by %s, cover both up to %d minutes, from %d hours before',
+             rule.go_by, rule.cover_both_minutes, rule.wait_hours)
+    return jsonify({'success': True, 'go_by': rule.go_by})
+
+
+# ---------------------------------------------------------------------------
+# The words and lengths that keep a listing out (app/sports_skips.py, dev/changelog/1634)
+# ---------------------------------------------------------------------------
+
+@sports_bp.route('/api/sports/leagues/<int:league_id>/skip-words', methods=['PUT'])
+def set_skip_words(league_id):
+    """Add one word to a league's list (`add`) or take one off (`remove`), on the list the page shows
+    (`kind`)."""
+    league = db.session.get(SportsLeague, league_id)
+    if league is None:
+        return jsonify({'error': 'That league no longer exists.'}), 404
+    data = request.get_json(silent=True) or {}
+    # The list the page shows, which it names (sports_view.skips_context).
+    kind = data.get('kind')
+    if kind not in sports_skips.KINDS:
+        return jsonify({'error': 'Say which list: game or race.'}), 400
+    try:
+        if isinstance(data.get('add'), str) and 'remove' not in data:
+            _skips, word = sports_skips.add_word(league.tsdb_id, kind, data['add'])
+            log.info('Sports: %s skips listings that say "%s"', league.name, word)
+        elif isinstance(data.get('remove'), str) and 'add' not in data:
+            sports_skips.remove_word(league.tsdb_id, kind, data['remove'])
+            word = sports_skips.clean_word(data['remove'])
+            log.info('Sports: %s no longer skips listings that say "%s"', league.name, word)
+        else:
+            return jsonify({'error': 'Send one word to add or to remove.'}), 400
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify({'success': True, 'word': word})
+
+
+@sports_bp.route('/api/sports/leagues/<int:league_id>/skip-words', methods=['DELETE'])
+def restore_skip_words(league_id):
+    """Restore defaults: the built-in words and lengths for this league."""
+    league = db.session.get(SportsLeague, league_id)
+    if league is None:
+        return jsonify({'error': 'That league no longer exists.'}), 404
+    sports_skips.restore(league.tsdb_id)
+    log.info('Sports: %s skip words and lengths restored to the defaults', league.name)
+    return jsonify({'success': True})
+
+
+@sports_bp.route('/api/sports/leagues/<int:league_id>/skip-minutes', methods=['PUT'])
+def set_skip_minutes(league_id):
+    """A league's own shortest listing of one kind; empty is the built-in again."""
+    league = db.session.get(SportsLeague, league_id)
+    if league is None:
+        return jsonify({'error': 'That league no longer exists.'}), 404
+    data = request.get_json(silent=True) or {}
+    value = data.get('minutes')
+    if value == '':
+        value = None
+    elif isinstance(value, str) and value.strip().isdecimal():
+        value = int(value.strip())
+    try:
+        skips = sports_skips.set_minutes(league.tsdb_id, data.get('length'), value)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    log.info('Sports: %s shortest %s listing is %d minutes', league.name, data.get('length'),
+             skips.minutes(data.get('length')))
+    return jsonify({'success': True, 'minutes': skips.minutes(data.get('length'))})
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +421,10 @@ def event_listings(event_id):
     groups = sports_match.listing_groups(event_id, get_display_tz(), is_24h())
     league = db.session.get(SportsLeague, event.league_id)
     return jsonify({'success': True, 'groups': groups, 'names': sports_match.name_rows(event_id),
+                    'skipped': sports_match.skipped_listings(event_id, get_display_tz(), is_24h(),
+                                                             one=sports_view.event_noun(league, event)),
+                    'league': league.name if league is not None else '',
+                    'matchup': bool(event.home_team_id or event.away_team_id),
                     'one': sports_view.event_noun(league, event),
                     'listings': sum(1 for g in groups for c in g['channels'] if not c['wrong']),
                     'channels': len({c['channel_id'] for g in groups for c in g['channels'] if not c['wrong']}),

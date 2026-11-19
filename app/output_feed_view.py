@@ -52,7 +52,8 @@ MODE_HELP = {
     output_feed.MODE_MIXED: ('Channel groups and sports channels play through ChannelBin, so a group can '
                              'move to another channel mid-stream and a sports channel\'s waiting screen '
                              'turns into the game by itself. Every other channel is sent straight to your '
-                             'IPTV provider\'s own stream, which ChannelBin never sees end.'),
+                             'IPTV provider\'s own stream, which ChannelBin never sees end. An Up next channel '
+                             'is ChannelBin\'s own picture and plays through it in every mode.'),
     output_feed.MODE_REDIRECT: ('The IPTV player is sent to your IPTV provider\'s own stream. No move to '
                                 'another channel, your provider\'s login reaches the player, and '
                                 'ChannelBin never sees the play end.'),
@@ -64,7 +65,7 @@ MODE_LABELS = [(output_feed.MODE_PROXY, 'Proxy, everything through ChannelBin'),
                (output_feed.MODE_REDIRECT, 'Redirect, everything straight from the provider')]
 
 KIND_TEXT = {output_feed.KIND_CHANNEL: 'Channel', output_feed.KIND_GROUP: 'Channel group',
-             output_feed.KIND_SPORTS: 'Sports channel'}
+             output_feed.KIND_SPORTS: 'Sports channel', output_feed.KIND_UP_NEXT: 'Up next channel'}
 _PLAY_CHIPS = {FEED_PLAY_ENDED: 'Ended', FEED_PLAY_REFUSED: 'Refused',
                FEED_PLAY_REDIRECTED: 'Tuned in'}
 _LOCAL_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
@@ -175,11 +176,16 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
     view = {'feed_id': row.feed_id, 'kind': row.kind, 'kind_text': KIND_TEXT[row.kind],
             'name': row.name, 'category': row.category, 'num': row.num or '-',
             'is_sports': row.kind == output_feed.KIND_SPORTS,
+            'is_up_next': row.kind == output_feed.KIND_UP_NEXT,
             'on': row.offered, 'switchable': True, 'switch_tip': '', 'problem': '',
             'plays': None, 'note': '', 'sub': KIND_TEXT[row.kind], 'live': None,
             'watching': watching.get(row.feed_id, 0), 'how': '', 'how_tip': ''}
     if output_feed.mode_of(fcfg) == output_feed.MODE_MIXED:
-        if output_feed.relays(fcfg, row.feed_id):
+        if row.kind == output_feed.KIND_UP_NEXT:
+            view['how'] = 'Through ChannelBin'
+            view['how_tip'] = ('ChannelBin\'s own picture, so it always plays through ChannelBin and uses no '
+                               'connection to your IPTV provider.')
+        elif output_feed.relays(fcfg, row.feed_id):
             view['how'] = 'Through ChannelBin'
             view['how_tip'] = ('ChannelBin plays it through itself, so it can move to another channel '
                                'when a stream drops, and a sports channel\'s waiting screen turns into '
@@ -269,6 +275,21 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
                 view['live'] = offer(following)
         else:
             raise ValueError(f'Unknown play phase "{phase}"')
+        if row.left_out:
+            # Not a fault: a tune-in from a player that kept it still plays (dev/changelog/1621).
+            view['note'] = (f'Not in the channel list right now: {row.left_out}. It comes back as the same '
+                            f'channel when one of its games is that close. {view["note"]}')
+    elif row.kind == output_feed.KIND_UP_NEXT:
+        ch = row.row
+        view['url'] = (url_for('sports.sports_page') if ch.everything
+                       else url_for('sports.league_page', league_id=ch.league.id))
+        view['sub'] = (f'{KIND_TEXT[row.kind]} - every league you follow' if ch.everything
+                       else f'{KIND_TEXT[row.kind]} - {ch.league.name}')
+        view['note'] = ('ChannelBin\'s own picture of the coming games, a new page every 10 seconds. It '
+                        'uses no connection to your IPTV provider.')
+        if row.left_out:
+            view['problem'] = f'Not on the output: {row.left_out}.'
+            view['switch_tip'] = 'Follow something in its league again in Sports Schedules to bring it back.'
     else:
         raise ValueError(f'Unknown feed row kind "{row.kind}"')
     view['hay'] = ' '.join(x for x in (row.name, row.category,
@@ -303,6 +324,7 @@ def _watching(sessions, by_feed: dict, accounts: dict, sports: dict, now, tz, h2
                 'account': accounts.get(s.account_id),
                 'starting': s.state == output_feed.STATE_STARTING,
                 'waiting': s.state == output_feed.STATE_WAITING,
+                'showing': s.state == output_feed.STATE_SHOWING,
                 'waiting_text': _waiting_text(s),
                 'from_screen': (f'Came from the waiting screen after {fmt_duration(s.screen_seconds)}'
                                 if s.left_screen_at is not None else ''),
@@ -313,7 +335,10 @@ def _watching(sessions, by_feed: dict, accounts: dict, sports: dict, now, tz, h2
                 'reserve_note': output_feed.reserve_short_note(s.ring),
                 'notes': output_feed.play_notes(s),
                 'program': '', 'program_times': ''}
-        if row is not None and row.kind == output_feed.KIND_SPORTS:
+        if row is not None and row.kind == output_feed.KIND_UP_NEXT:
+            view['row_url'] = (url_for('sports.sports_page') if row.row.everything
+                               else url_for('sports.league_page', league_id=row.row.league.id))
+        elif row is not None and row.kind == output_feed.KIND_SPORTS:
             view['row_url'] = url_for('sports.league_page', league_id=row.row.league.id)
             tuned, _phase = _sports_tuned(sports.get(row.row.row.id, _NO_SPORTS), now, window)
             view['program'] = tuned.title if tuned is not None else ''
@@ -460,8 +485,12 @@ def _accounts(rows, sessions, accounts: dict, cfg: dict, fcfg: dict) -> list:
             on = {row.row.account_id}
         elif row.kind == output_feed.KIND_GROUP:
             on = {m.channel.account_id for m in row.row.memberships if m.recording_enabled}
-        else:
+        elif row.kind == output_feed.KIND_SPORTS:
             on = set()      # a sports channel plays from whichever account lists the game then
+        elif row.kind == output_feed.KIND_UP_NEXT:
+            on = set()      # ChannelBin's own picture: no account at all
+        else:
+            raise ValueError(f'Unknown feed row kind "{row.kind}"')
         for account_id in on:
             if account_id in included:
                 included[account_id] += 1
@@ -496,11 +525,11 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
     from .channel_groups import blocked_account_ids_now
     blocked = blocked_account_ids_now()
     allowed = output_feed.allowed_account_ids(fcfg)
-    sports, carrying = _sports_programs(rows, now, int(fcfg.get('xmltv_days') or 3), window[1],
+    sports, carrying = _sports_programs(rows, now, output_feed.guide_days(fcfg), window[1],
                                         blocked=blocked, allowed=allowed)
-    # In redirect mode the one play ChannelBin can see is a sports channel's waiting screen,
-    # which is its own stream there too (dev/changelog/1534).
-    sessions = ([s for s in output_feed.live_sessions() if not redirect or s.waiting]
+    # In redirect mode the plays ChannelBin can see are its own pictures, a sports channel's
+    # waiting screen and an Up next channel, its own stream there too (dev/changelog/1534, 1614).
+    sessions = ([s for s in output_feed.live_sessions() if not redirect or s.own_picture]
                 if state == STATE_ON else [])
     watching = {}
     for s in sessions:
