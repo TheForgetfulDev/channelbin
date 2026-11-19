@@ -203,9 +203,11 @@ def _drawn(chans: list, by_league: dict, followed: list) -> dict:
     return out
 
 
-def _where(event, start: datetime, carrying: list, listed: list, names: dict) -> tuple:
+def _where(event, start: datetime, carrying: list, listed: list, names: dict, named=None) -> tuple:
     """(long, short): where a game is on. ChannelBin's own sports channel carrying it, else the
-    channel whose guide lists it nearest its start and how many more, else not in the guide."""
+    channel whose guide lists it nearest its start and how many more, else, for a game no guide
+    lists, the channel whose name mentions it that Record would take (`named`, a NameSource,
+    dev/changelog/1643), else not in the guide."""
     if carrying:
         first, more = carrying[0].name, len(carrying) - 1
         return (f'On {first}' + (f' and {counted(more, "other channel")}' if more else ''),
@@ -216,6 +218,10 @@ def _where(event, start: datetime, carrying: list, listed: list, names: dict) ->
             off = abs(begin - start)
             nearest[channel_id] = min(off, nearest.get(channel_id, off))
     found = sorted(nearest, key=lambda c: (nearest[c], names[c].lower()))
+    if not found and named is not None:
+        first, more = named.pick.named.said_by, len({n.channel_id for n in named.names}) - 1
+        return (f'On {first}' + (f' and {counted(more, "more channel")}' if more else ''),
+                f'{first} +{more}' if more else first)
     if not found:
         return NOT_IN_GUIDE, NOT_IN_GUIDE_SHORT
     first, more = names[found[0]], len(found) - 1
@@ -239,6 +245,7 @@ class _Pages:
         served = sports_feed.served_channels()
         self.carriers = sports_feed.carriers(served, events)
         self.listings = sports_match.listing_windows([e.id for e in events], now)
+        self.named = sports_feed.name_sources({e.league_id for e in events}, now) if events else {}
         channel_ids = {c for rows in self.listings.values() for c, _a, _b, _e in rows}
         self.names = (dict(db.session.query(Channel.id, Channel.name).filter(Channel.id.in_(channel_ids)).all())
                       if channel_ids else {})
@@ -249,7 +256,8 @@ class _Pages:
         from .sports_screen import game_of
         game = game_of(event, self.teams, self.cfg, self.now, self.tz, self.h24, self.badges)
         where, short = _where(event, window[0], self.carriers.get(event.id, []),
-                              self.listings.get(event.id, []), self.names)
+                              self.listings.get(event.id, []), self.names,
+                              None if self.listings.get(event.id) else self.named.get(event.id))
         live = window[0] <= self.now
         when = ((f'Started {game.clock}' if game.clock else 'On now') if live
                 else f'{game.day} {game.clock}'.strip())

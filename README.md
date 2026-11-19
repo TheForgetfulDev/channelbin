@@ -169,8 +169,8 @@ and hands them to whatever you already use to watch them.
   league, teams, venue and date in its file name.
 - An auto-record rule can name a league or a team: it then shows the games it expects, records each
   game once, can skip replays, and can record from an event channel when no guide lists the game.
-- A followed team or league can be a channel of its own on the IPTV output, which plays whichever of
-  your channels lists the game and shows a waiting screen between games.
+- A followed team or league can be a channel of its own on the IPTV output, which plays the game from
+  the same channel a recording of it would use and shows a waiting screen between games.
 
 ## Install
 
@@ -657,7 +657,8 @@ Three ways the stream can reach the IPTV player, chosen by **How the IPTV player
 - **Proxy** (the default): ChannelBin plays the channel through itself. It holds a provider
   connection for the IPTV player, buffers a few seconds behind live so a dropout or a failover plays
   through, and can say why a play stopped. A recording always wins: an IPTV player holding the connection a
-  recording needs is cut, and the Alerts page names the recording that took it.
+  recording needs moves to another channel of its group or game that has a connection free, and
+  when there is none it is cut and the Alerts page names the recording that took it.
 - **Redirect**: the IPTV player is sent straight to the provider's stream for the member chosen at that
   moment. No failover mid-stream, the provider's credentials reach the IPTV player, and ChannelBin never
   sees when the play ends - so a recording that then needs the connection is refused by the

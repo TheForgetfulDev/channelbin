@@ -3608,10 +3608,10 @@ class SportsEvent(db.Model):
     feed_moved_at    = db.Column(db.DateTime)
     feed_moved_from  = db.Column(db.Integer)
     feed_moved_by    = db.Column(db.Integer)
-    # Go live now (app/sports_feed.py::set_live_now(), dev/changelog/1530): a person said this game
-    # is on early, so every sports channel carrying it plays it ahead of its window until
-    # `live_now_until`, fixed when the button is pressed so a game moved to next week cannot bring it
-    # back. Written by that person's button and nothing else; the schedule update never touches it.
+    # Start broadcast, first named Go live now (app/sports_feed.py::set_live_now(), dev/changelog/1530,
+    # 1644): a person said this game is on early, so every sports channel carrying it plays it ahead
+    # of its window until `live_now_until`, fixed when the button is pressed so a game moved to next
+    # week cannot bring it back. Written by that person's button and nothing else; the schedule update never touches it.
     live_now_at      = db.Column(db.DateTime)
     live_now_until   = db.Column(db.DateTime)
 

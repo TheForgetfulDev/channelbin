@@ -11,7 +11,14 @@
    a re-encode on the GPU, which starts a new session that re-encodes the video
    (dev/changelog/1461). Nothing re-encodes unless the viewer asks.
 
-   Called by the channel page's Preview and by the TV Guide's program chooser. The hls.js
+   A feed preview ({ feedId }) plays one of ChannelBin's own channels on the IPTV output as an
+   IPTV player gets it (dev/changelog/1645). The server starts a new round of segments each time
+   the output's play moves to another source - the waiting screen handing over to the game, a
+   move to another channel - and the status names the round, so the player lets go of the old
+   round and attaches to the new one, saying what is on now.
+
+   Called by the channel page's Preview, the TV Guide's program chooser, the IPTV Output page, the
+   sports pages and a channel group's page. The hls.js
    URL comes from this script tag's data-hls-js: it is loaded on the first Preview, not with
    the page - 620 KB nobody pays for until they ask to watch something
    (static/vendor/hls.js/NOTICE.md). */
@@ -19,7 +26,10 @@
 (() => {
   const HLS_SRC = (document.currentScript && document.currentScript.dataset.hlsJs) || '';
 
-  function openLivePreview({ channelId, channelName }) {
+  function openLivePreview({ channelId, feedId, channelName }) {
+    const startUrl = feedId !== undefined && feedId !== null
+      ? `/api/feed/${encodeURIComponent(feedId)}/preview`
+      : `/api/channels/${encodeURIComponent(channelId)}/preview`;
     const player = buildPlayerStage();
     const { video, setStatus, tryPlay } = player;
 
@@ -30,6 +40,7 @@
     let recoveredOnce = false;
     let failed = false;     // this session's decode failure has been reported
     let attached = false;
+    let attachedRound = null;   // a feed preview's round the player is on
     let gen = 0;            // which begin() a response belongs to
 
     // pagehide cannot wait for a fetch and sendBeacon cannot set headers, so the token
@@ -96,7 +107,10 @@
     video.addEventListener('playing', () => {
       if (closed || !session) return;
       let text = 'Playing.';
-      if (session.reencode) {
+      if (session.source === 'feed') {
+        text = `Playing what an IPTV player gets: ${session.now_playing || 'the stream'}. Its sound is re-encoded to AAC so this browser can play it.`;
+        if (session.reencode) text += ' ChannelBin re-encodes the video on the GPU so this browser can play it.';
+      } else if (session.reencode) {
         text = 'Playing. ChannelBin re-encodes the video on the GPU, and the audio to AAC, so this browser can play it.';
       } else if (session.transcode_audio) {
         text = 'Playing. Audio is re-encoded to AAC so the browser can decode it; video is untouched.';
@@ -162,10 +176,22 @@
         .then((s) => {
           if (closed || !session || token !== gen) return;
           if (s.state === 'STOPPED') { ended(s); return; }
+          session.now_playing = s.now_playing;
+          if (attached && s.source === 'feed' && (s.state === 'STARTING' || s.round !== attachedRound)) {
+            // The output moved to another source: this round is over, and the next one starts
+            // with a decoder of its own.
+            detachPlayer();
+            attached = false;
+            recoveredOnce = false;
+          }
           if (s.state === 'READY' && !attached) {
             attached = true;
-            setStatus('Connected - starting playback…');
+            attachedRound = s.round;
+            session.playlist_url = s.playlist_url;
+            setStatus(attachedRound > 1 ? `Switching to ${s.now_playing}…` : 'Connected - starting playback…');
             attach(token);
+          } else if (s.state === 'STARTING' && s.source === 'feed' && attachedRound !== null) {
+            setStatus(`The IPTV output moved to another source. Switching to it…`);
           } else if (s.state === 'STARTING') {
             setStatus(`Connecting to the stream… (${Math.round(s.elapsed_seconds)}s)`);
           }
@@ -184,12 +210,13 @@
       detachPlayer();
       session = null;
       attached = false;
+      attachedRound = null;
       recoveredOnce = false;
       failed = false;
       setStatus(reencode ? 'Starting the re-encode…' : 'Starting…');
       const opts = { method: 'POST' };
       if (reencode) opts.body = JSON.stringify({ reencode: true });
-      jsonFetch(`/api/channels/${encodeURIComponent(channelId)}/preview`, opts)
+      jsonFetch(startUrl, opts)
         .then((data) => {
           if (closed || token !== gen) {
             // Closed or replaced before the start round-trip came back: stop what was just started.
@@ -210,5 +237,27 @@
     return modal;
   }
 
+  /* A Preview button drawn by a page (the IPTV Output page's channel rows, the league page's
+     sports channels, the sports dialogs, a channel group's page): data-feed for one of
+     ChannelBin's own channels, data-channel for a provider's, data-name for the dialog's title,
+     data-why when there is nothing to preview, which is said instead. */
+  function previewFrom(el) {
+    const d = el.dataset;
+    if (d.why) { showToast(d.why, { type: 'warning' }); return null; }
+    // A dialog that names the channel closes first, as the TV Guide's program chooser does, so
+    // the player is the only dialog up and Escape closes only it.
+    const host = el.closest('.modal');
+    if (host && host.closeModal) host.closeModal();
+    if (d.feed) return openLivePreview({ feedId: Number(d.feed), channelName: d.name || '' });
+    return openLivePreview({ channelId: Number(d.channel), channelName: d.name || '' });
+  }
+
+  /* The same button as templates/_macros.html::preview_btn, for a provider's channel a script
+     draws (the sports pages' dialogs). */
+  // duplicated from templates/_macros.html::preview_btn - a dialog's markup is built in JS
+  const previewButton = ({ channelId, name }) => `<button class="btn btn-sm tip-plain" data-act="preview" data-channel="${escHtml(String(channelId))}" data-name="${escHtml(name || '')}" data-tip="Preview.&#10;Plays this channel's live stream right here. Holds one of its account's connections while it runs, and gives it up to any recording that needs it.">${icon('preview')}Preview</button>`;
+
   window.openLivePreview = openLivePreview;
+  window.previewFrom = previewFrom;
+  window.previewButton = previewButton;
 })();

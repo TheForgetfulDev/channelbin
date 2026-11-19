@@ -27,7 +27,7 @@ from sqlalchemy import and_, or_
 
 from . import admission, db, event_names, sports_skips
 from .database import (
-    Channel, EPGEntry, SPORTS_AIRING_FIRST, SPORTS_AIRING_REPLAY, SPORTS_AIRING_UNKNOWN,
+    Account, Channel, EPGEntry, SPORTS_AIRING_FIRST, SPORTS_AIRING_REPLAY, SPORTS_AIRING_UNKNOWN,
     SPORTS_MATCH_KIND_CHANNEL_NAME, SPORTS_MATCH_KIND_GUIDE, SPORTS_MATCH_STRONG, SPORTS_MATCH_WEAK, SportsEvent, SportsLeague,
     SportsLeagueCategory, SportsMatch, SportsState, SportsTeam,
 )
@@ -1684,9 +1684,10 @@ def _windows_query(event_ids: list):
 
 
 def _timed(event_ids: list, rows, now: datetime, rules) -> list:
-    """[(event id, channel id, account id, start, stop)] for `rows`, each listing at the times its
-    league's answer gives it (app/sports_times.py): one listing may be two windows under Cover both.
-    The events and their leagues are read in one query."""
+    """[(event id, channel id, account id, start, stop, guide start)] for `rows`, each listing at
+    the times its league's answer gives it (app/sports_times.py), and last the start the guide
+    gives it: one listing may be two windows under Cover both. The events and their leagues are
+    read in one query."""
     from .sports_times import Rules, event_windows
     rules = rules if rules is not None else Rules()
     events = {e.id: (e, tsdb_id) for e, tsdb_id in
@@ -1700,27 +1701,29 @@ def _timed(event_ids: list, rows, now: datetime, rules) -> list:
             continue
         event, tsdb_id = found
         for begin, end in event_windows(start, stop, event, rules.of(tsdb_id), now):
-            out.append((event_id, channel_id, account_id, begin, end))
+            out.append((event_id, channel_id, account_id, begin, end, start))
     return out
 
 
 def airing_now(event_ids: list, now: datetime, before: timedelta = timedelta(0),
-               after: timedelta = timedelta(0), rules=None) -> list:
+               after: timedelta = timedelta(0), rules=None, listed=False) -> list:
     """[(event id, channel id, program start, program stop)] for each listing of these events on a
     visible channel that is within reach of `now`: it starts no more than `before` from now and
     ended no more than `after` ago. With both at zero that is the listings on at `now`. Each listing
     counts at the times its league's answer gives it (app/sports_times.py), which can move it by up
     to the matcher's WINDOW, so the query reaches that much further and the times are checked
-    after. Two queries (app/sports_feed.py decides which of them a play takes)."""
+    after. With `listed`, each tuple also ends with the listing's own start in the guide, which is
+    how a play names the listings it holds (auto_rules.game_sources()). Two queries
+    (app/sports_feed.py decides which of them a play takes)."""
     if not event_ids:
         return []
     rows = (_windows_query(event_ids)
             .filter(SportsMatch.program_start_time <= now + before + WINDOW,
                     SportsMatch.program_stop_time > now - after - WINDOW).distinct().all())
     out = []
-    for event_id, channel_id, _account, start, stop in _timed(event_ids, rows, now, rules):
+    for event_id, channel_id, _account, start, stop, listed_at in _timed(event_ids, rows, now, rules):
         if start is not None and stop is not None and start <= now + before and stop > now - after:
-            out.append((event_id, channel_id, start, stop))
+            out.append((event_id, channel_id, start, stop) + ((listed_at,) if listed else ()))
     return list(dict.fromkeys(out))
 
 
@@ -1732,7 +1735,8 @@ def listing_windows(event_ids: list, now: datetime, rules=None) -> dict:
     out = {}
     if not event_ids:
         return out
-    for event_id, channel_id, account_id, start, stop in _timed(event_ids, _windows_query(event_ids).all(), now, rules):
+    for event_id, channel_id, account_id, start, stop, _listed in _timed(event_ids, _windows_query(event_ids).all(),
+                                                                         now, rules):
         out.setdefault(event_id, []).append((channel_id, account_id, start, stop))
     return out
 
@@ -1769,31 +1773,39 @@ def _name_why(reason: str) -> str:
     return rest[:1].upper() + rest[1:]
 
 
+# The account columns the listings dialog draws beside each channel (its pill), read in the same query.
+_ACCOUNT_COLS = (Account.id, Account.name, Account.color)
+
+
 def name_rows(event_id: int) -> list:
     """The event channels naming one event, as the listings dialog lists them: still named, on a channel
-    not hidden, strong before weak, then by name, wrong matches included and flagged. One query,
-    whatever the size."""
-    rows = (db.session.query(SportsMatch, Channel.name, Channel.category_name)
+    not hidden, strong before weak, then by name, wrong matches included and flagged, each with the
+    account it is on. One query, whatever the size."""
+    rows = (db.session.query(SportsMatch, Channel.name, Channel.category_name, *_ACCOUNT_COLS)
             .join(Channel, Channel.id == SportsMatch.channel_id)
+            .join(Account, Account.id == Channel.account_id)
             .filter(SportsMatch.event_id == event_id, SportsMatch.kind == SPORTS_MATCH_KIND_CHANNEL_NAME,
                     SportsMatch.gone_since.is_(None), _offered())
             .order_by(db.case((SportsMatch.strength == SPORTS_MATCH_WEAK, 1), else_=0), Channel.name).all())
     return [{'id': m.id, 'channel_id': m.channel_id, 'name': name, 'category': category or '',
+             'account': {'id': acct_id, 'name': acct_name, 'color': acct_color},
              'why': _name_why(m.reason), 'badge': NAME_AIRING_BADGES[m.airing], 'wrong': m.rejected_at is not None}
-            for m, name, category in rows]
+            for m, name, category, acct_id, acct_name, acct_color in rows]
 
 
 def listing_groups(event_id: int, tz, h24: bool) -> list:
     """An event's guide matches as the listings dialog shows them: one group per way a listing is
     worded and aired, each with its channels, wrong matches included and flagged. Rows gone from the
-    guide and rows on a hidden channel are left out. Two queries, whatever the size."""
-    rows = (db.session.query(SportsMatch, Channel.name, Channel.category_name)
+    guide and rows on a hidden channel are left out. Each channel carries the account it is on. One
+    query, whatever the size."""
+    rows = (db.session.query(SportsMatch, Channel.name, Channel.category_name, *_ACCOUNT_COLS)
             .join(Channel, Channel.id == SportsMatch.channel_id)
+            .join(Account, Account.id == Channel.account_id)
             .filter(SportsMatch.event_id == event_id, SportsMatch.kind == SPORTS_MATCH_KIND_GUIDE,
                     SportsMatch.gone_since.is_(None), _offered())
             .order_by(SportsMatch.program_start_time, Channel.name).all())
     groups = {}
-    for m, name, category in rows:
+    for m, name, category, acct_id, acct_name, acct_color in rows:
         key = (m.program_title, m.program_sub_title, m.airing, m.program_start_time)
         g = groups.get(key)
         if g is None:
@@ -1805,6 +1817,7 @@ def listing_groups(event_id: int, tz, h24: bool) -> list:
         if m.strength == SPORTS_MATCH_WEAK:
             g['strength'] = SPORTS_MATCH_WEAK
         g['channels'].append({'id': m.id, 'channel_id': m.channel_id, 'name': name, 'category': category or '',
+                              'account': {'id': acct_id, 'name': acct_name, 'color': acct_color},
                               'wrong': m.rejected_at is not None})
     out = sorted(groups.values(), key=lambda g: (-len(g['channels']), g['start']))
     for g in out:

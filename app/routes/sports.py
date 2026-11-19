@@ -3,7 +3,7 @@ import logging
 import threading
 import time
 
-from flask import Blueprint, abort, jsonify, render_template, request
+from flask import Blueprint, abort, jsonify, render_template, request, url_for
 
 from .. import db, sports_data, sports_match, sports_skips, sports_times, sports_view
 from ..database import SportsLeague
@@ -60,6 +60,65 @@ def league_page(league_id):
         sections_pref_key=sports_view.SECTIONS_PREF_KEY, **ctx)
 
 
+def _stored_league(tsdb_id):
+    """The league ChannelBin already has with this TheSportsDB number, or None."""
+    if not isinstance(tsdb_id, int) or isinstance(tsdb_id, bool):
+        return None
+    return SportsLeague.query.filter_by(tsdb_id=tsdb_id).first()
+
+
+def _stored_payload(league) -> dict:
+    """A league already here, in the shape a lookup answers, read from what is stored. Its names
+    are not in it: following a league already here never rewrites them."""
+    return {'tsdb_id': league.tsdb_id, 'name': league.name, 'sport': league.sport,
+            'season': league.current_season}
+
+
+def _with_here(body: dict) -> dict:
+    """A lookup's answer, with what the person follows now in its league when that league is here,
+    so the dialog's picker starts from it (dev/changelog/1641)."""
+    stored = _stored_league(body['league']['tsdb_id']) if body.get('league') else None
+    body['here'] = sports_view.follow_state(stored) if stored is not None else None
+    return body
+
+
+def _team_ids(raw):
+    """(sorted team numbers, None), or (None, the error). Whole team numbers only, each once. 0 is
+    how the whole league is stored, so a 0 beside a team would store both, and a repeat breaks the
+    follow's unique key (dev/docs/BUGS.md 2026-11-15 @ 12:58:58 PM). A bool is an int to Python and
+    is refused with the rest."""
+    raw = raw if raw is not None else []
+    if not isinstance(raw, list):
+        return None, 'team_ids must be a list.'
+    if not all(isinstance(t, int) and not isinstance(t, bool) and t > 0 for t in raw):
+        return None, 'team_ids must be team numbers. Send none to follow the whole league.'
+    return sorted(set(raw)), None
+
+
+def _vouched(league: dict, stored, team_ids: list) -> tuple:
+    """(teams a lookup just checked in this league, None), or ([], the 409 naming a team that is
+    neither that nor one ChannelBin already knows plays in the league, sports_data.known_team_ids()).
+    A follow may name only these, so a request cannot invent a team (design 5)."""
+    checked, rest = [], []
+    for team_id in team_ids:
+        team = _recall(_checked_teams, team_id)
+        if team is not None and team['league']['tsdb_id'] == league['tsdb_id']:
+            checked.append(team)
+        else:
+            rest.append(team_id)
+    if stored is not None and rest:
+        known = sports_data.known_team_ids(stored.id)
+        rest = [t for t in rest if t not in known]
+    if not rest:
+        return checked, None
+    team = _recall(_checked_teams, rest[0])
+    if team is not None:
+        why = f'{team["team"]} plays in the {team["league"]["name"]}, not the {league["name"]}.'
+    else:
+        why = f'ChannelBin has not checked team {rest[0]} in the {league["name"]}, or the check has expired.'
+    return [], (jsonify({'error': f'{why} Look the team up again first.'}), 409)
+
+
 def _too_soon(exc: sports_data.TryAgain):
     return jsonify({'error': f'ChannelBin makes one call at a time to TheSportsDB, and one just went out. '
                              f'Try again in {exc.seconds} seconds.', 'retry_after': exc.seconds}), 409
@@ -82,15 +141,20 @@ def lookup():
                                  'https://www.thesportsdb.com/team/134936-philadelphia-eagles.'}), 400
     if kind == 'league' and not str(value).isdecimal():
         return jsonify({'error': 'That is not a league number.'}), 400
+    if kind == 'league':
+        # A league already here is answered from what is stored, with no call (dev/changelog/1641).
+        stored = _stored_league(int(value))
+        if stored is not None:
+            return jsonify(_with_here({'success': True, 'league': _stored_payload(stored)}))
     try:
         if kind == 'league':
             league = sports_data.lookup_league(int(value))
             _remember(league)
-            return jsonify({'success': True, 'league': league})
+            return jsonify({'success': True, 'league': league, 'here': None})
         if kind == 'teamlink':
             team = sports_data.lookup_team(value)
             _remember(team['league'], team)
-            return jsonify({'success': True, 'league': team['league'], 'team': team})
+            return jsonify(_with_here({'success': True, 'league': team['league'], 'team': team}))
         teams, defunct = sports_data.search_teams(value)
     except sports_data.TryAgain as exc:
         return _too_soon(exc)
@@ -111,43 +175,54 @@ def lookup():
         _remember(team['league'], team)
     skipped = [t['team'] for t in defunct]
     if len(teams) == 1:
-        return jsonify({'success': True, 'league': teams[0]['league'], 'team': teams[0],
-                        'best_match': True, 'skipped': skipped})
-    return jsonify({'success': True, 'choices': teams, 'skipped': skipped})
+        return jsonify(_with_here({'success': True, 'league': teams[0]['league'], 'team': teams[0],
+                                   'best_match': True, 'skipped': skipped}))
+    # Each choice says what is followed in its league, as a single answer does (_with_here).
+    choices = []
+    for team in teams:
+        stored = _stored_league(team['league']['tsdb_id'])
+        choices.append({**team, 'here': sports_view.follow_state(stored) if stored is not None else None})
+    return jsonify({'success': True, 'choices': choices, 'skipped': skipped})
 
 
 @sports_bp.route('/api/sports/leagues', methods=['POST'])
 def add_league():
-    """Follow a checked league, whole or just one team of it."""
+    """Follow a league, whole or just `team_ids` of it, replacing what the person followed in it. A
+    league or team must be one a lookup just checked, or one ChannelBin already has, so a request
+    cannot invent a name or a number (design 5)."""
     data = request.get_json(silent=True) or {}
-    league = _recall(_checked_leagues, data.get('tsdb_id'))
+    team_ids, error = _team_ids(data.get('team_ids'))
+    if error:
+        return jsonify({'error': error}), 400
+    stored = _stored_league(data.get('tsdb_id'))
+    league = _recall(_checked_leagues, data.get('tsdb_id')) or (_stored_payload(stored) if stored else None)
     if league is None:
         return jsonify({'error': 'Look that league up again first: the check has expired.'}), 409
-    team = None
-    if data.get('team_id'):
-        team = _recall(_checked_teams, data['team_id'])
-        if team is None or team['league']['tsdb_id'] != league['tsdb_id']:
-            return jsonify({'error': 'Look that team up again first: the check has expired.'}), 409
-    league_id = sports_data.follow_league(league, team)
+    checked, refused = _vouched(league, stored, team_ids)
+    if refused:
+        return refused
+    before = _sports_served()
+    league_id = sports_data.follow_league(league, team_ids, checked)
     sports_data.ensure_worker()
-    return jsonify({'success': True, 'id': league_id})
+    return jsonify({'success': True, 'id': league_id, 'cut': _cut_unserved(before)})
 
 
 @sports_bp.route('/api/sports/leagues/<int:league_id>/following', methods=['PUT'])
 def set_following(league_id):
-    """What a person follows in this league: `team_ids`, or the whole league with none."""
+    """What a person follows in this league: `team_ids`, or the whole league with none. Each team is
+    one a lookup just checked in the league, stored with its name, or one ChannelBin already has."""
     data = request.get_json(silent=True) or {}
-    raw = data.get('team_ids') or []
-    if not isinstance(raw, list):
-        return jsonify({'error': 'team_ids must be a list.'}), 400
-    # Whole team numbers only, each once. 0 is how the whole league is stored, so a 0 beside a team
-    # would store both, and a repeat breaks the follow's unique key (dev/docs/BUGS.md 2026-11-15
-    # @ 12:58:58 PM). A bool is an int to Python and is refused with the rest.
-    if not all(isinstance(t, int) and not isinstance(t, bool) and t > 0 for t in raw):
-        return jsonify({'error': 'team_ids must be team numbers. Send none to follow the whole league.'}), 400
-    team_ids = sorted(set(raw))
+    team_ids, error = _team_ids(data.get('team_ids') or [])
+    if error:
+        return jsonify({'error': error}), 400
+    league = db.session.get(SportsLeague, league_id)
+    if league is None:
+        return jsonify({'error': 'That league no longer exists.'}), 404
+    checked, refused = _vouched({'tsdb_id': league.tsdb_id, 'name': league.name}, league, team_ids)
+    if refused:
+        return refused
     before = _sports_served()
-    if not sports_data.set_following(league_id, team_ids):
+    if not sports_data.set_following(league_id, team_ids, checked):
         return jsonify({'error': 'That league no longer exists.'}), 404
     sports_data.ensure_worker()
     return jsonify({'success': True, 'cut': _cut_unserved(before)})
@@ -228,7 +303,8 @@ def _cut_unserved(before) -> int:
 
 @sports_bp.route('/api/sports/events/<int:event_id>/live-now', methods=['PUT'])
 def set_live_now(event_id):
-    """Go live now for one game, on or off (app/sports_feed.py::set_live_now, dev/changelog/1530).
+    """Start broadcast or Stop broadcast for one game (app/sports_feed.py::set_live_now,
+    dev/changelog/1530, 1644).
     The page names the game and nothing else: which channels play it and until when are worked
     out here, from what is stored now."""
     from datetime import datetime
@@ -237,7 +313,7 @@ def set_live_now(event_id):
     from ..tz_utils import get_display_tz, is_24h
     data = request.get_json(silent=True) or {}
     if not isinstance(data.get('on'), bool):
-        return jsonify({'error': 'Say whether Go live now is on.'}), 400
+        return jsonify({'error': 'Say whether to start or stop the broadcast.'}), 400
     fcfg = output_feed.feed_config()
     _before, after = output_feed.sports_window(fcfg)
     now = datetime.utcnow()
@@ -249,16 +325,16 @@ def set_live_now(event_id):
     if done is None:
         return jsonify({'error': 'That game is no longer in the schedule.'}), 404
     if done['on']:
-        log.info('Sports channels: Go live now turned on for %s (event %d) on %s, until %s UTC',
+        log.info('Sports channels: broadcast started early for %s (event %d) on %s, until %s UTC',
                  done['game'], event_id, join_labels(done['channels']), done['until'])
         # A play on a waiting screen moves to the game now, not at its next re-check.
         output_feed.recheck_waiting()
-        message = (f'Go live now is on for {done["game"]} until '
+        message = (f'Broadcasting {done["game"]} early, until '
                    f'{sports_feed.at_clause(done["until"], now, get_display_tz(), is_24h())}.')
     else:
         if done['was_on']:
-            log.info('Sports channels: Go live now turned off for %s (event %d)', done['game'], event_id)
-        message = f'Go live now is off for {done["game"]}.'
+            log.info('Sports channels: early broadcast stopped for %s (event %d)', done['game'], event_id)
+        message = f'Stopped the early broadcast of {done["game"]}.'
     return jsonify({'success': True, 'on': done['on'], 'message': message})
 
 
@@ -419,8 +495,12 @@ def event_listings(event_id):
     if event is None:
         return jsonify({'error': 'That event is no longer stored.'}), 404
     groups = sports_match.listing_groups(event_id, get_display_tz(), is_24h())
+    names = sports_match.name_rows(event_id)
+    for row in [c for g in groups for c in g['channels']] + names:
+        row['url'] = url_for('channels.channel_detail', channel_id=row['channel_id'])
+        row['account']['url'] = url_for('accounts.account_detail', account_id=row['account']['id'])
     league = db.session.get(SportsLeague, event.league_id)
-    return jsonify({'success': True, 'groups': groups, 'names': sports_match.name_rows(event_id),
+    return jsonify({'success': True, 'groups': groups, 'names': names,
                     'skipped': sports_match.skipped_listings(event_id, get_display_tz(), is_24h(),
                                                              one=sports_view.event_noun(league, event)),
                     'league': league.name if league is not None else '',
@@ -437,6 +517,14 @@ def event_record(event_id):
     the listing a rule for the league would pick, a replay, or an event channel, each with the
     dialog's notice saying which and why. Reads only; the save is the ordinary create path."""
     payload, status = sports_view.record_offer(event_id)
+    return jsonify(payload), status
+
+
+@sports_bp.route('/api/sports/events/<int:event_id>/channel-now')
+def event_channel_now(event_id):
+    """Channel it would use (dev/changelog/1639): the channel a recording of this game would start
+    on if it started now, and the one its sports channel would play, each with why. Reads only."""
+    payload, status = sports_view.channel_now(event_id)
     return jsonify(payload), status
 
 

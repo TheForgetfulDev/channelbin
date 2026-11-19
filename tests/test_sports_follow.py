@@ -562,6 +562,97 @@ class RunningTests(Case):
         self.assertEqual(self.rec(second.id).stop_time, self.stop + self.late + POST)
 
 
+class NamedRunningTests(Case):
+    """A rule's recording from an event channel's name, already under way when TheSportsDB moves the
+    game later (dev/changelog/1643): no listing to recompute a window from and no guide start for
+    kept_start(), so its end moves by TheSportsDB's start less the recording's program start, the
+    pick's, from the pick's own end. The same answer on every pass, so the delay is never added
+    twice, and a delay entered in steps adds up."""
+
+    early = timedelta(0)
+    ahead = timedelta(minutes=-30)
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch('app.scheduler.reschedule_recording_stop')
+        self.rearm_stop = p.start()
+        self.addCleanup(p.stop)
+        SportsMatch.query.delete()
+        db.session.get(SportsEvent, self.event.id).guide_start = None
+        db.session.commit()
+
+    def named_rule_recording(self, kind='rule'):
+        rid = self.recording(kind=kind, status='IN_PROGRESS')
+        if kind == 'rule':
+            RuleMatch.query.filter_by(recording_id=rid).update({'sports_event_tsdb_id': 7001})
+            db.session.commit()
+        return rid
+
+    def move(self, by, seen=None):
+        ev = db.session.get(SportsEvent, self.event.id)
+        ev.previous_start, ev.start_at = ev.start_at, self.listed + by
+        ev.start_changed_at = seen or self.now - timedelta(minutes=5)
+        db.session.commit()
+
+    def test_its_end_moves_later_by_the_move_from_the_picks_end_and_its_ledger_with_it(self):
+        rid = self.named_rule_recording()
+        self.move(timedelta(minutes=90))
+        self.assertEqual(self.follow()['extended'], 1)
+        self.assertEqual(self.window(rid), (self.listed - PRE, self.stop + timedelta(minutes=90) + POST))
+        m = RuleMatch.query.filter_by(recording_id=rid).one()
+        self.assertEqual(m.rec_stop_time, self.stop + timedelta(minutes=90) + POST)
+        (ev,) = self.events(rid, RECORDING_SPORTS_RETIMED)
+        self.assertIn('the recording started from, and it changed that after the recording had started', ev.detail)
+        self.assertIn('90 minutes later', ev.detail)
+        self.rearm_stop.assert_called_once_with(rid, self.stop + timedelta(minutes=90) + POST)
+
+    def test_a_second_pass_never_adds_the_delay_twice(self):
+        rid = self.named_rule_recording()
+        self.move(timedelta(minutes=90))
+        self.follow()
+        self.assertEqual(self.follow()['extended'], 0)
+        self.assertEqual(self.window(rid)[1], self.stop + timedelta(minutes=90) + POST)
+        self.assertEqual(len(self.events(rid, RECORDING_SPORTS_RETIMED)), 1)
+
+    def test_a_delay_entered_in_steps_adds_up(self):
+        """previous_start is overwritten at each step for a game no guide lists; the recording's own
+        start is the anchor, so the second step lands on the whole delay."""
+        rid = self.named_rule_recording()
+        self.move(timedelta(minutes=30))
+        self.follow()
+        self.move(timedelta(minutes=75), seen=self.now - timedelta(minutes=1))
+        self.assertEqual(self.follow()['extended'], 1)
+        self.assertEqual(self.window(rid)[1], self.stop + timedelta(minutes=75) + POST)
+
+    def test_with_no_profile_it_keeps_its_padding_and_a_second_pass_adds_nothing(self):
+        """No profile: the padding is the gap to the program, then the one the event stored."""
+        rid = self.recording(kind='rule', status='IN_PROGRESS', profile=False)
+        RuleMatch.query.filter_by(recording_id=rid).update({'sports_event_tsdb_id': 7001})
+        db.session.commit()
+        self.move(timedelta(minutes=45))
+        self.assertEqual(self.follow()['extended'], 1)
+        self.assertEqual(self.follow()['extended'], 0)
+        self.assertEqual(self.window(rid)[1], self.stop + timedelta(minutes=45) + POST)
+
+    def test_a_move_read_before_its_start_changes_nothing(self):
+        rid = self.named_rule_recording()
+        self.move(timedelta(minutes=90), seen=self.listed - timedelta(hours=1))
+        self.assertEqual(self.follow()['extended'], 0)
+        self.assertEqual(self.window(rid), (self.listed - PRE, self.stop + POST))
+
+    def test_a_move_to_another_day_is_a_new_date_not_a_delay(self):
+        rid = self.named_rule_recording()
+        self.move(timedelta(days=1))
+        self.follow()
+        self.assertEqual(self.window(rid), (self.listed - PRE, self.stop + POST))
+
+    def test_a_record_recording_from_a_name_keeps_the_persons_window(self):
+        rid = self.named_rule_recording(kind='record')
+        self.move(timedelta(minutes=90))
+        self.follow()
+        self.assertEqual(self.window(rid), (self.listed - PRE, self.stop + POST))
+
+
 class HookTests(Case):
     def test_a_matcher_run_follows_the_games_times(self):
         from app import sports_match

@@ -294,6 +294,14 @@ def counted(n, one, many=None) -> str:
     return f'{n:,} {plural(n, one, many)}'
 
 
+def length_words(length) -> str:
+    """'1 hour 30 minutes', '45 minutes', 'no time at all': an exact length (a timedelta) in a
+    sentence, whole minutes, where fmt_duration_phrase() rounds an estimate."""
+    hours, rest = divmod(int(length.total_seconds()) // 60, 60)
+    parts = ([counted(hours, 'hour')] if hours else []) + ([counted(rest, 'minute')] if rest else [])
+    return ' '.join(parts) or 'no time at all'
+
+
 def iso_or_none(value):
     """`value.isoformat()`, or None for a None value - the JSON payload spelling of an
     optional datetime. iso_seconds_or_none() below is the second-precision form;

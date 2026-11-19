@@ -134,7 +134,7 @@ class SportsListScriptTests(unittest.TestCase):
 
     def test_a_team_search_offers_that_team_and_follows_it(self):
         self.assertTrue(self.obs['only_team_checked'])
-        self.assertEqual(self.obs['follow_body'], [{'tsdb_id': 9001, 'team_id': 11}])
+        self.assertEqual(self.obs['follow_body'], [{'tsdb_id': 9001, 'team_ids': [11]}])
 
     def test_the_dialog_is_named_for_leagues_and_teams(self):
         """dev/changelog/1497."""
@@ -165,7 +165,8 @@ class SportsListScriptTests(unittest.TestCase):
         self.assertEqual(len(self.obs['choices']), 2)
         self.assertEqual(self.obs['choices_foot'], ['Back', 'Cancel'])
         self.assertIn('Left out, as defunct: Old Reds.', self.obs['choices_text'])
-        self.assertIn('Only Reds Reserves', self.obs['choice_confirm_team'])
+        self.assertIn('Only these teams', self.obs['choice_confirm_team'])
+        self.assertIn('Reds Reserves', self.obs['choice_confirm_team'])
         self.assertFalse(self.obs['best_match_after_choice'])
 
     def test_escape_on_a_later_step_goes_back_with_the_text_kept(self):

@@ -374,7 +374,8 @@ def build_file_playback_cmd(cfg: dict, path: str, out_dir: str, *, offset: float
 
 
 def _hls_window_args(out_dir: str, *, segment_seconds: int, list_size: int,
-                     transcode_audio: bool, live: bool, reencode: bool = False) -> list:
+                     transcode_audio: bool, live: bool, reencode: bool = False,
+                     segment_pattern: str = None, playlist: str = None) -> list:
     """The output half shared by build_preview_cmd and build_file_playback_cmd: one video and
     one audio stream copied (audio to stereo AAC only when the browser cannot decode it) into a
     rolling HLS window. `reencode` re-encodes the video on the GPU (reencode_args(), the device
@@ -391,8 +392,33 @@ def _hls_window_args(out_dir: str, *, segment_seconds: int, list_size: int,
     cmd += ['-f', 'hls', '-hls_time', str(segment_seconds), '-hls_list_size', str(list_size),
             '-hls_delete_threshold', '3',
             '-hls_flags', flags,
-            '-hls_segment_filename', os.path.join(out_dir, PREVIEW_SEGMENT_PATTERN),
-            '-y', os.path.join(out_dir, PREVIEW_PLAYLIST)]
+            '-hls_segment_filename', os.path.join(out_dir, segment_pattern or PREVIEW_SEGMENT_PATTERN),
+            '-y', os.path.join(out_dir, playlist or PREVIEW_PLAYLIST)]
+    return cmd
+
+
+def build_feed_preview_cmd(cfg: dict, out_dir: str, round_no: int, *, segment_seconds: int = 2,
+                           list_size: int = 6, reencode_device: Optional[str] = None) -> list:
+    """ffmpeg command that turns one stretch of an IPTV output play - the MPEG-TS a player is
+    sent, fed on stdin by app/preview.py's pump - into the preview's rolling HLS window, so the
+    browser plays exactly what an IPTV player gets, waiting screen included (dev/changelog/1645).
+
+    One of these runs per `round_no`: the pump starts a new one at each output_feed.SOURCE_MARK,
+    because one ffmpeg reading a pipe does not follow a change of codec in it (measured with
+    ffmpeg 7.1: same codecs with a timestamp jump and a new resolution segmented fine, an AAC
+    track followed by an AC3 one came out as garbage labeled AAC). Each round's playlist and
+    segments carry its number (feed_preview_names), so a player still on the last round can
+    never be handed a segment of this one. Audio is always AAC, whatever the source sends: a
+    round starts before anything says what its audio is, and stereo AAC is about 5% of one core
+    (build_preview_cmd). Video is a copy unless `reencode_device` asks for the GPU re-encode."""
+    playlist, pattern = feed_preview_names(round_no)
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path']), '-hide_banner', '-loglevel', 'error']
+    if reencode_device:
+        cmd += reencode_input_args(reencode_device)
+    cmd += ['-f', 'mpegts', '-i', 'pipe:0']
+    cmd += _hls_window_args(out_dir, segment_seconds=segment_seconds, list_size=list_size,
+                            transcode_audio=True, live=True, reencode=bool(reencode_device),
+                            segment_pattern=pattern, playlist=playlist)
     return cmd
 
 
@@ -401,6 +427,13 @@ def _hls_window_args(out_dir: str, *, segment_seconds: int, list_size: int,
 PREVIEW_PLAYLIST = 'index.m3u8'
 PREVIEW_SEGMENT_PATTERN = 'seg%05d.ts'
 PREVIEW_SEGMENT_RE = re.compile(r'^seg\d{5}\.ts$')
+#: A feed preview's round's segments (build_feed_preview_cmd): the round's number, then the name.
+FEED_PREVIEW_SEGMENT_RE = re.compile(r'^r(\d{3,})-seg\d{5}\.ts$')
+
+
+def feed_preview_names(round_no: int) -> tuple:
+    """(playlist name, segment pattern) of one round of a feed preview."""
+    return f'r{round_no:03d}.m3u8', f'r{round_no:03d}-{PREVIEW_SEGMENT_PATTERN}'
 
 
 #: How long a forward timestamp jump a capture, a preview and a conversion keep as a gap

@@ -44,6 +44,16 @@ Rules this module enforces, each of which a test in tests/test_preview.py guards
   writing (CapturePlace, dev/changelog/1316). The recorder never learns it is there: the
   reaper reads its live state and ends the follower, by name, when that segment is left or
   the capture stops, and the player starts the next session itself.
+* A feed session (start_feed_preview, dev/changelog/1645) plays one of ChannelBin's own channels
+  on the IPTV output - a group, a sports channel, an Up next channel - as an IPTV player gets
+  it, waiting screen included: it starts a real output play (output_feed.start_session with
+  preview=True) and a pump thread feeds that play's bytes into the HLS segmenter. The play, not
+  the session, holds the provider seat, and only while it carries a game, so the waiting screen
+  and Up next use no connection; a recording preempts or moves it as it would a player's. The
+  segmenter is restarted at every output_feed.SOURCE_MARK - a new round - because one ffmpeg
+  does not follow a codec change inside its input, and the player re-attaches to each round.
+  Every end stops the round's ffmpeg and the play; a play that ends on its own ends the session
+  as REASON_PLAY_ENDED with the play's own reason.
 
 Session state is process-local (like recorder._active): a restart kills the ffmpeg this
 process owned, so there is nothing to recover. Full reasoning: dev/changelog/1018.
@@ -67,8 +77,9 @@ from .account_links import (is_credential_refusal, is_resolution_failure,
                             note_refusal_for_holder, render_held_login,
                             roll_host_for_channel)
 from .config import resolve_ffmpeg_path
-from .proc_utils import (PREVIEW_PLAYLIST, PREVIEW_SEGMENT_RE, build_file_playback_cmd,
-                         build_preview_cmd, read_stderr_tail, stderr_cause, terminate_or_kill)
+from .proc_utils import (FEED_PREVIEW_SEGMENT_RE, PREVIEW_PLAYLIST, PREVIEW_SEGMENT_RE,
+                         build_feed_preview_cmd, build_file_playback_cmd, build_preview_cmd,
+                         feed_preview_names, read_stderr_tail, stderr_cause, terminate_or_kill)
 from .recording_story import http_answer, plain_cause
 from .url_utils import mask_creds_in_text
 
@@ -101,6 +112,8 @@ REASON_SEGMENT_CHANGED = 'segment_changed'
 REASON_CAPTURE_STOPPED = 'capture_stopped'
 # Re-encoding sessions only (dev/changelog/1461).
 REASON_CONVERSION_STARTED = 'conversion_started'
+# Feed sessions only (dev/changelog/1645): the IPTV output's play ended on its own.
+REASON_PLAY_ENDED = 'play_ended'
 
 REASON_TEXT = {
     REASON_USER: 'Stopped.',
@@ -120,6 +133,13 @@ REASON_TEXT = {
     REASON_CAPTURE_STOPPED: 'The recording stopped capturing.',
     REASON_CONVERSION_STARTED: ('Stopped - a recording started converting, and a conversion comes '
                                 'before a re-encoded picture. Try again once it has finished.'),
+    REASON_PLAY_ENDED: 'The IPTV output stopped playing it.',
+}
+
+# Where a channel's wording does not fit a feed session.
+FEED_REASON_TEXT = {
+    REASON_CONNECT_TIMEOUT: 'Stopped - the IPTV output sent nothing playable in time.',
+    REASON_FFMPEG_EXITED: 'The preview\'s ffmpeg stopped reading the IPTV output.',
 }
 
 # Where a channel's wording does not fit a recording's file.
@@ -144,6 +164,13 @@ FOLLOW_START_SECONDS = 60.0
 
 SOURCE_CHANNEL = 'channel'
 SOURCE_FILE = 'file'
+SOURCE_FEED = 'feed'
+
+# How long a feed session's round may go without a playable segment: from the play starting or
+# a source mark to the first segment of the next round. Longer than a channel's connect timeout,
+# because the play itself may spend that long failing over between channels before it sends
+# anything (output_feed.CONNECT_TIMEOUT_SECONDS per channel).
+FEED_ROUND_START_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -283,6 +310,16 @@ class PreviewSession:
     # The video is re-encoded on the GPU (dev/changelog/1461); the session yields to a
     # conversion.
     reencode: bool = False
+    # Feed sessions: the feed id, the output's play (output_feed.RelaySession), the round its
+    # segmenter is on and when that round began, what the play is playing as the round began,
+    # the render node each round re-encodes on, and the config each round is built from.
+    feed_id: Optional[int] = None
+    relay: Optional[object] = field(default=None, repr=False)
+    round_no: int = 0
+    round_started_mono: float = 0.0
+    now_playing: str = ''
+    reencode_device: str = field(default='', repr=False)
+    cfg: Optional[dict] = field(default=None, repr=False)
     # _finish() claims a session under _lock and tears it down under _teardown_lock, so a
     # second finisher blocks until the first is done rather than returning early.
     _finishing: bool = False
@@ -294,10 +331,14 @@ class PreviewSession:
 
     @property
     def playlist_path(self) -> str:
+        if self.source == SOURCE_FEED:
+            return os.path.join(self.dir, feed_preview_names(self.round_no)[0])
         return os.path.join(self.dir, PREVIEW_PLAYLIST)
 
     @property
     def label(self) -> str:
+        if self.source == SOURCE_FEED:
+            return f'IPTV output feed {self.feed_id} ({self.channel_name})'
         if self.source == SOURCE_FILE and self.capture is not None:
             where = 'following' if self.following else f'from {self.offset:.0f}s of'
             return (f'recording {self.recording_id} ({self.recording_name}), {where} segment '
@@ -311,6 +352,8 @@ class PreviewSession:
             return ''
         if self.following and self.reason in FOLLOW_REASON_TEXT:
             return FOLLOW_REASON_TEXT[self.reason]
+        if self.source == SOURCE_FEED and self.reason in FEED_REASON_TEXT:
+            return FEED_REASON_TEXT[self.reason]
         if self.source == SOURCE_FILE and self.reason in FILE_REASON_TEXT:
             return FILE_REASON_TEXT[self.reason]
         return REASON_TEXT.get(self.reason, '')
@@ -335,6 +378,9 @@ class PreviewSession:
             'detail': self.detail,
             'transcode_audio': self.transcode_audio,
             'reencode': self.reencode,
+            'feed_id': self.feed_id,
+            'round': self.round_no,
+            'now_playing': self.now_playing,
             'elapsed_seconds': round(now - self.started_mono, 1) if self.started_mono else 0,
             'max_seconds': self.max_seconds,
         }
@@ -591,6 +637,247 @@ def start_file_playback(recording_id: int, recording_name: str, path: str, offse
     return session
 
 
+def start_feed_preview(feed_id: int, reencode: bool = False) -> PreviewSession:
+    """Preview `feed_id` - a group, a sports channel or an Up next channel on the IPTV output - as an
+    IPTV player gets it, replacing whatever session is being watched. Raises PreviewRefused with a
+    user-facing message: the play's own refusal (404 for a feed id the output does not serve, 409
+    when nothing can play, 503 at "IPTV players at once"), 409 for a re-encode that may not start,
+    500 when the directory cannot be made. Requires an app context; the returned session is
+    registered and reaped, and its pump is running.
+
+    The session holds no seat: the play is a real one and takes its own, only while it carries a
+    game (output_feed.start_session(preview=True)). The watched session is replaced before the play
+    starts, so a preview already holding the one play "IPTV players at once" allows gives its place
+    to this one."""
+    from . import output_feed
+    from .config import load_config
+
+    cfg = load_config()
+    pcfg = cfg.get('preview', {}) or {}
+    device = ''
+    if reencode:
+        device, why = reencode_device(cfg)
+        if not device:
+            raise PreviewRefused(why, 409)
+    watched = live_session(PURPOSE_WATCH)
+    if watched is not None:
+        _finish(watched, REASON_REPLACED)
+
+    session = PreviewSession(
+        id=secrets.token_urlsafe(12),
+        channel_id=None,
+        channel_name='',
+        account_id=None,
+        dir='',
+        stderr_path='',
+        transcode_audio=True,
+        idle_timeout=float(pcfg.get('idle_timeout_seconds', 15)),
+        max_seconds=float(pcfg.get('max_seconds', 600)),
+        connect_timeout=max(float(pcfg.get('connect_timeout_seconds', 20)), FEED_ROUND_START_SECONDS),
+        started_mono=time.monotonic(),
+        source=SOURCE_FEED,
+        feed_id=feed_id,
+        reencode=bool(device),
+        reencode_device=device,
+        cfg=cfg,
+    )
+    session.round_started_mono = session.started_mono
+    with _lock:
+        _sessions[session.id] = session
+        _prune_ended_locked()
+    try:
+        session.dir = tempfile.mkdtemp(prefix='channelbin-preview-', dir=pcfg.get('dir') or None)
+    except OSError as exc:
+        _finish(session, REASON_LAUNCH_FAILED, detail=str(exc))
+        raise PreviewRefused(f'Could not create the preview directory: {exc}', 500)
+
+    try:
+        relay = output_feed.start_session(feed_id, output_feed.PREVIEW_CLIENT, cfg, preview=True)
+    except output_feed.FeedRefused as exc:
+        _finish(session, REASON_LAUNCH_FAILED, detail=exc.message)
+        raise PreviewRefused(exc.message, exc.status)
+    # Handed over under the lock _finish() claims under: a stop that claimed first finds no play
+    # and the play is stopped here; one that claims after finds it on the session.
+    with _lock:
+        ending = not session.live or session._finishing
+        if not ending:
+            session.relay = relay
+            session.channel_name = relay.label
+            session.now_playing = _feed_now_playing(relay)
+    if ending:
+        output_feed.stop_session(relay.id, output_feed.REASON_CLIENT_GONE,
+                                 detail='The preview in ChannelBin ended as the play started.')
+        raise PreviewRefused(session.reason_text() or REASON_TEXT[REASON_REPLACED], 409)
+    log.info('Preview %s: %s through play %s, now on %s%s', session.id, session.label, relay.id,
+             session.now_playing, _encoding_note(session))
+    threading.Thread(target=_pump, args=(session,), daemon=True,
+                     name=f'preview-pump-{session.id}').start()
+    _ensure_reaper()
+    return session
+
+
+def _feed_now_playing(relay) -> str:
+    """What the output's play is on right now, in the words the preview shows."""
+    from . import output_feed
+    if relay.showing:
+        return output_feed.PICTURE_NAME
+    if relay.waiting:
+        return output_feed.SCREEN_NAME
+    return f'"{relay.channel_name}"' if relay.channel_name else 'the stream'
+
+
+def _pump(session: PreviewSession) -> None:
+    """Feed the output's play into the session's segmenter until either ends: a new round at the
+    first bytes after each source mark, a write into the round's ffmpeg for everything else. The
+    play's own reader drains the provider whatever happens here, so a slow segmenter can only fill
+    the play's ring (output_feed.Ring), never stall a provider read. When the play ends on its own
+    the session ends REASON_PLAY_ENDED with the play's reason; a round's ffmpeg that stops taking
+    input ends it REASON_FFMPEG_EXITED with its exit code and stderr; when the session ends first,
+    its _finish() stops the play with the preview's reason before the body here is closed, so the
+    play's record names why. Never joined: it ends by itself within a second of either side
+    stopping (output_feed.stream's take timeout), and _finish() can run on it."""
+    from . import output_feed
+    relay = session.relay
+    body = output_feed.stream(relay, marks=True)
+    pending = True       # the next bytes start a round
+    died = None          # a round's ffmpeg that stopped taking input
+    exhausted = False    # the play ended on its own
+    try:
+        for chunk in body:
+            if not session.live or session._finishing:
+                break
+            if chunk is output_feed.SOURCE_MARK:
+                if not pending:
+                    _end_round(session)
+                    pending = True
+                continue
+            if pending:
+                if not _start_round(session):
+                    break
+                pending = False
+            with _lock:
+                proc = session.proc
+            if proc is None:
+                break
+            try:
+                proc.stdin.write(chunk)
+            except (OSError, ValueError):
+                # Killed by a stop (a closed pipe), or it exited on its own: _segment_died() tells
+                # the two apart and names the second.
+                died = proc
+                break
+        else:
+            exhausted = True
+    finally:
+        if died is not None:
+            _segmenter_died(session, died)
+        with _lock:
+            finishing = session._finishing
+        if finishing:
+            # The finisher stops the play with the preview's reason; closing the body first would
+            # end it as a player gone, with nothing said.
+            with session._teardown_lock:
+                pass
+        body.close()
+    with _lock:
+        ended_first = exhausted and session.live and not session._finishing and not relay.live
+    if ended_first:
+        said = relay.reason_text() or relay.reason or ''
+        _finish(session, REASON_PLAY_ENDED, detail=' '.join(t for t in (said, relay.detail) if t))
+
+
+def _segmenter_died(session: PreviewSession, proc) -> None:
+    """The pump could not write into `proc`. Unless a stop or a source mark took it off the session
+    (both clear session.proc first), it stopped taking input on its own: end the session by name with
+    its exit code and stderr, before the play is let go, so the play's record says the preview ended
+    and why. One that is still running but not reading is killed here."""
+    with _lock:
+        ours = session.proc is proc and session.live and not session._finishing
+    if not ours:
+        return
+    try:
+        rc = proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        rc = None
+    tail = read_stderr_tail(session.stderr_path) if session.stderr_path else ''
+    said = f'ffmpeg exited with code {rc}' if rc is not None else 'ffmpeg stopped reading the IPTV output'
+    _finish(session, REASON_FFMPEG_EXITED, detail=said + (f': {tail}' if tail else ''))
+
+
+def _start_round(session: PreviewSession) -> bool:
+    """Start the next round's segmenter, reading stdin. False when the session is ending, or when
+    ffmpeg could not start, which ends it by name."""
+    with _lock:
+        if not session.live or session._finishing:
+            return False
+        session.round_no += 1
+        round_no = session.round_no
+        session.state = STATE_STARTING
+        session.round_started_mono = time.monotonic()
+        session.ready_mono = None
+        session.now_playing = _feed_now_playing(session.relay)
+    pcfg = session.cfg.get('preview', {}) or {}
+    stderr_path = os.path.join(session.dir, f'ffmpeg-r{round_no:03d}.stderr')
+    cmd = build_feed_preview_cmd(session.cfg, session.dir, round_no,
+                                 segment_seconds=int(pcfg.get('segment_seconds', 2)),
+                                 reencode_device=session.reencode_device or None)
+    try:
+        # stderr to a file, never a pipe (dev/changelog/430); stdin is the pump's to write.
+        with open(stderr_path, 'wb') as err:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
+    except OSError as exc:
+        log.error('Preview %s: could not start round %d: %s', session.id, round_no, exc)
+        _finish(session, REASON_LAUNCH_FAILED, detail=str(exc))
+        return False
+    with _lock:
+        adopt = session.live and not session._finishing
+        if adopt:
+            session.proc = proc
+            session.stderr_path = stderr_path
+    if not adopt:
+        _kill_round(proc)
+        return False
+    log.info('Preview %s: round %d, %s - %s', session.id, round_no, session.now_playing, ' '.join(cmd))
+    return True
+
+
+def _kill_round(proc) -> None:
+    """Stop one round's segmenter. Killed outright, and killed BEFORE its stdin is closed: a pump
+    blocked writing into a segmenter that stopped reading holds the pipe's lock, so a close first
+    would wait on that write forever, and the kill is what ends the write."""
+    if proc is None:
+        return
+    terminate_or_kill(proc, hard=True)
+    try:
+        proc.stdin.close()
+    except (OSError, ValueError):
+        pass   # already closed by a write that failed, or by the other finisher
+
+
+def _end_round(session: PreviewSession) -> None:
+    """A source mark: stop this round's segmenter and delete its files. The session goes back to
+    STARTING, so the player lets go of the round and waits for the next one."""
+    with _lock:
+        proc, round_no = session.proc, session.round_no
+        session.proc = None
+        if session.live and not session._finishing:
+            session.state = STATE_STARTING
+            session.round_started_mono = time.monotonic()
+    _kill_round(proc)
+    prefix = feed_preview_names(round_no)[0].rsplit('.', 1)[0]
+    try:
+        names = os.listdir(session.dir)
+    except OSError:
+        names = []   # the directory went with a stop; nothing left to delete
+    for name in names:
+        if name.startswith(prefix):
+            try:
+                os.unlink(os.path.join(session.dir, name))
+            except OSError:
+                pass   # already gone
+    log.info('Preview %s: round %d ended - the IPTV output moved to another source', session.id, round_no)
+
+
 def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
     """Tear down everything `session` acquired - ffmpeg, the connection slot, the segment
     directory - and only THEN mark it STOPPED with `reason`. The order is the contract:
@@ -607,16 +894,26 @@ def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
             # Taken under _lock so no later caller can slip in ahead of the claimant.
             session._teardown_lock.acquire()
         proc = session.proc
+        relay = session.relay
     if not claimed:
         with session._teardown_lock:
             return False
     try:
         try:
-            # A follower waiting at the end of a growing file does not act on the one SIGTERM
-            # terminate_or_kill sends, so it would sit out the whole grace before the SIGKILL
-            # (measured, dev/changelog/1316). Its output is a throwaway window with no
-            # trailer to finish, and a seek waits on this teardown.
-            terminate_or_kill(proc, hard=session.following)
+            if session.source == SOURCE_FEED:
+                # The play first, with the preview's reason, then the round: the pump closes the play's
+                # body when the round's pipe breaks, and a play ended by that close says nothing.
+                try:
+                    if relay is not None:
+                        _stop_play(relay, reason)
+                finally:
+                    _kill_round(proc)
+            else:
+                # A follower waiting at the end of a growing file does not act on the one SIGTERM
+                # terminate_or_kill sends, so it would sit out the whole grace before the SIGKILL
+                # (measured, dev/changelog/1316). Its output is a throwaway window with no
+                # trailer to finish, and a seek waits on this teardown.
+                terminate_or_kill(proc, hard=session.following)
         finally:
             try:
                 if session.source == SOURCE_CHANNEL:
@@ -632,11 +929,21 @@ def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
         session._teardown_lock.release()
     level = (logging.INFO if reason in (REASON_USER, REASON_REPLACED, REASON_CAPTURED,
                                         REASON_FILE_END, REASON_SEGMENT_CHANGED,
-                                        REASON_CAPTURE_STOPPED, REASON_CONVERSION_STARTED)
+                                        REASON_CAPTURE_STOPPED, REASON_CONVERSION_STARTED,
+                                        REASON_PLAY_ENDED)
              else logging.WARNING)
     log.log(level, 'Preview %s: %s stopped - %s%s', session.id, session.label, reason,
             f' ({detail})' if detail else '')
     return True
+
+
+def _stop_play(relay, reason: str) -> None:
+    """End a feed session's play and its seat, saying the preview ended and why. A play that has
+    already ended (why this session is ending) is left as it is."""
+    from . import output_feed
+    why = REASON_TEXT.get(reason, reason)
+    output_feed.stop_session(relay.id, output_feed.REASON_CLIENT_GONE,
+                             detail=f'The preview in ChannelBin ended: {why}')
 
 
 def stop_preview(session_id: str, reason: str = REASON_USER) -> bool:
@@ -679,12 +986,15 @@ def preempt_for_account(account_id: int) -> bool:
     return bool(matched)
 
 
-def touch_playlist(session_id: str) -> Optional[str]:
+def touch_playlist(session_id: str, round_no: Optional[int] = None) -> Optional[str]:
     """Path of the session's playlist for the route to serve, or None. A fetch is the
     player's heartbeat: it moves the idle clock, which is what lets a closed tab be
-    noticed without the browser ever saying goodbye."""
+    noticed without the browser ever saying goodbye. A feed session serves only the round it
+    is on (`round_no`), so a player still on the last one is told it is gone."""
     session = get_session(session_id)
     if session is None or not session.live:
+        return None
+    if session.source == SOURCE_FEED and round_no != session.round_no:
         return None
     path = session.playlist_path
     if not os.path.exists(path):
@@ -698,10 +1008,14 @@ def touch_playlist(session_id: str) -> Optional[str]:
 def segment_path(session_id: str, name: str) -> Optional[str]:
     """Path of one segment file, or None. `name` must match exactly what ffmpeg names its
     segments - anything else (a traversal, the stderr spool, the playlist) is None."""
-    if not PREVIEW_SEGMENT_RE.match(name or ''):
-        return None
     session = get_session(session_id)
     if session is None or not session.live:
+        return None
+    if session.source == SOURCE_FEED:
+        m = FEED_PREVIEW_SEGMENT_RE.match(name or '')
+        if m is None or int(m.group(1)) != session.round_no:
+            return None
+    elif not PREVIEW_SEGMENT_RE.match(name or ''):
         return None
     path = os.path.join(session.dir, name)
     if not os.path.isfile(path):
@@ -871,6 +1185,9 @@ def _check(session: PreviewSession):
     if session.source == SOURCE_FILE:
         _check_file(session)
         return
+    if session.source == SOURCE_FEED:
+        _check_feed(session)
+        return
     now = time.monotonic()
     proc = session.proc
     rc = proc.poll() if proc is not None else None
@@ -887,6 +1204,39 @@ def _check(session: PreviewSession):
             tail = mask_creds_in_text(read_stderr_tail(session.stderr_path))
             _finish(session, REASON_CONNECT_TIMEOUT, detail=stream_stop_detail(tail))
             _roll_if_unresolved(session, tail)
+            return
+    if session.state == STATE_READY and session.last_seen_mono is not None:
+        if now - session.last_seen_mono > session.idle_timeout:
+            _finish(session, REASON_IDLE)
+            return
+    if now - session.started_mono > session.max_seconds:
+        _finish(session, REASON_MAX_DURATION)
+
+
+def _check_feed(session: PreviewSession):
+    """The reaper's rules for a feed session. The play's own end is the pump's to name; here are
+    the round's ffmpeg exiting by itself, a round that gives nothing playable in time, the idle
+    timeout and the hard cap. Between rounds (no ffmpeg) only the time limits apply."""
+    now = time.monotonic()
+    with _lock:
+        proc = session.proc
+    rc = proc.poll() if proc is not None else None
+    if rc is not None:
+        with _lock:
+            still = session.proc is proc
+        if still:
+            # Not a round the pump ended at a mark: _end_round() takes proc off before the kill.
+            tail = read_stderr_tail(session.stderr_path) if session.stderr_path else ''
+            _finish(session, REASON_FFMPEG_EXITED,
+                    detail=f'ffmpeg exited with code {rc}' + (f': {tail}' if tail else ''))
+            return
+    if session.state == STATE_STARTING:
+        if proc is not None and _playlist_is_playable(session.playlist_path):
+            _mark_ready(session, now)
+        elif now - session.round_started_mono > session.connect_timeout:
+            _finish(session, REASON_CONNECT_TIMEOUT,
+                    detail=f'Nothing playable for {session.connect_timeout:.0f}s; it was on '
+                           f'{session.now_playing}.')
             return
     if session.state == STATE_READY and session.last_seen_mono is not None:
         if now - session.last_seen_mono > session.idle_timeout:

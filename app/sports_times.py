@@ -34,7 +34,7 @@ from .sports_data import event_shape_is_matchup
 # AGREE: starts this close are the same start. OFF_LIMIT: a listing further than this from the guide's
 # time for the game is another airing of it, a replay or a re-air, and never moves.
 # WINDOW: the matcher's reach around TheSportsDB's start; a gap past it is no listing of this game.
-from .sports_match import AGREE, OFF_LIMIT, WINDOW, kept_start
+from .sports_match import AGREE, MAX_DELAY, OFF_LIMIT, WINDOW, kept_start
 
 GO_TSDB = 'tsdb'
 GO_GUIDE = 'guide'
@@ -156,6 +156,21 @@ def running_late(event) -> timedelta:
         return timedelta(0)
     late = event.start_at - event.previous_start
     return late if late > AGREE else timedelta(0)
+
+
+def name_late(event, start) -> timedelta:
+    """running_late() for a recording made from an event channel's name at `start` (its program
+    start, the pick's): how much later TheSportsDB now has the game, when it moved it after `start`
+    had passed. An unlisted game never has the guide start kept_start() reads, and its
+    previous_start is overwritten at each step of a delay entered in steps, so the recording's own
+    start is the anchor, and the same answer comes back on every pass (dev/changelog/1643). Zero for
+    a move read before `start`, one earlier or within AGREE, one past MAX_DELAY (a new date), and a
+    postponed game."""
+    if (start is None or event.start_at is None or event.postponed or event.start_changed_at is None
+            or event.start_changed_at < start):
+        return timedelta(0)
+    late = event.start_at - start
+    return late if AGREE < late <= MAX_DELAY else timedelta(0)
 
 
 def windows(start, stop, listed, tsdb, rule: Rule, now: datetime, late: timedelta = timedelta(0)) -> list:

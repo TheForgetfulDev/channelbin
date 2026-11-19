@@ -13,10 +13,10 @@ const LIVE = fs.readFileSync(`${REPO}/static/js/live-now.js`, 'utf8');
 const channels = JSON.stringify(['Ironvale Bears', 'Pretend League 3']).replace(/"/g, '&quot;');
 const PAGE = `<!doctype html><html><head><meta name="csrf-token" content="t"></head><body>
   <button id="on" data-act="live-now" data-event="7" data-on="0" data-channels="${channels}"
-    data-message="Gulls at Bears is scheduled to start today at 7:00 PM.">Go live now</button>
-  <button id="off" data-act="live-now" data-event="7" data-on="1">Turn off Go live now</button>
-  <button id="why" data-act="live-now" data-event="8" data-on="0" data-why="No sports channel carries it.">Go live now</button>
-  <button id="stale" data-act="live-now" data-event="13" data-on="1">Turn off Go live now</button>
+    data-message="Gulls at Bears is scheduled to start today at 7:00 PM.">Start broadcast</button>
+  <button id="off" data-act="live-now" data-event="7" data-on="1">Stop broadcast</button>
+  <button id="why" data-act="live-now" data-event="8" data-on="0" data-why="No sports channel carries it.">Start broadcast</button>
+  <button id="stale" data-act="live-now" data-event="13" data-on="1">Stop broadcast</button>
 </body></html>`;
 
 const errors = [];
@@ -34,7 +34,7 @@ w.fetch = async (url, opts = {}) => {
   calls.push({ url, method: opts.method, body: opts.body ? JSON.parse(opts.body) : null });
   const refused = url.includes('/13/');
   const body = refused ? { error: 'That game is no longer in the schedule.' }
-    : { success: true, message: 'Go live now is on for Gulls at Bears until 12:30 AM.' };
+    : { success: true, message: 'Broadcasting Gulls at Bears early, until 12:30 AM.' };
   return { ok: !refused, status: refused ? 409 : 200, statusText: '', json: async () => body };
 };
 w.eval(UTIL);

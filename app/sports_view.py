@@ -20,7 +20,7 @@ from .database import (
 )
 from .config import load_config
 from .sports_times import Rules
-from .fmt_utils import counted, fmt_duration_phrase, plural
+from .fmt_utils import counted, fmt_duration_phrase, length_words, plural
 from .sports_data import (
     MISSING_KEEP_DAYS, ONE_GAME_KINDS, ROUND_ROW_CAP, SHIPPED_LEAGUES, search_parts, _settings, capped_spans, event_game_name, event_shape_is_matchup,
     link_has_time, queue_line, seconds_until_call, _is_day,
@@ -357,7 +357,7 @@ def list_context() -> dict:
             'count': len(mine) if lfollows else 0,
             'updated': ago(updated, now), 'updated_at': format_local(updated, 'day_datetime', none_value='', tz=tz, h24=h24),
             'updated_sort': int((now - updated).total_seconds()) if updated else 10 ** 9,
-            'has_teams': any(event_shape_is_matchup(e) for e in events),
+            'has_teams': _can_change_teams([f for f in lfollows if not f.rule_id], events),
             # The person's own follow, as on the league's page; a rule's is changed on the rule.
             'dialog': _dialog(league, [f for f in lfollows if not f.rule_id], teams, events, settings,
                               sorted(rule_names[f.rule_id] for f in lfollows if f.rule_id in rule_names),
@@ -385,20 +385,49 @@ def _dialog(league, follows, teams, events, settings, rules=(), one='game', many
     """What the row's dialogs act on, read from the row itself so it is never older than the page.
     `rules` names the auto-record rules that name the league, so Delete league says it cannot before
     it is pressed (dev/changelog/1491). `one` and `many` are the league's noun, so a dialog never
-    calls a race a game."""
+    calls a race a game. `teams` lists the teams in `events`, which Change teams ticks; with none
+    and `has_schedule`, the league has no teams to pick (a racing series). `chosen_names` names a
+    followed team with no game here yet, which the dialog adds to by search (dev/changelog/1641)."""
     names = {}
     for e in events:
         if e.home_team_id:
             names[e.home_team_id] = e.home_name
         if e.away_team_id:
             names[e.away_team_id] = e.away_name
-    return {'id': league.id, 'name': league.name, 'stored': len(events), 'keep_days': settings['history_keep_days'],
-            'one': one, 'many': many,
-            'chosen': sorted(f.team_tsdb_id for f in follows if f.team_tsdb_id),
+    chosen = sorted(f.team_tsdb_id for f in follows if f.team_tsdb_id)
+    return {'id': league.id, 'tsdb_id': league.tsdb_id, 'name': league.name, 'stored': len(events),
+            'keep_days': settings['history_keep_days'], 'one': one, 'many': many,
+            'chosen': chosen, 'chosen_names': {i: teams.get(i) or names.get(i) or str(i) for i in chosen},
             'whole': any(f.team_tsdb_id == 0 for f in follows),
-            'followed': bool(follows), 'rules': list(rules),
+            'followed': bool(follows), 'rules': list(rules), 'has_schedule': bool(events),
             'teams': sorted(({'id': i, 'name': teams.get(i) or n} for i, n in names.items()),
                             key=lambda t: t['name'] or '')}
+
+
+def _can_change_teams(person, events) -> bool:
+    """Change teams shows for a league with games between teams, and for one a person follows by team
+    before any of its games are here, whose teams the dialog finds by search (dev/changelog/1641)."""
+    return any(event_shape_is_matchup(e) for e in events) or any(f.team_tsdb_id for f in person)
+
+
+def follow_state(league) -> dict:
+    """What a lookup says about a league already here, beside TheSportsDB's own answer: the same
+    data as the league's row on the list page, so the Add dialog's picker starts from what the person
+    follows now. A fixed number of queries."""
+    from .database import AutoRule
+    now = datetime.utcnow()
+    tz = get_display_tz()
+    settings = _settings()
+    events = [e for e in _upcoming_query(now, settings, tz).filter(SportsEvent.league_id == league.id).all()
+              if _still_ahead(e, now, tz)]
+    follows = SportsFollow.query.filter_by(league_id=league.id).all()
+    ids = {f.team_tsdb_id for f in follows if f.team_tsdb_id}
+    ids |= {i for e in events for i in (e.home_team_id, e.away_team_id) if i}
+    teams = ({t.tsdb_id: t.full_name for t in SportsTeam.query.filter(SportsTeam.tsdb_id.in_(ids))} if ids else {})
+    rule_ids = {f.rule_id for f in follows if f.rule_id}
+    rules = (sorted(n for (n,) in db.session.query(AutoRule.name).filter(AutoRule.id.in_(rule_ids))) if rule_ids else [])
+    one, many = _noun(league, events)
+    return _dialog(league, [f for f in follows if not f.rule_id], teams, events, settings, rules, one=one, many=many)
 
 
 def _round_dates(league_id, now, tz) -> dict:
@@ -796,7 +825,7 @@ def page_context(league_id: int, scope: str = SCOPE_FOLLOWED, page: int = 1, fee
                           sorted({r['name'] for r in rule_follows}), one=one, many=many),
         'rule_follows': rule_follows,
         'feed': feed,
-        'can_change_teams': any(event_shape_is_matchup(e) for e in all_events),
+        'can_change_teams': _can_change_teams(person, all_events),
         'section_names': {**SECTION_NAMES, 'upcoming': f'Upcoming {many}', 'times': f'{one.capitalize()} time settings'},
         'league_url': f'https://www.thesportsdb.com/league/{league.tsdb_id}',
     }
@@ -995,21 +1024,26 @@ def _guide_cell(event, c, n, checked_at, guide_end, now, tz) -> dict:
 
 
 def _live_now(events, counts, cfg, now, tz, h24) -> dict:
-    """{event id: Go live now's offer} for each shown game the guide has found, and none for the
-    rest: before that there is no channel to play (dev/changelog/1530). The playable listings, the
-    served sports channels and the blocked accounts are read once for every game together."""
+    """{event id: Start broadcast's offer} for each shown game the guide has found or only a channel's
+    name gives (dev/changelog/1643), and none for the rest: before that there is no channel to play
+    (dev/changelog/1530). None for a game whose own time on air has come (dev/changelog/1644). The playable listings, the games only a name gives, the served sports
+    channels and the blocked accounts are read once for every game together."""
     from . import output_feed, sports_feed
     from .channel_groups import blocked_account_ids_now
-    found = [e for e in events if (counts.get(e.id) or {}).get('channels')]
+    if not events:
+        return {}
+    named = sports_feed.name_sources({e.league_id for e in events}, now)
+    found = [e for e in events if (counts.get(e.id) or {}).get('channels') or e.id in named]
     if not found:
         return {}
     fcfg = output_feed.feed_config(cfg)
-    _before, after = output_feed.sports_window(fcfg)
+    before, after = output_feed.sports_window(fcfg)
     blocked, allowed = blocked_account_ids_now(), output_feed.allowed_account_ids(fcfg)
     listings = sports_match.listing_windows([e.id for e in found], now)
     carrying = sports_feed.carriers(sports_feed.served_channels(), found)
     return {e.id: sports_feed.live_now_offer(e, listings.get(e.id, ()), [c.name for c in carrying.get(e.id, ())],
-                                             now, after, tz, h24, blocked=blocked, allowed=allowed)
+                                             now, before, after, tz, h24, blocked=blocked, allowed=allowed,
+                                             named=named.get(e.id))
             for e in found}
 
 
@@ -1265,12 +1299,6 @@ def _day_words(dt, now, tz) -> str:
     return day.lower() if day in ('Today', 'Tomorrow', 'Yesterday') else f'on {day}'
 
 
-def _length_words(length: timedelta) -> str:
-    hours, rest = divmod(int(length.total_seconds()) // 60, 60)
-    parts = ([counted(hours, 'hour')] if hours else []) + ([counted(rest, 'minute')] if rest else [])
-    return ' '.join(parts) or 'no time at all'
-
-
 def _goes_by_words(league, rule) -> str:
     """'NBA goes by TheSportsDB, the default for every league,': the clause a notice leads its
     times with (app/sports_times.py)."""
@@ -1299,7 +1327,7 @@ def listing_times(event, league, rule, start, stop, one, now, tz, h24) -> tuple:
     if not acts(listed, tsdb, rule, now):
         away = min(tsdb, listed) - now
         far = (counted(round(away / timedelta(days=1)), 'day') if away >= timedelta(hours=48)
-               else _length_words(away))
+               else length_words(away))
         then = ("moves it to TheSportsDB's time" if rule.go_by == GO_TSDB else 'widens it to cover both')
         return wins[0], (f"{both} {league.name} goes by TheSportsDB's time only from "
                          f"{counted(rule.wait_hours, 'hour')} before a {one}, and this one is {far} away, so the "
@@ -1310,13 +1338,13 @@ def listing_times(event, league, rule, start, stop, one, now, tz, h24) -> tuple:
     if rule.go_by == GO_TSDB:
         w_start, w_stop = wins[0]
         end = (f'ends with the listing, at {clock(w_stop)}' if w_stop == stop
-               else f'ends {_length_words(w_stop - stop)} after the listing, at {clock(w_stop)}')
+               else f'ends {length_words(w_stop - stop)} after the listing, at {clock(w_stop)}')
         return wins[0], f'{both} {goes} so the recording starts at {clock(w_start)} and {end}.{follows}'
     if rule.go_by != GO_BOTH:
         raise ValueError(f'unknown answer {rule.go_by!r}')
     if len(wins) == 1:
         return wins[0], f'{both} {goes} so the recording runs from {clock(wins[0][0])} to {clock(wins[0][1])}.{follows}'
-    return wins[0], (f"TheSportsDB has the {one} at {clock(tsdb)}, {_length_words(abs(tsdb - start))} from the "
+    return wins[0], (f"TheSportsDB has the {one} at {clock(tsdb)}, {length_words(abs(tsdb - start))} from the "
                      f"listing's {clock(start)}. That is more than the {rule.cover_both_minutes}-minute "
                      f"limit for covering both in one recording, so this recording keeps the listing's times and "
                      f"ChannelBin schedules a second one at {clock(tsdb)}, in case TheSportsDB is right. Change the "
@@ -1374,7 +1402,7 @@ def _pick_notice(pick, event, league, one, many, now, tz, h24, times_text="The t
                      f"{_day_words(ep.start, now, tz)}), which {league.name} goes by,")
         return {'tone': 'warn', 'strong': "From an event channel's name.",
                 'text': (f'This {one} has no listing in your guide yet. "{ep.named.said_by}" mentions it, so '
-                         f'Record uses {_record_channel_words(ep.named)}. {start} and it records for {_length_words(ep.stop - ep.start)}, '
+                         f'Record uses {_record_channel_words(ep.named)}. {start} and it records for {length_words(ep.stop - ep.start)}, '
                          'since there is no listing to say how long. Change either time below if you know better. '
                          f'Providers rename these channels during the week, so look again closer to the {one}.')}
     raise ValueError(f'a GamePick with no notice: {pick.kind!r}')
@@ -1460,6 +1488,182 @@ def record_offer(event_id, cfg=None) -> tuple:
                         'suggested_name_template': args.get('sports_name_template') or '',
                         'has_recording': False, 'description': None},
             'channel': {'id': ch.id, 'default_profile_id': profile.id if profile is not None else None}}, 200
+
+
+def channel_now(event_id, cfg=None) -> tuple:
+    """(payload, HTTP status) for "Channel it would use" on one game (dev/changelog/1639): the
+    channel a recording of it would start on if it started now, and the channel its sports channel
+    on the IPTV output would play, each from the code that does it, never a copy. Both start from
+    auto_rules.game_sources(). The recording then takes Record's seat_choice() and, for a group,
+    the member the group would start on (output_feed.sports_member_now() with no allowlist); the
+    play walks the same order with the blocks and the IPTV output's allowlist, as a tune-in does.
+
+    `go` is the channel page to open when there is one answer to give - the two agree, or no sports
+    channel would play it at all - and nothing else needs saying; otherwise the page shows both and
+    why. Reads only: no seat, no admission ticket, no row."""
+    from flask import url_for
+    from . import auto_rules as ar
+    from . import output_feed, sports_feed
+    from .channel_groups import blocked_account_ids_now
+    from .database import Account, Channel, Recording
+    cfg = cfg or load_config()
+    now = datetime.utcnow()
+    tz, h24 = get_display_tz(), is_24h()
+    event = db.session.get(SportsEvent, event_id)
+    if event is None:
+        return {'error': 'That event is no longer stored.'}, 404
+    league = db.session.get(SportsLeague, event.league_id)
+    one, _many = _noun(league, [event])
+    game = event_game_name(event)
+    found = ar.game_sources(event.id, now, cfg)
+    pick = found.pick
+    blocked = blocked_account_ids_now()
+    fcfg = output_feed.feed_config(cfg)
+
+    def chosen(channel_id, group_id=None, group_name=''):
+        return {'channel_id': channel_id, 'group_id': group_id, 'group_name': group_name}
+
+    # The recording: Record's own steps (record_offer), then the member a group starts on.
+    record = {'why': '', 'note': ''}
+    if pick.kind == ar.PICK_NONE:
+        guide_end = db.session.query(func.max(EPGEntry.start_time)).scalar()
+        record['why'] = pick_why(pick.why, one, guide_end, now, tz)
+    elif pick.kind == ar.PICK_EVENT:
+        from .routes.recordings import BULK_SKIP, _plan_event_schedule
+        ep = pick.event
+        plan = _plan_event_schedule(ep.named.channel_id, pick.game.title, ep.start, ep.stop, 'default', cfg)
+        if plan['verdict'] == BULK_SKIP or not plan.get('_create'):
+            record['why'] = plan.get('reason') or 'The event channel cannot be recorded from.'
+        else:
+            record.update(chosen(ep.named.channel_id))
+            record['note'] = (f'Your guide has no listing of this {one}, so it would be recorded from the channel '
+                              'whose name mentions it.')
+    elif pick.kind in (ar.PICK_LIVE, ar.PICK_REPLAY):
+        choice = ar.seat_choice(pick.program, 'default', cfg)
+        showing = choice.showing
+        notes = []
+        if pick.kind == ar.PICK_REPLAY:
+            notes.append(f'Every live listing of this {one} has ended, so it would record a replay.')
+        if choice.moved or choice.refused or choice.kept is not None:
+            notes.append(choice.sentence())
+        member, why, _from = output_feed.sports_member_now([showing], blocked, None)
+        if member is None:
+            where = f'the group "{showing.group_name}"' if showing.group_id is not None else f'"{showing.channel_name}"'
+            record['why'] = (f'Record would pick {where}, but it could not start now: '
+                             f'{_record_drop_words(why)}.')
+        else:
+            record.update(chosen(member.id, showing.group_id, showing.group_name or ''))
+        record['note'] = ' '.join(notes)
+    else:
+        raise ValueError(f'a GamePick kind channel_now does not name: {pick.kind!r}')
+
+    # The sports channel: a tune-in's walk over the same order (output_feed._resolve_sports_play).
+    # While the game is in a carrier's window now, over the listings that play holds, ended ones
+    # included, as the tune-in does; otherwise over the listings not yet over, as if it started now.
+    feed_on = output_feed.is_enabled(fcfg)
+    served = sports_feed.carriers(sports_feed.served_channels(), [event]).get(event.id, ())
+    play = {'why': '', 'note': '', 'applies': feed_on and bool(served), 'carriers': [s.name for s in served]}
+    if not feed_on:
+        play['note'] = 'The IPTV output is off, so nothing plays it there.'
+    elif not served:
+        play['note'] = (f'No sports channel on your IPTV output carries this {one}. Switch one on for it in '
+                        "this league's On your IPTV output card.")
+    if play['applies']:
+        before, after = output_feed.sports_window(fcfg)
+        on = sports_feed.playing_now(served[0], now, event_id=event.id, before=before, after=after)
+        play_pick, sources = pick.kind, found.sources
+        if on.channels and on.named is None:
+            held_by_play = ar.game_sources(event.id, now, cfg, listings=on.listings)
+            sources = held_by_play.sources if held_by_play is not None else []
+            play_pick = ar.PICK_LIVE if sources else None
+        if play_pick is None:
+            play['why'] = (f'Your guide lists {game} on {counted(len(on.channels), "channel")} now, but none of '
+                           'those listings is one Record would pick for it.')
+        elif play_pick in (ar.PICK_LIVE, ar.PICK_EVENT):
+            named = play_pick == ar.PICK_EVENT
+            member, why, source = output_feed.sports_member_now(sources, blocked,
+                                                                output_feed.allowed_account_ids(fcfg))
+            if member is None:
+                play['why'] = ('A sports channel would have nothing to play: '
+                               f'{output_feed.sports_drop_words(why, game, named=named)}.')
+            else:
+                play.update(chosen(member.id, source.group_id, source.group_name or ''))
+                if named:
+                    play['note'] = (f'Your guide has no listing of this {one}, so a sports channel plays it from '
+                                    'the channel whose name mentions it, as a recording would.')
+        elif play_pick == ar.PICK_REPLAY:
+            play['why'] = (f'Every live listing of this {one} has ended, and a sports channel plays only the live '
+                           f'{one}, never a replay.')
+        elif play_pick == ar.PICK_NONE:
+            play['why'] = 'There is nothing for a sports channel to play either.'
+        else:
+            raise ValueError(f'a GamePick kind channel_now does not name: {play_pick!r}')
+
+    ids = [s['channel_id'] for s in (record, play) if s.get('channel_id')]
+    rows = {c.id: (c, a) for c, a in db.session.query(Channel, Account).join(
+        Account, Account.id == Channel.account_id).filter(Channel.id.in_(ids))} if ids else {}
+    for side in (record, play):
+        cid = side.pop('channel_id', None)
+        gid, gname = side.pop('group_id', None), side.pop('group_name', '')
+        side['channel'] = side['group'] = None
+        if cid is None:
+            continue
+        if cid not in rows:
+            side['why'] = 'The channel it would use was removed as this was worked out. Ask again.'
+            continue
+        ch, acct = rows[cid]
+        side['channel'] = {'id': ch.id, 'name': ch.name,
+                           'url': url_for('channels.channel_detail', channel_id=ch.id),
+                           'account': {'id': acct.id, 'name': acct.name, 'color': acct.color,
+                                       'url': url_for('accounts.account_detail', account_id=acct.id)}}
+        if gid is not None:
+            side['group'] = {'id': gid, 'name': gname,
+                             'url': url_for('channel_groups.group_detail', group_id=gid)}
+
+    rec_ch, play_ch = record['channel'], play['channel']
+    same = rec_ch is not None and play_ch is not None and rec_ch['id'] == play_ch['id']
+    footnote = ''
+    if record['group'] is not None:
+        footnote = (f'A recording of a group picks its channel as it starts, so one that starts while an '
+                    f"account's connection is in use can start on another channel of \"{record['group']['name']}\".")
+    slot = 'replay' if pick.kind == ar.PICK_REPLAY else 'main'
+    held = (_held_by_event([event], now, tz, h24).get(event.id) or {}).get(slot)
+    if held is not None and held['state'] in (HELD_SCHEDULED, HELD_RECORDING):
+        # A recording already made keeps its own listing; said only where it is not this answer.
+        rec = db.session.get(Recording, held['id'])
+        mine = (rec.group_id is not None and record['group'] is not None and rec.group_id == record['group']['id']) or (
+            rec.group_id is None and rec_ch is not None and rec.channel_id == rec_ch['id'])
+        if not mine:
+            what = 'replay' if slot == 'replay' else 'recording'
+            has = (f'is being recorded, on {held["where"]}' if held['state'] == HELD_RECORDING
+                   else f'already has its {what} scheduled, on {held["where"]}')
+            record['note'] = ' '.join(x for x in (record['note'], f'This {one} {has}, which keeps the listing it '
+                                                                   'was made from. The channel above is the one a '
+                                                                   'new recording would use now.') if x)
+
+    go, toast = None, ''
+    if rec_ch is not None and not record['note'] and (same or not play['applies']):
+        go = rec_ch['url']
+        group = record['group']
+        toast = (f'If {game} started now, ChannelBin would record it from this channel'
+                 + (f', the one the group "{group["name"]}" would start on' if group is not None else '')
+                 + (', and its sports channel on your IPTV output would play it from here too.' if same
+                    else f'. {play["note"]}'))
+        if footnote:
+            toast += f' {footnote}'
+    return {'success': True, 'game': game, 'one': one, 'same': same, 'record': record, 'play': play,
+            'footnote': footnote, 'go': go, 'toast': toast}, 200
+
+
+def _record_drop_words(why) -> str:
+    """Why the channel Record would pick could not start now (channel_now), for each _DROP_* one
+    showing can answer with nothing yet tried and no allowlist."""
+    from . import output_feed as of
+    return {
+        of._DROP_BLOCKED: 'its account is blocked right now, or every channel of the group is on one that is',
+        of._DROP_RECORDING: 'the group has no channel with Recording on',
+        of._DROP_GONE: 'it was removed as this was worked out',
+    }[why]
 
 
 def event_record_check(event_id, channel_id):
@@ -1593,11 +1797,27 @@ def skips_context(league, cfg: dict, one: str) -> dict:
 
 
 def add_dialog_config() -> dict:
-    """The shipped list, for Add league or team. Which are followed already comes with the page."""
-    followed = {tsdb for (tsdb,) in db.session.query(SportsLeague.tsdb_id).join(
-        SportsFollow, SportsFollow.league_id == SportsLeague.id).distinct().all()}
+    """The shipped list, for Add league or team. `following` says what the person follows in a
+    league already here ("Following all games", "Following 3 teams", "Followed by a rule", "Not
+    followed"), or is None for
+    one ChannelBin has never had, whose row shows its sport. Every row can be picked: a league here
+    opens the team picker on what is followed now (dev/changelog/1641). Two queries."""
+    tsdb_ids = [s['tsdb_id'] for s in SHIPPED_LEAGUES]
+    here = {lg.id: lg for lg in SportsLeague.query.filter(SportsLeague.tsdb_id.in_(tsdb_ids)).all()}
+    every = _group(SportsFollow.query.filter(SportsFollow.league_id.in_(list(here))).all() if here else [],
+                   lambda f: f.league_id)
+    following = {}
+    for league_id, league in here.items():
+        follows = [f for f in every.get(league_id, []) if not f.rule_id]
+        if not follows:
+            # A rule's follow is changed on the rule (dev/changelog/1490), so the picker starts empty.
+            following[league.tsdb_id] = 'Followed by a rule' if every.get(league_id) else 'Not followed'
+        elif any(f.team_tsdb_id == 0 for f in follows):
+            following[league.tsdb_id] = f'Following all {_noun(league)[1]}'
+        else:
+            following[league.tsdb_id] = f'Following {counted(len(follows), "team")}'
     return {'shipped': [{'tsdb_id': s['tsdb_id'], 'name': s['name'], 'sport': s['sport'],
-                         'followed': s['tsdb_id'] in followed} for s in SHIPPED_LEAGUES],
+                         'following': following.get(s['tsdb_id'])} for s in SHIPPED_LEAGUES],
             'site': 'https://www.thesportsdb.com/'}
 
 

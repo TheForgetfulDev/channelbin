@@ -368,3 +368,13 @@
 {% macro beta_mark(page) -%}
 <span class="badge b-sched tip-plain beta-mark" data-tip="{{ page }} is in beta. Still being built. Some parts do not work yet, and how it works may change often.">Beta</span>
 {%- endmacro %}
+
+{#- The Preview button for a channel a page names (dev/changelog/1645), opened by
+    live-preview.js::previewFrom(): `feed` for one of ChannelBin's own channels on the IPTV output,
+    played as a player gets it, `channel` for a provider's channel. `why` dims it and is said on a
+    click instead; `label` is a menu item's name when a menu holds several. A page that draws one
+    loads live-preview.js. -#}
+{% macro preview_btn(name, feed=none, channel=none, why='', menu=false, label='Preview', cls='') -%}
+{%- set tip = "Preview.&#10;Plays it right here as an IPTV player gets it from ChannelBin, with its sound re-encoded so the browser can play it. It is a real play: it counts as one of the IPTV players at once, and while it plays one of your channels it uses a connection to your IPTV provider and gives it up to any recording that needs it. A waiting screen and an Up next channel use none." if feed is not none else "Preview.&#10;Plays this channel's live stream right here. Holds one of its account's connections while it runs, and gives it up to any recording that needs it." -%}
+<button class="{{ 'menu-item' if menu else 'btn btn-sm' }}{{ ' disabled' if why else '' }}{{ '' if menu else ' tip-plain' }}{{ ' ' ~ cls if cls else '' }}" data-act="preview"{% if feed is not none %} data-feed="{{ feed }}"{% else %} data-channel="{{ channel }}"{% endif %} data-name="{{ name }}"{% if why %} aria-disabled="true" data-why="{{ why }}"{% endif %}{% if not menu %} data-tip="{{ tip | safe }}"{% endif %}>{{ icon('preview') }}{{ label }}</button>
+{%- endmacro %}

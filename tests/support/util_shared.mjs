@@ -132,4 +132,7 @@ list.querySelector('[data-act="block"]').click();
 out.listSheet.acts = listActs;
 out.listSheet.overlaysAfter = overlays();
 
+const joinLabels = w.eval('joinLabels');
+out.join = [[], ['a'], ['a', 'b'], ['a', 'b', 'c'], ['a', 'b', 'a']].map((l) => joinLabels(l));
+
 process.stdout.write(JSON.stringify(out));

@@ -64,17 +64,244 @@
     applySort();
   }
 
+  /* ---- The team picker (mockup 60, dev/changelog/1641) ---------------------------------------
+     The confirm step of Add league or team, and the body of Change teams. `here` is what ChannelBin
+     already holds for the league (the row's dialog data, or a lookup's `here`; null for a league it
+     has never had); `found` is the team a lookup just found. With games here, their teams are a
+     ticked list and picking makes no calls. Without any, each team is found with a search, one name
+     at a time, since TheSportsDB's list of a league's teams answers the same English sides for every
+     league on the free key (sports_data._teams_without_a_game()). What is ticked is the follow: Save
+     replaces it. `onChange(state)` hears {ok, text} whenever the choice changes, so the dialog can
+     disable its button, and `text` says why, as a warning while there is nothing to do. */
+  function teamPicker({ league, here, found = null, bestMatch = false, onChange = () => {} }) {
+    const el = document.createElement('div');
+    const many = here ? here.many : 'games';
+    const stored = here && here.teams.length ? here.teams : null;
+    const names = new Map();
+    (stored || []).forEach((t) => names.set(t.id, t.name));
+    Object.entries((here && here.chosen_names) || {}).forEach(([id, n]) => names.set(Number(id), n));
+    if (found) names.set(found.team_id, found.team);
+    const before = {
+      followed: !!(here && here.followed), whole: !!(here && here.followed && here.whole),
+      ids: new Set(here && here.followed && !here.whole ? here.chosen : []),
+    };
+    // Games here and no teams in them is a racing series: followed whole, nothing to pick.
+    const noTeams = !!(here && here.has_schedule && !stored && !before.ids.size && !found);
+    const chosen = new Set(before.ids);
+    if (found) chosen.add(found.team_id);
+    // A team followed or found with no upcoming game gets a row too, so every one sent can be unticked.
+    const rows = stored ? [...stored, ...[...chosen].filter((id) => !stored.some((t) => t.id === id))
+      .map((id) => ({ id, name: names.get(id) || String(id) }))].sort((a, b) => a.name.localeCompare(b.name)) : null;
+    // A team found in a league followed whole starts on All games, which the sentence says it already covers.
+    let mode = chosen.size && !(found && before.whole) ? 'teams' : 'all';
+    let searching = false;
+    let waitTimer = null;
+
+    const nameOf = (id) => names.get(id) || String(id);
+    const sortedNames = (ids) => [...ids].map(nameOf).sort((a, b) => a.localeCompare(b));
+
+    function nowLine() {
+      if (!here) return '';
+      let text;
+      if (!before.followed) text = `You do not follow ${here.name} now.`;
+      else if (before.whole) text = `You follow all ${here.name} ${many} now.`;
+      else text = `You follow ${joinLabels(sortedNames(before.ids))} now.`;
+      return `<div class="sp-msg" id="sp-now">${escHtml(text)}</div>`;
+    }
+
+    function state() {
+      const name = league.name;
+      if (noTeams) {
+        return before.followed
+          ? { ok: false, text: `${name} has no teams, so it is followed whole. Nothing to change here.` }
+          : { ok: true, text: `ChannelBin will follow all ${name} ${many}.` };
+      }
+      if (mode === 'teams' && !chosen.size) return { ok: false, text: `Pick at least one team, or choose All ${many}.` };
+      const picked = sortedNames(chosen);
+      if (!before.followed) {
+        return { ok: true, text: mode === 'all' ? `ChannelBin will follow all ${name} ${many}.`
+          : `ChannelBin will follow only ${joinLabels(picked)}.` };
+      }
+      if (before.whole) {
+        if (mode === 'all') {
+          return { ok: false, text: found
+            ? `All ${many} already covers ${found.team}, so following it changes nothing. To follow only some teams, choose Only these teams.`
+            : `Nothing changes: you follow all ${name} ${many} now.` };
+        }
+        return { ok: true, text: `You will follow only ${joinLabels(picked)}, and stop following ${name}'s other ${many}.` };
+      }
+      if (mode === 'all') return { ok: true, text: `You will follow all ${name} ${many}, not only ${joinLabels(sortedNames(before.ids))}.` };
+      const added = sortedNames([...chosen].filter((id) => !before.ids.has(id)));
+      const dropped = sortedNames([...before.ids].filter((id) => !chosen.has(id)));
+      if (!added.length && !dropped.length) return { ok: false, text: 'Nothing changes: these are the teams you follow now.' };
+      const parts = [added.length ? `adds ${joinLabels(added)}` : '', dropped.length ? `stops ${joinLabels(dropped)}` : ''].filter(Boolean);
+      return { ok: true, text: `You will follow ${joinLabels(picked)}. This ${parts.join(' and ')}.` };
+    }
+
+    function tell() {
+      const s = state();
+      const line = el.querySelector('#sp-effect');
+      if (line) {
+        line.textContent = s.text;
+        // Why the button is disabled stands out; what it would do reads as a plain line.
+        line.className = s.ok ? 'sp-msg' : 'sp-msg notice notice-warn';
+      }
+      onChange(s);
+    }
+
+    const setMode = (m) => {
+      mode = m;
+      const r = el.querySelector(`input[name="sp-t"][value="${m}"]`);
+      if (r) r.checked = true;
+    };
+
+    const listRows = (q) => rows.filter((t) => t.name.toLowerCase().includes(q.trim().toLowerCase()))
+      .map((t) => `<label class="check-row"><input type="checkbox" value="${t.id}"${chosen.has(t.id) ? ' checked' : ''}> ${escHtml(t.name)}</label>`).join('')
+      || '<div class="sp-msg">No team by that name in these games.</div>';
+
+    const chipsHtml = () => (chosen.size
+      ? [...chosen].sort((a, b) => nameOf(a).localeCompare(nameOf(b))).map((id) => `<span class="chip sp-term">${escHtml(nameOf(id))}<button type="button" class="chip-x" data-remove="${id}" aria-label="Remove ${escHtml(nameOf(id))}">${icon('close')}</button></span>`).join('')
+      : '<span class="form-hint">No teams yet. Search for one below.</span>');
+
+    function teamsArea() {
+      if (stored) {
+        return `<input class="form-control sp-team-filter" id="sp-tf" type="text" placeholder="Filter teams" autocomplete="off">
+          <div class="sp-teams" id="sp-tl">${listRows('')}</div>
+          <span class="form-hint">These are the teams in the upcoming ${escHtml(league.name)} ${escHtml(many)} ChannelBin already has, so picking makes no calls.</span>`;
+      }
+      const why = here
+        ? `There are no upcoming ${escHtml(league.name)} ${escHtml(many)} here to list teams from yet`
+        : `ChannelBin does not have the ${escHtml(league.name)} schedule yet`;
+      return `<div class="sp-terms sp-chosen" id="sp-chips">${chipsHtml()}</div>
+        <form class="sp-addterm" id="sp-search"><input class="form-control" name="team" type="text" autocomplete="off" placeholder="Add another team" aria-label="Add another team of ${escHtml(league.name)}"><button class="btn btn-sm" type="submit">Search</button></form>
+        <div id="sp-search-msg"></div>
+        <span class="form-hint">${why}, so each team is found with a search on TheSportsDB, one name at a time. Once there are games, Change teams lists every team playing.</span>`;
+    }
+
+    function bestMatchNote() {
+      if (!found || !bestMatch) return '';
+      const fix = stored ? 'untick it and tick the right one' : 'remove it and search again with more of the name, such as the city and nickname';
+      return `<div class="sp-msg" id="sp-best">TheSportsDB gives only its best match for a name. If ${escHtml(found.team)} is not the team you meant, ${fix}.</div>`;
+    }
+
+    el.innerHTML = `${nowLine()}
+      ${noTeams ? '' : `<div class="form-group sp-follow-group">
+        <label class="sp-radio"><input type="radio" name="sp-t" value="all"${mode === 'all' ? ' checked' : ''}> All ${escHtml(many)} in the league</label>
+        <label class="sp-radio"><input type="radio" name="sp-t" value="teams"${mode === 'teams' ? ' checked' : ''}> Only these teams</label>
+        ${teamsArea()}
+      </div>`}
+      ${bestMatchNote()}
+      <div class="sp-msg" id="sp-effect"></div>`;
+
+    el.addEventListener('change', (e) => {
+      if (e.target.name === 'sp-t') { mode = e.target.value; tell(); return; }
+      if (e.target.type !== 'checkbox') return;
+      const id = Number(e.target.value);
+      if (e.target.checked) chosen.add(id); else chosen.delete(id);
+      setMode('teams');
+      tell();
+    });
+    el.addEventListener('input', (e) => {
+      if (e.target.id === 'sp-tf') el.querySelector('#sp-tl').innerHTML = listRows(e.target.value);
+    });
+    el.addEventListener('click', (e) => {
+      const x = e.target.closest('[data-remove]');
+      if (!x) return;
+      chosen.delete(Number(x.dataset.remove));
+      el.querySelector('#sp-chips').innerHTML = chipsHtml();
+      tell();
+    });
+
+    const searchMsg = (text, cls = '') => {
+      const box = el.querySelector('#sp-search-msg');
+      if (box) box.innerHTML = text ? `<div class="sp-msg${cls ? ` ${cls}` : ''}">${escHtml(text)}</div>` : '';
+    };
+
+    // One search at a time, through the lookup Add uses. An answer of "one call at a time" is waited
+    // out where the search is, counted down, and the search sent again by itself.
+    async function search(text) {
+      const form = el.querySelector('#sp-search');
+      const input = form.querySelector('input');
+      const btn = form.querySelector('button');
+      const lock = (on) => { searching = on; input.disabled = on; btn.disabled = on; };
+      lock(true);
+      searchMsg('Searching TheSportsDB...');
+      let answer;
+      try {
+        answer = await jsonFetch('/api/sports/lookup', { method: 'POST', body: JSON.stringify({ text }) });
+      } catch (err) {
+        if (err.status === 409 && err.data && err.data.retry_after && el.isConnected) {
+          let left = err.data.retry_after;
+          const say = () => searchMsg(`ChannelBin makes one call at a time to TheSportsDB. Searching for "${text}" in ${counted(left, 'second')}.`, 'warn');
+          say();
+          waitTimer = setInterval(() => {
+            left -= 1;
+            if (!el.isConnected) { clearInterval(waitTimer); return; }
+            if (left > 0) { say(); return; }
+            clearInterval(waitTimer);
+            search(text);
+          }, 1000);
+          return;
+        }
+        lock(false);
+        searchMsg(err.message, 'bad');
+        return;
+      }
+      lock(false);
+      const t = answer.team;
+      if (!t) {
+        searchMsg(answer.choices ? `TheSportsDB found more than one team for "${text}". Type more of the name, such as the city and nickname.`
+          : `"${text}" is a league, not a team. Type a team's name.`, 'bad');
+        return;
+      }
+      if (t.league.tsdb_id !== league.tsdb_id) {
+        searchMsg(`TheSportsDB's best match for "${text}" is ${t.team}, in the ${t.league.name}, not the ${league.name}. Type more of the name, such as the city and nickname.`, 'bad');
+        return;
+      }
+      if (chosen.has(t.team_id)) { searchMsg(`${t.team} is already on the list.`, 'warn'); input.value = ''; return; }
+      names.set(t.team_id, t.team);
+      chosen.add(t.team_id);
+      setMode('teams');
+      el.querySelector('#sp-chips').innerHTML = chipsHtml();
+      input.value = '';
+      searchMsg(answer.best_match
+        ? `Added ${t.team}, TheSportsDB's best match for "${text}". If it is not the one you meant, remove it and type more of the name.`
+        : `Added ${t.team}.`);
+      tell();
+      input.focus();
+    }
+
+    el.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const text = e.target.querySelector('input').value.trim();
+      if (text && !searching) search(text);
+    });
+
+    setTimeout(tell, 0);
+    return {
+      el,
+      teamIds: () => (mode === 'all' || noTeams ? [] : [...chosen].sort((a, b) => a - b)),
+      picked: () => (mode === 'all' || noTeams ? null : sortedNames(chosen)),
+      state,
+      stop: () => clearInterval(waitTimer),
+    };
+  }
+
+  // What a save says: what is followed now, and an IPTV player it cut (saidCut).
+  const savedText = (name, many, picked) => (picked ? `${name}: following ${joinLabels(picked)}.` : `Following all ${name} ${many}.`);
+
   /* ---- Add league or team ------------------------------------------------------------------
      Three steps on one modal: the entry (Cancel, Search), the "which one" list (Back, Cancel) and
-     the confirm (Back, Cancel, Follow). Back returns to the entry with the typed text kept. Each
-     step rebuilds the body, so its listeners go on the elements it draws, never on the body. */
+     the confirm, which is the team picker (Back, Cancel, Follow or Save). Back returns to the entry
+     with the typed text kept. Each step rebuilds the body, so its listeners go on the elements it
+     draws, never on the body. A league already followed is picked again from the list to change it. */
   const isShippedName = (text) => BOOT.shipped.some((l) => l.name.toLowerCase() === text.trim().toLowerCase());
 
   function listHtml(needle) {
     const q = needle.trim().toLowerCase();
     const rows = BOOT.shipped.filter((l) => !q || l.name.toLowerCase().includes(q) || l.sport.toLowerCase().includes(q));
-    const picks = rows.map((l) => `<button type="button" class="sp-pick" data-pick="${l.tsdb_id}"${l.followed ? ' disabled' : ''}>
-        <span>${escHtml(l.name)}</span><span class="meta">${l.followed ? 'Following' : escHtml(l.sport)}</span></button>`).join('');
+    const picks = rows.map((l) => `<button type="button" class="sp-pick" data-pick="${l.tsdb_id}">
+        <span>${escHtml(l.name)}</span><span class="meta">${escHtml(l.following || l.sport)}</span></button>`).join('');
     const hint = !q
       ? `<span class="form-hint sp-lookup">Not listed? Type a team name, a league's number, or paste a link to a league's or team's page on ${siteLink()}.</span>`
       : rows.length ? ''
@@ -88,7 +315,9 @@
 
   function openAdd() {
     const body = document.createElement('div');
-    const modal = buildModal({ title: 'Add league or team', body, footer: [{ label: 'Cancel' }] });
+    let picker = null;
+    const modal = buildModal({ title: 'Add league or team', body, footer: [{ label: 'Cancel' }],
+      onClose: () => { if (picker) picker.stop(); } });
     const foot = modal.querySelector('.modal-foot');
     let typed = '';
     let busy = false;
@@ -120,6 +349,7 @@
     };
 
     function showEntry() {
+      if (picker) { picker.stop(); picker = null; }
       onEntry = true;
       body.innerHTML = `<div class="form-group sp-entry-group">
           <label for="sp-entry">League, team or link</label>
@@ -149,7 +379,7 @@
       });
       results.addEventListener('click', (e) => {
         const pick = e.target.closest('[data-pick]');
-        if (pick && !pick.disabled) lookup({ tsdb_id: Number(pick.dataset.pick) });
+        if (pick) lookup({ tsdb_id: Number(pick.dataset.pick) });
       });
       results.innerHTML = listHtml(typed);
       setFoot(cancelBtn(), search);
@@ -166,40 +396,30 @@
         const b = e.target.closest('[data-choice]');
         if (!b) return;
         const c = answer.choices[Number(b.dataset.choice)];
-        showConfirm(c.league, c, {});
+        showConfirm(c.league, c, { here: c.here || null });
       });
       setFoot(backBtn(), cancelBtn());
     }
 
     function showConfirm(league, team, answer) {
-      const leaguePage = `league/${league.tsdb_id}`;
-      body.innerHTML = `<div class="sp-confirm-name">${escHtml(league.name)}</div>
-        <div class="sp-confirm-sub">${[league.sport, league.season ? `${league.season} season` : null].filter(Boolean).map(escHtml).join(', ')}${league.sport || league.season ? ', ' : ''}${siteLink(`TheSportsDB league ${league.tsdb_id}`, leaguePage)}</div>
-        ${team ? `<div class="form-group sp-follow-group">
-          <label class="sp-radio"><input type="radio" name="sp-follow" value="team" checked> Only ${escHtml(team.team)}</label>
-          <label class="sp-radio"><input type="radio" name="sp-follow" value="all"> All games in the league</label>
-          <span class="form-hint">ChannelBin gets the whole league's schedule either way, so more teams can be picked once it is here.</span>
-        </div>` : ''}
-        ${answer.best_match ? '<div class="sp-msg" id="sp-best">TheSportsDB gives only its best match for a name. If this is not the team you meant, go back and type more of it, such as the city and nickname.</div>' : ''}
-        ${skippedHtml(answer)}
-        <div class="sp-msg">Getting a new schedule can take up to an hour, because the calls are spread out. After that it costs a few calls a day.</div>
-        <div id="sp-msg-2"></div>`;
       onEntry = false;
+      if (picker) picker.stop();
+      const here = answer.here || null;
       const back = backBtn();
-      const msg2 = body.querySelector('#sp-msg-2');
+      let msg2 = null;
       // While a follow is posting, Back (and Escape) must not swap the step out from under its answer.
-      const go = button('Follow', 'btn btn-primary', async () => {
-        const choice = body.querySelector('input[name="sp-follow"]:checked');
-        const teamId = team && choice && choice.value === 'team' ? team.team_id : null;
+      const go = button(here && here.followed ? 'Save' : 'Follow', 'btn btn-primary', async () => {
         go.disabled = true;
         back.disabled = true;
         posting = true;
+        const picked = picker.picked();
         try {
-          await jsonFetch('/api/sports/leagues', {
-            method: 'POST', body: JSON.stringify({ tsdb_id: league.tsdb_id, team_id: teamId }),
+          const data = await jsonFetch('/api/sports/leagues', {
+            method: 'POST', body: JSON.stringify({ tsdb_id: league.tsdb_id, team_ids: picker.teamIds() }),
           });
           modal.closeModal();
-          showToastAfterLoad(`Following ${league.name}. Getting its schedule.`);
+          const said = here ? savedText(league.name, here.many, picked) : `Following ${league.name}. Getting its schedule.`;
+          showToastAfterLoad(data && data.cut ? `${said} ${cutText(data.cut)}` : said, { type: data && data.cut ? 'warning' : 'success' });
           window.location.reload();
         } catch (err) {
           go.disabled = false;
@@ -209,6 +429,16 @@
           posting = false;
         }
       });
+      picker = teamPicker({ league, here, found: team, bestMatch: !!answer.best_match,
+        onChange: (s) => { if (!posting) go.disabled = !s.ok; } });
+      const leaguePage = `league/${league.tsdb_id}`;
+      body.innerHTML = `<div class="sp-confirm-name">${escHtml(league.name)}</div>
+        <div class="sp-confirm-sub">${[league.sport, league.season ? `${league.season} season` : null].filter(Boolean).map(escHtml).join(', ')}${league.sport || league.season ? ', ' : ''}${siteLink(`TheSportsDB league ${league.tsdb_id}`, leaguePage)}</div>`;
+      body.appendChild(picker.el);
+      body.insertAdjacentHTML('beforeend', `${skippedHtml(answer)}
+        ${here ? '' : '<div class="sp-msg">Getting a new schedule can take up to an hour, because the calls are spread out. After that it costs a few calls a day.</div>'}
+        <div id="sp-msg-2"></div>`);
+      msg2 = body.querySelector('#sp-msg-2');
       setFoot(back, cancelBtn(), go);
     }
 
@@ -233,45 +463,34 @@
     showEntry();
   }
 
-  /* ---- Change teams ---------------------------------------------------------------------- */
+  /* ---- Change teams ----------------------------------------------------------------------
+     The team picker on its own. It shows for a league with games between teams, and for one
+     followed by team before any of its games are here (sports_view._can_change_teams()). */
   function openTeams(d) {
-    const chosen = new Set(d.chosen);
-    const body = document.createElement('div');
-    const draw = (q) => d.teams.filter((t) => t.name.toLowerCase().includes(q.trim().toLowerCase()))
-      .map((t) => `<label class="check-row"><input type="checkbox" value="${t.id}"${chosen.has(t.id) ? ' checked' : ''}> ${escHtml(t.name)}</label>`).join('')
-      || '<div class="sp-msg">No team by that name in this schedule.</div>';
-    body.innerHTML = `<div class="sp-confirm-sub sp-teams-note">This makes no calls. The whole league's schedule is already here, and this only picks which games are yours.</div>
-      <label class="sp-radio"><input type="radio" name="sp-t" value="all"${d.whole ? ' checked' : ''}> All games</label>
-      <label class="sp-radio"><input type="radio" name="sp-t" value="teams"${d.whole ? '' : ' checked'}> Only these teams</label>
-      <input class="form-control sp-team-filter" id="sp-tf" type="text" placeholder="Filter teams" autocomplete="off">
-      <div class="sp-teams" id="sp-tl">${draw('')}</div>`;
-    buildModal({
-      title: `${d.name}: teams`, body,
+    let save = null;
+    const picker = teamPicker({ league: { name: d.name, tsdb_id: d.tsdb_id }, here: d,
+      onChange: (s) => { if (save) save.disabled = !s.ok; } });
+    const modal = buildModal({
+      title: `${d.name}: teams`, body: picker.el,
+      onClose: () => picker.stop(),
       footer: [{ label: 'Cancel' }, {
         label: 'Save', class: 'btn btn-primary',
         onClick: (close) => {
-          const useTeams = body.querySelector('input[name="sp-t"]:checked').value === 'teams';
-          if (useTeams && !chosen.size) {
-            showToast('Pick at least one team, or choose All games.', { type: 'error' });
-            return false;
-          }
+          const picked = picker.picked();
+          save.disabled = true;
           jsonFetch(`/api/sports/leagues/${d.id}/following`, {
-            method: 'PUT', body: JSON.stringify({ team_ids: useTeams ? [...chosen] : [] }),
-          }).then((data) => { saidCut(data); close(); return refresh(); })
-            .catch((err) => showToast(err.message, { type: 'error' }));
+            method: 'PUT', body: JSON.stringify({ team_ids: picker.teamIds() }),
+          }).then((data) => {
+            close();
+            if (!saidCut(data)?.cut) showToast(savedText(d.name, d.many, picked), { type: 'success' });
+            return refresh();
+          }).catch((err) => { save.disabled = false; showToast(err.message, { type: 'error' }); });
           return false;
         },
       }],
     });
-    body.addEventListener('input', (e) => {
-      if (e.target.id === 'sp-tf') body.querySelector('#sp-tl').innerHTML = draw(e.target.value);
-    });
-    body.addEventListener('change', (e) => {
-      if (e.target.type !== 'checkbox') return;
-      const id = Number(e.target.value);
-      if (e.target.checked) chosen.add(id); else chosen.delete(id);
-      body.querySelector('input[name="sp-t"][value="teams"]').checked = true;
-    });
+    save = modal.querySelector('.modal-foot .btn-primary');
+    save.disabled = !picker.state().ok;
   }
 
   /* ---- Stop following, follow again, delete ---------------------------------------------- */
@@ -280,11 +499,10 @@
 
   // A person's act that stopped a sports channel being served ended the plays of it
   // (output_feed.stop_unserved_sports); say so, since the IPTV player just went dark.
+  const cutText = (cut) => `${cut === 1 ? 'An IPTV player' : `${cut} IPTV players`} watching a sports channel `
+    + `that is no longer on the IPTV output ${cut === 1 ? 'was' : 'were'} cut.`;
   const saidCut = (data) => {
-    if (data && data.cut) {
-      showToast(`${data.cut === 1 ? 'An IPTV player' : `${data.cut} IPTV players`} watching a sports channel `
-        + `that is no longer on the IPTV output ${data.cut === 1 ? 'was' : 'were'} cut.`, { type: 'warning' });
-    }
+    if (data && data.cut) showToast(cutText(data.cut), { type: 'warning' });
     return data;
   };
 
@@ -335,6 +553,9 @@
   /* ---- Listings on your guide, Wrong match (app/sports_match.py, mockup 51) ---------------- */
   const leagueId = () => Number((document.getElementById('sp-actionbar') || {}).dataset.league);
 
+  /* A matched channel: its name linking to its channel page, and the account it is on. */
+  const channelHtml = (c) => `<a class="name-link" href="${escHtml(c.url)}">${escHtml(c.name)}</a> ${accountPill(c.account)}`;
+
   function groupHtml(grp, gi, open) {
     const wrongCount = grp.channels.filter((c) => c.wrong).length;
     const label = grp.sub ? `${grp.title}: ${grp.sub}` : grp.title;
@@ -346,7 +567,7 @@
       const btn = grp.all_wrong ? ''
         : c.wrong ? `<span class="sp-rej">Wrong match</span><button class="btn btn-sm" data-wrong="0" data-match="${c.id}">Undo</button>`
           : `<button class="btn btn-sm" data-wrong="1" data-match="${c.id}">Wrong match</button>`;
-      return `<div class="sp-chan${c.wrong ? ' rejected' : ''}"><span class="sp-cname">${escHtml(c.name)}<span class="sp-cat">${escHtml(c.category)}</span></span><span class="sp-cact">${btn}</span></div>`;
+      return `<div class="sp-chan${c.wrong ? ' rejected' : ''}"><span class="sp-cname">${channelHtml(c)}<span class="sp-cat">${escHtml(c.category)}</span></span><span class="sp-cact">${previewButton({ channelId: c.channel_id, name: c.name })}${btn}</span></div>`;
     }).join('')}</div>` : '';
     return `<div class="sp-group${open ? ' open' : ''}${grp.all_wrong ? ' rejected' : ''}">
       <div class="sp-ghead">
@@ -366,7 +587,7 @@
         ? `<span class="sp-rej">Wrong match</span><button class="btn btn-sm" data-wrong="0" data-match="${n.id}">Undo</button>`
         : `<button class="btn btn-sm" data-wrong="1" data-match="${n.id}">Wrong match</button>`;
       const badge = n.badge ? ` <span class="badge ${n.badge[0]}">${escHtml(n.badge[1])}</span>` : '';
-      return `<div class="sp-chan sp-ename${n.wrong ? ' rejected' : ''}"><span class="sp-cname">${escHtml(n.name)}${badge}<span class="sp-cat">${escHtml(n.category)}</span><span class="sp-why">${escHtml(n.why)}</span></span><span class="sp-cact">${act}</span></div>`;
+      return `<div class="sp-chan sp-ename${n.wrong ? ' rejected' : ''}"><span class="sp-cname">${channelHtml(n)}${badge}<span class="sp-cat">${escHtml(n.category)}</span><span class="sp-why">${escHtml(n.why)}</span></span><span class="sp-cact">${previewButton({ channelId: n.channel_id, name: n.name })}${act}</span></div>`;
     }).join('');
     return `<h3 class="sp-h3">Event channels <span class="cnt">${names.length}</span></h3>
       <p class="sp-intro">These channels have no real listing in your guide at this ${one}'s time: nothing at all then, or only their own name repeated. Each one's name says it carries this ${one}, and the name is all ChannelBin has to go on. Providers rename these channels as the day goes on, so the names are read again after every sync, and a channel whose name moves on to another ${one} drops off this list.</p>
@@ -831,6 +1052,8 @@
     if (name === 'sections') { if (sectionLayout) sectionLayout.open(); return; }
     if (name === 'listings') { e.preventDefault(); openListings(Number(act.dataset.event), act.dataset.name, act.dataset.namesOnly === '1'); return; }
     if (name === 'live-now') { goLiveNow(act).then((changed) => { if (changed) refresh(); }); return; }
+    if (name === 'channel-now') { channelNow(act, e); return; }
+    if (name === 'preview') { previewFrom(act); return; }
     if (name === 'remove-term') {
       const left = termsNow().filter((t) => t !== act.dataset.term);
       if (!left.length) { showToast('A league needs at least one name, or no listing could ever match it.', { type: 'error' }); return; }

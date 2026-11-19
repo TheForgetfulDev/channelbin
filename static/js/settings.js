@@ -514,7 +514,7 @@
       const badge = $('.gate-badge', row);
       if (badge) {
         badge.textContent = unmet.length
-          ? `Not used while ${unmet.length > 1 ? `${unmet.slice(0, -1).join(', ')} and ${unmet[unmet.length - 1]}` : unmet[0]}`
+          ? `Not used while ${joinLabels(unmet)}`
           : '';
         badge.hidden = !unmet.length;
       }

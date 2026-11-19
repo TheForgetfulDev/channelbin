@@ -69,6 +69,13 @@ class SharedUtilTests(unittest.TestCase):
                 bad.append(f'{name}: builds its own sheet')
         self.assertEqual(bad, [], 'use util.js: MOBILE_MQ/isPhone, readBootJson, openMenuSheet')
 
+    # ── the list sentence (dev/changelog/1641) ──
+    def test_join_labels_reads_as_app_fmt_utils_join_labels(self):
+        from app.fmt_utils import join_labels
+        cases = [[], ['a'], ['a', 'b'], ['a', 'b', 'c'], ['a', 'b', 'a']]
+        self.assertEqual(self.phone['join'], [join_labels(c) for c in cases])
+        self.assertEqual(self.phone['join'][3], 'a, b and c')
+
     # ── boot-block reader ──
     def test_a_good_block_parses(self):
         self.assertEqual(self.phone['boot']['good'], {'answer': 42, 'list': [1, 2]})

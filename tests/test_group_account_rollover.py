@@ -104,6 +104,40 @@ class OccupancyHelperTests(unittest.TestCase):
         self.assertLessEqual(parse.call_count, 1)
 
 
+class SeatStandingTests(unittest.TestCase):
+    """app/connection_limits.py::seat_standing - the one answer to "which accounts are free, and
+    free of whom" that a recording's member pick and the IPTV output's both read
+    (dev/changelog/1642)."""
+    setUp = OccupancyHelperTests.setUp
+    tearDown = OccupancyHelperTests.tearDown
+
+    def test_an_iptv_player_makes_an_account_cost_a_recording_a_cut_not_a_wait(self):
+        connlim.try_acquire(self.busy_id, 'viewer', 'v1')
+        self.assertEqual(connlim.seat_standing([self.busy_id, self.idle_id], 'recording'),
+                         {self.busy_id: connlim.SEAT_BY_CUTTING_VIEWER,
+                          self.idle_id: connlim.SEAT_FREE})
+        self.assertEqual(connlim.accounts_without_free_recording_slot([self.busy_id]), set(),
+                         'a recording can still take the seat - it is not full for one')
+
+    def test_for_an_iptv_player_every_holder_counts_and_its_own_seat_does_not(self):
+        connlim.try_acquire(self.busy_id, 'test', 77)
+        connlim.try_acquire(self.idle_id, 'viewer', 'v1')
+        self.assertEqual(connlim.seat_standing([self.busy_id, self.idle_id], 'viewer'),
+                         {self.busy_id: connlim.SEAT_NONE, self.idle_id: connlim.SEAT_NONE})
+        self.assertEqual(connlim.seat_standing([self.idle_id], 'viewer', ('viewer', 'v1')),
+                         {self.idle_id: connlim.SEAT_FREE})
+
+    def test_only_recordings_fill_an_account_for_a_recording(self):
+        connlim.try_acquire(self.roomy_id, 'recording', 1)
+        connlim.try_acquire(self.roomy_id, 'viewer', 'v1')
+        self.assertEqual(connlim.seat_standing([self.roomy_id], 'recording'),
+                         {self.roomy_id: connlim.SEAT_BY_CUTTING_VIEWER})
+        connlim.release(self.roomy_id, 'viewer', 'v1')
+        connlim.try_acquire(self.roomy_id, 'recording', 2)
+        self.assertEqual(connlim.seat_standing([self.roomy_id], 'recording'),
+                         {self.roomy_id: connlim.SEAT_NONE})
+
+
 class _GroupCase(unittest.TestCase):
     """Two single-connection accounts, one group holding a member on each. The busy
     account's member is deliberately the better one on the existing ranking (same score,
@@ -213,6 +247,54 @@ class RecordStartPrefersAFreeAccountTests(_GroupCase):
         self.assertIn('free connection slot', ev.detail)
 
 
+class RecordStartPrefersAnAccountNoIptvPlayerIsOnTests(_GroupCase):
+    """dev/changelog/1642 (A2): an account an IPTV player on the output feed holds is less free
+    than an empty one. A recording takes it only when no empty account has a member - before
+    waiting on a full one."""
+    _scheduled = RecordStartPrefersAFreeAccountTests._scheduled
+
+    def _start(self):
+        rid = self._scheduled()
+        with mock.patch('app.scheduler.reschedule_recording_start'), \
+             mock.patch.object(recorder, '_launch_segment'):
+            recorder.start_recording(self.t.app, rid)
+        db.session.expire_all()
+        return db.session.get(Recording, rid), _selection_event(rid)
+
+    def test_it_takes_the_empty_accounts_member_over_the_one_a_player_is_watching_on(self):
+        connlim.try_acquire(self.busy_id, 'viewer', 'v1')
+        rec, ev = self._start()
+        self.assertEqual(rec.channel_id, self.spare_id)
+        self.assertIn(('viewer', 'v1'), connlim._holders.get(self.busy_id, []),
+                      'the IPTV player is not cut off')
+        self.assertIn('so as not to cut it off', ev.detail)
+        self.assertIn('Strong Feed', ev.detail)
+        extra = json.loads(ev.extra_data)
+        self.assertEqual(extra['skipped_viewer_account_channel_ids'], [self.strong_id])
+        self.assertIs(extra['took_viewer_account'], False)
+
+    def test_it_cuts_the_player_off_before_it_waits_on_a_full_account(self):
+        connlim.try_acquire(self.busy_id, 'viewer', 'v1')
+        connlim.try_acquire(self.idle_id, 'recording', 999999)
+        rec, ev = self._start()
+        self.assertEqual(rec.channel_id, self.strong_id)
+        self.assertEqual(rec.status, REC_STATUS_IN_PROGRESS, 'it connects now rather than waiting')
+        self.assertEqual(connlim._holders.get(self.busy_id), [('recording', rec.id)])
+        self.assertIn('takes the one an IPTV player is watching on "Busy Account"', ev.detail)
+        self.assertIs(json.loads(ev.extra_data)['took_viewer_account'], True)
+
+
+    def test_it_never_takes_a_failing_feed_to_spare_a_player(self):
+        """Sparing an IPTV player is not worth a recording from a feed the health checks say is
+        down: the recording always wins (DESIGN-output-feed.md 4.4)."""
+        db.session.get(Channel, self.spare_id).consecutive_test_failures = 10
+        db.session.commit()
+        connlim.try_acquire(self.busy_id, 'viewer', 'v1')
+        rec, ev = self._start()
+        self.assertEqual(rec.channel_id, self.strong_id)
+        self.assertIs(json.loads(ev.extra_data)['took_viewer_account'], True)
+
+
 class FailoverPrefersAFreeAccountTests(_GroupCase):
     """The failover swap refuses rather than exceeding the target's limit
     (dev/changelog/854), so a ranking blind to accounts walks straight into that refusal."""
@@ -246,6 +328,22 @@ class FailoverPrefersAFreeAccountTests(_GroupCase):
     def tearDown(self):
         recorder._active.pop(self.rid, None)
         super().tearDown()
+
+    def test_it_fails_over_onto_an_empty_account_before_one_a_player_is_watching_on(self):
+        """dev/changelog/1642: the same order at a failover, which shares the helper."""
+        connlim.try_acquire(self.busy_id, 'viewer', 'v1')
+        self.assertTrue(recorder.failover_group_member(self.t.app, self.rid, 'stream died'))
+        db.session.expire_all()
+        self.assertEqual(db.session.get(Recording, self.rid).channel_id, self.spare_id)
+        self.assertIn(('viewer', 'v1'), connlim._holders.get(self.busy_id, []))
+
+    def test_a_failover_never_takes_a_failing_feed_to_spare_a_player(self):
+        connlim.try_acquire(self.busy_id, 'viewer', 'v1')
+        db.session.get(Channel, self.spare_id).consecutive_test_failures = 10
+        db.session.commit()
+        self.assertTrue(recorder.failover_group_member(self.t.app, self.rid, 'stream died'))
+        db.session.expire_all()
+        self.assertEqual(db.session.get(Recording, self.rid).channel_id, self.strong_id)
 
     def test_it_fails_over_onto_the_idle_account_not_the_busy_one(self):
         connlim.try_acquire(self.busy_id, 'recording', 999999)

@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support import clips  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support.seed import (make_account, make_channel,  # noqa: E402
-                                make_epg_entry, make_group, make_recording)
+                                make_epg_entry, make_group, make_guide_match, make_recording)
 
 import app.connection_limits as connlim  # noqa: E402
 import app.output_feed as feed  # noqa: E402
@@ -52,6 +52,13 @@ def _wait(predicate, timeout=15.0, interval=0.1):
             return True
         time.sleep(interval)
     return predicate()
+
+
+def _fresh_count(query) -> int:
+    """`query`'s count read in a new transaction: a row a play's own thread commits is not in the
+    snapshot a read transaction the test already holds open was given."""
+    db.session.commit()
+    return query().count()
 
 
 def _feed_cfg(**overrides):
@@ -695,6 +702,48 @@ class ReaperJudgementTests(_FeedCase):
         self.assertEqual(session.reason, feed.REASON_CLIENT_TOO_SLOW)
 
 
+class LivePickPrefersAFreeAccountTests(_FeedCase):
+    """dev/changelog/1642 (A1): a play's own pick of a group's member prefers one on an account
+    with a connection free, as a recording's start does; a page asking what would play is told
+    the member a recording would start on with every account free."""
+
+    def setUp(self):
+        super().setUp()
+        self.other = make_account('Other', max_connections=1)
+        self.a = make_channel(self.account, name='Feed a')
+        self.b = make_channel(self.other, name='Feed b')
+        self.a.health_score, self.b.health_score = 90.0, 50.0
+        self.a.in_guide = self.b.in_guide = False
+        self.group = make_group('Game feeds', members=[self.a, self.b])
+        self.group.in_guide = True
+        db.session.commit()
+        self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 4242))
+        self.addCleanup(connlim.release, self.account.id, 'recording', 4242)
+
+    def test_a_group_play_picks_the_member_on_the_free_account(self):
+        play = feed.resolve_play(feed.feed_id_for_group(self.group.id))
+        self.assertEqual(play.member.id, self.b.id)
+
+    def test_a_play_does_not_count_its_own_seat_against_the_member_it_is_on(self):
+        connlim.release(self.account.id, 'recording', 4242)
+        self.assertTrue(connlim.try_acquire(self.account.id, 'viewer', 'v1'))
+        self.addCleanup(connlim.release, self.account.id, 'viewer', 'v1')
+        play = feed.resolve_play(feed.feed_id_for_group(self.group.id), viewer_id='v1')
+        self.assertEqual(play.member.id, self.a.id)
+        self.assertEqual(feed.resolve_play(feed.feed_id_for_group(self.group.id)).member.id, self.b.id)
+
+    def test_a_sports_plays_group_source_prefers_the_free_account_and_a_page_does_not(self):
+        from types import SimpleNamespace
+        source = SimpleNamespace(channel_id=self.a.id, group_id=self.group.id)
+        self.assertEqual(feed._sports_member([source], set(), None, frozenset(), live=True)[0].id,
+                         self.b.id)
+        self.assertEqual(feed.sports_member_now([source], set(), None)[0].id, self.a.id)
+
+    def test_the_guide_rows_member_is_not_moved_by_who_is_connected(self):
+        from app.channel_groups import serving_member
+        self.assertEqual(serving_member(self.group).member.id, self.a.id)
+
+
 class ReasonVocabularyTests(unittest.TestCase):
     def test_every_reason_has_user_facing_text(self):
         reasons = {v for k, v in vars(feed).items() if k.startswith('REASON_') and k != 'REASON_TEXT'}
@@ -1024,6 +1073,9 @@ class RelayFailoverTests(_Relay):
         before = session.bytes_sent
         self._read(resp, 2)
         self.assertGreater(session.bytes_sent, before)
+        # Written after the move is recorded on the session, by the play's own thread.
+        self.assertTrue(_wait(lambda: _fresh_count(lambda: ChannelGroupEvent.query.filter_by(
+            group_id=group.id, event_type=GROUP_VIEWER_FAILOVER)) == 1, 5))
         event = ChannelGroupEvent.query.filter_by(group_id=group.id,
                                                   event_type=GROUP_VIEWER_FAILOVER).one()
         self.assertEqual(event.channel_id, b.id)
@@ -1033,7 +1085,10 @@ class RelayFailoverTests(_Relay):
 
     def test_a_group_tune_in_tries_the_next_member_when_the_best_ones_account_is_full(self):
         """dev/docs/BUGS.md 2026-11-16 (the tune-in walk): a group's play was refused 409 on the
-        best member's account with a member on another account free."""
+        best member's account with a member on another account free. The pick prefers the free
+        account itself since dev/changelog/1642, so the walk is what catches the account that
+        filled between the pick and the seat: the pick here is told nothing about seats."""
+        from unittest import mock
         other = make_account('Other', max_connections=1)
         a = self._clip_channel('Feed a', clip='a.ts')
         b = self._clip_channel('Feed b', clip='b.ts', account=other)
@@ -1042,7 +1097,8 @@ class RelayFailoverTests(_Relay):
         db.session.commit()
         self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 4242))
         self.addCleanup(connlim.release, self.account.id, 'recording', 4242)
-        resp = self._play(feed.feed_id_for_group(group.id))
+        with mock.patch.object(feed, '_viewer_standing', return_value={}):
+            resp = self._play(feed.feed_id_for_group(group.id))
         self._read(resp, 1)
         session = self._session()
         self.assertEqual(session.channel_id, b.id)
@@ -1070,11 +1126,185 @@ class RelayFailoverTests(_Relay):
             session.preempted, session.preempted_by = True, 4242
             return False
 
-        with mock.patch.object(feed, '_take_seat', refused_and_flagged):
+        with mock.patch.object(feed, '_take_seat', refused_and_flagged), \
+                mock.patch.object(feed, '_viewer_standing', return_value={}):
             resp = self._play(feed.feed_id_for_group(group.id))
         self._read(resp, 1)
         session = self._session()
         self.assertEqual((session.channel_id, session.preempted), (b.id, False))
+
+    def _two_account_group(self):
+        other = make_account('Other', max_connections=1)
+        a = self._clip_channel('Feed a', clip='a.ts')
+        b = self._clip_channel('Feed b', clip='b.ts', account=other)
+        a.health_score, b.health_score = 90.0, 50.0
+        group = make_group('Game feeds', members=[a, b])
+        rec = make_recording(status='SCHEDULED', name='The big game', channel_id=a.id)
+        db.session.commit()
+        return other, a, b, group, rec
+
+    def test_a_group_tune_in_starts_on_the_member_whose_account_is_free(self):
+        """dev/changelog/1642 (A1): the pick itself prefers a member on an account with a
+        connection free, as a recording's start does, so the play starts there without being
+        refused a seat first."""
+        from unittest import mock
+        other, a, b, group, _rec = self._two_account_group()
+        self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 4242))
+        self.addCleanup(connlim.release, self.account.id, 'recording', 4242)
+        with mock.patch.object(feed, '_seat_for', wraps=feed._seat_for) as walk:
+            resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        self.assertEqual((session.channel_id, session.account_id), (b.id, other.id))
+        walk.assert_not_called()
+        self.assertEqual(feed.play_notes(session), '', 'no seat was refused on the way')
+
+    def _preempt(self, rec):
+        from app.recorder import _try_acquire_slot_with_preemption
+        self.assertTrue(_try_acquire_slot_with_preemption(self.t.app, rec.id, self.account.id))
+        self.addCleanup(connlim.release, self.account.id, 'recording', rec.id)
+
+    def test_a_recording_moves_a_group_play_to_a_member_on_a_free_account(self):
+        """dev/changelog/1642 (A3): the recording takes the connection, and the play moves to
+        the group's member on the idle account in the same response instead of ending, saying
+        why on the play, the group's timeline and the recording's."""
+        other, a, b, group, rec = self._two_account_group()
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        self.assertEqual(session.channel_id, a.id)
+        old_proc = session.proc
+        self._preempt(rec)
+        self.assertIsNotNone(old_proc.poll(), 'the old connection is closed before the recording connects')
+        self.assertTrue(_wait(lambda: bool(session.failovers), 15), session)
+        self.assertTrue(session.live)
+        self.assertEqual((session.channel_id, session.account_id), (b.id, other.id))
+        self.assertEqual(connlim._holders.get(other.id), [('viewer', session.id)])
+        self.assertEqual(connlim._holders.get(self.account.id), [('recording', rec.id)])
+        self.assertEqual(session.failovers, [('Feed a', 'Feed b', feed.REASON_MOVED_FOR_RECORDING)])
+        self.assertIn('a recording needed the connection', feed.move_text(*session.failovers[0]))
+        before = session.bytes_sent
+        self._read(resp, 2)
+        self.assertGreater(session.bytes_sent, before)
+        self.assertTrue(_wait(lambda: _fresh_count(lambda: RecordingEvent.query.filter_by(
+            recording_id=rec.id, event_type=DIAGNOSTICS)) == 1, 5))
+        self.assertEqual(Alert.query.filter_by(alert_type='VIEWER_PREEMPTED').count(), 0,
+                         'the play kept playing')
+        event = RecordingEvent.query.filter_by(recording_id=rec.id, event_type=DIAGNOSTICS).one()
+        self.assertIn('moved to "Feed b"', event.detail)
+        group_event = ChannelGroupEvent.query.filter_by(group_id=group.id,
+                                                        event_type=GROUP_VIEWER_FAILOVER).one()
+        self.assertIn('needed the connection', group_event.detail)
+        self.assertEqual(group_event.channel_id, b.id)
+
+    def test_the_recording_holds_its_seat_before_the_move_asks_for_one(self):
+        """dev/changelog/1642: the move starts only once the recording's acquire is done, so it
+        can never take back the seat being freed for the recording."""
+        from unittest import mock
+        other, a, b, group, rec = self._two_account_group()
+        self._read(self._play(feed.feed_id_for_group(group.id)), 1)
+        session = self._session()
+        seen = []
+        real = feed._seat_for
+
+        def asked(*args, **kwargs):
+            seen.append(list(connlim._holders.get(self.account.id, [])))
+            return real(*args, **kwargs)
+
+        with mock.patch.object(feed, '_seat_for', asked):
+            self._preempt(rec)
+            self.assertTrue(_wait(lambda: bool(session.failovers), 15), session)
+            self.assertTrue(_wait(lambda: _fresh_count(lambda: RecordingEvent.query.filter_by(
+                recording_id=rec.id, event_type=DIAGNOSTICS)) == 1, 5))
+        self.assertEqual(seen[0], [('recording', rec.id)])
+
+    def test_a_move_whose_target_fills_first_ends_by_name_and_releases_everything(self):
+        """The free account fills between the move's pick and its seat (the check is advisory,
+        dev/changelog/855): the play ends preempted, with the alert, no ffmpeg and no seat."""
+        from unittest import mock
+        other, a, b, group, rec = self._two_account_group()
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        old_proc = session.proc
+        real = feed.resolve_play
+
+        def then_fill(*args, **kwargs):
+            play = real(*args, **kwargs)
+            if not connlim.seated_holder_ids('recording') - {rec.id}:
+                connlim.try_acquire(other.id, 'recording', 4343)
+            return play
+
+        self.addCleanup(connlim.release, other.id, 'recording', 4343)
+        with mock.patch.object(feed, 'resolve_play', then_fill):
+            self._preempt(rec)
+            self.assertTrue(_wait(lambda: not session.live, 15), session)
+        self.assertEqual(session.reason, feed.REASON_PREEMPTED)
+        self.assertIsNotNone(old_proc.poll())
+        self.assertIsNone(session.proc)
+        self.assertFalse(os.path.exists(session.stderr_path))
+        self.assertNotIn(session.id, connlim.seated_holder_ids('viewer'))
+        self.assertTrue(_wait(lambda: _fresh_count(
+            lambda: Alert.query.filter_by(alert_type='VIEWER_PREEMPTED')) == 1, 5))
+
+    def test_a_second_recording_does_not_blame_a_play_that_is_moving(self):
+        """A play between channels holds no seat on the account it left, so a second recording
+        on that account takes nothing from it and says nothing about it."""
+        other, a, b, group, rec = self._two_account_group()
+        self._read(self._play(feed.feed_id_for_group(group.id)), 1)
+        session = self._session()
+        with feed._lock:
+            session._moving = True
+        try:
+            self.assertFalse(feed.preempt_for_account(self.t.app, self.account.id, 4545, movers=[]))
+        finally:
+            with feed._lock:
+                session._moving = False
+        self.assertFalse(session.preempted)
+
+    def test_a_timeline_write_that_fails_never_ends_a_play_that_moved(self):
+        from unittest import mock
+        from sqlalchemy.exc import OperationalError
+        other, a, b, group, rec = self._two_account_group()
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        boom = OperationalError('INSERT', {}, Exception('disk I/O error'))
+        with mock.patch('app.db_utils.retry_on_locked', side_effect=lambda *a, **k: (lambda fn: fn)), \
+                mock.patch.object(db.session, 'commit', side_effect=boom):
+            self._preempt_quiet(rec)
+            self.assertTrue(_wait(lambda: bool(session.failovers), 15), session)
+            time.sleep(0.5)
+        self.assertTrue(session.live, session)
+        self.assertEqual(session.channel_id, b.id)
+
+    def _preempt_quiet(self, rec):
+        from app.recorder import _try_acquire_slot_with_preemption
+        self.assertTrue(_try_acquire_slot_with_preemption(self.t.app, rec.id, self.account.id))
+        self.addCleanup(connlim.release, self.account.id, 'recording', rec.id)
+
+    def test_a_player_that_leaves_mid_move_is_still_on_the_recordings_timeline(self):
+        """The recording cut it as surely as if it had ended there: the recording's own page
+        says what it took, with no alert for a play the recording did not end."""
+        from unittest import mock
+        other, a, b, group, rec = self._two_account_group()
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        real = feed.resolve_play
+
+        def player_left(*args, **kwargs):
+            if kwargs.get('viewer_id') == session.id:
+                resp.close()
+                _wait(lambda: not session.live, 5)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(feed, 'resolve_play', player_left):
+            self._preempt(rec)
+            self.assertTrue(_wait(lambda: _fresh_count(lambda: RecordingEvent.query.filter_by(
+                recording_id=rec.id, event_type=DIAGNOSTICS)) == 1, 10))
+        self.assertEqual(session.reason, feed.REASON_CLIENT_GONE)
+        self.assertEqual(Alert.query.filter_by(alert_type='VIEWER_PREEMPTED').count(), 0)
 
     def test_a_group_with_every_account_full_is_still_refused_naming_the_best_member(self):
         other = make_account('Other', max_connections=1)
@@ -1119,7 +1349,7 @@ class SportsRelayTests(_Relay):
 
     def _team_channel(self, *clip_names, scores=(90.0, 50.0)):
         from app import sports_feed
-        from app.database import SportsEvent, SportsFollow, SportsLeague, SportsMatch
+        from app.database import SportsEvent, SportsFollow, SportsLeague
         now = datetime.utcnow()
         league = SportsLeague(tsdb_id=9001, name='Pretend League', match_terms='[]')
         db.session.add(league)
@@ -1136,9 +1366,7 @@ class SportsRelayTests(_Relay):
             account = self.account if not members else make_account(f'Other {len(members)}', max_connections=1)
             ch = self._clip_channel(f'Local {clip}', clip=clip, account=account)
             ch.health_score = score
-            db.session.add(SportsMatch(event_id=event.id, channel_id=ch.id, kind='guide', strength='strong',
-                                       airing='first', program_start_time=start,
-                                       program_stop_time=start + timedelta(hours=3), title_key='g', reason='r'))
+            make_guide_match(event, ch, start, title='g', reason='r')
             members.append(ch)
         db.session.commit()
         sports_feed.set_team_channel(league.id, 101, True)
@@ -1164,7 +1392,7 @@ class SportsRelayTests(_Relay):
         self.assertEqual(ChannelGroupEvent.query.count(), 0, 'a sports channel is not a group')
 
     def test_a_failover_stays_on_the_game_the_play_started_on(self):
-        from app.database import SportsEvent, SportsMatch
+        from app.database import SportsEvent
         feed_id, (a, b) = self._team_channel('a.ts', 'b.ts')
         resp = self._play(feed_id)
         self._read(resp, 1)
@@ -1180,9 +1408,7 @@ class SportsRelayTests(_Relay):
         db.session.flush()
         c = self._clip_channel('Local c', clip='a.ts', account=make_account('Third', max_connections=1))
         c.health_score = 99.0
-        db.session.add(SportsMatch(event_id=later.id, channel_id=c.id, kind='guide', strength='strong',
-                                   airing='first', program_start_time=start,
-                                   program_stop_time=start + timedelta(hours=3), title_key='h', reason='r'))
+        make_guide_match(later, c, start, title='h', reason='r')
         db.session.commit()
         self.assertEqual(feed.resolve_play(feed_id).member.id, c.id, 'a new tune-in gets the later game')
         session.proc.kill()
@@ -1317,11 +1543,26 @@ class MixedModeHeldSeatTests(_FeedCase):
         self.t.sandbox_config(_feed_cfg(mode='redirect', held_seats={str(self.account.id): 1}))
         self.assertIn('left alone for IPTV players', _slot_wait_reason(self.account.id))
 
+    def test_a_recordings_seat_standing_counts_a_play_on_a_held_seat_as_in_its_way(self):
+        """dev/changelog/1642: a play on a held seat is never preempted (dev/changelog/1536), so
+        an account whose only seat it holds is full for a recording, not "free by cutting it
+        off" - and one with a second seat is free outright."""
+        self._mixed(self.account, held=1, connections=1)
+        self._seat('viewer', 'v1')
+        self.assertEqual(connlim.seat_standing([self.account.id], 'recording'),
+                         {self.account.id: connlim.SEAT_NONE})
+        self._mixed(self.account, held=1, connections=2)
+        self.assertEqual(connlim.seat_standing([self.account.id], 'recording'),
+                         {self.account.id: connlim.SEAT_FREE})
+        self._seat('viewer', 'v2')
+        self.assertEqual(connlim.seat_standing([self.account.id], 'recording'),
+                         {self.account.id: connlim.SEAT_BY_CUTTING_VIEWER})
+
     def test_recent_plays_offers_both_kinds_a_mixed_output_writes(self):
         from app.output_feed_view import _recent
         from app.database import FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED
         with self.t.app.test_request_context('/iptv-output'):
-            chips = _recent({}, feed.MODE_MIXED, {}, datetime.utcnow(), None, False)['chips']
+            chips = _recent({}, feed.MODE_MIXED, {}, {}, datetime.utcnow(), None, False)['chips']
         self.assertEqual([c['key'] for c in chips],
                          ['all', FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED])
 
@@ -1371,8 +1612,13 @@ class MixedModeRouteTests(_Relay):
         self.assertTrue(_try_acquire_slot_with_preemption(self.t.app, rec.id, self.account.id))
         self.addCleanup(connlim.release, self.account.id, 'recording', rec.id)
         self.assertTrue(first.live, 'the play on the held seat plays on')
-        self.assertFalse(second.live)
+        # A group's play is moved rather than ended when it can be; with nowhere to go, the
+        # move ends it by the same name (dev/changelog/1642).
+        self.assertTrue(_wait(lambda: not second.live, 10))
         self.assertEqual(second.reason, feed.REASON_PREEMPTED)
+        self.assertTrue(_wait(lambda: _fresh_count(
+            lambda: Alert.query.filter_by(alert_type='VIEWER_PREEMPTED')) == 1, 5),
+            'the move thread has finished with the play before the test tears down')
         self.assertEqual(sorted(map(str, connlim._holders.get(self.account.id))),
                          sorted(map(str, [('viewer', first.id), ('recording', rec.id)])))
 

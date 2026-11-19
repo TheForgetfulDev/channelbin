@@ -367,54 +367,108 @@ def at_limit(account_id: int) -> bool:
         return all(len(_held_in(pool)) >= limit for pool, limit, _ in pools)
 
 
-def accounts_without_free_recording_slot(account_ids, exclude_holder=None) -> set:
-    """Of `account_ids`, the ones a recording could not take a slot on right now.
+#: seat_standing()'s answers, best first: a seat nobody is in; a seat only by cutting off an
+#: IPTV player on the output feed (a recording's question only - a viewer cuts nobody); none.
+SEAT_FREE = 'free'
+SEAT_BY_CUTTING_VIEWER = 'by_cutting_viewer'
+SEAT_NONE = 'none'
+SEAT_STANDINGS = (SEAT_FREE, SEAT_BY_CUTTING_VIEWER, SEAT_NONE)
 
-    "Free for a recording" is a narrower question than at_limit(): a slot held by a
-    channel test is preempted rather than waited on
-    (recorder._try_acquire_slot_with_preemption), so a test holder never delays a
-    recording and never makes an account look full here. Only 'recording'-kind holders
-    count. `exclude_holder` is a (holder_kind, holder_id) pair to discount - a live
-    recording asking where it could fail over to must not see its own slot as somebody
-    else's.
 
-    Advisory and racy in exactly the way at_limit() documents: this informs *which
-    member to prefer*, never whether a recording may connect. try_acquire() remains the
-    only thing that decides, and a member on a "full" account is still selectable when
-    no alternative exists (dev/changelog/855).
+def seat_standing(account_ids, holder_kind: str, exclude_holder=None) -> dict:
+    """{account_id: SEAT_*} - whether a `holder_kind` holder could take a seat on each account
+    right now, and whom it would have to cut off to get one. The ONE answer to "which accounts
+    are free, and free of whom" that a recording's member pick and the IPTV output's ask
+    (dev/changelog/1642), so the two cannot disagree about which account is idle.
 
-    Batched deliberately. One selection pass asks this once for a group whose members
-    may span many accounts, where at_limit() would re-read the config and one Account
-    row per member (CLAUDE.md, no hidden I/O in per-row loops).
-    """
+    For a 'recording': a channel test or a live preview is preempted rather than waited on
+    (recorder._try_acquire_slot_with_preemption) and never makes an account less free. An IPTV
+    player is preempted too, but cutting one off is a cost a viewer sees, so an account whose
+    only free seats are a viewer's answers SEAT_BY_CUTTING_VIEWER and an empty one is preferred
+    over it. Only other recordings make an account SEAT_NONE - and a viewer the preemption would
+    leave seated, one on its account's held seats (dev/changelog/1536), which counts as one.
+
+    For a 'viewer': the question try_acquire() would answer - a viewer preempts nobody, so every
+    holder counts and its account's held seats are its own. SEAT_FREE or SEAT_NONE.
+
+    `exclude_holder` is a (holder_kind, holder_id) pair to discount: a live recording or play
+    asking where it could move to must not see its own seat as somebody else's.
+
+    Advisory and racy in exactly the way at_limit() documents: this informs *which member to
+    prefer*, never whether anything may connect. try_acquire() remains the only thing that
+    decides, and a member on a SEAT_NONE account is still selectable when no alternative exists
+    (dev/changelog/855).
+
+    Batched deliberately. One selection pass asks this once for a group whose members may span
+    many accounts, where at_limit() would re-read the config and one Account row per member
+    (CLAUDE.md, no hidden I/O in per-row loops)."""
     from .config import load_config
     from .database import Account
+    from .output_feed import held_seats_now
     ids = {a for a in account_ids if a is not None}
     if not ids:
-        return set()
+        return {}
     cfg = load_config()
     default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
     seats = _seats_now(ids)
-    taken = _pool_taken_now(ids, seats, cfg)
+    taken = _pool_taken_now(ids, seats, cfg, holder_kind)
     pools_by_account = {a.id: _usable_limits(a, default_max_connections, taken, seats.get(a.id, []))
                         for a in Account.query.filter(Account.id.in_(ids)).all()}
-    full = set()
+    # The viewers a recording's preemption leaves seated (preempt_viewers_for_slot keeps up to
+    # an account's held seats, dev/changelog/1536) are in its way as surely as a recording.
+    held = {} if holder_kind == 'viewer' else held_seats_now(None, cfg)
+    out = {}
     with _lock:
         for account_id in ids:
             pools = pools_by_account.get(account_id)
             if pools is None:
                 # No account row: try_acquire() refuses outright, so this is as
                 # unavailable as a full account. Same answer at_limit() gives.
-                full.add(account_id)
+                out[account_id] = SEAT_NONE
                 continue
+            best = SEAT_NONE
+            # One count across the account's pools, as the preemption keeps its held seats
+            # across all of them (_strip_kind's `keep`), not up to that many in each.
+            kept: dict = defaultdict(int)
             for pool, limit, _ in pools:
-                held = sum(1 for h in _held_in(pool)
-                           if h[0] == 'recording' and h != exclude_holder)
-                if held < limit:
+                hard, soft = _in_the_way(pool, holder_kind, exclude_holder, held, kept)
+                if hard + soft < limit:
+                    best = SEAT_FREE
                     break
+                if hard < limit:
+                    best = SEAT_BY_CUTTING_VIEWER
+            out[account_id] = best
+    return out
+
+
+def _in_the_way(pool, holder_kind: str, exclude_holder, held: dict, kept: dict) -> tuple:
+    """(holders a `holder_kind` holder would have to wait on in `pool`, viewers it could cut off
+    instead). `kept` counts, per account, the viewers already found on its held seats in the
+    pools before this one. The caller holds _lock."""
+    others = [h for h in _held_in(pool) if h != exclude_holder]
+    if holder_kind == 'viewer':
+        return len(others), 0
+    hard = soft = 0
+    for h in others:
+        if h[0] == 'recording':
+            hard += 1
+        elif h[0] == 'viewer':
+            owner = _account_of(pool, h)
+            if kept[owner] < held.get(owner, 0):
+                kept[owner] += 1
+                hard += 1
             else:
-                full.add(account_id)
-    return full
+                soft += 1
+    return hard, soft
+
+
+def accounts_without_free_recording_slot(account_ids, exclude_holder=None) -> set:
+    """Of `account_ids`, the ones a recording could not take a slot on right now, even by
+    cutting off an IPTV player: seat_standing()'s SEAT_NONE for a 'recording'. Only other
+    recordings make an account full here; the rule scheduler's seat moves read this
+    (app/seat_moves.py)."""
+    return {a for a, s in seat_standing(account_ids, 'recording', exclude_holder).items()
+            if s == SEAT_NONE}
 
 
 def must_yield_to_block(account_id: int, recording_id: int) -> bool:

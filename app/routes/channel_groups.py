@@ -9,7 +9,7 @@ from datetime import datetime
 from flask import Blueprint, render_template, request, jsonify, url_for, abort
 from sqlalchemy.orm import selectinload
 
-from .. import db, health_bands, channel_hiding, duplicate_streams, history_filter
+from .. import db, health_bands, channel_hiding, duplicate_streams, history_filter, output_feed
 from ..database import (
     Channel, ChannelGroup, ChannelGroupMember, ChannelEvent, ChannelTest, Tag,
     Recording, RecordingEvent, RecordingProfile, HealthCheckProfile, OnDemandTestJob,
@@ -1636,6 +1636,8 @@ def build_group_detail_context(group):
         # For the delete confirm - deleting the group stops these (DESIGN-autoschedule.md §3.2).
         'auto_rules': _rules_by_group().get(group.name, []),
         'records': records,
+        # Preview plays the group as the IPTV output would, offered there or not (dev/changelog/1645).
+        'preview_feed_id': output_feed.feed_id_for_group(group.id) if is_stored and records else None,
         'bar_state': _action_bar_state(job, tester_status),
         'is_system': group.is_system,
         'payload': payload,

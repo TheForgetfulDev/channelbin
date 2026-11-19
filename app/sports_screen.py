@@ -291,7 +291,7 @@ def words_for(state: str, mode: str, noun: str, *, carries: str = '', game: str 
                     f"All {slots} of the IPTV output's slots are in use. "
                     'It starts here by itself when one is free.')
         elif held == HELD_NO_CONNECTION:
-            note = ('Every account whose guide lists it is using all of its connections right now. '
+            note = ('Every account it can be played from is using all of its connections right now. '
                     'It starts here by itself when one frees up.')
         else:
             raise ValueError(f'Unknown reason a game is held "{held}"')

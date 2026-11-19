@@ -11,18 +11,25 @@ Rules this module holds, each guarded in tests/test_sports_feed.py:
 
 * Watch only and feed only. A sports channel is never a channel group, never in the TV Guide, and
   nothing records from it.
-* It plays only from a channel whose guide lists the game near that moment: a strong guide match
+* It plays from a channel whose guide lists the game near that moment: a strong guide match
   still in the guide, not marked wrong, not a replay, on a channel that is not hidden, whose
   listing is on or within the output's sports window of it (sports_match.airing_now,
-  dev/changelog/1529). Never an event channel's name.
+  dev/changelog/1529). Which of those listings and channels plays is auto_rules.game_sources()'s
+  answer, the one Record and a rule read (dev/changelog/1637).
+* A game no guide lists at all plays from an event channel whose name mentions it, exactly when
+  Record would record it from one (auto_rules_sports.name_pick(), dev/changelog/1643): from the
+  window's `before` ahead of the pick's start to the pick's end, which is where game_sources()
+  calls it over. Any listing, even a weak one, means no name is read. Its guide lists it at the
+  pick's times, and its play, its guide description and its note say it came from a name.
 * A row of sports_feed_channels is an identity, and its id is the feed id an IPTV player caches. A
   switch going off or a follow ending stops the channel being served and keeps the row.
 * A team's channel is served while its switch is on and the team is followed; a league's numbered
   channels while the league's switch is on and the league is followed whole. Both are read where
   the channel is served, so no path that changes a follow has to remember them.
-* Go live now is a fact about a game, not a channel (dev/changelog/1530): a person said it is on
-  early, so every sports channel carrying it plays it ahead of its window until the end that was
-  fixed when the button was pressed. Written by set_live_now() and nothing else.
+* Start broadcast is a fact about a game, not a channel (dev/changelog/1530, named so since
+  dev/changelog/1644): a person said it is on early, so every sports channel carrying it plays it
+  ahead of its window until the end that was fixed when the button was pressed. Written by
+  set_live_now() and nothing else; the code keeps the feature's first name, live now.
 * A league's layout is stored. SportsEvent.feed_number is written where the schedule is written
   and a game keeps it, with one exception: a game whose time has changed so that it lands on
   another's on the same channel is placed again, since the guide an IPTV player cached for it was
@@ -33,12 +40,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 
 from . import db, sports_match
 from .database import Channel, SportsEvent, SportsFeedChannel, SportsFollow, SportsLeague, SportsTeam
 from .db_utils import retry_on_locked
-from .fmt_utils import counted
+from .fmt_utils import counted, length_words
 from .sports_data import event_game_name, event_shape_is_matchup
 from .sports_times import Rules, kickoff as times_kickoff
 
@@ -90,9 +97,18 @@ class Program:
     #: How many channels list the game at its time, on any account: 0 when no guide lists it.
     listed: int = 0
     #: The game, and its listings a play may take [(channel id, account id, start, stop)], for a
-    #: page that says what Go live now would do without asking again.
+    #: page that says what Start broadcast would do without asking again.
     event: Optional[SportsEvent] = field(default=None, repr=False)
     listings: tuple = field(default=(), repr=False)
+    #: For a game no guide lists, the event channels it plays from (auto_rules_sports.NameSource);
+    #: None when it has a listing or nothing names it.
+    named: object = field(default=None, repr=False)
+
+    @property
+    def playable(self) -> bool:
+        """A tune-in has something to take the game from: a guide lists it, or a channel's name
+        gives it (dev/changelog/1643). Whether the account allows it is the description's to say."""
+        return bool(self.listed) or self.named is not None
 
 
 #: Where a play's moment falls against the listing it plays from (playing_now). Every value is
@@ -100,18 +116,24 @@ class Program:
 PHASE_ON = 'on'          # the listing is on now
 PHASE_AFTER = 'after'    # the listing ended no more than the window's `after` ago
 PHASE_BEFORE = 'before'  # the listing starts no more than the window's `before` from now
-PHASE_LIVE_NOW = 'live_now'  # a person opened the game early with Go live now (set_live_now)
+PHASE_LIVE_NOW = 'live_now'  # a person started the broadcast early with Start broadcast (set_live_now)
 
 
 @dataclass
 class NowPlaying:
     """What a sports channel has on at one moment: the game and the channels whose guide lists it
     within the window, or `why_none`, a clause that finishes "Nothing to play for <channel>: ...".
-    `note` says where now falls against the listings played from when that is not "on now"."""
+    `note` says where now falls against the listings played from when that is not "on now".
+    `listings` names those listings, (channel id, the listing's start in the guide), for
+    auto_rules.game_sources() to pick the channel from (dev/changelog/1637). A game no guide lists
+    that an event channel's name gives has no listings and its `named` instead (a NameSource);
+    `channels` are then the channels naming it (dev/changelog/1643)."""
     event: Optional[SportsEvent] = field(default=None, repr=False)
     channels: list = field(default_factory=list, repr=False)
+    listings: frozenset = frozenset()
     why_none: str = ''
     note: str = ''
+    named: object = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -161,14 +183,21 @@ def served_channels(row_id: int = None) -> list:
 # A game's time on a sports channel
 # ---------------------------------------------------------------------------
 
-def event_window(event, listings=()) -> Optional[tuple]:
+def event_window(event, listings=(), named=None) -> Optional[tuple]:
     """(start, stop) of a game on a sports channel, or None when it has no time to show. The start
     is the guide's own when the matcher has found the game there (SportsEvent.guide_start), else
     TheSportsDB's. The stop is the latest end among `listings` [(channel id, account id, start,
     stop)] that start with the game, else a length by the event's shape. A postponed game has no time, and
-    neither does a field event still at TheSportsDB's 00:00 placeholder (DESIGN-sports-data.md 7)."""
+    neither does a field event still at TheSportsDB's 00:00 placeholder (DESIGN-sports-data.md 7).
+    A game no guide lists that an event channel's name gives (`named`, a NameSource) is at its
+    pick's start and end, the times Record would record it at (dev/changelog/1643)."""
+    if event.postponed:
+        return None
+    if named is not None and not listings:
+        begin, end = named.pick.start, named.pick.stop
+        return begin, min(max(end, begin + MIN_LENGTH), begin + MAX_LENGTH)
     start = event.guide_start or event.start_at
-    if start is None or event.postponed:
+    if start is None:
         return None
     matchup = event_shape_is_matchup(event)
     if not matchup and event.guide_start is None and (start.hour, start.minute) == (0, 0):
@@ -184,15 +213,16 @@ def with_the_game(listings, start: datetime) -> list:
     return [row for row in listings if row[2] is not None and abs(row[2] - start) <= START_AGREE]
 
 
-def placement_window(event) -> Optional[tuple]:
+def placement_window(event, named=None) -> Optional[tuple]:
     """(start, stop) of a game for laying a league out. TheSportsDB's own start and a length by
     shape, so it moves only when TheSportsDB moves the game: the guide's start shifts by minutes as
     listings come and go, and a layout must not. A field event at the 00:00 placeholder has only
-    the guide's start to go on."""
+    the guide's start to go on, or, when no guide lists it, the start an event channel's name gives
+    (`named`, a NameSource, dev/changelog/1643), so a race only a name gives has a channel too."""
     start = event.start_at
     matchup = event_shape_is_matchup(event)
     if start is not None and not matchup and (start.hour, start.minute) == (0, 0):
-        start = event.guide_start
+        start = event.guide_start or (named.pick.start if named is not None else None)
     if start is None or event.postponed:
         return None
     return start, start + (MATCHUP_LENGTH if matchup else FIELD_LENGTH)
@@ -200,6 +230,44 @@ def placement_window(event) -> Optional[tuple]:
 
 def event_start():
     return func.coalesce(SportsEvent.guide_start, SportsEvent.start_at)
+
+
+def _since(lo: datetime):
+    """Games whose start is after `lo`, and the games no guide has given a start that TheSportsDB
+    has up to a day before it: a field event at the 00:00 placeholder whose real time is a
+    channel's name's, later that day (dev/changelog/1643). Their windows decide the rest."""
+    return or_(event_start() > lo,
+               and_(SportsEvent.guide_start.is_(None), SportsEvent.start_at > lo - timedelta(days=1)))
+
+
+def _timed(events, now: datetime) -> dict:
+    """{event id: event_window()} for `events`, a game with no time of its own (a field event at
+    TheSportsDB's 00:00 placeholder that no guide lists) at the times an event channel's name gives
+    it. The names are read only when such a game is there: one name_sources() load then, none
+    otherwise."""
+    out = {e.id: event_window(e) for e in events}
+    untimed = [e for e in events if out[e.id] is None and not e.postponed and e.guide_start is None]
+    if untimed:
+        names = name_sources({e.league_id for e in untimed}, now)
+        for e in untimed:
+            out[e.id] = event_window(e, named=names.get(e.id))
+    return out
+
+
+def name_sources(league_ids, now: datetime) -> dict:
+    """{event id: NameSource} for the games of `league_ids` no guide lists that an event channel's
+    name gives: auto_rules_sports.name_sources(), read over the same days and at the same `now` as
+    auto_rules.game_sources() reads them, since a pick's length is the longest listing among the
+    games read. A fixed handful of queries, none with no league."""
+    from .auto_rules import PICK_LOOKBACK
+    from .auto_rules_sports import name_sources as read
+    league_ids = sorted({i for i in league_ids if i})
+    return read(league_ids, now, lookback=PICK_LOOKBACK) if league_ids else {}
+
+
+def _usable_names(named, blocked, allowed) -> list:
+    """The channels naming a game that are on an account a play may use."""
+    return [n for n in named.names if n.account_id not in blocked and (allowed is None or n.account_id in allowed)]
 
 
 def _events_of(served: Served):
@@ -253,11 +321,12 @@ def screen_events(served: list, now: datetime) -> dict:
     numbered, teams = _carrier_keys(served)
     start = event_start()
     events = (SportsEvent.query.filter(SportsEvent.league_id.in_({s.league.id for s in served}),
-                                       start > now - MAX_LENGTH, SportsEvent.postponed.is_(False))
+                                       _since(now - MAX_LENGTH), SportsEvent.postponed.is_(False))
               .order_by(start, SportsEvent.id).all())
+    windows = _timed(events, now)
     out = {}
     for event in events:
-        window = event_window(event)
+        window = windows[event.id]
         if window is None or window[1] <= now:
             continue
         for s in _carriers_of(event, numbered, teams):
@@ -279,15 +348,31 @@ def screen_team_ids(now: datetime) -> set:
 # The guide
 # ---------------------------------------------------------------------------
 
-def _description(event, channels: int, unusable: int) -> str:
+def _description(event, channels: int, unusable: int, named=None) -> str:
     """A game's guide description. Says where the stream comes from, and says so when there is
     none: an IPTV player shows this before anyone presses play. `channels` list the game and can be
-    played from; `unusable` list it on an account the feed cannot use right now."""
+    played from; `unusable` list it on an account the feed cannot use right now. With `named` (a
+    NameSource) the two count the channels whose names mention a game no guide lists."""
+    from .auto_rules_sports import START_FROM_NAME, START_FROM_TSDB
     bits = []
     where = ', '.join(x for x in (event.venue, event.city) if x)
     if where:
         bits.append(f'{where}.')
-    if channels:
+    if named is not None:
+        if channels:
+            bits.append("No guide lists this, so ChannelBin plays it from "
+                        + ('the channel whose name mentions it.' if channels == 1
+                           else f'one of the {counted(channels, "channel")} whose names mention it.'))
+            if named.pick.source == START_FROM_TSDB:
+                bits.append("Its time is TheSportsDB's: the channel's name gives no time zone.")
+            elif named.pick.source != START_FROM_NAME:
+                raise ValueError(f'unknown event start source {named.pick.source!r}')
+        else:
+            bits.append(f'No stream it can play: no guide lists this, and the {counted(unusable, "channel")} '
+                        f"whose {'name mentions' if unusable == 1 else 'names mention'} it "
+                        f"{'is' if unusable == 1 else 'are'} on an account that is blocked or that the IPTV "
+                        'output is not allowed to use.')
+    elif channels:
         bits.append(f'ChannelBin plays this from one of the {counted(channels, "channel")} whose guide lists it.'
                     if channels > 1 else 'ChannelBin plays this from the 1 channel whose guide lists it.')
     elif unusable:
@@ -302,38 +387,54 @@ def _description(event, channels: int, unusable: int) -> str:
     return ' '.join(bits)
 
 
-def guide_programs(served: list, now: datetime, days: int, blocked=frozenset(), allowed=None) -> list:
+def guide_programs(served: list, now: datetime, days: int, blocked=frozenset(), allowed=None,
+                   asked_at: datetime = None) -> list:
     """Every game in the served channels' guides from `now` for `days`, as Programs ordered by
-    channel then start. Two queries whatever is served: the leagues' events in the window, and the
-    listings matched to them. A game ends where the next one on its channel starts. `blocked` and
-    `allowed` are the account ids a play would drop (output_feed._resolve_sports_play), so the
-    description counts the channels a play could really use."""
+    channel then start. A fixed number of queries whatever is served: the leagues' events in the
+    window, the listings matched to them, and the games only an event channel's name gives
+    (name_sources()). A game ends where the next one on its channel starts. `blocked` and
+    `allowed` are the account ids a play drops (output_feed._resolve_sports_play), so the description
+    counts the channels listing the game on an account a play may use. Which of them it plays is
+    auto_rules.game_sources()'s answer at the play, which can also pass over a listing or a group
+    member this count includes (dev/changelog/1637); asking it per game here would be a search per
+    game per guide. `asked_at` is the moment the games only a channel's name gives are read at,
+    when `now` is moved back to keep games just over (output_feed_view): a pick that waits on a
+    league's wait is the play's answer at the real moment, never at a moved one."""
     if not served:
         return []
     numbered, teams = _carrier_keys(served)
     start = event_start()
-    events = (SportsEvent.query.filter(SportsEvent.league_id.in_({s.league.id for s in served}),
-                                       start > now - MAX_LENGTH, start < now + timedelta(days=days))
+    league_ids = {s.league.id for s in served}
+    events = (SportsEvent.query.filter(SportsEvent.league_id.in_(league_ids),
+                                       _since(now - MAX_LENGTH), start < now + timedelta(days=days))
               .order_by(start, SportsEvent.id).all())
     listings = sports_match.listing_windows([e.id for e in events], now)
+    names = name_sources(league_ids, asked_at or now) if events else {}
     by_row = {}
     for event in events:
         rows = _carriers_of(event, numbered, teams)
         if not rows:
             continue
         mine = listings.get(event.id, ())
-        window = event_window(event, mine)
+        named = names.get(event.id) if not mine else None
+        window = event_window(event, mine, named)
         if window is None or window[1] <= now:
             continue
-        carrying = with_the_game(mine, window[0])
-        usable = {c for c, account, _b, _e in carrying
-                  if account not in blocked and (allowed is None or account in allowed)}
-        listed = {c for c, _a, _b, _e in carrying}
-        description = _description(event, len(usable), len(listed - usable))
+        if named is not None:
+            usable = {n.channel_id for n in _usable_names(named, blocked, allowed)}
+            naming = {n.channel_id for n in named.names}
+            description = _description(event, len(usable), len(naming - usable), named)
+            listed = set()
+        else:
+            carrying = with_the_game(mine, window[0])
+            usable = {c for c, account, _b, _e in carrying
+                      if account not in blocked and (allowed is None or account in allowed)}
+            listed = {c for c, _a, _b, _e in carrying}
+            description = _description(event, len(usable), len(listed - usable))
         for s in rows:
             by_row.setdefault(s.row.id, []).append(Program(
                 s.row.id, window[0], window[1], event_game_name(event), description,
-                s.league.sport or 'Sports', len(listed), event, tuple(mine)))
+                s.league.sport or 'Sports', len(listed), event, tuple(mine), named))
     out = []
     for s in served:
         programs = sorted(by_row.get(s.row.id, ()), key=lambda p: p.start)
@@ -350,19 +451,21 @@ def numbered_with_games(served: list, now: datetime, days: int, after: timedelta
     one not over by `after` (the output's sports window, so a game running long keeps its channel)
     that starts within `days`. A numbered channel with none is left out of the output's channel list
     (dev/changelog/1621); its row, and so its feed id, stays. One query, none when no numbered
-    channel is served."""
+    channel is served, and the names (_timed) when a game has no time of its own."""
     numbered = {(s.league.id, s.row.number): s.row.id for s in served if not s.is_team}
     if not numbered:
         return set()
     start = event_start()
     rows = (SportsEvent.query.filter(SportsEvent.league_id.in_({league for league, _n in numbered}),
                                      SportsEvent.feed_number.isnot(None),
-                                     start > now - MAX_LENGTH - after, start < now + timedelta(days=days))
+                                     _since(now - MAX_LENGTH - after), start < now + timedelta(days=days))
             .all())
+    rows = [e for e in rows if (e.league_id, e.feed_number) in numbered]
+    windows = _timed(rows, now)
     out = set()
     for event in rows:
-        row_id = numbered.get((event.league_id, event.feed_number))
-        window = event_window(event) if row_id is not None else None
+        row_id = numbered[(event.league_id, event.feed_number)]
+        window = windows[event.id]
         if window is not None and window[1] > now - after:
             out.add(row_id)
     return out
@@ -434,21 +537,24 @@ def guide_fillers(served: list, programs: list, now: datetime, days: int, tz, h2
         gaps = []
         for program in by_row.get(s.row.id, ()):
             if program.start > cursor:
-                gaps.append((cursor, program.start, program.event, program.start))
+                gaps.append((cursor, program.start, program.event, program.start, program.named))
             cursor = max(cursor, program.stop)
         later = beyond.get(s.row.id)
         later_start = event_window(later)[0] if later is not None else None
         if cursor < end:
-            gaps.append((cursor, end, later, later_start))
-        for lo, hi, event, start in gaps:
+            gaps.append((cursor, end, later, later_start, None))
+        for lo, hi, event, start, named in gaps:
             if event is not None:
                 # The kickoff, by the league's answer to which time a game goes by: the game's
-                # block may start earlier, with the earliest channel's coverage.
-                kickoff = times_kickoff(event, rules.of(s.league.tsdb_id), now, listed_fallback=start)
+                # block may start earlier, with the earliest channel's coverage. A game only a
+                # channel's name gives starts where its pick does, as its own block does.
+                kickoff = (named.pick.start if named is not None
+                           else times_kickoff(event, rules.of(s.league.tsdb_id), now, listed_fallback=start))
                 words = next_game_words(event, kickoff, now, tz, h24)
                 title = f'{NEXT_MARK} Next: {words}'
-                desc = (f'No game on {s.name} until {words}. ChannelBin plays it from a channel whose '
-                        'guide lists it. Schedule from TheSportsDB.')
+                source = ('a channel whose name mentions it, since no guide lists it' if named is not None
+                          else 'a channel whose guide lists it')
+                desc = f'No game on {s.name} until {words}. ChannelBin plays it from {source}. Schedule from TheSportsDB.'
             else:
                 title = f'{NEXT_MARK} No game scheduled'
                 desc = f'TheSportsDB lists no coming game for {s.name} yet.'
@@ -473,17 +579,18 @@ def _when(start: datetime, now: datetime) -> str:
 
 
 def _pick(by_id: dict, listings: list, now: datetime) -> Optional[tuple]:
-    """(event, {channel ids}, phase, listing start, listing stop) for the game a play takes from
-    `listings` [(event id, channel id, start, stop)], or None when there are none. A listing on now
+    """(event, {(channel id, guide start)}, phase, listing start, listing stop) for the game a play
+    takes from `listings` [(event id, channel id, start, stop, guide start)], or None when there
+    are none. A listing on now
     wins; else the one that ended last, since its game may be running long; else the one that
     starts soonest. So a game's tail holds the channel until the next game's listing starts."""
     on, ended, coming = {}, {}, {}
-    for found, channel_id, begin, stop in listings:
+    for found, channel_id, begin, stop, listed_at in listings:
         if found not in by_id:
             continue
         bucket = on if begin <= now < stop else ended if stop <= now else coming
         channels, lo, hi = bucket.get(found, (set(), begin, stop))
-        channels.add(channel_id)
+        channels.add((channel_id, listed_at))
         bucket[found] = (channels, min(lo, begin), max(hi, stop))
     if on:
         # Two games listed at once on one channel: the one the guide shows now is the latest that
@@ -515,8 +622,74 @@ def _phase_note(phase: str, begin: datetime, stop: datetime, now: datetime) -> s
     if phase == PHASE_BEFORE:
         return f'its listing starts {_when(begin, now)}'
     if phase == PHASE_LIVE_NOW:
-        return f'Go live now is on; its listing starts {_when(begin, now)}'
+        return f'broadcasting early; its listing starts {_when(begin, now)}'
     raise ValueError(f'Unknown play phase "{phase}"')
+
+
+#: What a play's note says of a game it takes from a channel's name: the play's own label is kept
+#: for a proxy session's whole life, so where the stream came from is said here as well.
+FROM_NAME_NOTE = 'no guide lists it, so it plays from a channel whose name mentions it'
+
+
+def _name_note(phase: str, start: datetime, now: datetime) -> str:
+    if phase == PHASE_ON:
+        return FROM_NAME_NOTE
+    if phase == PHASE_BEFORE:
+        return f'{FROM_NAME_NOTE}; it starts {_when(start, now)}'
+    if phase == PHASE_LIVE_NOW:
+        return f'broadcasting early; {FROM_NAME_NOTE}; it starts {_when(start, now)}'
+    raise ValueError(f'Unknown play phase for a game taken from a name "{phase}"')
+
+
+def _name_play(by_id: dict, names: dict, now: datetime, before: timedelta, opened: bool = False) -> Optional[tuple]:
+    """(event, NameSource, phase) for the game of `by_id` a play takes from an event channel's name,
+    or None. The pick's own window counts, from `before` ahead of its start to its end; a game
+    broadcast early with Start broadcast counts from now to the same end. One that has started wins, the latest
+    first, as with listings (_pick); else the one that starts soonest."""
+    on, coming = [], []
+    for event_id, event in by_id.items():
+        named = names.get(event_id)
+        window = event_window(event, named=named) if named is not None else None
+        if window is None or now >= window[1]:
+            continue
+        if named.pick.start <= now:
+            on.append((event, named))
+        elif opened or named.pick.start - before <= now:
+            coming.append((event, named))
+    if on:
+        event, named = max(on, key=lambda p: (p[1].pick.start, p[0].id))
+        return event, named, PHASE_ON
+    if coming:
+        event, named = min(coming, key=lambda p: (p[1].pick.start, p[0].id))
+        return event, named, PHASE_LIVE_NOW if opened else PHASE_BEFORE
+    return None
+
+
+def _name_first(from_name: tuple, picked) -> bool:
+    """Whether a game taken from a name goes ahead of `picked`, the listing _pick() found (one not
+    on now), by _pick()'s own order: a game on now beats another's tail or pregame, a game running
+    long holds the channel until the next one starts, and of two still to start the sooner wins.
+    So a game on the air is never cut for another's schedule."""
+    if picked is None:
+        return True
+    _event, named, phase = from_name
+    if phase == PHASE_ON:
+        return True
+    if phase != PHASE_BEFORE:
+        raise ValueError(f'Unknown play phase for a game taken from a name "{phase}"')
+    if picked[2] == PHASE_AFTER:
+        return False
+    if picked[2] == PHASE_BEFORE:
+        return named.pick.start < picked[3]
+    raise ValueError(f'Unknown play phase "{picked[2]}"')
+
+
+def _named_now(found: tuple, now: datetime) -> Optional[NowPlaying]:
+    event, named, phase = found
+    channels = Channel.query.filter(Channel.id.in_({n.channel_id for n in named.names})).all()
+    if not channels:
+        return None
+    return NowPlaying(event=event, channels=channels, named=named, note=_name_note(phase, named.pick.start, now))
 
 
 def playing_now(served: Served, now: datetime, event_id: int = None, before: timedelta = timedelta(0),
@@ -525,42 +698,67 @@ def playing_now(served: Served, now: datetime, event_id: int = None, before: tim
     of a listing's start to `after` past its end (integrations.output_feed's sports window,
     dev/changelog/1529): a viewer tuning in for the pregame or to a game running long expects
     something on. Zero for both is the listings on at this moment. `event_id` holds the answer to
-    that one game, which is how a failover stays on the game it started on. A game opened with Go
-    live now plays from its listings that start with the game, whenever they start, until its
-    stored end (set_live_now).
+    that one game, which is how a failover stays on the game it started on. A game broadcast early
+    with Start broadcast plays from its listings that start with the game, whenever they start, until its
+    stored end (set_live_now). A game no guide lists that an event channel's name gives plays from
+    the channels naming it (_name_play, dev/changelog/1643), only when no listing has a game to
+    play: a listing always comes first, as it does for Record.
     With nothing to play, `why_none` says which of four things is true: no game is near, a game is
-    near that no guide lists, the game this play was held to is over, or a game opened early has no
+    near that nothing lists, the game this play was held to is over, or a game opened early has no
     listing any more."""
     start = event_start()
-    q = _events_of(served).filter(start > now - MAX_LENGTH - after)
+    q = _events_of(served).filter(_since(now - MAX_LENGTH - after))
     if event_id is not None:
         q = q.filter(SportsEvent.id == event_id)
     events = q.order_by(start, SportsEvent.id).limit(_PLAY_EVENTS).all()
     by_id = {e.id: e for e in events}
     opened = {i: e for i, e in by_id.items() if live_now_on(e, now)}
+    names = None
+
+    def named():
+        # Read once, and only on a path that has found no listing to play.
+        nonlocal names
+        if names is None:
+            names = name_sources([served.league.id], now) if events else {}
+        return names
+
     picked = None
     if opened:
         # A game a person opened early wins: they said it is on. Its listings count up to the end
         # fixed when the button was pressed, and no further.
         reach = max(e.live_now_until for e in opened.values()) - now
-        rows = [row for row in sports_match.airing_now(list(opened), now, reach, after)
+        rows = [row for row in sports_match.airing_now(list(opened), now, reach, after, listed=True)
                 if _starts_with_game(opened[row[0]], row[2])]
         picked = _pick(opened, rows, now)
         if picked is not None and picked[2] == PHASE_BEFORE:
             picked = picked[:2] + (PHASE_LIVE_NOW,) + picked[3:]
+        if picked is None:
+            from_name = _name_play(opened, named(), now, before, opened=True)
+            found = _named_now(from_name, now) if from_name is not None else None
+            if found is not None:
+                return found
     if picked is None:
-        picked = _pick(by_id, sports_match.airing_now(list(by_id), now, before, after), now)
+        picked = _pick(by_id, sports_match.airing_now(list(by_id), now, before, after, listed=True), now)
+        if picked is None or picked[2] != PHASE_ON:
+            from_name = _name_play(by_id, named(), now, before)
+            found = (_named_now(from_name, now)
+                     if from_name is not None and _name_first(from_name, picked) else None)
+            if found is not None:
+                return found
     if picked is not None:
-        event, channel_ids, phase, begin, stop = picked
-        channels = Channel.query.filter(Channel.id.in_(channel_ids)).all()
-        return NowPlaying(event=event, channels=channels, note=_phase_note(phase, begin, stop, now))
+        event, listings, phase, begin, stop = picked
+        channels = Channel.query.filter(Channel.id.in_({c for c, _start in listings})).all()
+        return NowPlaying(event=event, channels=channels, listings=frozenset(listings),
+                          note=_phase_note(phase, begin, stop, now))
     if opened:
         name = event_game_name(min(opened.values(), key=lambda e: (e.live_now_until, e.id)))
-        return NowPlaying(why_none=f"Go live now is on for {name}, but no channel's guide lists it any more")
+        return NowPlaying(why_none=(f"{name} was started early with Start broadcast, but no channel's guide lists it any more, "
+                                    f'and it is not one Record would take from a channel\'s name either'))
     if event_id is not None:
         name = event_game_name(events[0]) if events else 'the game'
-        return NowPlaying(why_none=f"no channel's guide lists {name} any more")
-    windows = [(e, event_window(e)) for e in events]
+        return NowPlaying(why_none=(f"no channel's guide lists {name} any more, and it is not one Record would "
+                                    "take from a channel's name either"))
+    windows = [(e, event_window(e, named=named().get(e.id))) for e in events]
     for event, window in windows:
         if window is not None and window[0] - before <= now < window[1]:
             when = '' if window[0] <= now else f', {_when(window[0], now)}'
@@ -570,16 +768,20 @@ def playing_now(served: Served, now: datetime, event_id: int = None, before: tim
     for event, window in windows:
         if window is not None and window[0] > now:
             return NowPlaying(why_none=f'no game is on right now. Next: {event_game_name(event)}, '
-                                       f'{_when(window[0], now)}{_plays_from(event, window[0], before, now)}')
+                                       f'{_when(window[0], now)}'
+                                       f'{_plays_from(event, window[0], before, now, named().get(event.id))}')
     return NowPlaying(why_none='no game is on right now, and none is in the schedule')
 
 
-def _plays_from(event, shown: datetime, before: timedelta, now: datetime) -> str:
+def _plays_from(event, shown: datetime, before: timedelta, now: datetime, named=None) -> str:
     """When the channel starts playing `event`, as a clause after its time: from `before` ahead of
-    its earliest listing, said only when that is not the time already shown. One query, on the
-    refusal path only."""
-    starts = [begin for _c, _a, begin, _stop in sports_match.listing_windows([event.id], now).get(event.id, ())
-              if begin is not None and begin > now]
+    its earliest listing, or of its pick's start for a game only a channel's name gives (`named`),
+    said only when that is not the time already shown. One query, on the refusal path only."""
+    if named is not None:
+        starts = [named.pick.start] if named.pick.start > now else []
+    else:
+        starts = [begin for _c, _a, begin, _stop in sports_match.listing_windows([event.id], now).get(event.id, ())
+                  if begin is not None and begin > now]
     if not starts:
         return ''
     opens = min(starts) - before
@@ -587,11 +789,11 @@ def _plays_from(event, shown: datetime, before: timedelta, now: datetime) -> str
 
 
 # ---------------------------------------------------------------------------
-# Go live now
+# Start broadcast (Go live now until dev/changelog/1644)
 # ---------------------------------------------------------------------------
 
 class LiveNowRefused(Exception):
-    """Go live now has nothing to open for a game. The message is user-facing."""
+    """Start broadcast has nothing to put on air for a game. The message is user-facing."""
 
 
 def live_now_on(event, now: datetime) -> bool:
@@ -600,7 +802,7 @@ def live_now_on(event, now: datetime) -> bool:
 
 def _starts_with_game(event, begin) -> bool:
     """Whether a listing starting at `begin` is the game itself, the rule with_the_game() applies
-    for the guide's own count, so a page's "listed" and what Go live now plays never disagree."""
+    for the guide's own count, so a page's "listed" and what Start broadcast plays never disagree."""
     window = event_window(event)
     return window is not None and begin is not None and abs(begin - window[0]) <= START_AGREE
 
@@ -609,11 +811,16 @@ def _game_listings(event, listings) -> list:
     return [row for row in listings if row[3] is not None and _starts_with_game(event, row[2])]
 
 
-def live_now_end(event, listings, now: datetime, after: timedelta) -> Optional[datetime]:
-    """When Go live now for `event` turns itself off: `after` past the end of its listings that
+def live_now_end(event, listings, now: datetime, after: timedelta, named=None) -> Optional[datetime]:
+    """When Start broadcast for `event` turns itself off: `after` past the end of its listings that
     start with the game and are still to end. That is where the game's own window ends, so the
     switch cannot outlive the game. None when no such listing is left: there is nothing to play.
-    `listings` are [(channel id, account id, start, stop)], already narrowed to usable accounts."""
+    `listings` are [(channel id, account id, start, stop)], already narrowed to usable accounts.
+    A game no guide lists that a channel's name gives (`named`, a NameSource with a usable channel)
+    turns it off at its pick's end, where its play ends (dev/changelog/1643)."""
+    if named is not None and not listings:
+        window = event_window(event, named=named)
+        return window[1] if window is not None and window[1] > now else None
     ahead = [row for row in _game_listings(event, listings) if row[3] > now]
     return max(row[3] for row in ahead) + after if ahead else None
 
@@ -630,18 +837,32 @@ def _usable(listings, blocked, allowed) -> list:
     return [row for row in listings if row[1] not in blocked and (allowed is None or row[1] in allowed)]
 
 
-def _live_now_problem(event, listings, usable: list, channels: list, now: datetime) -> str:
-    """Why Go live now has nothing to open for `event`, or ''. Every case is named: a game over
-    never reads as one not listed yet."""
+def _live_now_problem(event, listings, usable: list, channels: list, now: datetime, named=None,
+                      named_usable=()) -> str:
+    """Why Start broadcast has nothing to put on air for `event`, or ''. Every case is named: a game over
+    never reads as one not listed yet. `named` is the NameSource of a game no guide lists, and
+    `named_usable` its channels on an account a play may use."""
     game = event_game_name(event)
     if event.postponed:
-        return f'{game} is postponed, so there is no time to open it for.'
+        return f'{game} is postponed, so there is no time to broadcast it for.'
     mine = _game_listings(event, listings)
+    if not mine and named is not None:
+        if named.pick.stop <= now:
+            return (f'{game} is over by the times the channel whose name mentions it gives, so there is '
+                    'nothing left to broadcast.')
+        if not named_usable:
+            return (f'Every channel whose name mentions {game} is on an account that is blocked right now '
+                    'or that the IPTV output does not play from.')
+        if not channels:
+            return (f'No sports channel on your IPTV output carries {game}. Switch one on for it on its '
+                    "league's page first.")
+        return ''
     if not mine:
-        return (f"No channel's guide lists {game} yet, so there is nothing to play. ChannelBin looks "
-                'again after each guide update.')
+        return (f"No channel's guide lists {game} yet, and it is not one Record would take from a channel's "
+                "name either, so there is nothing to play. The league page's Record says why. ChannelBin "
+                'looks again after each guide update.')
     if not any(row[3] > now for row in mine):
-        return f"Every listing of {game} has ended, so there is nothing left to open."
+        return f"Every listing of {game} has ended, so there is nothing left to broadcast."
     if not any(row[3] > now for row in _game_listings(event, usable)):
         return (f'Every channel whose guide lists {game} is on an account that is blocked right now or '
                 'that the IPTV output does not play from.')
@@ -651,19 +872,58 @@ def _live_now_problem(event, listings, usable: list, channels: list, now: dateti
     return ''
 
 
-def live_now_offer(event, listings, channels: list, now: datetime, after: timedelta, tz, h24: bool,
-                   blocked=frozenset(), allowed=None) -> dict:
-    """What a page shows for Go live now on one game, from what it has already read: the game's
+def _live_now_named(listings, named, blocked, allowed) -> tuple:
+    """(the NameSource Start broadcast plays from, its usable channels): the game's `named` when no
+    listing is there to play instead, else (None, [])."""
+    if named is None or listings:
+        return None, []
+    return named, _usable_names(named, blocked, allowed)
+
+
+def _on_air_at(event, usable: list, now: datetime, before: timedelta, named=None) -> Optional[datetime]:
+    """When a sports channel puts `event` on air by itself: the window's `before` ahead of the
+    first of its usable listings that start with the game, or of the name pick's start for a game
+    no guide lists (`named`, with a usable channel). None when it has neither."""
+    if named is not None:
+        return named.pick.start - before
+    starts = [row[2] for row in _game_listings(event, usable)]
+    return min(starts) - before if starts else None
+
+
+def broadcast_tip(game: str, before: timedelta, on: bool) -> str:
+    """Start broadcast's and Stop broadcast's tooltip, with the lead the play really uses."""
+    when = f'{length_words(before)} before it starts' if before > timedelta(0) else 'when it starts'
+    if on:
+        return (f'Stop broadcast takes the sports channel back to its own schedule, so it goes on air for '
+                f'{game} {when}.')
+    return f'A sports channel goes on air for {game} by itself {when}. Start broadcast puts it on air now.'
+
+
+def live_now_offer(event, listings, channels: list, now: datetime, before: timedelta, after: timedelta, tz,
+                   h24: bool, blocked=frozenset(), allowed=None, named=None) -> Optional[dict]:
+    """What a page shows for Start broadcast on one game, from what it has already read: the game's
     listings [(channel id, account id, start, stop)], the names of the sports channels carrying it,
-    and the account ids a play drops (output_feed._resolve_sports_play). No query. `why` is set when
-    there is nothing to open, and `message` is the confirm's text."""
+    the account ids a play drops (output_feed._resolve_sports_play), and for a game no guide lists
+    the channels naming it (`named`, a NameSource, dev/changelog/1643). No query, so `usable` is the
+    listings on an account a play may use, not the channel it picks (auto_rules.game_sources()).
+    `why` is set when there is nothing to broadcast, `message` is the confirm's text and `tip` the
+    button's tooltip. None once the game's own time on air has come (`before` ahead of its start,
+    _on_air_at): the channel plays it by itself then, so Stop broadcast would stop nothing and
+    Start broadcast start nothing (dev/changelog/1644)."""
     game = event_game_name(event)
     on = live_now_on(event, now)
     usable = _usable(listings, blocked, allowed)
-    until = event.live_now_until if on else live_now_end(event, usable, now, after)
+    named, named_usable = _live_now_named(listings, named, blocked, allowed)
+    why = '' if on else _live_now_problem(event, listings, usable, channels, now, named, named_usable)
+    if not why:
+        opens = _on_air_at(event, usable, now, before, named if named_usable else None)
+        if opens is not None and opens <= now:
+            return None
+    until = event.live_now_until if on else live_now_end(event, usable, now, after,
+                                                         named if named_usable else None)
     out = {'event': event.id, 'game': game, 'on': on, 'channels': list(channels),
            'until': at_clause(until, now, tz, h24) if until is not None else '',
-           'why': '' if on else _live_now_problem(event, listings, usable, channels, now), 'message': ''}
+           'why': why, 'message': '', 'tip': broadcast_tip(game, before, on)}
     if out['why'] or on:
         return out
     start = event.start_at
@@ -671,23 +931,26 @@ def live_now_offer(event, listings, channels: list, now: datetime, after: timede
         scheduled = f'TheSportsDB has no start time for {game}'
     else:
         scheduled = f'{game} is scheduled to start {at_clause(start, now, tz, h24)}'
+    if named is not None:
+        scheduled += (', and no guide lists it, so it plays from a channel whose name mentions it'
+                      + (f', from {at_clause(named.pick.start, now, tz, h24)}' if named.pick.start != start else ''))
     starts = [row[2] for row in _game_listings(event, usable) if row[3] > now]
     listed = min(starts) if starts else None
     if listed is not None and listed != start:
         scheduled += f', and your guide lists it from {at_clause(listed, now, tz, h24)}'
     where = 'the sports channel' if len(channels) == 1 else 'any of the sports channels'
-    out['message'] = (f'{scheduled}. From now on, tuning in to {where} below plays it, and Go live now '
-                      f'turns itself off {out["until"]}. A play already running is not cut.')
+    out['message'] = (f'{scheduled}. From now on, tuning in to {where} below plays it, and the broadcast '
+                      f'stops by itself {out["until"]}. A play already running is not cut.')
     return out
 
 
 @retry_on_locked()
 def set_live_now(event_id: int, on: bool, after: timedelta, now: datetime = None, blocked=frozenset(),
                  allowed=None) -> Optional[dict]:
-    """A person's Go live now for one game, the only writer of SportsEvent.live_now_at and
+    """A person's Start broadcast or Stop broadcast for one game, the only writer of SportsEvent.live_now_at and
     live_now_until. Turning it on fixes its end with live_now_end(), so the switch dies with the
     game's own window whatever later happens to the game, and is refused (LiveNowRefused) when
-    there is nothing to open (_live_now_problem names which). `blocked` and `allowed` are the
+    there is nothing to broadcast (_live_now_problem names which). `blocked` and `allowed` are the
     account ids a play drops, so a game listed only where the feed cannot play is refused here
     rather than at every tune-in. Turning it off clears both. None when the game is gone. Returns {game, on, until,
     channels}."""
@@ -703,9 +966,11 @@ def set_live_now(event_id: int, on: bool, after: timedelta, now: datetime = None
         return {'game': game, 'on': False, 'was_on': was, 'until': None, 'channels': []}
     listings = sports_match.listing_windows([event.id], now).get(event.id, ())
     usable = _usable(listings, blocked, allowed)
-    until = live_now_end(event, usable, now, after)
+    named, named_usable = _live_now_named(
+        listings, name_sources([event.league_id], now).get(event.id) if not listings else None, blocked, allowed)
+    until = live_now_end(event, usable, now, after, named if named_usable else None)
     channels = [s.name for s in carriers(served_channels(), [event]).get(event.id, ())]
-    problem = _live_now_problem(event, listings, usable, channels, now)
+    problem = _live_now_problem(event, listings, usable, channels, now, named, named_usable)
     if problem:
         db.session.rollback()
         raise LiveNowRefused(problem)
@@ -734,9 +999,19 @@ def place_league_events(league: SportsLeague, now: datetime) -> int:
     if not league.feed_league_channels:
         return 0
     start = event_start()
-    events = (SportsEvent.query.filter(SportsEvent.league_id == league.id, start > now - MAX_LENGTH)
+    lo = now - MAX_LENGTH
+    events = (SportsEvent.query.filter(SportsEvent.league_id == league.id, _since(lo))
               .order_by(start, SportsEvent.id).all())
     windows = {e.id: placement_window(e) for e in events}
+    # The day before is read only for a game with no time of its own; a game TheSportsDB timed
+    # that long ago is over and is never laid out late.
+    events = [e for e in events if (e.guide_start or e.start_at) > lo or windows[e.id] is None]
+    untimed = [e for e in events if windows[e.id] is None and not e.postponed and e.guide_start is None]
+    if untimed:
+        # A race no guide lists has only an event channel's name to go on (dev/changelog/1643).
+        names = name_sources([league.id], now)
+        for e in untimed:
+            windows[e.id] = placement_window(e, names.get(e.id))
     placed = {}
     for event in events:
         if event.feed_number is not None and windows[event.id] is not None:
@@ -908,11 +1183,19 @@ def card_context(league: SportsLeague, follows: list, team_names: dict, events: 
     else:
         names = {}
         team_ids = {f.team_tsdb_id for f in follows if f.team_tsdb_id}
-    teams = sorted(({'id': i, 'name': team_names.get(i) or names.get(i) or f'Team {i}', 'on': i in on}
+    # Preview (dev/changelog/1645) plays a channel's feed id, so it needs the channel switched on: a
+    # sports channel that is off has nothing to play, and a team never switched on has no row yet.
+    team_rows = {r.team_tsdb_id: r.id for r in rows if r.team_tsdb_id and r.enabled}
+    teams = sorted(({'id': i, 'name': team_names.get(i) or names.get(i) or f'Team {i}', 'on': i in on,
+                     'feed_id': output_feed.feed_id_for_sports(team_rows[i]) if i in team_rows else None}
                     for i in team_ids), key=lambda t: t['name'].lower())
+    numbered_feeds = ([{'name': f'{league.name} {r.number}', 'feed_id': output_feed.feed_id_for_sports(r.id)}
+                       for r in sorted((r for r in rows if not r.team_tsdb_id), key=lambda r: r.number)]
+                      if league.feed_league_channels else [])
     return {'feed_on': output_feed.is_enabled(output_feed.feed_config(cfg)),
             'followed': bool(follows), 'whole': whole, 'league_on': bool(league.feed_league_channels),
-            'numbered': numbered, 'teams': teams,
+            'numbered': numbered, 'teams': teams, 'numbered_feeds': numbered_feeds,
+            'up_next_feed_id': output_feed.feed_id_for_up_next(up_next.id) if up_next is not None else None,
             'up_next_on': bool(up_next is not None and up_next.enabled), 'up_next_name': name_for(league),
             'moved': moved_games(league, events) if whole and league.feed_league_channels else []}
 

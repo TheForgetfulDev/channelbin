@@ -198,7 +198,7 @@ await type('reds');
 await press(searchButton());
 const league = d.querySelector('.sp-confirm-sub a');
 out.league_link = league ? { text: league.textContent, target: league.target, href: league.href } : null;
-const onlyTeam = d.querySelector('input[name="sp-follow"][value="team"]');
+const onlyTeam = d.querySelector('input[name="sp-t"][value="teams"]');
 out.only_team_checked = onlyTeam ? onlyTeam.checked : null;
 out.confirm_foot = foot();
 out.best_match_after_search = Boolean(d.getElementById('sp-best'));

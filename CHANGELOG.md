@@ -5,6 +5,44 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.45.0 - 2026-11-19
+
+Preview ChannelBin's own channels, and follow a few teams of a league.
+
+**Added**
+
+- Preview on every channel group, sports channel and Up next channel on the IPTV output plays
+  in the browser exactly what an IPTV player gets, waiting screen included, and follows the
+  play when the game comes on or it changes channel. A channel group's own page, and the
+  channels the sports pages name for a game, can be previewed too.
+- Add league or team can follow a few teams of one league instead of the whole league, and
+  Change teams uses the same team picker.
+- Channel it would use, beside Record on a league page and on the IPTV Output page's sports
+  rows, says which channel a game would record and play from if it started now.
+- A sports channel plays a game that only an event channel's name mentions, from the same
+  channel a recording would use.
+
+**Changed**
+
+- A channel group's play on the IPTV output starts on an account with a connection free. When
+  a recording needs that connection, a group's or sports channel's play moves to another
+  channel with a connection free instead of being cut.
+- A recording takes the connection of an account an IPTV player is watching on only when no
+  account with a free connection carries the channel.
+- Go live now is renamed Start broadcast and Stop broadcast, with a tooltip saying how long
+  before a game a sports channel goes on air by itself.
+- Recent plays on the IPTV Output page and a game's listings dialog link each channel to its
+  page and show the account it is on.
+- An auto-record rule recording from an event channel's name ends later when TheSportsDB moves
+  a game that has already started.
+
+**Fixed**
+
+- A sports channel plays the channel Record or an auto-record rule would record the game from;
+  the two could pick different channels.
+- A game's listings dialog no longer runs off the side of a phone screen when a channel has a
+  long name.
+
 ## 0.44.0 - 2026-11-18
 
 Up next channels and game times you choose.

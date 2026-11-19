@@ -86,3 +86,36 @@ class LivePreviewDecodeFailureTests(unittest.TestCase):
         self.assertIn("is unsupported", n['status'])
         self.assertIsNone(n['button'])
         self.assertIn('there is no GPU device', n['offer'])
+
+
+@unittest.skipIf(shutil.which('node') is None, 'node not installed')
+@unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
+class FeedPreviewRoundTests(unittest.TestCase):
+    """A feed preview (dev/changelog/1645): the player attaches to one round at a time, lets go of
+    it when the output moves to another source, attaches to the next with its own decoder, and says
+    what is on."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.obs = _observe()
+
+    def test_it_starts_on_the_feed_route_and_plays_round_one(self):
+        r1 = self.obs['feedRound1']
+        self.assertEqual(r1['posted'], ['/api/feed/1000000001/preview'])
+        self.assertEqual(r1['url'], '/api/preview/f1/index.m3u8?round=1')
+        self.assertEqual(r1['made'], 1)
+        self.assertEqual(r1['status'], 'Playing what an IPTV player gets: the waiting screen. Its sound is '
+                                       're-encoded to AAC so this browser can play it.')
+
+    def test_the_first_connect_says_connecting_not_moved(self):
+        self.assertIn('Connecting to the stream', self.obs['feedConnecting']['status'])
+
+    def test_a_new_round_lets_go_of_the_old_one_and_attaches_again(self):
+        switching = self.obs['feedSwitching']
+        self.assertTrue(switching['r1Destroyed'])
+        self.assertEqual(switching['made'], 1, 'nothing is attached until the next round is ready')
+        self.assertIn('moved to another source', switching['status'])
+        r2 = self.obs['feedRound2']
+        self.assertEqual(r2['made'], 2)
+        self.assertEqual(r2['url'], '/api/preview/f1/index.m3u8?round=2')
+        self.assertTrue(r2['status'].startswith('Playing what an IPTV player gets: "Local game".'), r2['status'])
