@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -191,7 +192,7 @@ class GuideColumnTests(LeaguePageCase):
             db.session.commit()
         trust(18, 6)
         text = self.page(league_id)
-        self.assertIn('Match your guide on 6 of the last 18 events', text)
+        self.assertIn('Matched your guide on 6 of the last 18 events', text)
         self.assertIn('only 6 of the last 18', text)
         self.assertIn('Not enough to rely on', text)
         trust(5, 5)
@@ -355,7 +356,8 @@ class ListingsAndWrongMatchTests(LeaguePageCase):
             db.session.add(SportsTeam(tsdb_id=tid, full_name=full, names=json.dumps([full, nick]),
                                       city=full[:-len(nick)].strip(), last_looked_up=datetime.utcnow()))
         db.session.add(SportsState(id=1))
-        stray = soon + timedelta(hours=2)
+        # Near TheSportsDB's start and on more channels, so only marking it wrong moves the start off it.
+        stray = soon + timedelta(minutes=60)
         for c in ch[:2]:
             make_epg_entry(c, title='PFL Football', sub_title='Harborview Gulls at Ironvale Bears', start_time=stray,
                            duration_minutes=180)
@@ -499,9 +501,23 @@ class LeaguePageScriptTests(unittest.TestCase):
                                       own_names=json.dumps(['Ironvale U'])))
             db.session.commit()
             html = t.client.get(f'/sports/{league.id}').get_data(as_text=True)
-            listings = t.client.get(f'/api/sports/events/{soon_ev.id}/listings').get_data(as_text=True)
+            listings = t.client.get(f'/api/sports/events/{soon_ev.id}/listings').get_json()
+            # What app/sports_match.py::skipped_listings answers, two rows of it; the reader is
+            # tested in tests/test_sports_match.py::SkippedListingsTests.
+            listings['skipped'] = [
+                {'title': 'PFL Pregame', 'sub': 'Gulls at Bears', 'when': '7:00 PM', 'channels': 3, 'start': '',
+                 'why': 'It says "pre game", and it is 60 minutes long, shorter than the 90 a game listing needs.'},
+                {'title': 'PFL Gulls at Bears', 'sub': '', 'when': '11:00 PM', 'channels': 1, 'start': '',
+                 'why': 'It is 30 minutes long, shorter than the 90 a game listing needs.'}]
+            listings = json.dumps(listings)
+            # Restore defaults is offered only once something changed.
+            from app import sports_skips
+            with mock.patch('app.scheduler.queue_sports_match', return_value=True):
+                sports_skips.add_word(league.tsdb_id, sports_skips.KIND_GAME, 'scoreboard')
+            html = t.client.get(f'/sports/{league.id}').get_data(as_text=True)
             cls.match_ids = [m.id for m in SportsMatch.query.filter_by(kind='guide').order_by(SportsMatch.id)]
             cls.name_id = SportsMatch.query.filter_by(kind='channel_name').one().id
+            cls.league_id = league.id
         finally:
             t.cleanup()
         with tempfile.TemporaryDirectory() as tmp:
@@ -554,6 +570,26 @@ class LeaguePageScriptTests(unittest.TestCase):
         self.assertEqual(puts[1], ['Pretend Football League', 'PFL', 'PFL on Two'])
         self.assertEqual(puts[2][-1], 'NASCAR Craftsman Truck Series')
         self.assertEqual(self.obs['swaps_after_terms'], 3)
+
+    def test_skipped_listings_hide_behind_show_which_becomes_hide(self):
+        self.assertEqual(self.obs['skipped_closed'], {'button': 'Show 2 skipped listings', 'rows': 0})
+        opened = self.obs['skipped_open']
+        self.assertEqual((opened['button'], opened['expanded']), ('Hide skipped listings', 'true'))
+        self.assertEqual(opened['rows'][0], {'title': 'PFL Pregame: Gulls at Bears',
+                                             'why': '3 channels. It says "pre game", and it is 60 minutes long, '
+                                                    'shorter than the 90 a game listing needs.'})
+        self.assertEqual(len(opened['rows']), 2)
+        self.assertEqual(self.obs['skipped_hidden'], {'button': 'Show 2 skipped listings', 'rows': 0})
+
+    def test_skip_words_and_lengths_save_one_change_each_and_restore_asks_first(self):
+        base = f'/api/sports/leagues/{self.league_id}'
+        self.assertEqual(self.obs['skip_requests'], [
+            {'method': 'PUT', 'path': f'{base}/skip-words', 'body': {'remove': 'pre game', 'kind': 'game'}},
+            {'method': 'PUT', 'path': f'{base}/skip-words', 'body': {'add': 'Gameday', 'kind': 'game'}},
+            {'method': 'PUT', 'path': f'{base}/skip-minutes', 'body': {'length': 'game', 'minutes': 75}},
+            {'method': 'PUT', 'path': f'{base}/skip-minutes', 'body': {'length': 'game', 'minutes': None}},
+            {'method': 'DELETE', 'path': f'{base}/skip-words', 'body': None}])
+        self.assertIn("Restore ChannelBin's default words and lengths for this league?", self.obs['restore_confirm'])
 
     def test_categories_flip_untie_and_add_from_the_offer(self):
         self.assertEqual(self.obs['offer'], ['PFL Sunday Ticket'])

@@ -167,13 +167,16 @@ class UpcomingPagingTests(_Case):
 
 class FeedPagingTests(_Case):
     def test_the_league_row_is_on_every_page_with_25_teams_a_page(self):
+        # The league's Up next row and its league row lead every page (dev/changelog/1614).
         feed = section(self.page(), 'feed')
-        self.assertEqual(len(rows(feed)), 26)
-        self.assertIn('data-team="0"', rows(feed)[0])
+        self.assertEqual(len(rows(feed)), 27)
+        self.assertIn('data-act="up-next"', rows(feed)[0])
+        self.assertIn('data-team="0"', rows(feed)[1])
         self.assertEqual(pager_text(feed), 'Page 1 of 3: Miami (OH) RedHawks to Team 24')
         feed = section(self.page('?feed_page=3'), 'feed')
-        self.assertEqual(len(rows(feed)), 11)
-        self.assertIn('data-team="0"', rows(feed)[0])
+        self.assertEqual(len(rows(feed)), 12)
+        self.assertIn('data-act="up-next"', rows(feed)[0])
+        self.assertIn('data-team="0"', rows(feed)[1])
 
     def test_the_filter_comes_before_the_pages_and_ignores_case(self):
         feed = section(self.page('?feed_page=3&feed_q=oH'), 'feed')
@@ -185,8 +188,9 @@ class FeedPagingTests(_Case):
 
     def test_the_league_row_stays_when_the_filter_names_the_league(self):
         feed = section(self.page('?feed_q=pretend'), 'feed')
-        self.assertEqual(len(rows(feed)), 1)
+        self.assertEqual(len(rows(feed)), 2, 'the league row and its Up next row both carry its name')
         self.assertIn('data-team="0"', feed)
+        self.assertIn('data-act="up-next"', feed)
 
     def test_a_filter_nothing_matches_says_so(self):
         feed = section(self.page('?feed_q=zzz'), 'feed')

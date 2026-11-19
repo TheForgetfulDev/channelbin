@@ -71,7 +71,8 @@ class IptvOutputPageConformanceTests(FeedCase):
                        'class="gd-statezone" id="of-state"', 'class="gd-sections" id="of-sections"',
                        'class="gd-actionbar"'):
             self.assertIn(needle, html)
-        self.assertIn('<h1>IPTV Output</h1>', html)
+        # The Beta mark after the name, still being built (dev/changelog/1635).
+        self.assertRegex(html, r'<h1>IPTV Output <span class="badge b-sched tip-plain beta-mark"[^>]*>Beta</span></h1>')
         self.assertNotIn('page-sub', html)
 
     def test_the_cards_come_in_the_approved_order(self):

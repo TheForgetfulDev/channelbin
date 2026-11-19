@@ -169,19 +169,25 @@
     const on = input.checked;
     const watchers = Number(tr.dataset.watching) || 0;
     if (!on && watchers) {
+      const upNext = tr.dataset.upNext === '1';
       const ok = await confirmModal({
-        title: `Hide ${name}?`,
-        message: `${players(watchers)} ${watchers === 1 ? 'is' : 'are'} watching it right now, and hiding it stops that play.`,
-        confirmLabel: 'Hide',
+        title: upNext ? `Turn off ${name}?` : `Hide ${name}?`,
+        message: `${players(watchers)} ${watchers === 1 ? 'is' : 'are'} watching it right now, and ${upNext ? 'turning it off' : 'hiding it'} stops that play.`,
+        confirmLabel: upNext ? 'Turn off' : 'Hide',
       });
       if (!ok) { input.checked = true; return; }
     }
     try {
       const d = await post(`/api/iptv-output/rows/${tr.dataset.feed}`, { on });
       await refresh(CARDS);
-      if (on) showToast(`${name} is back on the IPTV output, as the same channel it was before.`);
+      const cut = d.cut ? ` ${players(d.cut)} watching it ${d.cut === 1 ? 'was' : 'were'} cut.` : '';
+      // An Up next channel is ChannelBin's own, in no TV Guide, and off until a person turns it on.
+      if (tr.dataset.upNext === '1') {
+        showToast(on ? `${name} is on the IPTV output. An IPTV player shows it the next time it refreshes its channel list.`
+          : `${name} is off the IPTV output. An IPTV player drops it the next time it refreshes its channel list.${cut}`);
+      } else if (on) showToast(`${name} is back on the IPTV output, as the same channel it was before.`);
       else {
-        showToast(`${name} is hidden from the IPTV output and stays in your TV Guide. An IPTV player drops it the next time it refreshes its channel list.${d.cut ? ` ${players(d.cut)} watching it ${d.cut === 1 ? 'was' : 'were'} cut.` : ''}`);
+        showToast(`${name} is hidden from the IPTV output and stays in your TV Guide. An IPTV player drops it the next time it refreshes its channel list.${cut}`);
       }
     } catch (err) {
       input.checked = !on;

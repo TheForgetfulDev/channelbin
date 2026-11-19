@@ -82,7 +82,8 @@ RUN sed -i 's/^Components: main$/Components: main non-free/' \
 #
 # No version label. app/version.py's __version__ is the only source of the tag a publish
 # uses, and a second copy here could disagree with what the running container reports about
-# itself.
+# itself. An in-between build's stamp comes in as CHANNELBIN_BUILD below and is read back by
+# app/version.py, so it has that one home too.
 LABEL org.opencontainers.image.title="ChannelBin" \
       org.opencontainers.image.description="Self-hosted IPTV channel tester and recorder (DVR)." \
       org.opencontainers.image.source="https://github.com/TheForgetfulDev/channelbin" \
@@ -113,7 +114,13 @@ COPY . /app
 # the volume is what makes an image upgrade keep your settings, database and session key.
 # .dockerignore keeps a real config.yaml/instance out of the build context, so these never
 # land on top of a copied file.
-RUN chmod -R a+rX /app \
+#
+# CHANNELBIN_BUILD is empty for a release and set by dev/tools/publish_image.py for an
+# in-between build; app/version.py appends it as `+<stamp>` (dev/changelog/1622). Declared
+# here, after the pip layer, so a new stamp never invalidates the dependency cache.
+ARG CHANNELBIN_BUILD=""
+RUN if [ -n "$CHANNELBIN_BUILD" ]; then printf '%s\n' "$CHANNELBIN_BUILD" > /app/app/BUILD_STAMP; fi \
+    && chmod -R a+rX /app \
     && ln -s /config/config.yaml /app/config.yaml \
     && ln -s /config/instance /app/instance \
     && mkdir -p /app/capture-logs /config /dvr \

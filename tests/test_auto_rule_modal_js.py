@@ -322,6 +322,38 @@ class AboutRowTests(unittest.TestCase):
         self.assertIn(['777', 'Pruned Pelicans'], run['first']['teams'])
         self.assertEqual(run['sent'][0]['body']['sports_team_tsdb_id'], 777)
 
+    def test_practice_and_qualifying_is_offered_for_a_league_with_sessions_and_sent(self):
+        """dev/changelog/1633: the switch is the person's answer, off until they turn it on."""
+        run = self.obs['sessions_turned_on']
+        self.assertEqual(run['errors'], [])
+        self.assertFalse(run['first']['sessions_disabled'])
+        self.assertFalse(run['first']['sessions_checked'])
+        self.assertIn('Practice and qualifying', run['first']['text'])
+        self.assertIs(run['sent'][0]['body']['sports_sessions'], True)
+
+    def test_practice_and_qualifying_is_not_offered_for_a_league_without_sessions(self):
+        run = self.obs['sessions_not_offered']
+        self.assertTrue(run['first']['sessions_disabled'])
+        self.assertIs(run['sent'][0]['body']['sports_sessions'], False)
+
+    def test_moving_to_a_league_without_sessions_turns_it_off(self):
+        run = self.obs['sessions_moved_off']
+        self.assertTrue(run['first']['sessions_checked'])
+        self.assertTrue(run['after']['sessions_disabled'])
+        self.assertIs(run['sent'][0]['body']['sports_sessions'], False)
+
+    def test_a_rule_with_it_on_keeps_it_offered_on_its_own_league(self):
+        run = self.obs['sessions_kept_back']
+        self.assertFalse(run['first']['sessions_disabled'])
+        self.assertTrue(run['first']['sessions_checked'])
+        self.assertFalse(run['after']['sessions_disabled'], 'back on its own league it can be turned on again')
+
+    def test_moving_to_a_league_with_sessions_offers_it_off(self):
+        run = self.obs['sessions_moved_on']
+        self.assertTrue(run['first']['sessions_disabled'])
+        self.assertFalse(run['after']['sessions_disabled'])
+        self.assertIs(run['sent'][0]['body']['sports_sessions'], False)
+
     def test_with_no_league_on_sports_schedules_it_says_where_to_add_one(self):
         run = self.obs['sports_no_leagues']
         self.assertIn('No league is on Sports Schedules yet; add one there first.', run['first']['text'])

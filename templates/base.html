@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+{% from '_macros.html' import beta_mark %}<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -122,9 +122,9 @@
     <a class="nav-link{% if on['hide'] %} active{% endif %}" href="{{ url_for('channel_hide_rules.hide_rules_page') }}">{{ icon('nav-hide-rules', 'nav-i') }}<span class="nav-t">Hide Channels</span></a>
     <a class="nav-link{% if on['tags'] %} active{% endif %}" href="{{ url_for('tags.tags_list') }}">{{ icon('nav-tags', 'nav-i') }}<span class="nav-t">Tags</span></a>
     {# EPG Manager (dev/changelog/1325): the tools that work across every account's guide. #}
-    <a class="nav-link{% if on['epg'] %} active{% endif %}" href="{{ url_for('epg_manager.epg_manager') }}">{{ icon('nav-epg-manager', 'nav-i') }}<span class="nav-t">EPG Manager</span></a>
-    <a class="nav-link{% if on['sports'] %} active{% endif %}" href="{{ url_for('sports.sports_page') }}">{{ icon('nav-sports', 'nav-i') }}<span class="nav-t">Sports Schedules</span></a>
-    <a class="nav-link{% if on['output'] %} active{% endif %}" href="{{ url_for('iptv_output.page') }}">{{ icon('nav-iptv-output', 'nav-i') }}<span class="nav-t">IPTV Output</span></a>
+    <a class="nav-link{% if on['epg'] %} active{% endif %}" href="{{ url_for('epg_manager.epg_manager') }}">{{ icon('nav-epg-manager', 'nav-i') }}<span class="nav-t">EPG Manager</span>{{ beta_mark('EPG Manager') }}</a>
+    <a class="nav-link{% if on['sports'] %} active{% endif %}" href="{{ url_for('sports.sports_page') }}">{{ icon('nav-sports', 'nav-i') }}<span class="nav-t">Sports Schedules</span>{{ beta_mark('Sports Schedules') }}</a>
+    <a class="nav-link{% if on['output'] %} active{% endif %}" href="{{ url_for('iptv_output.page') }}">{{ icon('nav-iptv-output', 'nav-i') }}<span class="nav-t">IPTV Output</span>{{ beta_mark('IPTV Output') }}</a>
     </div>
     {% call nav_fold('setup', 'Setup', ['Accounts', 'Auto-record', 'Recording Profiles', 'Health Check Profiles'],
                      on['accounts'] or on['rules'] or on['recprof'] or on['hcprof']) %}

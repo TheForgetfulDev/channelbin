@@ -373,9 +373,27 @@
       <div class="sp-enames">${rows}</div>`;
   }
 
+  /* The listings a word or a length kept out (app/sports_match.py::skipped_listings, mockup 59,
+     dev/changelog/1634), behind Show, which turns into Hide while they are open. */
+  function skippedListingsHtml(data, open) {
+    const rows = data.skipped || [];
+    if (!rows.length) return '';
+    const n = rows.length;
+    const toggle = open
+      ? '<button class="btn btn-sm sp-skip-show" data-skipped="hide" aria-expanded="true">Hide skipped listings</button>'
+      : `<button class="btn btn-sm sp-skip-show" data-skipped="show" aria-expanded="false">Show ${n} skipped ${n === 1 ? 'listing' : 'listings'}</button>`;
+    const list = open ? rows.map((r) => `<div class="sp-group sp-skipped">
+        <div class="sp-ghead"><span class="sp-gtitle">${escHtml(r.sub ? `${r.title}: ${r.sub}` : r.title)}</span><span class="sp-gmeta">${escHtml(r.when)}</span></div>
+        <p class="sp-why"><strong>${r.channels} ${r.channels === 1 ? 'channel' : 'channels'}</strong>. ${escHtml(r.why)}</p></div>`).join('') : '';
+    return `<h3 class="sp-h3">Skipped <span class="cnt">${n}</span></h3>
+      <p class="sp-intro">These listings name ${escHtml(data.league)}${data.matchup ? ' and both teams' : ` on this ${escHtml(data.one)}'s day`}, but ChannelBin does not count them as this ${escHtml(data.one)}, because of a word in them or their length. The words and the lengths are on the league page, under Matching your guide.</p>
+      ${toggle}${list}`;
+  }
+
   function openListings(eventId, name, namesOnly) {
     let data = null;
     let changed = false;
+    let skippedOpen = false;
     const opened = new Set();
     const modal = buildModal({
       title: namesOnly ? `${name}: event channels naming it` : `${name}: where it is in your guide`,
@@ -390,19 +408,20 @@
       if (!data.groups.length) {
         body.innerHTML = data.names.length
           ? `${namesHtml(data.names, data.one)}
-            <p class="sp-intro sp-faint">If a name is wrong for this ${data.one}, press its <strong>Wrong match</strong>. Nothing is recorded, cancelled or deleted, and Undo puts it back. ChannelBin reads what the name says. It cannot see what the channel actually shows.</p>${foot}`
-          : `<p class="sp-intro">Nothing in your guide matches it now.</p>${foot}`;
+            <p class="sp-intro sp-faint">If a name is wrong for this ${data.one}, press its <strong>Wrong match</strong>. Nothing is recorded, cancelled or deleted, and Undo puts it back. ChannelBin reads what the name says. It cannot see what the channel actually shows.</p>${skippedListingsHtml(data, skippedOpen)}${foot}`
+          : `<p class="sp-intro">Nothing in your guide matches it now.</p>${skippedListingsHtml(data, skippedOpen)}${foot}`;
         return;
       }
       body.innerHTML = `<p class="sp-intro">These are the <strong>${data.listings} ${data.listings === 1 ? 'listing' : 'listings'}</strong> on <strong>${data.channels} ${data.channels === 1 ? 'channel' : 'channels'}</strong> in your guide that ChannelBin believes are this one, grouped by how the listing is worded. Open a group to see its channels.</p>
         <p class="sp-intro">If ChannelBin got a group wrong, press its <strong>Wrong match</strong>. Those listings then stop counting: this count drops, ChannelBin works out the live airing and the guide's time without them, and anything that later uses this match, such as a recording's details or an auto-record rule, leaves them out. Nothing is recorded, cancelled or deleted, and Undo puts it back. Inside a group, each channel has its own Wrong match for the rare channel whose listing is wrong when the rest are right.</p>
         <p class="sp-intro sp-faint">ChannelBin reads what the listing says. It cannot see what the channel actually shows.</p>
         ${data.groups.map((g, gi) => groupHtml(g, gi, opened.has(gi))).join('')}
-        ${namesHtml(data.names, data.one)}${foot}`;
+        ${namesHtml(data.names, data.one)}${skippedListingsHtml(data, skippedOpen)}${foot}`;
     };
     const load = () => jsonFetch(`/api/sports/events/${eventId}/listings`).then((d) => { data = d; draw(); })
       .catch((err) => { body.innerHTML = `<p class="sp-intro">${escHtml(err.message)}</p>`; });
     body.addEventListener('click', (e) => {
+      if (e.target.closest('[data-skipped]')) { skippedOpen = !skippedOpen; draw(); return; }
       const toggle = e.target.closest('[data-toggle]');
       if (toggle) {
         const gi = Number(toggle.dataset.toggle);
@@ -547,7 +566,41 @@
     }).catch((err) => { body.innerHTML = `<p class="sp-intro">${escHtml(err.message)}</p>`; });
   }
 
+  /* ---- The words and lengths that keep a listing out (mockup 59, dev/changelog/1634) ---------
+     Each change saves at once; the swap then draws the list as the server holds it. */
+  const skipsUrl = (what) => `/api/sports/leagues/${leagueId()}/${what}`;
+  const skipSaved = () => { showToast('Saved. ChannelBin checks your guide again in a minute.', { type: 'success' }); return refresh(); };
+  const skipFailed = (err) => { showToast(err.message, { type: 'error' }); return refresh(); };
+
+  // The list the page shows: the server writes the change to that one.
+  const skipKind = () => (document.getElementById('sp-skips') || {}).dataset.skipKind;
+  function saveSkipWord(body) {
+    return jsonFetch(skipsUrl('skip-words'), { method: 'PUT', body: JSON.stringify({ ...body, kind: skipKind() }) })
+      .then(skipSaved).catch(skipFailed);
+  }
+
+  function restoreSkips() {
+    confirmModal({
+      title: 'Restore defaults',
+      message: "Restore ChannelBin's default words and lengths for this league? Every word you added is taken off, every one you removed is put back, and the lengths go back to the defaults.",
+      consequence: 'Listings may count again, or stop counting, at the next check of your guide.',
+      confirmLabel: 'Restore defaults',
+    }).then((ok) => {
+      if (!ok) return;
+      jsonFetch(skipsUrl('skip-words'), { method: 'DELETE' })
+        .then(() => { showToast('Restored. ChannelBin checks your guide again in a minute.', { type: 'success' }); return refresh(); })
+        .catch(skipFailed);
+    });
+  }
+
   document.addEventListener('submit', (e) => {
+    const skip = e.target.closest('form[data-act="add-skip"]');
+    if (skip) {
+      e.preventDefault();
+      const value = skip.querySelector('[name="word"]').value.trim();
+      if (value) saveSkipWord({ add: value });
+      return;
+    }
     const form = e.target.closest('form[data-act="add-term"]');
     if (!form) return;
     e.preventDefault();
@@ -565,7 +618,33 @@
       .catch((err) => { showToast(err.message, { type: 'error' }); return refresh(); });
   }
 
+  /* The league's Up next channel on the output feed (app/sports_up_next.py). */
+  function saveUpNext(enabled) {
+    return jsonFetch('/api/sports/up-next', { method: 'PUT', body: JSON.stringify({ league_id: leagueId(), enabled }) })
+      .then(saidCut).then(refresh)
+      .catch((err) => { showToast(err.message, { type: 'error' }); return refresh(); });
+  }
+
+  /* ---- Game time settings (mockup 58, dev/changelog/1630) ---------------------------------
+     Each control saves on change, like the IPTV Output page's settings; the swap then draws the
+     rows the answer shows. On a league page an empty choice or box is the default again. */
+  function saveGameTime(field) {
+    const card = field.closest('[data-gt-url]');
+    const value = field.type === 'number' && field.value !== '' ? Number(field.value) : field.value;
+    jsonFetch(card.dataset.gtUrl, { method: 'PUT', body: JSON.stringify({ [field.dataset.gtField]: value }) })
+      .then(() => { showToast('Saved.', { type: 'success' }); return refresh(); })
+      .catch((err) => { showToast(err.message, { type: 'error' }); refresh(); });
+  }
+
   document.addEventListener('change', (e) => {
+    const gt = e.target.closest('[data-gt-url] [data-gt-field]');
+    if (gt) { saveGameTime(gt); return; }
+    const len = e.target.closest('input[data-skip-length]');
+    if (len) {
+      jsonFetch(skipsUrl('skip-minutes'), { method: 'PUT', body: JSON.stringify({ length: len.dataset.skipLength, minutes: len.value === '' ? null : Number(len.value) }) })
+        .then(skipSaved).catch(skipFailed);
+      return;
+    }
     const sw = e.target.closest('input[data-act="replay"]');
     if (sw) {
       if (Date.now() < settlingUntil) {
@@ -578,6 +657,8 @@
     }
     const feed = e.target.closest('input[data-act="feed-channel"]');
     if (feed) saveFeedChannel(Number(feed.dataset.team), feed.checked);
+    const upNext = e.target.closest('input[data-act="up-next"]');
+    if (upNext) saveUpNext(upNext.checked);
   });
 
   /* ---- A page at a time (mockup 57) --------------------------------------------------------
@@ -672,7 +753,9 @@
       }
       const group = pick.group_id ? `?group=${pick.group_id}` : '';
       const ctx = await jsonFetch(`/api/channels/airings/${pick.epg_id}/record-context${group}`);
-      openModal(ctx.program, ctx.channel, { notice });
+      // pick.times: where the league's answer to which time a game goes by puts the listing
+      // (sports_view.listing_times()); the profile's padding goes on top, as for any listing.
+      openModal(ctx.program, ctx.channel, { notice, sportsEventId: pick.sports_event_id, times: pick.times });
     } catch (err) {
       // A 409 is the page being out of date: a recording made elsewhere, or nothing left.
       showToast(err.message, { type: 'error' });
@@ -763,7 +846,9 @@
     }
     if (name === 'tie') { openTie(); return; }
     if (name === 'untie') { saveCategories({ remove: [act.dataset.name] }); return; }
-    if (name === 'add-term' || name === 'replay' || name === 'feed-channel') return;
+    if (name === 'remove-skip') { saveSkipWord({ remove: act.dataset.word }); return; }
+    if (name === 'restore-skips') { restoreSkips(); return; }
+    if (name === 'add-term' || name === 'add-skip' || name === 'replay' || name === 'feed-channel') return;
     if (name === 'record') { record(act); return; }
     if (name === 'search-why') { showToast(act.dataset.why, { type: 'warning' }); return; }
     if (name === 'edit-rec') { editRecording(act); return; }
@@ -786,7 +871,7 @@
      because the swap would replace what the person is working on; the next turn catches up. A
      failed fetch (a restart, a dropped connection) skips a turn, where an action's reloads. */
   const LIVE_MS = 30 * 1000;
-  const TEXT_FIELDS = 'input:not([type]), input[type="text"], input[type="search"], textarea';
+  const TEXT_FIELDS = 'input:not([type]), input[type="text"], input[type="search"], input[type="number"], textarea';
 
   const inUse = () => REGIONS.some((sel) => {
     const region = document.querySelector(sel);

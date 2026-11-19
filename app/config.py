@@ -950,6 +950,21 @@ _DEFAULTS = {
         # and the badges of the teams playing next on the output feed's sports channels
         # (dev/changelog/1532). Off, nothing is downloaded and none already downloaded is used.
         'download_images': True,
+        # Which time a game goes by when TheSportsDB and the guide disagree: the default for every
+        # league, and each league's own answers under `leagues` keyed by TheSportsDB's league id.
+        # One reader and writer, app/sports_times.py (dev/changelog/1630).
+        'game_times': {
+            'go_by': 'tsdb',              # tsdb | guide | both
+            'cover_both_minutes': 90,     # under both: starts this far apart or closer are one recording
+            'wait_hours': 24,             # go by the listing until this close to a game
+            'leagues': {},                # league id -> only the answers that league changed
+        },
+        # The words and lengths that keep a guide listing from counting as a league's game or race,
+        # as each league changed them on its page: league id -> its added and removed words and any
+        # length changed. One reader and writer, app/sports_skips.py (dev/changelog/1634).
+        'skip_words': {
+            'leagues': {},
+        },
     },
     'auto_scheduling': {
         # Per-rule cap on SCHEDULED recordings when the rule sets none of its own; a showing

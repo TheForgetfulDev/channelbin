@@ -5,6 +5,43 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.44.0 - 2026-11-18
+
+Up next channels and game times you choose.
+
+**Added**
+
+- Up next channels on the IPTV output: ChannelBin's own picture of the coming games, one for
+  everything followed and one per league, showing where each game is on. They use no IPTV
+  provider connection.
+- Each league chooses which time a game goes by when TheSportsDB and the guide disagree:
+  TheSportsDB, the guide, or Cover both, with a default on Sports Schedules.
+- A recording made by an auto-record rule or a league page's Record moves with that time when
+  a game moves, and one already under way ends later when a game runs late.
+- Motorsports: practice, qualifying and sprints match as their own events, and an auto-record
+  rule records them when its Practice and qualifying switch is on.
+- Each league page shows the words and lengths that keep a guide listing from counting as a
+  game, and lets you change them.
+- EPG Manager, Sports Schedules and IPTV Output carry a Beta mark.
+
+**Changed**
+
+- A league's sports channels with no game in the guide days sent are left out of the IPTV
+  player's channel list, and the guide between games names the next game and its start.
+
+**Fixed**
+
+- Channels on the IPTV output carry their logos.
+- A game's start goes by TheSportsDB's time and live listings, so replays on many channels no
+  longer pull a live game to the wrong time.
+- A game TheSportsDB moves after it has started keeps its start, so a sports channel no longer
+  shows its waiting screen over a game on the air.
+- A race's start no longer comes from a support series listing, and a race's side feeds are no
+  longer matched in place of the main feed.
+- Record on a league page picks the listing at the game's start rather than a moved game's old
+  time.
+- A play on the IPTV output stopped the moment it started no longer stays live.
+
 ## 0.43.0 - 2026-11-17
 
 Recordings move off a full account, and sharper sports matching.

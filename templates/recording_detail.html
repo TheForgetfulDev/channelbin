@@ -1079,7 +1079,12 @@
       {% if sports.where %}{{ stat_row('Venue', sports.where) }}{% endif %}
       {% if sports.start %}
       {{ stat_row('Listed start', sports.start, sv_cls='warn',
-                  tip='When TheSportsDB says the event starts. It is shown because it differs from the guide, and it never changes when this recording starts or stops: only the guide does.') }}
+                  tip=('When TheSportsDB says the event starts. It is shown because it differs from the guide. ChannelBin made this recording for the game, so while it is scheduled its times follow the time its league goes by, and once it is recording its end moves later if TheSportsDB moves the start later, unless you change them.' if sports.follows else 'When TheSportsDB says the event starts. It is shown because it differs from the guide, and it never changes when this recording starts or stops: ChannelBin did not set its times, so it keeps the times it was given.')) }}
+      {% endif %}
+      {% if sports.pair %}
+      {#- Cover both's two recordings of one game (app/sports_view.py::_cover_pair, dev/changelog/1631).
+          duplicated from _macros.html stat_row - the value carries a link, which stat_row escapes. -#}
+      <div class="srow wide"><span class="sk">{{ sports.pair.label }}</span><span class="sv">{{ sports.pair.before }}<a href="{{ url_for('recordings.recording_detail', recording_id=sports.pair.other_id) }}">Recording #{{ sports.pair.other_id }}</a>{{ sports.pair.after }}</span></div>
       {% endif %}
       {{ stat_row('Matched', ('Strong' if sports.strong else 'Weak') ~ ', ' ~ sports.airing ~ '. ' ~ sports.reason,
                   sv_cls=('ok' if sports.strong else 'warn'), wide=true) }}
@@ -1290,6 +1295,7 @@
   'CAPTURE_VIDEO_RESUMED': 'ok',
   'RECORDING_FORMAT_OVERRIDE': 'warn', 'RECORDING_FORMAT_CHANGED': 'warn',
   'RECORDING_RULE_PROGRAM_MOVED': 'warn',
+  'RECORDING_SPORTS_TIME_KEPT': 'warn', 'RECORDING_SPORTS_RETIMED': 'info', 'RECORDING_SPORTS_SECOND': 'info',
   'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info', 'CAPTURE_PACING_ENABLED': 'info',
   'RECORDING_METADATA_REFRESHED': 'info', 'RECORDING_METADATA_REFRESH_SKIPPED': 'info',
   'RECORDING_METADATA_EDITED': 'info', 'RECORDING_RULE_RETRACKED': 'info',

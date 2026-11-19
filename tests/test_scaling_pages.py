@@ -1466,6 +1466,10 @@ NOT_ROW_SCALING = {
         'Plays ONE channel to an IPTV player: resolves one feed id and either redirects or relays '
         'its stream. Not a page and renders no rows; the catalog answers it lists from carry '
         'their own cases (test_output_feed_catalog and siblings).'),
+    'output_feed.logo': (
+        'Serves ONE channel\'s logo image to an IPTV player: one channel looked up by id, one '
+        'membership check, then a cached file or one fetch (dev/changelog/1618). Not a page and '
+        'renders no rows.'),
 }
 
 

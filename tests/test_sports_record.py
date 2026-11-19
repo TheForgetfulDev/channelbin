@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support.seed import make_account, make_channel, make_epg_entry, make_recording  # noqa: E402
 
-from app import db, sports_match  # noqa: E402
+from app import db, sports_match, sports_times  # noqa: E402
 from app.database import (  # noqa: E402
     AutoRule, Recording, RecordingSports, SportsEvent, SportsFollow, SportsLeague, SportsMatch,
 )
@@ -37,6 +37,10 @@ SUB = 'Harborview Gulls at Ironvale Bears'
 
 def now_utc():
     return datetime.utcnow().replace(second=0, microsecond=0)
+
+
+def iso(dt):
+    return dt.strftime('%Y-%m-%dT%H:%M:%S')
 
 
 class Rig:
@@ -149,6 +153,43 @@ class PickTests(Case):
         self.assertIn('most of your channels carry (3 of the 5 channels with this game)', body['notice']['text'])
         self.assertIn('f.event=7001', body['search_url'])
 
+    def moved(self, rig, believed=True):
+        """2026-11-17's Mavericks-Warriors shape: one channel at the game's start, three at a time
+        95 minutes later, where the guide still lists the game TheSportsDB moved."""
+        if believed:
+            rig.event.guide_start = rig.start
+        near = rig.listing(rig.channel('KFAA'))
+        far = [rig.listing(rig.channel(f'Wide {i}'), start=rig.start + timedelta(minutes=95)) for i in range(3)]
+        return near, far
+
+    def test_a_listing_at_the_believed_start_beats_more_channels_95_minutes_off(self):
+        """dev/changelog/1625: Record picked ESPN's 14 channels at 9:35 over KFAA at TheSportsDB's
+        8:00, which the matcher believed, and would have missed 90 minutes of the game."""
+        rig = Rig()
+        near, _far = self.moved(rig)
+        body = self.pick(rig).get_json()
+        self.assertEqual((body['kind'], body['epg_id']), ('live', near.id))
+        text = body['notice']['text']
+        self.assertIn("the live airing at the game's start, on 1 of the 4 channels with this game, recorded from KFAA.",
+                      text)
+        self.assertRegex(text, r'3 channels list it at \d+:\d\d [AP]M instead, too far from \d+:\d\d [AP]M, when '
+                               r'ChannelBin believes it starts\.')
+        self.assertNotIn('most of your channels carry', text)
+
+    def test_the_record_button_ranks_the_same_way(self):
+        """The row's label comes from sports_view._preview_pick(): a game that started at its
+        believed start offers Record now from that listing, not Record from the later one."""
+        rig = Rig(start=now_utc() - timedelta(minutes=30))
+        self.moved(rig)
+        self.assertRegex(self.page(rig), r'data-act="record" data-event="\d+">.*?Record now</button>')
+
+    def test_with_no_believed_start_the_most_channels_still_win(self):
+        rig = Rig()
+        _near, far = self.moved(rig, believed=False)
+        body = self.pick(rig).get_json()
+        self.assertIn(body['epg_id'], [x.id for x in far])
+        self.assertIn('most of your channels carry (3 of the 4 channels with this game)', body['notice']['text'])
+
     def test_only_replays_in_the_guide_records_the_replay_and_says_so(self):
         rig = Rig()
         entry = rig.listing(rig.channel(), start=rig.start + timedelta(hours=6), airing='replay')
@@ -259,18 +300,20 @@ class EventChannelTests(Case):
         self.assertIn('Its name gives the start', body['notice']['text'])
         self.assertIn('4 hours', body['notice']['text'])
 
-    def test_no_time_zone_in_a_trusted_league_records_from_thesportsdbs_start(self):
-        rig = Rig()
+    def test_no_time_zone_in_a_league_that_goes_by_thesportsdb_records_from_its_start(self):
+        """Untrusted on purpose: the league's answer decides, not its measured record (dev/changelog/1630)."""
+        rig = Rig(trusted=False)
         ch = rig.channel(name='1pm Gulls at Bears')
         rig.name(ch)
         body = self.pick(rig).get_json()
         self.assertEqual(body['kind'], 'event')
         self.assertEqual(body['program']['start_time'], rig.start.strftime('%Y-%m-%dT%H:%M:%S'))
         self.assertIn("so the start is TheSportsDB's", body['notice']['text'])
-        self.assertIn('which matched your guide on 12 of the last 12 games', body['notice']['text'])
+        self.assertIn('which Pretend Football League goes by', body['notice']['text'])
 
-    def test_no_time_zone_and_untrusted_times_greys_record_with_the_reason(self):
-        rig = Rig(trusted=False)
+    def test_no_time_zone_in_a_league_that_goes_by_the_guide_greys_record_with_the_reason(self):
+        rig = Rig()
+        sports_times.set_league(9001, {'go_by': sports_times.GO_GUIDE})
         ch = rig.channel(name='1pm Gulls at Bears')
         rig.name(ch)
         r = self.pick(rig)
@@ -551,6 +594,71 @@ class RowScriptTests(unittest.TestCase):
         self.assertGreaterEqual(self.obs['saved_swaps'], 1)
 
 
+class GameTimesTests(Case):
+    """Record's times by the league's answer to which time a game goes by (app/sports_times.py,
+    dev/changelog/1630). TheSportsDB has the game three hours out; the guide lists it earlier."""
+
+    def rig(self, early, hours=5):
+        rig = Rig()
+        listed = rig.start - early
+        entry = rig.listing(rig.channel(), start=listed, hours=hours)
+        rig.event.guide_start = listed
+        return rig, entry, listed
+
+    def times(self, body):
+        return body['times']['start_time'], body['times']['stop_time']
+
+    def test_go_by_thesportsdb_starts_the_dialog_at_its_time_and_ends_that_much_later(self):
+        rig, _entry, listed = self.rig(timedelta(minutes=75))
+        body = self.pick(rig).get_json()
+        self.assertEqual(self.times(body), (iso(rig.start), iso(listed + timedelta(hours=5, minutes=75))))
+        self.assertIn('the default for every league, so the recording starts at', body['notice']['text'])
+
+    def test_your_guide_keeps_the_listings_times(self):
+        rig, _entry, listed = self.rig(timedelta(minutes=75))
+        sports_times.set_league(9001, {'go_by': sports_times.GO_GUIDE})
+        body = self.pick(rig).get_json()
+        self.assertEqual(self.times(body), (iso(listed), iso(listed + timedelta(hours=5))))
+        self.assertIn("goes by your guide, so the recording keeps the listing's times", body['notice']['text'])
+
+    def test_cover_both_past_the_limit_keeps_the_listing_and_names_the_second_time(self):
+        rig, _entry, listed = self.rig(timedelta(hours=4), hours=2)
+        sports_times.set_league(9001, {'go_by': sports_times.GO_BOTH})
+        body = self.pick(rig).get_json()
+        self.assertEqual(self.times(body), (iso(listed), iso(listed + timedelta(hours=2))))
+        self.assertIn('more than the 90-minute limit', body['notice']['text'])
+        self.assertIn('ChannelBin schedules a second one at', body['notice']['text'])
+
+    def test_further_off_than_the_wait_keeps_the_listing_and_says_why(self):
+        rig, _entry, listed = self.rig(timedelta(minutes=75))
+        sports_times.set_league(9001, {'wait_hours': 1})
+        body = self.pick(rig).get_json()
+        self.assertEqual(self.times(body), (iso(listed), iso(listed + timedelta(hours=5))))
+        self.assertIn("only from 1 hour before a game", body['notice']['text'])
+
+    def save(self, entry, event_id):
+        db.session.commit()
+        with mock.patch('app.routes.recordings.schedule_recording'):
+            r = self.client.post('/recordings/new-json', data={
+                'name': 'PFL Football', 'url': 'http://example.test/live/1',
+                'start_time': local_input_value(entry.start_time), 'stop_time': local_input_value(entry.stop_time),
+                'channel_id': str(entry.channel_id), 'source_epg_id': str(entry.id),
+                'sports_event_id': str(event_id), 'force': '1'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        db.session.expire_all()
+        return db.session.get(Recording, r.get_json()['id'])
+
+    def test_a_save_from_record_marks_the_recording_as_the_games(self):
+        rig, entry, _listed = self.rig(timedelta(minutes=75))
+        self.assertEqual(self.save(entry, rig.event_id).sports_record_tsdb_id, 7001)
+
+    def test_a_listing_that_is_not_the_games_is_never_marked(self):
+        """The page's event id is checked against the matcher's listings, never taken on trust."""
+        rig, entry, _listed = self.rig(timedelta(minutes=75))
+        other = rig.game(7100, rig.start + timedelta(days=1), 'Saltmarsh Otters', 'Harborview Gulls')
+        self.assertIsNone(self.save(entry, other.id).sports_record_tsdb_id)
+
+
 @unittest.skipIf(shutil.which('node') is None or not os.path.isdir(JSDOM), 'node or jsdom not installed')
 class RecordDialogScriptTests(unittest.TestCase):
     """The shared record dialog (static/js/guide.js::openModal, templates/_record_modal.html) on the
@@ -567,6 +675,7 @@ class RecordDialogScriptTests(unittest.TestCase):
             db.session.commit()
             html = t.client.get(f'/sports/{rig.league_id}').get_data(as_text=True)
             live = t.client.get(f'/api/sports/events/{rig.event_id}/record').get_data(as_text=True)
+            cls.event_id = rig.event_id
             context = t.client.get(f'/api/channels/airings/{entry.id}/record-context').get_data(as_text=True)
             rig.name(named, start=rig.start)
             SportsMatch.query.filter_by(kind='guide').delete()
@@ -588,14 +697,16 @@ class RecordDialogScriptTests(unittest.TestCase):
     def test_guide_js_runs_on_the_league_page_without_errors(self):
         self.assertEqual(self.obs['errors'], [])
 
-    def test_a_listing_pick_draws_its_notice_and_no_event(self):
+    def test_a_listing_pick_draws_its_notice_and_carries_its_event(self):
+        """The event id rides along so the save can mark the recording as this game's, once the
+        server has checked the listing is one of its own (dev/changelog/1630)."""
         live = self.obs['live']
         self.assertTrue(live['open'])
         self.assertTrue(live['note_shown'])
         self.assertIn('notice-info', live['note_class'])
         self.assertTrue(live['note_text'].startswith('ChannelBin picked this listing.'))
         self.assertIn('f.event=7001', live['note_link'])
-        self.assertEqual(live['sports_event'], '')
+        self.assertEqual(live['sports_event'], str(self.event_id))
         self.assertNotEqual(live['epg_id'], '')
 
     def test_an_event_channel_pick_carries_the_event_and_draws_its_head(self):

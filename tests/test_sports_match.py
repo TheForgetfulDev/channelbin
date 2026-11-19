@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 from datetime import date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,9 +17,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support.seed import make_account, make_channel, make_epg_entry  # noqa: E402
 
-from app import admission, db, sports_data, sports_match  # noqa: E402
+from app import admission, db, sports_data, sports_match, sports_skips, sports_times  # noqa: E402
+from app.config import load_config  # noqa: E402
 from app.database import (  # noqa: E402
-    EPGEntry, SPORTS_AIRING_FIRST, SPORTS_AIRING_REPLAY, SPORTS_MATCH_STRONG, SPORTS_MATCH_WEAK,
+    EPGEntry, SPORTS_AIRING_FIRST, SPORTS_AIRING_REPLAY, SPORTS_AIRING_UNKNOWN, SPORTS_MATCH_STRONG, SPORTS_MATCH_WEAK,
     SportsEvent, SportsLeague, SportsLeagueCategory, SportsMatch, SportsState, SportsTeam,
 )
 
@@ -267,7 +269,7 @@ class TimeTests(MatchCase):
         self.assertEqual(event.guide_start, real)
         self.assertTrue(sports_match.time_disagrees(event))
         self.assertTrue(all(m.airing == SPORTS_AIRING_FIRST for m in found))
-        self.assertIn('most channels list', found[0].reason)
+        self.assertIn('the time the guide lists', found[0].reason)
 
     def test_a_disagreement_names_both_times(self):
         self.t.sandbox_config({'display': {'timezone': 'America/New_York', 'time_format': '12h'}})
@@ -277,7 +279,7 @@ class TimeTests(MatchCase):
             self.row('PFL Football', sub_title='Harborview Gulls at Ironvale Bears', start=wrong + timedelta(hours=12))
         self.run_match(now=wrong)
         reason = self.matches(event)[0].reason
-        self.assertIn('at 6:30 PM, the time most channels list', reason)
+        self.assertIn('at 6:30 PM, the time the guide lists', reason)
         self.assertIn('TheSportsDB lists 6:30 AM', reason)
 
     def test_a_start_that_has_aired_is_kept_when_its_rows_leave_the_guide(self):
@@ -355,6 +357,340 @@ class TimeTests(MatchCase):
         self.assertEqual([m.program_start_time for m in self.matches(second)], [KICKOFF + timedelta(days=1)])
 
 
+class GuideStartTests(MatchCase):
+    """Which start a game is given when the guide lists it at several (dev/docs/BUGS.md 2026-11-17 @ 05:10:28 PM)."""
+
+    def listing(self, start, n, live=False):
+        title = 'PFL Football ᴸᶦᵛᵉ' if live else 'PFL Football'
+        return [self.row(title, sub_title='Harborview Gulls at Ironvale Bears', start=start)[0] for _ in range(n)]
+
+    def test_a_replay_on_more_channels_does_not_move_the_game_off_its_live_listings(self):
+        """104 NFL Network feeds listing a 12:30 AM replay outvoted 48 channels carrying the 8:15 PM game live,
+        and the live listings were then dropped as too early."""
+        event = self.game(2, 1)
+        self.listing(KICKOFF - timedelta(minutes=75), 3, live=True)
+        self.listing(KICKOFF - timedelta(minutes=15), 2, live=True)
+        self.listing(KICKOFF + timedelta(hours=4, minutes=15), 8)
+        self.run_match()
+        self.assertEqual(event.guide_start, KICKOFF - timedelta(minutes=75))
+        self.assertFalse(sports_match.time_disagrees(event))
+        live = [m for m in self.matches(event) if m.program_start_time <= KICKOFF]
+        self.assertEqual(len(live), 5)
+        self.assertEqual({m.airing for m in live}, {SPORTS_AIRING_FIRST})
+        playing = sports_match.airing_now([event.id], KICKOFF + timedelta(minutes=30))
+        self.assertEqual(len({channel for _e, channel, _s, _t in playing}), 5)
+
+    def test_the_leagues_answer_decides_when_a_sports_channel_plays_each_listing(self):
+        """Texans at Colts on Nov 18 (dev/changelog/1630): listed 7:00 PM on most channels, 8:00 PM on a
+        few, TheSportsDB 8:15 PM. Going by TheSportsDB each listing starts at 8:15 PM; the replay stays."""
+        event = self.game(2, 1)
+        self.listing(KICKOFF - timedelta(minutes=75), 3, live=True)
+        self.listing(KICKOFF - timedelta(minutes=15), 2, live=True)
+        self.listing(KICKOFF + timedelta(hours=4, minutes=15), 8)
+        self.run_match()
+
+        def starts(now):
+            return sorted({s for _c, _a, s, _t in sports_match.listing_windows([event.id], now)[event.id]})
+        self.assertEqual(starts(NOW), [KICKOFF])  # a replay is never played (_playable)
+        sports_times.set_league(9001, {'go_by': sports_times.GO_GUIDE})
+        self.assertEqual(starts(NOW), [KICKOFF - timedelta(minutes=75), KICKOFF - timedelta(minutes=15)])
+        sports_times.set_league(9001, {'go_by': sports_times.GO_BOTH})
+        self.assertEqual(starts(NOW), [KICKOFF - timedelta(minutes=75), KICKOFF - timedelta(minutes=15)])
+        sports_times.set_league(9001, {'go_by': None})
+        # Further off than the 24-hour wait, every listing is as listed.
+        self.assertEqual(starts(KICKOFF - timedelta(hours=26)),
+                         [KICKOFF - timedelta(minutes=75), KICKOFF - timedelta(minutes=15)])
+        on = sports_match.airing_now([event.id], KICKOFF - timedelta(minutes=30))
+        self.assertEqual(on, [], 'going by TheSportsDB, nothing plays before 8:15 PM')
+
+    def test_a_listing_moved_later_plays_past_its_listed_end(self):
+        """Listed 90 minutes, ending 15 minutes after TheSportsDB's start: asked 15 minutes after that, the
+        moved listing is still on, which airing_now's query has to reach back for (review of 1630)."""
+        event = self.game(2, 1)
+        early = KICKOFF - timedelta(minutes=75)
+        self.row('PFL Football ᴸᶦᵛᵉ', sub_title='Harborview Gulls at Ironvale Bears', start=early, minutes=90)
+        self.run_match()
+        self.assertEqual(event.guide_start, early)
+        on = sports_match.airing_now([event.id], KICKOFF + timedelta(minutes=30))
+        self.assertEqual([(s, t) for _e, _c, s, t in on], [(KICKOFF, KICKOFF + timedelta(minutes=90))])
+
+    def test_a_start_marked_live_beats_one_on_more_channels(self):
+        event = self.game(2, 1)
+        self.listing(KICKOFF - timedelta(minutes=60), 4)
+        self.listing(KICKOFF, 1, live=True)
+        self.run_match()
+        self.assertEqual(event.guide_start, KICKOFF)
+
+    def test_an_earlier_start_on_more_channels_stays_matched_as_a_first_airing(self):
+        """397 FOX stations listed a game at 3:30 PM and 44 at TheSportsDB's 7:00 PM. TheSportsDB's time is
+        the game's start, and the earlier listing on more channels is never dropped as a placeholder."""
+        event = self.game(2, 1)
+        self.listing(KICKOFF - timedelta(hours=3, minutes=30), 4)
+        self.listing(KICKOFF, 2)
+        self.run_match(now=KICKOFF - timedelta(hours=6))
+        self.assertEqual(event.guide_start, KICKOFF)
+        found = self.matches(event)
+        self.assertEqual([m.program_start_time for m in found], [KICKOFF - timedelta(hours=3, minutes=30)] * 4 + [KICKOFF] * 2)
+        self.assertEqual({m.airing for m in found if m.program_start_time == KICKOFF}, {SPORTS_AIRING_FIRST})
+
+    def test_a_lone_unmarked_listing_hours_off_is_not_the_start(self):
+        """ESPN+ listed Kent State vs Miami (OH) at 9 AM on one event channel for a 7 PM game: the guide
+        showed the game that morning and nothing at night."""
+        event = self.game(2, 1)
+        self.listing(KICKOFF - timedelta(hours=10), 1)
+        self.run_match(now=KICKOFF - timedelta(hours=12))
+        self.assertIsNone(event.guide_start)
+        self.assertEqual(self.matches(event), [])
+
+    def test_a_far_start_marked_live_is_believed_when_nothing_is_near(self):
+        event = self.game(2, 1)
+        self.listing(KICKOFF + timedelta(hours=3), 1, live=True)
+        self.run_match()
+        self.assertEqual(event.guide_start, KICKOFF + timedelta(hours=3))
+        self.assertTrue(sports_match.time_disagrees(event))
+
+    def test_a_stored_start_that_has_passed_is_measured_again_before_the_game(self):
+        """The 9 AM placeholder's start had passed by the afternoon and was kept as if the game had aired."""
+        event = self.game(2, 1)
+        event.guide_start, event.guide_channels = KICKOFF - timedelta(hours=10), 1
+        db.session.commit()
+        self.listing(KICKOFF, 2)
+        self.run_match(now=KICKOFF - timedelta(hours=4))
+        self.assertEqual((event.guide_start, event.guide_channels), (KICKOFF, 2))
+
+    def test_a_start_the_guide_no_longer_gives_is_cleared_before_the_game(self):
+        event = self.game(2, 1)
+        event.guide_start, event.guide_channels = KICKOFF - timedelta(hours=10), 1
+        db.session.commit()
+        self.run_match(now=KICKOFF - timedelta(hours=4))
+        self.assertEqual((event.guide_start, event.guide_channels), (None, None))
+
+
+class MovedGameTests(MatchCase):
+    """A game TheSportsDB moved while the guide still lists the old time (dev/docs/BUGS.md 2026-11-17 @ 06:55:07 PM).
+    Mavericks-Warriors moved from 9:30 to 8:00 PM ET; ESPN and ESPN Deportes went on listing 9:35 and 9:30,
+    and the Dallas station alone moved to 8:00."""
+
+    OLD = KICKOFF + timedelta(minutes=90)
+
+    def listing(self, start, n, minutes=150):
+        return [self.row('PFL Football', sub_title='Harborview Gulls at Ironvale Bears', start=start,
+                         minutes=minutes)[0] for _ in range(n)]
+
+    def moved(self):
+        return self.game(2, 1, previous_start=self.OLD, start_changed_at=NOW)
+
+    def test_one_listing_of_the_new_time_beats_more_at_the_old_one(self):
+        event = self.moved()
+        self.listing(KICKOFF, 1)
+        self.listing(self.OLD, 3)
+        self.run_match()
+        self.assertEqual(event.guide_start, KICKOFF)
+        self.assertIsNone(event.guide_behind_start)
+
+    def test_a_guide_still_at_the_old_time_goes_by_thesportsdb(self):
+        event = self.moved()
+        self.listing(self.OLD + timedelta(minutes=5), 3)
+        self.listing(self.OLD, 1)
+        note = self.run_match()
+        self.assertEqual(event.guide_start, KICKOFF)
+        self.assertEqual(event.guide_behind_start, self.OLD + timedelta(minutes=5))
+        self.assertEqual(event.guide_channels, 3)
+        self.assertFalse(sports_match.time_disagrees(event))
+        self.assertIn('still listed at the old time', note)
+        found = self.matches(event)
+        self.assertEqual({m.airing for m in found}, {SPORTS_AIRING_FIRST})
+        self.assertTrue(all('where the guide still lists it' in m.reason for m in found))
+
+    def test_a_sports_channel_plays_the_old_listings_from_the_new_time(self):
+        event = self.moved()
+        self.listing(self.OLD + timedelta(minutes=5), 3)
+        self.listing(self.OLD, 1)
+        self.run_match()
+        playing = sports_match.airing_now([event.id], KICKOFF + timedelta(minutes=10))
+        self.assertEqual(len({channel for _e, channel, _s, _t in playing}), 4)
+        # Each listing moves by its own gap to TheSportsDB's start, not the game's (dev/changelog/1630).
+        self.assertEqual({s for _e, _c, s, _t in playing}, {KICKOFF})
+        windows = sports_match.listing_windows([event.id], KICKOFF + timedelta(minutes=10))[event.id]
+        self.assertEqual({s for _c, _a, s, _t in windows}, {KICKOFF})
+
+    def test_a_moved_listing_ends_no_earlier_than_listed(self):
+        """A game moved earlier that runs long is not cut at the moved end of the network's slot."""
+        event = self.moved()
+        self.listing(self.OLD, 2, minutes=150)
+        self.run_match()
+        stops = {t for _e, _c, _s, t in sports_match.airing_now([event.id], KICKOFF + timedelta(minutes=10))}
+        self.assertEqual(stops, {self.OLD + timedelta(minutes=150)})
+
+    def test_a_replay_hours_later_stays_a_replay_and_is_not_moved(self):
+        event = self.moved()
+        self.listing(self.OLD, 2)
+        self.listing(self.OLD + timedelta(hours=6), 2)
+        self.run_match()
+        later = [m for m in self.matches(event) if m.program_start_time > self.OLD]
+        self.assertEqual({m.airing for m in later}, {SPORTS_AIRING_REPLAY})
+        start = self.OLD + timedelta(hours=6)
+        rule = sports_times.Rules().of(0)
+        self.assertEqual(sports_times.event_windows(start, start + timedelta(hours=2), event, rule, KICKOFF),
+                         [(start, start + timedelta(hours=2))])
+
+    def test_the_mark_clears_once_the_guide_follows(self):
+        event = self.moved()
+        self.listing(self.OLD, 2)
+        self.run_match()
+        self.assertIsNotNone(event.guide_behind_start)
+        self.listing(KICKOFF, 1)
+        self.run_match()
+        self.assertEqual(event.guide_start, KICKOFF)
+        self.assertIsNone(event.guide_behind_start)
+
+    def test_a_game_the_guide_is_behind_on_is_left_out_of_the_trust_sample(self):
+        event = self.moved()
+        self.listing(self.OLD, 2)
+        self.run_match()
+        self.assertIsNotNone(event.guide_behind_start)
+        self.assertEqual(db.session.get(SportsLeague, self.football.id).trust_sample, 0)
+
+    def test_the_league_page_row_says_the_guide_is_behind(self):
+        from app import sports_view
+        from app.tz_utils import get_display_tz
+        event = self.moved()
+        self.listing(self.OLD, 2)
+        self.run_match()
+        rules = sports_times.Rules()
+        notes = sports_view._game_row(event, rules.of(9001), NOW, get_display_tz(), False)['notes']
+        self.assertTrue(any(n.startswith('The guide still lists it at the old time') and 'on 2 channels' in n
+                            and n.endswith("Sports channels and Record on this page go by TheSportsDB's time")
+                            for n in notes), notes)
+        guide = sports_times.Rule(go_by=sports_times.GO_GUIDE, cover_both_minutes=90, wait_hours=24)
+        notes = sports_view._game_row(event, guide, NOW, get_display_tz(), False)['notes']
+        self.assertTrue(any(n.endswith('go by the listing') for n in notes), notes)
+
+    def test_an_unmoved_game_is_never_marked(self):
+        event = self.game(2, 1)
+        self.listing(self.OLD, 2)
+        self.run_match()
+        self.assertIsNone(event.guide_behind_start)
+        self.assertEqual(event.guide_start, self.OLD)
+
+
+class StartedGameMovedTests(MatchCase):
+    """A game TheSportsDB moves after it has started keeps its start (dev/docs/BUGS.md 2026-11-18 @ 07:52:09 AM).
+    A rain delay entered mid-game moved the start later; the matcher read the guide's listing at the old
+    start as behind and moved it later by the move, and a sports channel showed its waiting screen over
+    the game on the air."""
+
+    def setUp(self):
+        super().setUp()
+        db.session.add(SportsState(id=1))
+        self.event = self.game(2, 1)
+        for _ in range(3):
+            self.row('PFL Football', sub_title='Harborview Gulls at Ironvale Bears', start=KICKOFF, minutes=150)
+        self.run_match(now=KICKOFF - timedelta(hours=1))
+        self.assertEqual(self.event.guide_start, KICKOFF)
+
+    def move(self, to, seen=KICKOFF + timedelta(minutes=15)):
+        event = db.session.get(SportsEvent, self.event.id)
+        event.previous_start, event.start_at, event.start_changed_at = event.start_at, to, seen
+        db.session.commit()
+
+    def test_a_sports_channel_keeps_playing_a_game_moved_later_mid_game(self):
+        self.move(KICKOFF + timedelta(minutes=90))
+        self.run_match(now=KICKOFF + timedelta(minutes=20))
+        self.assertEqual(self.event.guide_start, KICKOFF)
+        self.assertIsNone(self.event.guide_behind_start)
+        playing = sports_match.airing_now([self.event.id], KICKOFF + timedelta(minutes=20), before=timedelta(hours=1))
+        self.assertEqual(len({channel for _e, channel, _s, _t in playing}), 3)
+        self.assertEqual({s for _e, _c, s, _t in playing}, {KICKOFF})
+
+    def test_its_listings_stay_strong_and_live_in_a_trusted_league(self):
+        """Checked against the moved start, a listing exactly 90 minutes off would turn weak, and a
+        sports channel plays strong listings only."""
+        self.trust(self.football)
+        self.move(KICKOFF + timedelta(minutes=90))
+        self.run_match(now=KICKOFF + timedelta(minutes=20))
+        found = self.matches(self.event)
+        self.assertEqual({(m.strength, m.airing) for m in found}, {(SPORTS_MATCH_STRONG, SPORTS_AIRING_FIRST)})
+        self.assertTrue(all('a game that has started keeps its start' in m.reason for m in found), found[0].reason)
+
+    def test_a_move_earlier_mid_game_changes_nothing(self):
+        self.move(KICKOFF - timedelta(minutes=30))
+        self.run_match(now=KICKOFF + timedelta(minutes=20))
+        self.assertEqual(self.event.guide_start, KICKOFF)
+        self.assertIsNone(self.event.guide_behind_start)
+
+    def test_a_move_seen_before_kickoff_still_goes_by_thesportsdb(self):
+        """The rule of dev/changelog/1623 is unchanged for a game that has not started."""
+        self.move(KICKOFF + timedelta(minutes=90), seen=KICKOFF - timedelta(minutes=50))
+        self.run_match(now=KICKOFF - timedelta(minutes=45))
+        self.assertEqual(self.event.guide_start, KICKOFF + timedelta(minutes=90))
+        self.assertEqual(self.event.guide_behind_start, KICKOFF)
+
+    def test_a_passed_placeholder_start_is_not_a_started_game(self):
+        event = SportsEvent(guide_start=KICKOFF - timedelta(hours=4), previous_start=KICKOFF,
+                            start_at=KICKOFF + timedelta(minutes=30), start_changed_at=KICKOFF - timedelta(hours=3))
+        self.assertFalse(sports_match.kept_start(event))
+
+    def test_it_is_left_out_of_the_trust_sample(self):
+        self.move(KICKOFF + timedelta(minutes=90))
+        self.run_match(now=KICKOFF + timedelta(minutes=20))
+        self.assertEqual(db.session.get(SportsLeague, self.football.id).trust_sample, 0)
+
+    def test_the_league_page_row_says_it_kept_its_start(self):
+        from app import sports_view
+        from app.tz_utils import get_display_tz
+        self.move(KICKOFF + timedelta(minutes=90))
+        self.run_match(now=KICKOFF + timedelta(minutes=20))
+        notes = sports_view._game_row(self.event, sports_times.Rules().of(9001), KICKOFF + timedelta(minutes=20),
+                                      get_display_tz(), False)['notes']
+        self.assertTrue(any(n.startswith('It had already started when TheSportsDB moved it') for n in notes), notes)
+        self.assertFalse(any(n.startswith('The guide still lists it') for n in notes), notes)
+        # A move later says how much later it runs (dev/changelog/1632), except under Go by the guide.
+        self.assertTrue(any('run 90 minutes later to match' in n for n in notes), notes)
+        guide = sports_times.Rule(go_by=sports_times.GO_GUIDE, cover_both_minutes=90, wait_hours=24)
+        notes = sports_view._game_row(self.event, guide, KICKOFF + timedelta(minutes=20), get_display_tz(), False)['notes']
+        self.assertFalse(any('later to match' in n for n in notes), notes)
+
+    def test_a_delay_entered_in_steps_stays_started_and_ends_later_by_all_of_it(self):
+        """dev/docs/BUGS.md 2026-11-18 @ 03:25:38 PM: read every 30 minutes, a rain delay arrives as
+        30-minute steps. Each move
+        used to overwrite previous_start, so after 90 minutes of steps the game stopped reading as
+        started and was shifted forward over the game on the air."""
+        from app.sports_data import _store_parsed
+        league = db.session.get(SportsLeague, self.football.id)
+        for step in range(1, 5):
+            seen = KICKOFF + timedelta(minutes=15 + 30 * (step - 1))
+            _store_parsed(league, [{'tsdb_id': self.event.tsdb_id, 'start_at': KICKOFF + timedelta(minutes=30 * step)}], seen)
+            db.session.commit()
+            self.run_match(now=seen + timedelta(minutes=5))
+        event = db.session.get(SportsEvent, self.event.id)
+        self.assertEqual((event.previous_start, event.guide_start), (KICKOFF, KICKOFF))
+        self.assertTrue(sports_match.kept_start(event))
+        self.assertEqual(sports_times.running_late(event), timedelta(hours=2))
+        now = KICKOFF + timedelta(minutes=110)
+        playing = sports_match.airing_now([self.event.id], now)
+        self.assertEqual(len({channel for _e, channel, _s, _t in playing}), 3)
+        self.assertEqual({(s, t) for _e, _c, s, t in playing},
+                         {(KICKOFF, KICKOFF + timedelta(minutes=150) + timedelta(hours=2))})
+
+    def test_a_sports_channel_holds_a_game_moved_later_mid_game_past_its_listing(self):
+        """The live channel and the recording go by the same reader (dev/changelog/1632): 90 minutes
+        later at the restart, the listing's channel plays on for 90 minutes past the listing."""
+        self.move(KICKOFF + timedelta(minutes=90))
+        self.run_match(now=KICKOFF + timedelta(minutes=20))
+        after_listing = KICKOFF + timedelta(minutes=170)
+        self.assertEqual(len(sports_match.airing_now([self.event.id], after_listing)), 3)
+
+    def test_the_run_says_so_and_logs_the_move_once(self):
+        self.move(KICKOFF + timedelta(minutes=90))
+        with self.assertLogs('app.sports_match', level='WARNING') as logs:
+            note = self.run_match(now=KICKOFF + timedelta(minutes=20))
+        self.assertIn('1 game TheSportsDB moved after it had started keeps its start', note)
+        self.assertTrue(any('after it had started' in line for line in logs.output), logs.output)
+        with self.assertNoLogs('app.sports_match', level='WARNING'):
+            self.run_match(now=KICKOFF + timedelta(minutes=40))
+
+
 class CategoryTests(MatchCase):
     """A category a person tied to a league supplies the league (design 5.2)."""
 
@@ -430,6 +766,351 @@ class FieldEventTests(MatchCase):
         self.run_match(now=datetime(2099, 11, 6, 12))
         self.assertEqual([m.airing for m in self.matches(event)],
                          [SPORTS_AIRING_FIRST, SPORTS_AIRING_REPLAY, SPORTS_AIRING_REPLAY])
+
+    def grand_prix(self):
+        """The Las Vegas Grand Prix's shape in prod's guide on 2026-11-18: a support series at 6:00 PM
+        ET, then the race at 10:55 and 11:00 PM ET, TheSportsDB's 04:00 UTC, and a replay at 3:25 AM."""
+        event = self.race('Harbor Grand Prix', datetime(2099, 11, 22, 4, 0), date(2099, 11, 21), self.series)
+        for _ in range(2):
+            self.row('Pretend Stock Car Series Academy', sub_title='Harbor', start=datetime(2099, 11, 21, 23, 0),
+                     minutes=120)
+        for _ in range(4):
+            self.row('Live Harbor Pretend Stock Car Series Grand Prix', start=datetime(2099, 11, 22, 3, 55),
+                     minutes=125)
+        self.row('Pretend Stock Car Series - Harbor Grand Prix ᴸᶦᵛᵉ', start=datetime(2099, 11, 22, 4, 0), minutes=120)
+        for _ in range(3):
+            self.row('Harbor Pretend Stock Car Series Grand Prix', start=datetime(2099, 11, 22, 8, 25), minutes=125)
+        return event
+
+    def test_a_weak_listing_from_another_series_never_sets_the_start(self):
+        """dev/docs/BUGS.md 2026-11-18 @ 09:04:05 AM: an F1 Academy listing at 6:00 PM ET set the Las
+        Vegas Grand Prix's start, and the 82 channels carrying the race live became replays."""
+        event = self.grand_prix()
+        self.run_match(now=datetime(2099, 11, 21, 12))
+        event = db.session.get(SportsEvent, event.id)
+        self.assertEqual(event.guide_start, datetime(2099, 11, 22, 4, 0))
+        by_title = {}
+        for m in self.matches(event):
+            by_title.setdefault(m.program_title, set()).add((m.strength, m.airing))
+        self.assertEqual(by_title['Live Harbor Pretend Stock Car Series Grand Prix'],
+                         {(SPORTS_MATCH_STRONG, SPORTS_AIRING_FIRST)})
+        self.assertEqual(by_title['Pretend Stock Car Series - Harbor Grand Prix'],
+                         {(SPORTS_MATCH_STRONG, SPORTS_AIRING_FIRST)})
+        self.assertEqual(by_title['Harbor Pretend Stock Car Series Grand Prix'],
+                         {(SPORTS_MATCH_STRONG, SPORTS_AIRING_REPLAY)})
+        self.assertEqual({a for s, a in by_title['Pretend Stock Car Series Academy']}, {SPORTS_AIRING_UNKNOWN})
+
+    def test_the_start_near_thesportsdb_beats_more_channels_further_off(self):
+        """The race's starts are ranked as a game's are (dev/changelog/1620): an earlier strong listing on
+        more channels does not outrank one at TheSportsDB's time."""
+        event = self.race('Harbor Grand Prix', datetime(2099, 11, 22, 4, 0), date(2099, 11, 21), self.series)
+        for _ in range(3):
+            self.row('Pretend Stock Car Series', sub_title='Harbor Grand Prix', start=datetime(2099, 11, 21, 20, 0))
+        self.row('Pretend Stock Car Series', sub_title='Harbor Grand Prix', start=datetime(2099, 11, 22, 4, 0))
+        self.run_match(now=datetime(2099, 11, 21, 12))
+        event = db.session.get(SportsEvent, event.id)
+        self.assertEqual((event.guide_start, event.guide_channels), (datetime(2099, 11, 22, 4, 0), 1))
+
+    def test_a_race_with_only_weak_listings_still_gets_a_start(self):
+        """Characterization: weak listings set the start when there is nothing stronger."""
+        event = self.race('Harbor Grand Prix', datetime(2099, 11, 22, 4, 0), date(2099, 11, 21), self.series)
+        self.row('Pretend Stock Car Series', sub_title='Ironvale 300', start=datetime(2099, 11, 22, 4, 0))
+        self.run_match(now=datetime(2099, 11, 21, 12))
+        event = db.session.get(SportsEvent, event.id)
+        self.assertEqual(event.guide_start, datetime(2099, 11, 22, 4, 0))
+
+    def test_a_race_moved_later_after_it_started_keeps_its_start(self):
+        """dev/docs/BUGS.md 2026-11-18 @ 03:25:38 PM, the F1 rain delay: moved two hours later at the green flag, the race
+        kept a start only matchups held, the start went to the re-air nearer the new time, and the
+        channels carrying the race live lost it."""
+        event = self.race('Harbor Grand Prix', datetime(2099, 11, 22, 4, 0), date(2099, 11, 21), self.series)
+        for _ in range(4):
+            self.row('Live Harbor Pretend Stock Car Series Grand Prix', start=datetime(2099, 11, 22, 3, 55),
+                     minutes=125)
+        self.row('Harbor Pretend Stock Car Series Grand Prix', start=datetime(2099, 11, 22, 6, 0), minutes=125)
+        self.run_match(now=datetime(2099, 11, 21, 12))
+        event = db.session.get(SportsEvent, event.id)
+        self.assertEqual(event.guide_start, datetime(2099, 11, 22, 3, 55))
+        event.previous_start, event.start_at = event.start_at, datetime(2099, 11, 22, 6, 0)
+        event.start_changed_at = datetime(2099, 11, 22, 4, 15)
+        db.session.commit()
+        now = datetime(2099, 11, 22, 4, 20)
+        self.run_match(now=now)
+        event = db.session.get(SportsEvent, event.id)
+        self.assertEqual(event.guide_start, datetime(2099, 11, 22, 3, 55))
+        playing = sports_match.airing_now([event.id], now)
+        self.assertEqual(len(playing), 4)
+        self.assertEqual({t for _e, _c, _s, t in playing}, {datetime(2099, 11, 22, 8, 0)})
+
+    def test_onboard_driver_and_pit_lane_feeds_are_not_the_race(self):
+        """The main feed is what is recorded and played (dev/docs/BUGS.md 2026-11-18 @ 09:04:05 AM)."""
+        event = self.race('Harbor Grand Prix', datetime(2099, 11, 22, 4, 0), date(2099, 11, 21), self.series)
+        start = datetime(2099, 11, 22, 4, 0)
+        self.row('Pretend Stock Car Series Onboard', sub_title='Harbor Grand Prix', start=start)
+        self.row('Pretend Stock Car Series: Driver Cam', sub_title='Harbor Grand Prix', start=start)
+        self.row('Pretend Stock Car Series Pit Lane', sub_title='Harbor Grand Prix', start=start)
+        self.row('Pretend Stock Car Series Data Channel', sub_title='Harbor Grand Prix', start=start)
+        self.run_match(now=datetime(2099, 11, 21, 12))
+        self.assertEqual(self.matches(event), [])
+
+
+class SkipWordsTests(MatchCase):
+    """The matcher reads each league's own words and lengths, once per run."""
+
+    def setUp(self):
+        super().setUp()
+        self.series = self.league(9003, 'Pretend Stock Car Series', ['Pretend Stock Car Series'], sport='Motorsport')
+        queued = mock.patch('app.scheduler.queue_sports_match', return_value=True)
+        queued.start()
+        self.addCleanup(queued.stop)
+        self.race_event = self.race('Lakeside 200', datetime(2099, 9, 17, 23, 30), date(2099, 9, 17), self.series)
+        self.when = datetime(2099, 9, 17, 23, 30)
+
+    def titles(self, event):
+        self.run_match(now=datetime(2099, 9, 17, 12))
+        return sorted(m.program_title for m in self.matches(event, gone_since=None))
+
+    def test_a_removed_word_lets_a_listing_count_and_an_added_one_keeps_it_out(self):
+        self.row('Pretend Stock Car Series Classics', sub_title='Lakeside 200', start=self.when)
+        self.row('Pretend Stock Car Series Chequered Flag', sub_title='Lakeside 200', start=self.when)
+        self.assertEqual(self.titles(self.race_event), ['Pretend Stock Car Series Chequered Flag'])
+        sports_skips.remove_word(9003, sports_skips.KIND_RACE, 'classics')
+        sports_skips.add_word(9003, sports_skips.KIND_RACE, 'chequered flag')
+        self.assertEqual(self.titles(self.race_event), ['Pretend Stock Car Series Classics'])
+
+    def test_the_race_length_is_the_leagues(self):
+        self.row('Pretend Stock Car Series', sub_title='Lakeside 200', start=self.when, minutes=60)
+        self.assertEqual(self.titles(self.race_event), [])
+        sports_skips.set_minutes(9003, sports_skips.LENGTH_RACE, 60)
+        self.assertEqual(self.titles(self.race_event), ['Pretend Stock Car Series'])
+
+    def test_a_game_reads_the_game_list_and_length(self):
+        game = self.game(1, 2)
+        self.row('Pretend Football League Gameday: Ironvale Bears at Harborview Gulls', start=KICKOFF)
+        self.row('PFL: Ironvale Bears at Harborview Gulls', start=KICKOFF + timedelta(hours=4), minutes=60)
+        self.run_match()
+        self.assertEqual(len(self.matches(game)), 1)
+        sports_skips.add_word(9001, sports_skips.KIND_GAME, 'gameday')
+        sports_skips.set_minutes(9001, sports_skips.LENGTH_GAME, 60)
+        self.run_match()
+        self.assertEqual([m.program_title for m in self.matches(game, gone_since=None)],
+                         ['PFL: Ironvale Bears at Harborview Gulls'])
+
+    def test_one_config_read_per_run_whatever_the_leagues(self):
+        self.game(1, 2)
+        self.game(11, 12, league=self.hockey)
+        with mock.patch('app.sports_skips.load_config', wraps=load_config) as read:
+            self.run_match()
+        self.assertEqual(read.call_count, 1)
+
+
+class SkippedListingsTests(MatchCase):
+    """The listings dialog's Skipped section, worked out when it opens."""
+
+    def setUp(self):
+        super().setUp()
+        self.series = self.league(9003, 'Pretend Stock Car Series', ['Pretend Stock Car Series', 'PSCS'],
+                                  sport='Motorsport')
+        queued = mock.patch('app.scheduler.queue_sports_match', return_value=True)
+        queued.start()
+        self.addCleanup(queued.stop)
+
+    def skipped(self, event):
+        r = self.t.client.get(f'/api/sports/events/{event.id}/listings')
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()
+
+    def test_a_race_names_its_skipped_listings_grouped_with_every_reason(self):
+        race = self.race('Harbor Grand Prix', datetime(2099, 11, 22, 4, 0), date(2099, 11, 21), self.series)
+        self.race('Harbor Grand Prix Qualifying', datetime(2099, 11, 21, 4, 0), date(2099, 11, 20), self.series)
+        for _ in range(3):
+            self.row('Harbor PSCS GP Highlights', start=datetime(2099, 11, 22, 7, 0), minutes=60)
+        self.row('PSCS Chequered Flag - Harbor Grand Prix', start=datetime(2099, 11, 22, 6, 0), minutes=60)
+        self.row('Harbor PSCS GP: Qualifying Hlts', start=datetime(2099, 11, 22, 1, 25), minutes=60)
+        self.row('Live Harbor PSCS Grand Prix', start=datetime(2099, 11, 22, 3, 55), minutes=125)
+        self.row('Harbor Highlights', start=datetime(2099, 11, 22, 8, 0), minutes=60)
+        data = self.skipped(race)
+        got = [(g['title'], g['channels'], g['why']) for g in data['skipped']]
+        self.assertEqual(got, [
+            ('PSCS Chequered Flag - Harbor Grand Prix', 1,
+             'It is 60 minutes long, shorter than the 120 a race listing needs.'),
+            ('Harbor PSCS GP Highlights', 3,
+             'It says "highlights", and it is 60 minutes long, shorter than the 120 a race listing needs.'),
+        ], "the qualifying's highlights are its own, the race listing counts, and a listing not naming the series is not shown")
+        self.assertEqual((data['league'], data['matchup']), ('Pretend Stock Car Series', False))
+
+    def test_a_game_shows_only_listings_naming_both_teams(self):
+        game = self.game(1, 2)
+        self.row('Pretend Football League In-Game Live: Ironvale Bears at Harborview Gulls', start=KICKOFF, minutes=60)
+        self.row('PFL Pregame: Harborview Gulls', start=KICKOFF - timedelta(hours=1), minutes=60)
+        self.row('PFL Highlights Factory', start=KICKOFF, minutes=30)
+        data = self.skipped(game)
+        self.assertEqual([(g['title'], g['why']) for g in data['skipped']], [
+            ('Pretend Football League In-Game Live: Ironvale Bears at Harborview Gulls',
+             'It says "in game", and it is 60 minutes long, shorter than the 90 a game listing needs.')])
+        self.assertTrue(data['matchup'])
+
+
+class SessionOfTests(unittest.TestCase):
+    """What a field event or a listing names (dev/changelog/1633), on TheSportsDB's and prod's guide
+    spellings, with the series' own names swapped for made-up ones."""
+
+    def test_thesportsdbs_names(self):
+        S = sports_match.Session
+        for name, want in (
+                ('Harbor Grand Prix', S(sports_match.SESSION_RACE)),
+                ('Harbor Grand Prix Practice 1', S(sports_match.SESSION_PRACTICE, 1)),
+                ('Harbor Grand Prix Practice 3', S(sports_match.SESSION_PRACTICE, 3)),
+                ('Harbor Grand Prix Qualifying', S(sports_match.SESSION_QUALIFYING)),
+                ('Harbor Grand Prix Sprint', S(sports_match.SESSION_SPRINT)),
+                ('Harbor Grand Prix Sprint Qualifying', S(sports_match.SESSION_SPRINT_QUALIFYING)),
+                ('Harbor Grand Final Qualifying Race 35', S(sports_match.SESSION_QUALIFYING, 35)),
+                ('Harbor Grand Final Top 10 Shootout Race 36', S(sports_match.SESSION_SHOOTOUT, 36)),
+                ('Harbor Grand Final Race 37', S(sports_match.SESSION_RACE)),
+                ('The Duel at Harbor', S(sports_match.SESSION_RACE))):
+            self.assertEqual(sports_match.session_of(sports_match.normalize(name)), want, name)
+
+    def test_the_guides_spellings(self):
+        S = sports_match.Session
+        for text, want in (
+                ('Live Harbor F1 GP: Practice 1', S(sports_match.SESSION_PRACTICE, 1)),
+                ('Harbor Grand Prix Practice-2 ᴸᶦᵛᵉ', S(sports_match.SESSION_PRACTICE, 2)),
+                ('Live: Formula 1 Harbor Grand Prix: 1st Practice', S(sports_match.SESSION_PRACTICE, 1)),
+                ('Harbor Grand Prix Qualification ᴸᶦᵛᵉ', S(sports_match.SESSION_QUALIFYING)),
+                ('Pretend Sprint Cup Series: Harbor 400', S(sports_match.SESSION_RACE))):
+            self.assertEqual(sports_match.session_of(sports_match.normalize(text)), want, text)
+
+
+class SessionTests(MatchCase):
+    """Practice, qualifying, shootouts and sprints match as their own events (dev/changelog/1633), in
+    the shape of prod's Las Vegas and Adelaide weekends of 2026-11-18."""
+
+    def setUp(self):
+        super().setUp()
+        self.series = self.league(9003, 'Pretend Stock Car Series', ['Pretend Stock Car Series', 'PSCS'],
+                                  sport='Motorsport')
+
+    def weekend(self):
+        ev = {}
+        for key, name, start, local in (
+                ('p1', 'Harbor Grand Prix Practice 1', datetime(2099, 11, 20, 0, 30), date(2099, 11, 19)),
+                ('p2', 'Harbor Grand Prix Practice 2', datetime(2099, 11, 20, 4, 0), date(2099, 11, 19)),
+                ('p3', 'Harbor Grand Prix Practice 3', datetime(2099, 11, 21, 0, 30), date(2099, 11, 20)),
+                ('q', 'Harbor Grand Prix Qualifying', datetime(2099, 11, 21, 4, 0), date(2099, 11, 20)),
+                ('race', 'Harbor Grand Prix', datetime(2099, 11, 22, 4, 0), date(2099, 11, 21))):
+            ev[key] = self.race(name, start, local, self.series)
+        return ev
+
+    def titles(self, event):
+        return {(m.program_title, m.strength, m.airing) for m in self.matches(event)}
+
+    def test_each_session_matches_its_own_event_and_never_the_race(self):
+        ev = self.weekend()
+        self.row('Live Harbor PSCS GP: Practice 1', start=datetime(2099, 11, 20, 0, 0), minutes=115)
+        for _ in range(2):
+            self.row('Live Harbor PSCS GP: Practice 2', start=datetime(2099, 11, 20, 3, 45), minutes=100)
+        self.row('Harbor PSCS GP: Practice 2', start=datetime(2099, 11, 20, 10, 15), minutes=75)
+        self.row('PSCS Racing - Harbor Grand Prix, Practice 3 ᴸᶦᵛᵉ', start=datetime(2099, 11, 21, 0, 15), minutes=115)
+        self.row('Live Harbor PSCS GP: Qualifying', start=datetime(2099, 11, 21, 3, 0), minutes=180)
+        self.row('Live Harbor PSCS Grand Prix', start=datetime(2099, 11, 22, 3, 55), minutes=125)
+        self.run_match(now=datetime(2099, 11, 19, 12))
+        first, replay = SPORTS_AIRING_FIRST, SPORTS_AIRING_REPLAY
+        self.assertEqual(self.titles(ev['p1']), {('Live Harbor PSCS GP: Practice 1', SPORTS_MATCH_STRONG, first)})
+        self.assertEqual(self.titles(ev['p2']), {('Live Harbor PSCS GP: Practice 2', SPORTS_MATCH_STRONG, first),
+                                                 ('Harbor PSCS GP: Practice 2', SPORTS_MATCH_STRONG, replay)})
+        self.assertEqual({t for t, _s, _a in self.titles(ev['p3'])}, {'PSCS Racing - Harbor Grand Prix, Practice 3'})
+        self.assertEqual(self.titles(ev['q']), {('Live Harbor PSCS GP: Qualifying', SPORTS_MATCH_STRONG, first)})
+        self.assertEqual(self.titles(ev['race']), {('Live Harbor PSCS Grand Prix', SPORTS_MATCH_STRONG, first)})
+        race, quali = (db.session.get(SportsEvent, ev[k].id) for k in ('race', 'q'))
+        self.assertEqual(race.guide_start, datetime(2099, 11, 22, 3, 55), "a session's listing never sets the race's")
+        self.assertEqual(quali.guide_start, datetime(2099, 11, 21, 3, 0))
+        self.assertIn('the qualifying, and the listing names this race weekend', self.matches(ev['q'])[0].reason)
+
+    def test_matched_sessions_count_toward_the_leagues_trust(self):
+        """Question 1(b) of dev/changelog/1629: F1 reaches 10 measured events in two weekends."""
+        ev = self.weekend()
+        for key, title in (('p1', 'Practice 1'), ('p2', 'Practice 2'), ('p3', 'Practice 3'), ('q', 'Qualifying')):
+            self.row(f'Live Harbor PSCS GP: {title}', start=ev[key].start_at, minutes=90)
+        self.row('Live Harbor PSCS Grand Prix', start=ev['race'].start_at, minutes=125)
+        self.run_match(now=datetime(2099, 11, 19, 12))
+        self.assertEqual(db.session.get(SportsLeague, self.series.id).trust_sample, 5)
+
+    def test_a_listing_naming_no_race_on_a_session_day_matches_nothing(self):
+        """`Formula 1` on qualifying day is as likely the qualifying, so it is matched to the race only
+        on a day the race is the one event (dev/changelog/1633)."""
+        ev = self.weekend()
+        self.row('Live PSCS', start=datetime(2099, 11, 21, 3, 0), minutes=180)
+        self.row('PSCS Racing', start=datetime(2099, 11, 21, 3, 5), minutes=180)
+        self.row('PSCS Racing', start=datetime(2099, 11, 22, 3, 55), minutes=180)
+        self.run_match(now=datetime(2099, 11, 19, 12))
+        self.assertEqual([m.program_start_time for m in self.matches(ev['race'])], [datetime(2099, 11, 22, 3, 55)])
+        for key in ('p1', 'p2', 'p3', 'q'):
+            self.assertEqual(self.matches(ev[key]), [], key)
+
+    def test_a_race_replay_on_practice_day_is_not_a_weak_practice_match(self):
+        """Prod's Las Vegas Practice 1, the only event on its day, held 84 weak matches from another
+        race's replay and the year before's."""
+        p1 = self.race('Harbor Grand Prix Practice 1', datetime(2099, 11, 20, 0, 30), date(2099, 11, 19), self.series)
+        self.row('PSCS', sub_title='Ironvale Grand Prix', start=datetime(2099, 11, 19, 20, 0), minutes=150)
+        self.row('Harbor PSCS Grand Prix 2098', start=datetime(2099, 11, 19, 22, 0), minutes=150)
+        self.run_match(now=datetime(2099, 11, 19, 12))
+        self.assertEqual(self.matches(p1), [])
+
+    def test_placeholders_pre_shows_highlights_and_short_listings_are_not_sessions(self):
+        ev = self.weekend()
+        self.row('Next EVENT: PSCS Harbor Grand Prix Practice-1 on 2099-11-19 at 07:30PM EST',
+                 start=datetime(2099, 11, 19, 20, 0), minutes=222)
+        self.row('PSCS Pre Qualifying - Harbor Grand Prix', start=datetime(2099, 11, 21, 3, 0), minutes=55)
+        self.row('Harbor PSCS GP: Qualifying Hlts', start=datetime(2099, 11, 21, 8, 10), minutes=60)
+        self.row('Live Harbor PSCS GP: Qualifying', start=datetime(2099, 11, 21, 3, 50), minutes=20)
+        self.run_match(now=datetime(2099, 11, 19, 12))
+        for key in ev:
+            self.assertEqual(self.matches(ev[key]), [], key)
+
+    def test_another_series_practice_with_several_practices_that_day_matches_none(self):
+        """`F1 Academy: Practice` beside the weekend's three practices."""
+        ev = self.weekend()
+        self.row('Live PSCS Academy: Practice', start=datetime(2099, 11, 20, 1, 55), minutes=55)
+        self.run_match(now=datetime(2099, 11, 19, 12))
+        for key in ('p1', 'p2', 'p3'):
+            self.assertEqual(self.matches(ev[key]), [], key)
+
+    def test_a_sprint_and_its_qualifying_are_their_own_events(self):
+        sq = self.race('Harbor Grand Prix Sprint Qualifying', datetime(2099, 11, 20, 20, 30), date(2099, 11, 20),
+                       self.series)
+        sprint = self.race('Harbor Grand Prix Sprint', datetime(2099, 11, 21, 16, 0), date(2099, 11, 21), self.series)
+        race = self.race('Harbor Grand Prix', datetime(2099, 11, 22, 18, 0), date(2099, 11, 22), self.series)
+        self.row('Live Harbor PSCS GP: Sprint Qualifying', start=datetime(2099, 11, 20, 20, 15), minutes=75)
+        self.row('Live Harbor PSCS GP: Sprint', start=datetime(2099, 11, 21, 15, 45), minutes=60)
+        self.run_match(now=datetime(2099, 11, 19, 12))
+        self.assertEqual({t for t, _s, _a in self.titles(sq)}, {'Live Harbor PSCS GP: Sprint Qualifying'})
+        self.assertEqual({t for t, _s, _a in self.titles(sprint)}, {'Live Harbor PSCS GP: Sprint'})
+        self.assertEqual(self.matches(race), [])
+
+    def test_three_qualifyings_in_one_band_go_by_number_then_by_the_nearest_start(self):
+        """Adelaide's shape: a qualifying and a race each of three days, so a day's band holds two or
+        three of each kind, and a session is rarely the only one of its day (dev/changelog/1633)."""
+        ev = {}
+        for key, name, start in (
+                ('q35', 'Harbor Grand Final Qualifying Race 35', datetime(2099, 11, 27, 2, 40)),
+                ('r35', 'Harbor Grand Final Race 35', datetime(2099, 11, 27, 5, 50)),
+                ('q36', 'Harbor Grand Final Qualifying Race 36', datetime(2099, 11, 28, 1, 15)),
+                ('s36', 'Harbor Grand Final Top 10 Shootout Race 36', datetime(2099, 11, 28, 2, 5)),
+                ('r36', 'Harbor Grand Final Race 36', datetime(2099, 11, 28, 4, 50)),
+                ('q37', 'Harbor Grand Final Qualifying Race 37', datetime(2099, 11, 29, 1, 15)),
+                ('r37', 'Harbor Grand Final Race 37', datetime(2099, 11, 29, 4, 45))):
+            ev[key] = self.race(name, start, start.date(), self.series)
+        self.row('PSCS: Qualifying Race 36', start=datetime(2099, 11, 28, 1, 10), minutes=60)
+        self.row('PSCS Qualifying', start=datetime(2099, 11, 29, 1, 15), minutes=45)
+        self.row('PSCS Qualifying', start=datetime(2099, 11, 28, 13, 0), minutes=45)
+        self.row('PSCS Top 10 Shootout', start=datetime(2099, 11, 28, 2, 0), minutes=40)
+        self.run_match(now=datetime(2099, 11, 26, 12))
+        starts = {k: [m.program_start_time for m in self.matches(e)] for k, e in ev.items()}
+        self.assertEqual(starts['q36'], [datetime(2099, 11, 28, 1, 10)])
+        self.assertEqual(starts['q37'], [datetime(2099, 11, 29, 1, 15)])
+        self.assertEqual(starts['s36'], [datetime(2099, 11, 28, 2, 0)])
+        self.assertEqual(starts['q35'], [])
+        self.assertIn('the one starting nearest it', self.matches(ev['q37'])[0].reason)
 
 
 class StorageTests(MatchCase):
@@ -540,7 +1221,9 @@ class TrustAndRunTests(MatchCase):
             start = KICKOFF - timedelta(days=day)
             event = self.game(2, 1, start=start, tsdb_id=1000 + day)
             offset = timedelta(hours=2) if day == 0 else timedelta(0)
-            self.row('PFL Football', sub_title='Harborview Gulls at Ironvale Bears', start=start + offset)
+            # Two channels: one unmarked listing that far off is not believed as the start at all.
+            for _ in range(2 if day == 0 else 1):
+                self.row('PFL Football', sub_title='Harborview Gulls at Ironvale Bears', start=start + offset)
             self.assertIsNotNone(event)
         self.run_match(now=KICKOFF)
         sports_match.match_league(self.football.id, KICKOFF - timedelta(days=11), pause=0)

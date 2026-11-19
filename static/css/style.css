@@ -75,7 +75,7 @@
      cited in prose beside three list layouts that reflow off the room it leaves, and
      because the rule itself needs it twice (width and flex-basis). Measured, not
      picked: see the fit note above .sidebar. */
-  --sidebar-w: 232px;
+  --sidebar-w: 244px;
   /* Width of the status-colored left edge drawn as an inset ::before bar on rows, cards,
      tiles and the live strip (dev/changelog/878). Every host reserves it in its padding as
      calc(<breathing room> + var(--edge-w)), so widening the edge is one edit here rather
@@ -776,13 +776,13 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    them as of dev/changelog/900. Changing any of these values, or adding a
    destination, means re-checking that fit. */
 .shell { display: flex; min-height: 100vh; }
-/* --sidebar-w is 232px because the labels have to fit without an ellipsis, measured in
-   a browser rather than eyeballed (dev/changelog/1045): "Health Check Profiles" is the
-   binding label and wants 222px, and "Maintenance" wants 231px in the synthetic case
-   where both its Readiness badges carry two digits - which app/readiness.py caps at 12
-   capabilities, so only one of the pair can ever reach two. 232 clears the real
-   constraint by 10px and the impossible one as well. A longer destination name, or a
-   badge on a row that has none today, means re-measuring. */
+/* --sidebar-w is 244px because the labels have to fit without an ellipsis, measured in
+   a browser rather than eyeballed (dev/changelog/1045): "Health Check Profiles" wanted 222px,
+   and "Maintenance" 231px in the synthetic case where both its Readiness badges carry two
+   digits - which app/readiness.py caps at 12 capabilities, so only one of the pair can ever
+   reach two. Since dev/changelog/1635 "Sports Schedules" with its Beta pill is the binding
+   label and wants 240px; 244 clears it by 4px. A longer destination name, or a badge on a
+   row that has none today, means re-measuring. */
 .sidebar {
   width: var(--sidebar-w); flex: 0 0 var(--sidebar-w); background: var(--bg1); border-right: 1px solid var(--border-soft);
   padding: 14px 12px; position: sticky; top: 0; height: 100vh; overflow-y: auto;
@@ -840,6 +840,9 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .nav-link .nav-t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nav-link:hover { background: var(--bg2); color: var(--text); text-decoration: none; }
 .nav-link.active { background: var(--accent-soft); color: var(--accent-text); }
+/* A page still being built (templates/_macros.html::beta_mark, mockup 59, dev/changelog/1635): the
+   blue badge after its name in the menu, small enough that the label beside it keeps its full width. */
+.nav-link .beta-mark { margin-left: auto; padding: 1px 5px; font-size: var(--fs-2xs); letter-spacing: 0; }
 .nav-count { font-size: var(--fs-xs); background: var(--bg3); color: var(--text-muted); border-radius: 999px; padding: 1px 7px; }
 .nav-link.active .nav-count { background: transparent; color: var(--accent-text); }
 /* The Alerts link's unread counts, split by severity (dev/changelog/923). They keep their
@@ -868,7 +871,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .nav-i { width: 18px; height: 18px; }
 .sys-mini { margin-top: auto; border-top: 1px solid var(--border-soft); padding: 8px 8px 0; font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); line-height: 1.45; }
 .sys-mini .sm-val { color: var(--text-muted); }
-.sys-mini .sm-row { padding: 1px 0; }
+.sys-mini .sm-row { padding: 1px 0; overflow-wrap: anywhere; }
 
 /* ── Collapse control + the collapsed rail (DESIGN.md 2, amended 2026-07-29) ──
    A 32px bordered button at the top right of the brand row; collapsed, CSS
@@ -917,6 +920,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   body.nav-min .nav-t { display: none; }
   body.nav-min .nav-link { justify-content: center; gap: 0; padding: 8px 0; }
   body.nav-min .nav-count { display: none; }
+  body.nav-min .nav-link .beta-mark { display: none; }
   body.nav-min .nav-pip { display: block; }
   /* A section heading with no room for its word becomes the hairline it was
      already drawing in the reader's head. Nothing folds on the rail: it is icons only,
@@ -1028,6 +1032,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 /* ── Page header (DESIGN.md 3.10) ──────────────────────────────────── */
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 6px; flex-wrap: wrap; }
 .page-head h1 { font-size: var(--fs-3xl); font-weight: 700; letter-spacing: -.015em; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.page-head h1 .beta-mark { align-self: center; }
 .page-head .sub { font-size: var(--fs-md); color: var(--text-muted); font-weight: 400; }
 /* The sentence or two under a page or card heading saying what the surface is for. One
    class, so the pages stop hand-writing the same inline style at a size (13px) that is
@@ -2449,6 +2454,9 @@ body.actbar-on #app-toast { bottom: 78px; }
   padding: 11px 18px; border-bottom: 1px solid var(--border-soft); }
 .frow:last-child { border-bottom: none; }
 .frow.full { grid-template-columns: minmax(0, 1fr); }
+/* The Settings page's rows inside a card body, which already has the side padding: the IPTV
+   Output page's Settings card and a league page's Game time settings (dev/changelog/1630). */
+.card-settings .frow { padding-left: 0; padding-right: 0; }
 .fl { min-width: 0; }
 .fl-label { font-size: var(--fs-lg); font-weight: 600; color: var(--text); display: flex;
   align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
@@ -4808,6 +4816,8 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
    The list is the Auto-record list above and the league page is its rule page. These are only
    what those two pages add. */
 .sp-credit { font-size: var(--fs-sm); color: var(--text-faint); margin-top: 16px; }
+/* Sports Schedules' Game time settings card, under the list (mockup 58). */
+.sp-times-default { margin-top: 18px; }
 .sp-sort { margin-bottom: 8px; }
 /* The Auto-record list's tracks, with room for this list's longest badge and for the next game's
    teams, which are the point of a row. Above the width where its rows turn into cards, so this
@@ -4915,6 +4925,13 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   padding: 8px 10px; background: var(--accent-soft); border-radius: var(--radius-sm); font-size: var(--fs-md);
 }
 .sp-catbar { margin-top: 10px; }
+/* The words and lengths that keep a listing out, and the listings dialog's Skipped rows (mockup 59,
+   dev/changelog/1634). The chips are the league names' own; a skipped row is a group with no toggle. */
+.sp-skipbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-top: 10px; }
+.sp-skipbar .sp-hint { margin: 0; }
+.sp-skipped .sp-gtitle { font-weight: 600; overflow-wrap: anywhere; }
+.sp-skipped .sp-why { margin: 2px 0 0; }
+.sp-skip-show { margin: 6px 0 2px; }
 .sp-cat-new { background: var(--accent-soft); }
 .sp-offer { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
 .sp-offer-row { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; padding: 4px 0; cursor: pointer; }
@@ -4937,6 +4954,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   .sp-gline { flex-direction: column; gap: 4px; }
   .sp-ghead { flex-direction: column; gap: 2px; }
   .sp-gmeta { padding-left: calc(.8rem + 6px); }
+  .sp-skipped .sp-gmeta { padding-left: 0; }
 }
 
 /* What it searches for: one row per part of the search, one column, because a value is a
@@ -5058,5 +5076,3 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   .of-addr { flex-direction: column; }
 }
 .of-conn-pane .of-conn:last-of-type { border-bottom: none; }
-/* The Settings page's rows inside a card body, which already has the side padding. */
-.of-settings .frow { padding-left: 0; padding-right: 0; }

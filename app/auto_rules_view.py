@@ -355,6 +355,7 @@ def dialog_data(rule, described, edit_search_url, team_names=None) -> dict:
             'sports_team_name': team_names.get(rule.sports_team_tsdb_id),
             'sports_skip_replays': bool(rule.sports_skip_replays),
             'sports_event_channels': bool(rule.sports_event_channels),
+            'sports_sessions': bool(rule.sports_sessions),
             'search_lines': lines, 'edit_search_url': edit_search_url}
 
 
@@ -550,15 +551,18 @@ def _lead(rule, profile, about=None):
             clauses.append('skips a replay while the game\'s first airing is scheduled or recorded')
         if rule.sports_event_channels:
             clauses.append('records a game from an event channel when the guide has no listing of it')
+        if rule.sports_sessions:
+            clauses.append('counts practice, qualifying and shootouts among its games')
         joined = clauses[0] if len(clauses) == 1 else ', '.join(clauses[:-1]) + ' and ' + clauses[-1]
         out += f'It is about {about}, from Sports Schedules, and {joined}. '
     return out + ('Recordings it makes are ordinary recordings: they fail over, wait for a '
                   'connection and show up in Recordings like any other.')
 
 
-def settings_items(rule, profile, default_cap, about=None) -> list:
+def settings_items(rule, profile, default_cap, about=None, sessions=False) -> list:
     """The Settings card's chips (util.js settingChipsHtml), each opening the edit dialog on
-    its own field."""
+    its own field. `sessions`: the league has practice or qualifying to offer
+    (auto_rules_sports.league_has_sessions), when its chip is shown."""
     cap = _cap_of(rule, default_cap)
     cap_text = (f'{cap:,} scheduled at once' if cap else 'No cap') \
         + (' (the default)' if rule.max_upcoming is None else '')
@@ -583,10 +587,15 @@ def settings_items(rule, profile, default_cap, about=None) -> list:
                      'value': 'When the guide has no listing' if about and rule.sports_event_channels else 'Off',
                      'tip': 'Records a game from a channel whose name names it, when the guide has no '
                             'listing of the game at all.'}
+    sessions_chip = {'focus': 'sports-sessions', 'label': 'Practice and qualifying',
+                     'value': 'Recorded' if about and rule.sports_sessions else 'Off',
+                     'tip': 'Counts practice, qualifying and shootouts among the league\'s events this rule '
+                            'records. A sprint is a race and is always counted.'}
     # The order mockup 52 drew: what the rule is about beside its profile, and the two game options
-    # beside repeats (dev/changelog/1490, 1491).
+    # beside repeats (dev/changelog/1490, 1491); sessions after them (dev/changelog/1633).
     return [
         profile_chip, about_chip, repeats_chip, replays_chip, channels_chip,
+        *([sessions_chip] if about and (sessions or rule.sports_sessions) else []),
         {'focus': 'limit', 'label': 'Limit', 'value': limit,
          'tip': 'At most X within Y hours, measured on start times. Optional; most series '
                 'need none.'},
@@ -905,7 +914,7 @@ def page_context(rule_id, *, hist='all', shown=HISTORY_PAGE, now=None):
         rec = recs.get(m.recording_id)
         e['rec_live'] = rec is not None and rec.status in live and not rec.gave_up_reason
     entries = [e for _m, e in pairs]
-    from .auto_rules_sports import about_text, scope_of
+    from .auto_rules_sports import about_text, league_has_sessions, scope_of
     scope = scope_of(rule)
     about = about_text(rule) if scope else None
     sports = _sports_context(rule, scope, pairs, urls[0], cfg, now, tz, h24) if scope else None
@@ -968,7 +977,8 @@ def page_context(rule_id, *, hist='all', shown=HISTORY_PAGE, now=None):
             f'{nxt["day"]}, {nxt["time"]}' if nxt else None),
         'search': described,
         'dialog': dialog_data(rule, described, urls[1]),
-        'settings': settings_items(rule, profile, default_cap, about),
+        'settings': settings_items(rule, profile, default_cap, about,
+                                   sessions=bool(about) and league_has_sessions(rule.sports_league_id)),
         'about': about,
         'sports': sports,
         'sections': sections_for(rule),

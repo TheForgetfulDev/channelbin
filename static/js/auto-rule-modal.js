@@ -102,6 +102,7 @@ const AUTO_RULE_FOCUS = {
   name: '#ar-name', profile: '#ar-profile', repeats: '#ar-repeats',
   limit: '#ar-limit-count', cap: '#ar-cap',
   sports: '#ar-league', 'sports-replays': '#ar-sports-replays', 'sports-channels': '#ar-sports-channels',
+  'sports-sessions': '#ar-sports-sessions',
 };
 
 /* The About row and Skip game replays (DESIGN-sports-data.md 10, dev/changelog/1490), or '' when
@@ -113,6 +114,9 @@ function autoRuleSportsRows(leagues, rule, sportsUrl) {
   const teamId = rule ? rule.sports_team_tsdb_id : null;
   const on = !!leagueId;
   const league = leagues.find((l) => l.id === leagueId);
+  // Offered for a league whose events include practice or qualifying, and kept for a rule that has it
+  // on whatever its league holds now, so it can always be turned off (dev/changelog/1633).
+  const sessions = on && (!!(league && league.sessions) || !!rule.sports_sessions);
   const link = sportsUrl ? `<a href="${escHtml(sportsUrl)}">Sports Schedules</a>` : 'Sports Schedules';
   const none = leagues.length ? '' : ` No league is on ${link} yet; add one there first.`;
   return fieldRow({
@@ -141,6 +145,14 @@ function autoRuleSportsRows(leagues, rule, sportsUrl) {
       + 'the name or TheSportsDB gives a start ChannelBin can stand behind. The search\'s account, day '
       + 'and time filters apply to these channels; its text, tag, group, category and length filters do not.',
     control: `<label class="switch"><input type="checkbox" id="ar-sports-channels"${on && rule.sports_event_channels ? ' checked' : ''}${on ? '' : ' disabled'}>`
+      + '<span class="knob"></span></label>',
+  }) + fieldRow({
+    label: 'Practice and qualifying',
+    meta: 'Counts practice, qualifying and shootouts among this rule\'s events, for a series TheSportsDB '
+      + 'lists them for, such as Formula 1. A sprint is a race and always counts. When this is off, a '
+      + 'session the search finds is still recorded, but the rule does not list it as expected or alert '
+      + 'when nothing lists it.',
+    control: `<label class="switch"><input type="checkbox" id="ar-sports-sessions"${sessions && rule.sports_sessions ? ' checked' : ''}${sessions ? '' : ' disabled'}>`
       + '<span class="knob"></span></label>',
   });
 }
@@ -277,6 +289,7 @@ function openAutoRuleModal(opts) {
     sports_team_tsdb_id: $('#ar-league').value && $('#ar-team').value ? Number($('#ar-team').value) : null,
     sports_skip_replays: !!$('#ar-league').value && $('#ar-sports-replays').checked,
     sports_event_channels: !!$('#ar-league').value && $('#ar-sports-channels').checked,
+    sports_sessions: !!$('#ar-league').value && !$('#ar-sports-sessions').disabled && $('#ar-sports-sessions').checked,
   } : {});
 
   // Naming nothing turns the team and the option off; a new league starts on all its games.
@@ -289,6 +302,10 @@ function openAutoRuleModal(opts) {
       $('#ar-team').disabled = !id;
       $('#ar-sports-replays').disabled = !id;
       $('#ar-sports-channels').disabled = !id;
+      const sessions = $('#ar-sports-sessions');
+      const kept = !!(rule && rule.sports_sessions && id === rule.sports_league_id);
+      sessions.disabled = !(league && (league.sessions || kept));
+      if (sessions.disabled) sessions.checked = false;
     });
   }
 

@@ -644,6 +644,7 @@ class SportsDefaultRebuildTests(unittest.TestCase):
         ('sports_feed_channels', 'team_tsdb_id', '0'), ('sports_feed_channels', 'number', '0'),
         ('sports_feed_channels', 'enabled', '0'), ('sports_leagues', 'feed_league_channels', '0'),
         ('sports_teams', 'own_names', "'[]'"),
+        ('sports_up_next_channels', 'enabled', '0'),
     })
 
     def test_the_list_is_what_the_models_declare(self):

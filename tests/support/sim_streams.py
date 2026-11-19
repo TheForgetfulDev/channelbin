@@ -140,6 +140,30 @@ def read_stream(url: str, seconds: float, *, read_timeout: float = 1.0, headers=
             'pieces': pieces, 'wall': time.monotonic() - start}
 
 
+def read_until(url: str, enough, *, at_least: float = 0.0, timeout: float = 10.0) -> tuple:
+    """(status, bytes) of a GET read until `enough(bytes)` says the stream holds what the test
+    needs, and for at least `at_least` seconds of wall time; at most `timeout`. For a test
+    whose stream's content, not a wall-clock allowance, says when it has read enough: a burst
+    read for a fixed 0.5 s came back nearly empty on a loaded box (dev/docs/BUGS.md
+    2026-11-17 03:01 PM)."""
+    out = bytearray()
+    start = time.monotonic()
+    checked = start
+    with requests.get(url, stream=True, timeout=10) as r:
+        if r.status_code != 200:
+            return r.status_code, b''
+        for piece in r.iter_content(4096):
+            out += piece
+            now = time.monotonic()
+            if now - start > timeout:
+                break
+            if now - start >= at_least and now - checked >= 0.1:
+                checked = now
+                if enough(bytes(out)):
+                    break
+        return r.status_code, bytes(out)
+
+
 def pes_dts(data: bytes, pid: int) -> list:
     """The decode timestamp (the PTS where there is no DTS), in 90 kHz ticks as sent and
     wrapping at 33 bits, of every PES of `pid`, in the order sent. Decode order, not

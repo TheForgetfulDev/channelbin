@@ -231,6 +231,7 @@ out.unmatched_refused = await unmatchedScenario(
 const LEAGUES = [
   { id: 3, name: 'Pretend Football League', teams: [{ id: 101, name: 'Harborview Gulls' }, { id: 102, name: 'Ironvale Bears' }] },
   { id: 4, name: 'Pretend Hockey League', teams: [{ id: 201, name: 'Saltmarsh Otters' }] },
+  { id: 5, name: 'Pretend Stock Car Series', teams: [], sessions: true },
 ];
 async function sportsScenario(rule, act, leagues = LEAGUES) {
   const { w, errors } = boot({ success: true, rule: { id: 9 }, evaluation: EV_OK });
@@ -248,6 +249,8 @@ async function sportsScenario(rule, act, leagues = LEAGUES) {
     team_disabled: ($(w, '#ar-team') || {}).disabled,
     replays_disabled: ($(w, '#ar-sports-replays') || {}).disabled,
     channels_checked: ($(w, '#ar-sports-channels') || {}).checked,
+    sessions_disabled: ($(w, '#ar-sports-sessions') || {}).disabled,
+    sessions_checked: ($(w, '#ar-sports-sessions') || {}).checked,
     focused: w.document.activeElement ? w.document.activeElement.id : null,
     text: $(w, '.modal-body').textContent.replace(/\s+/g, ' ').trim(),
   };
@@ -257,6 +260,7 @@ async function sportsScenario(rule, act, leagues = LEAGUES) {
     team_disabled: ($(w, '#ar-team') || {}).disabled,
     replays_disabled: ($(w, '#ar-sports-replays') || {}).disabled,
     channels_disabled: ($(w, '#ar-sports-channels') || {}).disabled,
+    sessions_disabled: ($(w, '#ar-sports-sessions') || {}).disabled,
   };
   $(w, '.modal-foot .btn-primary').click();
   await settle(w);
@@ -271,6 +275,21 @@ out.sports_moved = await sportsScenario(
 out.sports_cleared = await sportsScenario(
   { sports_league_id: 3, sports_team_tsdb_id: 101, sports_skip_replays: true },
   (w) => setValue(w, '#ar-league', ''));
+// Practice and qualifying (dev/changelog/1633): offered only for a league whose events include them.
+out.sessions_turned_on = await sportsScenario({ sports_league_id: 5 }, (w) => {
+  const box = $(w, '#ar-sports-sessions');
+  box.checked = true;
+  box.dispatchEvent(new w.Event('change', { bubbles: true }));
+});
+out.sessions_not_offered = await sportsScenario({ sports_league_id: 3 }, null);
+out.sessions_moved_off = await sportsScenario({ sports_league_id: 5, sports_sessions: true },
+  (w) => setValue(w, '#ar-league', '3'));
+// A rule that has it on keeps it offered on its own league, whatever that league holds now.
+out.sessions_kept_back = await sportsScenario({ sports_league_id: 3, sports_sessions: true }, (w) => {
+  setValue(w, '#ar-league', '4');
+  setValue(w, '#ar-league', '3');
+});
+out.sessions_moved_on = await sportsScenario({ sports_league_id: 3 }, (w) => setValue(w, '#ar-league', '5'));
 out.sports_no_leagues = await sportsScenario({ sports_league_id: null }, null, []);
 // A team no stored game names any more (retention, off-season) is still offered and kept.
 out.sports_pruned_team = await sportsScenario(

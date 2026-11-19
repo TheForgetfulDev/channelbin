@@ -3730,6 +3730,70 @@ def _m130_move_when_account_full(conn, cur):
     conn.commit()
 
 
+def _m131_sports_up_next(conn, cur):
+    """sports_up_next_channels: the Up next channels on the output feed (app/sports_up_next.py,
+    dev/changelog/1614). No backfill: no Up next channel exists before this, and each is off until a
+    person turns it on. AUTOINCREMENT because a league's row id is its feed id, which an IPTV player
+    caches. Re-runnable from the top."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS sports_up_next_channels (
+            id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            league_id INTEGER NOT NULL,
+            enabled BOOLEAN NOT NULL DEFAULT 0,
+            created_at DATETIME,
+            CONSTRAINT uq_sports_up_next_league UNIQUE (league_id)
+        );
+    """)
+    conn.commit()
+
+
+def _m132_sports_guide_behind(conn, cur):
+    """sports_events.guide_behind_start: the start the guide still lists for a game TheSportsDB has
+    moved (app/sports_match.py, dev/changelog/1623). No backfill: the next matcher run writes it for
+    every game in reach. Re-runnable from the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(sports_events)').fetchall()}
+    if cols and 'guide_behind_start' not in cols:
+        cur.execute('ALTER TABLE sports_events ADD COLUMN guide_behind_start DATETIME')
+    conn.commit()
+
+
+def _m133_sports_record_mark(conn, cur):
+    """recordings.sports_record_tsdb_id: TheSportsDB's event id when a league page's Record made the
+    recording (app/sports_times.py, dev/changelog/1630). No backfill: a recording made before it
+    was made without the mark, and nothing can tell now which were. Re-runnable from the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()}
+    if cols and 'sports_record_tsdb_id' not in cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN sports_record_tsdb_id INTEGER')
+    conn.commit()
+
+
+def _m134_sports_follow(conn, cur):
+    """recordings.sports_window_start/stop (the window ChannelBin gave a Record-made recording) and
+    sports_cover_for_id (Cover both's second recording), app/sports_follow.py, dev/changelog/1631.
+    No backfill: a Record recording made before this has no window ChannelBin can stand behind as
+    its own, so it is left as scheduled. Re-runnable from the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()}
+    if cols:
+        for name, kind in (('sports_window_start', 'DATETIME'), ('sports_window_stop', 'DATETIME'),
+                           ('sports_cover_for_id', 'INTEGER')):
+            if name not in cols:
+                cur.execute(f'ALTER TABLE recordings ADD COLUMN {name} {kind}')
+        cur.execute('CREATE INDEX IF NOT EXISTS ix_recordings_sports_cover_for_id '
+                    'ON recordings (sports_cover_for_id)')
+    conn.commit()
+
+
+def _m135_rule_sports_sessions(conn, cur):
+    """auto_rules.sports_sessions: whether a rule about a league counts its practice, qualifying and
+    shootouts among its games (app/auto_rules_sports.py, dev/changelog/1633). No backfill: before this a
+    session was a rule's game that nothing could match, so a rule listed it as expected and alerted that
+    nothing would record it; off ends that, and on is a person's answer. Re-runnable from the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(auto_rules)').fetchall()}
+    if cols and 'sports_sessions' not in cols:
+        cur.execute('ALTER TABLE auto_rules ADD COLUMN sports_sessions BOOLEAN NOT NULL DEFAULT 0')
+    conn.commit()
+
+
 def _m127_sports_team_look(conn, cur):
     """sports_teams.color1-3, short_name and badge_url: what a sports channel's waiting screen draws
     a team in. They come from the same once-a-season lookupteam answer as the names, so every team
@@ -4433,6 +4497,16 @@ SCHEMA_MIGRATIONS = [
     (130, 'recording_profiles + recordings: move_when_account_full, whether a recording may move '
      'to another channel with the same program when its account is full',
      _m130_move_when_account_full),
+    (131, 'sports_up_next_channels: the Up next channels on the output feed, ChannelBin\'s own '
+     'picture of the coming games', _m131_sports_up_next),
+    (132, 'sports_events.guide_behind_start: the start the guide still lists for a game TheSportsDB '
+     'has moved', _m132_sports_guide_behind),
+    (133, 'recordings.sports_record_tsdb_id: the game a league page\'s Record made the recording for',
+     _m133_sports_record_mark),
+    (134, 'recordings.sports_window_start/stop and sports_cover_for_id: automated recordings of a game '
+     'follow its time', _m134_sports_follow),
+    (135, 'auto_rules.sports_sessions: whether a rule about a league records its practice, qualifying '
+     'and shootouts', _m135_rule_sports_sessions),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

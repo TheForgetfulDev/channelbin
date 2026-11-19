@@ -1,5 +1,6 @@
 {% extends "base.html" %}
-{% from "_macros.html" import page_about %}
+{% from "_macros.html" import beta_mark, page_about %}
+{% from '_game_times.html' import game_times_rows %}
 {% block title %}Sports Schedules - ChannelBin{% endblock %}
 
 {#  Sports Schedules (dev/docs/DESIGN-sports-data.md 11, mockup 50). The Auto-record list's own
@@ -10,7 +11,7 @@
 
 {% block content %}
 <div class="page-head">
-  <h1>Sports Schedules
+  <h1>Sports Schedules {{ beta_mark('Sports Schedules') }}
     {% if rows %}<span class="sub">{{ followed }} followed{% if not_followed %}, {{ not_followed }} not followed{% endif %} &middot; {{ upcoming_total }} upcoming</span>{% endif %}
   </h1>
   <button type="button" class="btn btn-primary" id="sp-add">{{ icon('add') }} Add league or team</button>
@@ -124,6 +125,14 @@
   </div>
 </div>
 {% endif %}
+<div class="card sp-times-default" id="sp-times" data-gt-url="{{ url_for('sports.set_default_game_times') }}">
+  <div class="card-head"><h2>Game time settings</h2></div>
+  <div class="card-body">
+    <p class="card-note">When TheSportsDB and your guide list a game at different times, this is what every league goes by unless its own page says otherwise. The sports channels on your IPTV output and Record on a league page follow it. A recording you schedule from the TV Guide or by hand keeps the times you give it.</p>
+    {{ game_times_rows(times, false, 'game') }}
+    <p class="card-note">{{ times.overrides }}</p>
+  </div>
+</div>
 </div>
 <div class="sp-credit">Schedule data from <a href="https://www.thesportsdb.com/" target="_blank" rel="noopener">TheSportsDB</a>.</div>
 {% endblock %}

@@ -1,0 +1,46 @@
+{#- The rows of a Game time settings card: a league page's own (`league` true) and Sports
+    Schedules' default (app/sports_times.py, mockup 58, dev/changelog/1630). `t` is
+    sports_view.times_card() or default_times_card(). Each control saves on change through the
+    card's data-gt-url; static/js/sports.js then swaps the page, so these rows are the one
+    renderer of which rows show under which answer. `t.go` is sports_times.GO; Rules only ever
+    holds one of its three answers, so the chain names every state. -#}
+{% macro game_times_rows(t, league, one) -%}
+{%- set rule = t.rule -%}
+{%- set tsdb_link = '<a href="https://www.thesportsdb.com/" target="_blank" rel="noopener">TheSportsDB</a>' | safe -%}
+{%- set sports_link = ('<a href="' ~ url_for('sports.sports_page') ~ '">Sports Schedules</a>') | safe -%}
+<div class="card-settings">
+  <div class="frow"><div class="fl"><div class="fl-label"><span class="fl-name">Go by</span></div>
+    <div class="fl-desc">
+      {%- if rule.go_by == t.go.TSDB %}A {{ one }}'s listing starts at {{ tsdb_link }}'s time, and ends that much later, or when it is listed to end if that is later.
+      {%- elif rule.go_by == t.go.GUIDE %}A {{ one }}'s listing is recorded and played at the time your guide lists.
+      {%- elif rule.go_by == t.go.BOTH %}From the earlier of the two starts to the later end. Two times more than {{ rule.cover_both_minutes }} minutes apart are covered separately, unless the two would overlap anyway.
+      {%- endif %}</div>
+    {%- if league and rule.uses_default %}<div class="fl-default">The default for every league is set on {{ sports_link }}.</div>{% endif %}
+  </div><div class="fr-side"><div class="fr-ctl">
+    <select data-gt-field="go_by" aria-label="Go by">
+      {%- if league %}<option value=""{{ ' selected' if rule.uses_default else '' }}>Default ({{ t.labels[t.default.go_by] }})</option>{% endif %}
+      {%- for value, label in t.labels.items() %}
+      <option value="{{ value }}"{{ ' selected' if (league and t.own.get('go_by') == value) or (not league and rule.go_by == value) else '' }}>{{ label }}</option>
+      {%- endfor %}
+    </select>
+  </div></div></div>
+  {%- if rule.go_by == t.go.BOTH %}
+  <div class="frow"><div class="fl"><div class="fl-label"><span class="fl-name">Cover both up to (minutes apart)</span></div>
+    <div class="fl-desc">Two starts this far apart or closer are covered by one recording, from the earlier start to the later end.</div>
+    {%- if league %}<div class="fl-default">Default: <code>{{ t.default.cover_both_minutes }} minutes</code>, set on {{ sports_link }}. Leave it empty to use it.</div>{% endif %}
+  </div><div class="fr-side"><div class="fr-ctl">
+    <input type="number" min="0" max="{{ t.max_cover_both }}" data-gt-field="cover_both_minutes" aria-label="Cover both up to"
+           value="{{ t.own.get('cover_both_minutes', '') if league else rule.cover_both_minutes }}"{% if league %} placeholder="{{ t.default.cover_both_minutes }}"{% endif %}>
+  </div></div></div>
+  {%- endif %}
+  {%- if rule.go_by != t.go.GUIDE %}
+  <div class="frow"><div class="fl"><div class="fl-label"><span class="fl-name">Use TheSportsDB's time from (hours before the {{ one }})</span></div>
+    <div class="fl-desc">For some leagues {{ tsdb_link }} adds the {{ one }} without the correct start time, and the actual start time is updated later. This setting is how many hours before the scheduled start ChannelBin begins going by TheSportsDB's time. Further out than that it goes by your guide's listing, because TheSportsDB's time may still change. With {{ rule.wait_hours }}, a {{ one }} at {{ t.sunday }} goes by the listing until {{ t.example }}. It matters most for Record on a league page: a {{ one }} recorded further out than this keeps the listing's times. The sports channels on your IPTV output play a {{ one }} only near its start, so they are rarely affected. Raise it for a league whose times in TheSportsDB are right from the day a {{ one }} is added.</div>
+    {%- if league %}<div class="fl-default">Default: <code>{{ t.default.wait_hours }} hours</code>, set on {{ sports_link }}. Leave it empty to use it.</div>{% endif %}
+  </div><div class="fr-side"><div class="fr-ctl">
+    <input type="number" min="0" max="{{ t.max_wait }}" data-gt-field="wait_hours" aria-label="Use TheSportsDB's time from"
+           value="{{ t.own.get('wait_hours', '') if league else rule.wait_hours }}"{% if league %} placeholder="{{ t.default.wait_hours }}"{% endif %}>
+  </div></div></div>
+  {%- endif %}
+</div>
+{%- endmacro %}
