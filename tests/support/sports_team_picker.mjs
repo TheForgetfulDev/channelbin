@@ -85,11 +85,17 @@ const addTeam = async (name, ms) => {
   form.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
   await wait(ms);
 };
+/* The picker draws its effect line, and enables or disables the dialog's button, on a timer after it
+   is built. A fixed wait loses that race on a busy box, so wait for the line itself. */
+const settled = async () => {
+  for (let i = 0; i < 200 && !(q('#sp-effect') && q('#sp-effect').textContent.trim()); i++) await wait(10);
+};
 const typeAndSearch = async (value) => {
   const input = d.getElementById('sp-entry');
   input.value = value;
   input.dispatchEvent(new w.Event('input', { bubbles: true }));
   await press(footButton('Search'));
+  await settled();
 };
 const closeAll = async () => { Array.from(d.querySelectorAll('.modal')).forEach((m) => m.closeModal && m.closeModal()); await wait(); };
 const posts = () => requests.filter((r) => r.method !== 'GET' && r.path !== '/api/sports/lookup').map((r) => ({ method: r.method, path: r.path, body: r.body }));
@@ -154,6 +160,7 @@ out.early_menu = early ? Boolean(early.querySelector('[data-act="teams"]')) : nu
 if (early) {
   await click(early.querySelector('.c-actions button'));
   await click(early.querySelector('[data-act="teams"]'));
+  await settled();
   out.change = { title: modal().querySelector('h2').textContent, chips: chips(), now: text('#sp-now'),
     effect: effect(), save: footButton('Save') ? footButton('Save').disabled : 'missing' };
   await addTeam('greens');
