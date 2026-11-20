@@ -9,6 +9,8 @@
    The same swap also runs on a timer, so the page keeps up while it is open (see liveTick). */
 (() => {
   const BOOT = readBootJson('sports-boot', { shipped: [], site: '' });
+  // The league's own words (app/sports_words.py), on a league's page only.
+  const WORDS = readBootJson('sports-words', { many: 'events', teamed: 'game' });
   const PAGE = window.SPORTS_LEAGUE || null;
 
   const siteLink = (text = 'TheSportsDB', path = '') =>
@@ -37,7 +39,7 @@
   };
 
   /* ---- Sorting --------------------------------------------------------------------------- */
-  const SORT_LABELS = { name: 'League', status: 'Status', next: 'Next game', count: 'Upcoming', updated: 'Updated' };
+  const SORT_LABELS = { name: 'League', status: 'Status', next: 'Next event', count: 'Upcoming', updated: 'Updated' };
   const SORT_NUMERIC = new Set(['status', 'count', 'updated']);
   const SORT_FIRST = { name: 'asc', status: 'asc', next: 'asc', count: 'desc', updated: 'asc' };
   const sort = { key: 'next', dir: 'asc' };
@@ -754,7 +756,7 @@
           const on = d.replay_on || [];
           const what = added.length === 1 ? `Added "${added[0]}".` : `Added ${added.length} categories.`;
           const auto = on.length
-            ? ` Replays only is on for ${on.map((n) => `"${n}"`).join(' and ')}, because the name says replay. Turn it off if it shows live games.`
+            ? ` Replays only is on for ${on.map((n) => `"${n}"`).join(' and ')}, because the name says replay. Turn it off if it shows live ${WORDS.many}.`
             : '';
           showToast(`${what}${auto} The rows below ${added.length === 1 ? 'it' : 'them'} moved down.`, { type: on.length ? 'warning' : 'success', durationMs: 9000 });
         }
@@ -781,7 +783,7 @@
     const body = modal.querySelector('.sp-dialog-body');
     jsonFetch(`/api/sports/leagues/${leagueId()}/categories/offer`).then((d) => {
       const offer = d.categories.filter((c) => !c.tied);
-      body.innerHTML = `<p class="sp-intro">Categories on your accounts whose name has one of this league's names in it. A listing on a channel in a category you add counts as this league even when its title does not name it. A game still has to name both teams.</p>
+      body.innerHTML = `<p class="sp-intro">Categories on your accounts whose name has one of this league's names in it. A listing on a channel in a category you add counts as this league even when its title does not name it. ${/^[aeiou]/.test(WORDS.teamed) ? 'An' : 'A'} ${escHtml(WORDS.teamed)} still has to name both teams.</p>
         ${offer.length ? `<div class="sp-offer">${offer.map((c) => `<label class="sp-offer-row"><input type="checkbox" value="${escHtml(c.name)}"> <span>${escHtml(c.name)}</span><span class="sp-cat">${c.channels} ${c.channels === 1 ? 'channel' : 'channels'}</span></label>`).join('')}</div>`
     : '<p class="sp-intro">None of your categories has one of these names in it. Add a name above first if your provider spells the league differently.</p>'}`;
     }).catch((err) => { body.innerHTML = `<p class="sp-intro">${escHtml(err.message)}</p>`; });

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
+from . import sports_words
 from .fmt_utils import counted, fmt_bytes
 
 log = logging.getLogger(__name__)
@@ -259,12 +260,13 @@ def words_for(state: str, mode: str, noun: str, *, carries: str = '', game: str 
     if mode not in (MODE_PROXY, MODE_REDIRECT):
         raise ValueError(f'Unknown feed mode "{mode}"')
     proxy = mode == MODE_PROXY
+    many = sports_words.many(noun)
     cant = f"You're using redirect mode, so ChannelBin can't tune you in to the {noun}"
     if state == STATE_NONE:
         return Words(
-            kicker=f'No {noun}s scheduled', headline=carries, when='',
-            note=(f'TheSportsDB lists no upcoming {noun}s for this channel. The season may be over, '
-                  f'or the next {noun}s are not listed yet.'),
+            kicker=f'No {many} scheduled', headline=carries, when='',
+            note=(f'TheSportsDB lists no upcoming {many} for this channel. The season may be over, '
+                  f'or the next {many} are not listed yet.'),
             ticker_label='' if proxy else 'Redirect mode',
             ticker=() if proxy else (
                 f"You're using redirect mode, so ChannelBin can't tune you in to a {noun} by itself",
@@ -316,9 +318,9 @@ def carries(team_name: Optional[str], league: str, number: int, noun: str) -> st
     if team_name:
         return f'Every {team_name} {noun}'
     if number <= 1:
-        return f'{league} {noun}s'
+        return f'{league} {sports_words.many(noun)}'
     others = {2: 'another', 3: 'two others', 4: 'three others'}.get(number, f'{number - 1} others')
-    return f'The {league} {noun}s that overlap {others}'
+    return f'The {league} {sports_words.many(noun)} that overlap {others}'
 
 
 # ---------------------------------------------------------------------------

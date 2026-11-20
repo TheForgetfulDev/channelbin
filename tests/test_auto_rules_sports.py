@@ -617,16 +617,38 @@ class EventChannelTests(_EventCase):
             ctx = auto_rules_view.page_context(rid)
         self.assertEqual(ctx['sports']['rows'][0]['rule']['badge'][1], 'Not scheduled')
 
-    def test_a_bare_clock_further_off_than_the_wait_is_not_scheduled_yet(self):
-        """The kickoff is 30 hours off and the wait 24: TheSportsDB's time may still change."""
+    def test_a_bare_clock_further_off_than_the_wait_is_scheduled_when_no_guide_lists_it(self):
+        """dev/docs/BUGS.md 2026-11-20: the kickoff is 30 hours off and the wait 24. The wait sends a
+        far-off game to its listing, and this one has none, so TheSportsDB's time is all there is."""
         g = self.game()
         self.named(g, self.channel('PFL | 01 - Gulls at Bears 8pm'))
         rid = self.event_rule()
         self.evaluate(rid)
-        self.assertEqual(self.recordings(rid), [])
+        rec = self.recordings(rid)[0]
+        self.assertEqual(rec.program_start_time, self.kickoff)
+        row = RuleMatch.query.filter_by(rule_id=rid).one()
+        self.assertEqual(row.sports_start_from, 'tsdb')
+        self.assertIn('Start not confirmed', row.detail)
+        self.assertIn('this recording moves with it', row.detail)
+
+    def test_the_wait_still_holds_thesportsdbs_time_back_while_the_guide_lists_the_game(self):
+        g = self.game()
+        self.named(g, self.channel('PFL | 01 - Gulls at Bears 8pm'))
+        self.listing(g, [self.channel('Espanol')], 'Futbol PFL: Gulls vs. Bears', self.kickoff)
         from app.auto_rules_sports import GameIndex, event_pick
         games = GameIndex.load([self.league.id], datetime.utcnow())
-        self.assertIn('only from 24 hours before a game', event_pick(games, games.games[g.id])[1])
+        pick, why = event_pick(games, games.games[g.id])
+        self.assertIsNone(pick)
+        self.assertIn('only from 24 hours before it', why)
+
+    def test_a_sports_channel_reads_the_same_far_off_game(self):
+        """dev/docs/BUGS.md 2026-11-20: the output feed's sports channels ask the same question."""
+        g = self.game()
+        self.named(g, self.channel('PFL | 01 - Gulls at Bears 8pm'))
+        from app.auto_rules_sports import name_sources
+        found = name_sources([self.league.id], datetime.utcnow())
+        self.assertEqual(found[g.id].pick.start, self.kickoff)
+        self.assertEqual(found[g.id].pick.source, 'tsdb')
 
     def test_a_bare_clock_is_scheduled_at_thesportsdbs_time_unconfirmed_whatever_the_trust(self):
         """The league's answer decides, not its measured trust: none measured here (dev/changelog/1630)."""
@@ -816,6 +838,218 @@ class EventChannelTests(_EventCase):
         self.assertIn('From the event channel &#34;PFL | 01&#34;, at the time its name gives.', page)
         self.assertIn('Event channels', page)
         self.assertIn('its account, day and time filters apply to those channels', page)
+
+
+class PickReasonTests(_EventCase):
+    """A rule's recording of a game says why its listing and channel (dev/changelog/1661)."""
+
+    def created(self, rid):
+        rec = self.recordings(rid)[0]
+        return RecordingEvent.query.filter_by(recording_id=rec.id, event_type='RECORDING_RULE_SCHEDULED').one()
+
+    def test_a_listing_pick_says_most_channels_and_the_tie(self):
+        self.mnf()
+        rid = self.rule(sports_league_id=self.league.id)
+        self.evaluate(rid)
+        ev = self.created(rid)
+        self.assertIn('Its listing is the one most channels carry: 3 of the 5 that list it, across 3 listings.',
+                      ev.detail)
+        self.assertIn('3 share the best health score (50)', ev.detail)
+        self.assertEqual(json.loads(ev.extra_data)['picked']['listing'], 'widest')
+        row = RuleMatch.query.filter_by(rule_id=rid, action_taken=RULE_MATCH_SCHEDULED).one()
+        self.assertIn('the one most channels carry', row.detail)
+
+    def test_an_event_pick_says_it_is_the_only_name(self):
+        g = self.game()
+        self.named(g, self.channel('PFL | 01 - Gulls at Bears 8:15pm ET'), start=self.kickoff)
+        rid = self.event_rule()
+        self.evaluate(rid)
+        ev = self.created(rid)
+        self.assertIn('It is the only channel whose name mentions it.', ev.detail)
+        self.assertEqual(json.loads(ev.extra_data)['picked'], {'channel': 'name', 'game_channels': 1, 'score': 50})
+
+    def test_a_rule_that_names_no_league_says_nothing_new(self):
+        g = self.game()
+        self.listing(g, [self.channel('Sports 1'), self.channel('Sports 2')], 'PFL Football: Gulls at Bears',
+                     self.kickoff)
+        rid = self.rule()
+        self.evaluate(rid)
+        ev = self.created(rid)
+        self.assertNotIn('picked', json.loads(ev.extra_data))
+        self.assertNotIn('health score', ev.detail)
+
+
+class EventFollowTests(_EventCase):
+    """A rule's recording made on TheSportsDB's own time moves with it until it starts
+    (app/sports_follow.py, dev/docs/BUGS.md 2026-11-20)."""
+
+    def made(self, name='PFL | 01 - Gulls at Bears 8pm', start=None):
+        self.g = self.game()
+        self.named(self.g, self.channel(name), start=start)
+        self.rid = self.event_rule()
+        self.evaluate(self.rid)
+        return self.recordings(self.rid)[0].id
+
+    def move_game(self, by):
+        self.g.previous_start, self.g.start_at = self.g.start_at, self.g.start_at + by
+        self.g.start_changed_at = datetime.utcnow()
+        db.session.commit()
+
+    def follow(self):
+        from app import sports_follow
+        with patch('app.routes.recordings._rearm_replanned') as armed:
+            out = sports_follow.follow()
+        db.session.expire_all()
+        return out, armed
+
+    def events(self, rec_id, kind):
+        return RecordingEvent.query.filter_by(recording_id=rec_id, event_type=kind).all()
+
+    def test_it_moves_with_thesportsdb_window_program_and_ledger_together(self):
+        rec_id = self.made()
+        before = db.session.get(Recording, rec_id)
+        old = (before.start_time, before.stop_time, before.program_stop_time)
+        hour = timedelta(hours=1)
+        self.move_game(hour)
+        out, armed = self.follow()
+        self.assertEqual(out['moved'], 1)
+        rec = db.session.get(Recording, rec_id)
+        self.assertEqual((rec.start_time, rec.stop_time, rec.program_start_time, rec.program_stop_time),
+                         (old[0] + hour, old[1] + hour, self.kickoff + hour, old[2] + hour))
+        self.assertEqual((rec.scheduled_start_time, rec.scheduled_stop_time), (rec.start_time, rec.stop_time))
+        row = RuleMatch.query.filter_by(rule_id=self.rid).one()
+        self.assertEqual((row.rec_start_time, row.rec_stop_time, row.program_start_time),
+                         (rec.start_time, rec.stop_time, rec.program_start_time))
+        said = self.events(rec_id, 'RECORDING_SPORTS_RETIMED')
+        self.assertEqual(len(said), 1)
+        self.assertIn('TheSportsDB now has the game at', said[0].detail)
+        self.assertIn('Moved to', said[0].detail)
+        self.assertEqual(json.loads(said[0].extra_data)['start_from'], 'tsdb')
+        armed.assert_called_once()
+        # A second pass and the rule's next checks change nothing and blame nothing.
+        self.assertEqual(self.follow()[0]['moved'], 0)
+        self.evaluate(self.rid)
+        self.evaluate(self.rid)
+        self.assertEqual(len(self.recordings(self.rid)), 1)
+        self.assertEqual(self.events(rec_id, RECORDING_RULE_GAME_CHANGED), [])
+        self.assertNotIn('start now reads', db.session.get(AutoRule, self.rid).last_problems or '')
+
+    def test_the_rules_own_check_moves_it_and_never_says_it_keeps_its_slot(self):
+        rec_id = self.made()
+        self.move_game(timedelta(hours=1))
+        with patch('app.routes.recordings._rearm_replanned'):
+            self.evaluate(self.rid)
+        self.assertEqual(db.session.get(Recording, rec_id).program_start_time, self.kickoff + timedelta(hours=1))
+        self.assertEqual(self.events(rec_id, RECORDING_RULE_GAME_CHANGED), [])
+
+    def test_one_made_on_its_channels_own_clock_keeps_its_slot(self):
+        rec_id = self.made(name='PFL | 01 - Gulls at Bears 8:15pm ET', start=self.kickoff)
+        self.move_game(timedelta(hours=1))
+        out, _armed = self.follow()
+        self.assertEqual(out['moved'], 0)
+        self.assertEqual(db.session.get(Recording, rec_id).program_start_time, self.kickoff)
+        self.assertEqual(self.events(rec_id, 'RECORDING_SPORTS_RETIMED'), [])
+
+    def test_times_a_person_set_are_kept_and_said_once(self):
+        rec_id = self.made()
+        rec = db.session.get(Recording, rec_id)
+        rec.start_time = rec.scheduled_start_time = rec.start_time - timedelta(minutes=20)
+        db.session.commit()
+        self.move_game(timedelta(hours=1))
+        self.assertEqual(self.follow()[0]['kept'], 1)
+        self.assertEqual(self.follow()[0]['kept'], 0)
+        rec = db.session.get(Recording, rec_id)
+        self.assertEqual(rec.program_start_time, self.kickoff)
+        kept = self.events(rec_id, 'RECORDING_SPORTS_TIME_KEPT')
+        self.assertEqual(len(kept), 1)
+        self.assertIn('TheSportsDB now has the game at', kept[0].detail)
+
+    def test_a_league_since_set_to_go_by_the_guide_a_postponed_game_and_one_with_no_time_move_nothing(self):
+        rec_id = self.made()
+        self.move_game(timedelta(hours=1))
+        sports_times.set_league(self.league.tsdb_id, {'go_by': sports_times.GO_GUIDE})
+        self.assertEqual(self.follow()[0]['moved'], 0)
+        sports_times.set_league(self.league.tsdb_id, {'go_by': None})
+        self.g.postponed = True
+        db.session.commit()
+        self.assertEqual(self.follow()[0]['moved'], 0)
+        self.g.postponed, self.g.start_at = False, None
+        db.session.commit()
+        self.assertEqual(self.follow()[0]['moved'], 0)
+        self.assertEqual(db.session.get(Recording, rec_id).program_start_time, self.kickoff)
+
+    def kept_reasons(self, rec_id):
+        return [json.loads(e.extra_data)['reason'] for e in self.events(rec_id, 'RECORDING_SPORTS_TIME_KEPT')]
+
+    def test_a_postponed_game_is_said_once_and_not_moved(self):
+        """A recording left at a time TheSportsDB no longer has always says so."""
+        rec_id = self.made()
+        self.move_game(timedelta(days=7))
+        self.g.postponed = True
+        db.session.commit()
+        self.follow()
+        self.follow()
+        self.assertEqual(self.kept_reasons(rec_id), ['postponed'])
+        self.assertEqual(db.session.get(Recording, rec_id).program_start_time, self.kickoff)
+
+    def test_a_new_time_already_over_is_said_once_and_not_moved(self):
+        rec_id = self.made()
+        self.move_game(-timedelta(hours=40))
+        self.follow()
+        self.follow()
+        self.assertEqual(self.kept_reasons(rec_id), ['over'])
+        self.assertEqual(db.session.get(Recording, rec_id).program_start_time, self.kickoff)
+
+    def test_times_a_person_set_are_said_once_when_the_new_start_has_passed(self):
+        """The note is kept by the window before it is clamped to now, or every pass would write
+        another."""
+        rec_id = self.made()
+        rec = db.session.get(Recording, rec_id)
+        rec.stop_time = rec.scheduled_stop_time = rec.stop_time + timedelta(minutes=20)
+        db.session.commit()
+        self.move_game(-timedelta(hours=31))
+        from app import sports_follow
+        for minutes in (0, 1, 2):
+            with patch('app.routes.recordings._rearm_replanned'):
+                sports_follow.follow(now=datetime.utcnow() + timedelta(minutes=minutes))
+        db.session.expire_all()
+        self.assertEqual(self.kept_reasons(rec_id), ['edited'])
+
+    def test_a_field_event_at_midnight_is_a_placeholder_and_moves_nothing(self):
+        from app import sports_follow
+        self.g = self.game()
+        self.g.home_team_id = self.g.away_team_id = 0
+        db.session.commit()
+        rec = seed.make_recording(status='SCHEDULED', start_time=self.kickoff, stop_time=self.kickoff + timedelta(hours=4),
+                                  program_start_time=self.kickoff, program_stop_time=self.kickoff + timedelta(hours=4))
+        rec.sports_record_tsdb_id, rec.sports_start_from = self.g.tsdb_id, 'tsdb'
+        rec.sports_window_start, rec.sports_window_stop = rec.start_time, rec.stop_time
+        db.session.commit()
+        rec_id = rec.id
+        self.g.start_at = (self.kickoff + timedelta(days=1)).replace(hour=0, minute=0)
+        db.session.commit()
+        self.assertEqual(sports_follow.follow()['moved'], 0)
+        self.g.start_at = self.kickoff + timedelta(hours=1)
+        db.session.commit()
+        with patch('app.routes.recordings._rearm_replanned'):
+            self.assertEqual(sports_follow.follow()['moved'], 1)
+        db.session.expire_all()
+        self.assertEqual(db.session.get(Recording, rec_id).program_start_time, self.kickoff + timedelta(hours=1))
+
+    def test_a_move_onto_a_listing_the_rule_already_judged_is_left_and_said(self):
+        rec_id = self.made()
+        row = RuleMatch.query.filter_by(rule_id=self.rid).one()
+        db.session.add(RuleMatch(rule_id=self.rid, title_key=row.title_key, episode_key=row.episode_key,
+                                 program_start_time=self.kickoff + timedelta(hours=1),
+                                 program_stop_time=self.kickoff + timedelta(hours=4), action_taken='skipped_existing',
+                                 program_title=row.program_title))
+        db.session.commit()
+        self.move_game(timedelta(hours=1))
+        out, _armed = self.follow()
+        self.assertEqual((out['moved'], out['kept']), (0, 1))
+        self.assertEqual(db.session.get(Recording, rec_id).program_start_time, self.kickoff)
+        kept = self.events(rec_id, 'RECORDING_SPORTS_TIME_KEPT')
+        self.assertEqual(json.loads(kept[0].extra_data)['reason'], 'listing_there')
 
 
 class EventAlertTests(_EventCase):

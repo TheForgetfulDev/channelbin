@@ -60,6 +60,12 @@ SECTION_NAMES = {'games': 'Expected games', 'coming': 'Coming up', 'search': 'Wh
                  'checks': 'Checks', 'settings': 'Settings', 'history': 'History'}
 
 
+def section_names(sports) -> dict:
+    """SECTION_NAMES with the Expected card named for the rule's league's own word (`sports` is
+    page_context()'s, None for a rule that names nothing)."""
+    return {**SECTION_NAMES, 'games': f'Expected {sports["many"]}'} if sports else SECTION_NAMES
+
+
 def sections_for(rule) -> list:
     """The page's cards: Expected games only on a rule that names a league (dev/changelog/1490),
     first by default, since the games are what such a rule is for."""
@@ -546,13 +552,16 @@ def _lead(rule, profile, about=None):
         out += (f'It takes at most {rule.limit_count:,} within any '
                 f'{counted(rule.limit_window_hours, "hour")}. ')
     if about:
-        clauses = ['records each game once']
+        from . import sports_words
+        from .auto_rules_sports import rule_words
+        one, many = rule_words(rule)
+        clauses = [f'records each {one} once']
         if rule.sports_skip_replays:
-            clauses.append('skips a replay while the game\'s first airing is scheduled or recorded')
+            clauses.append(f'skips a replay while the {one}\'s first airing is scheduled or recorded')
         if rule.sports_event_channels:
-            clauses.append('records a game from an event channel when the guide has no listing of it')
+            clauses.append(f'records {sports_words.a(one)} from an event channel when the guide has no listing of it')
         if rule.sports_sessions:
-            clauses.append('counts practice, qualifying and shootouts among its games')
+            clauses.append(f'counts practice, qualifying and shootouts among its {many}')
         joined = clauses[0] if len(clauses) == 1 else ', '.join(clauses[:-1]) + ' and ' + clauses[-1]
         out += f'It is about {about}, from Sports Schedules, and {joined}. '
     return out + ('Recordings it makes are ordinary recordings: they fail over, wait for a '
@@ -572,21 +581,24 @@ def settings_items(rule, profile, default_cap, about=None, sessions=False) -> li
                     'value': profile or "Each showing's default profile",
                     'tip': "Its padding is what keeps a program that runs long. Each showing's default is "
                            'the profile its own Record button would pick.'}
+    from . import sports_words
+    from .auto_rules_sports import rule_words
+    one, many = rule_words(rule)
     about_chip = {'focus': 'sports', 'label': 'About', 'value': about or 'Nothing',
-                  'tip': 'A league or team from Sports Schedules. Lets this rule show the games it '
-                         'expects, record each game once, and skip game replays.'}
+                  'tip': f'A league or team from Sports Schedules. Lets this rule show the {many} it '
+                         f'expects, record each {one} once, and skip replays.'}
     repeats_chip = {'focus': 'repeats', 'label': 'Skip repeats', 'value': 'On' if rule.skip_repeats else 'Off',
                     'tip': 'A showing whose title AND episode title both match an earlier airing that was '
                            'already recorded is skipped. Showings without an episode title are never '
                            'skipped as repeats.'}
     replays_chip = {'focus': 'sports-replays', 'label': 'Skip game replays',
                     'value': 'On' if about and rule.sports_skip_replays else 'Off',
-                    'tip': 'Leaves out a listing TheSportsDB matched as a replay while the game\'s first '
+                    'tip': f'Leaves out a listing TheSportsDB matched as a replay while the {one}\'s first '
                            'airing is scheduled or recorded, by this rule or any other way.'}
     channels_chip = {'focus': 'sports-channels', 'label': 'Event channels',
                      'value': 'When the guide has no listing' if about and rule.sports_event_channels else 'Off',
-                     'tip': 'Records a game from a channel whose name names it, when the guide has no '
-                            'listing of the game at all.'}
+                     'tip': f'Records {sports_words.a(one)} from a channel whose name names it, when the guide has no '
+                            f'listing of the {one} at all.'}
     sessions_chip = {'focus': 'sports-sessions', 'label': 'Practice and qualifying',
                      'value': 'Recorded' if about and rule.sports_sessions else 'Off',
                      'tip': 'Counts practice, qualifying and shootouts among the league\'s events this rule '
@@ -628,8 +640,9 @@ def _game_notices(sports) -> list:
         return []
     games = '; '.join(f'{title}, {w["day"]} {w["time"]}' for title, w in sports['unrecordable'])
     n = len(sports['unrecordable'])
-    return [('warn', 'A game this rule is about has nothing to record it from.' if n == 1 else
-             f'{n} games this rule is about have nothing to record them from.',
+    from . import sports_words
+    return [('warn', f'{sports_words.a(sports["one"]).capitalize()} this rule is about has nothing to record it from.'
+             if n == 1 else f'{n} {sports["many"]} this rule is about have nothing to record them from.',
              f'{games}. {sports["unrecordable_reason"]} so '
              f'this rule cannot record {"it" if n == 1 else "them"}. If a channel you know of carries '
              f'{"it" if n == 1 else "one"}, record that channel by hand. This clears itself when a '
@@ -714,8 +727,9 @@ def _game_when(game, now, tz, h24) -> dict:
                  f'{format_local(game.start_changed_at, "clock", tz=tz, h24=h24)}'
                  if game.start_changed_at else '')
         out['was'] = f'was {was}'
-        out['was_tip'] = (f'Moved.\nTheSportsDB moved this game{moved}, from {was} to {clock}.\n'
-                          'TheSportsDB never moves a recording; the guide does, when it changes.')
+        out['was_tip'] = (f'Moved.\nTheSportsDB moved it{moved}, from {was} to {clock}.\n'
+                          'A recording this rule made follows the time its league goes by, which is set on '
+                          'Sports Schedules.')
     return out
 
 
@@ -821,7 +835,7 @@ def _held_statuses():
 def _sports_context(rule, scope, pairs, search_url, cfg, now, tz, h24):
     """The game line on each Coming up row, the Expected games card and the unrecordable-games
     notice, for a rule that names a league. A fixed handful of queries."""
-    from . import sports_match
+    from . import sports_match, sports_words
     from .auto_rules_sports import START_FROM_TSDB, GameIndex
     from .database import SportsEvent, SportsLeague, SportsState
     from .sports_data import _settings as sports_settings
@@ -830,6 +844,7 @@ def _sports_context(rule, scope, pairs, search_url, cfg, now, tz, h24):
     league = db.session.get(SportsLeague, scope.league_id)
     league_name = league.name if league is not None else ''
     games = GameIndex.load([scope.league_id], now, horizon)
+    one, many = games.words(scope.league_id)
     by_tsdb = {g.tsdb_id: g for g in games.games.values()}
     for m, e in pairs:
         if m.sports_event_tsdb_id:
@@ -874,11 +889,12 @@ def _sports_context(rule, scope, pairs, search_url, cfg, now, tz, h24):
         })
     if league is not None and sports_match.league_trusted(league):
         trust = (f'They matched your guide on {league.trust_agreed} of the last {league.trust_sample} '
-                 f'{league_name} games.')
+                 f'{league_name} {many}.')
     else:
-        trust = (f'ChannelBin has not checked enough {league_name} games against your guide to rely '
+        trust = (f'ChannelBin has not checked enough {league_name} {many} against your guide to rely '
                  'on them yet.')
     return {
+        'one': one, 'many': many, 'a_one': sports_words.a(one),
         'rows': rows, 'horizon': horizon, 'trust': trust, 'event_channels': scope.event_channels,
         'league_url': url_for('sports.league_page', league_id=scope.league_id) if league else None,
         'unrecordable': [(g.title, _game_when(g, now, tz, h24)) for g in unrecordable],

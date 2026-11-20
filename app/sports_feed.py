@@ -42,7 +42,7 @@ from typing import Optional
 
 from sqlalchemy import and_, func, or_
 
-from . import db, sports_match
+from . import db, sports_match, sports_words
 from .database import Channel, SportsEvent, SportsFeedChannel, SportsFollow, SportsLeague, SportsTeam
 from .db_utils import retry_on_locked
 from .fmt_utils import counted, length_words
@@ -508,6 +508,13 @@ def _next_after(served: list, when: datetime) -> dict:
     return out
 
 
+def event_word(league, events=()) -> str:
+    """The league's word for one of `events`, or for any of its events with none in hand
+    (app/sports_words.py)."""
+    events = [e for e in events if e is not None]
+    return sports_words.noun(league.sport, any(event_shape_is_matchup(e) for e in events) if events else None)[0]
+
+
 def next_game_words(event, start: datetime, now: datetime, tz, h24: bool) -> str:
     """'Eastern Michigan at Western Michigan, Fri 7:00 PM EST': the day by name within the coming
     week, with the date further off, always in the display timezone."""
@@ -554,10 +561,11 @@ def guide_fillers(served: list, programs: list, now: datetime, days: int, tz, h2
                 title = f'{NEXT_MARK} Next: {words}'
                 source = ('a channel whose name mentions it, since no guide lists it' if named is not None
                           else 'a channel whose guide lists it')
-                desc = f'No game on {s.name} until {words}. ChannelBin plays it from {source}. Schedule from TheSportsDB.'
+                desc = (f'No {event_word(s.league, [event])} on {s.name} until {words}. ChannelBin plays it from {source}. '
+                        'Schedule from TheSportsDB.')
             else:
-                title = f'{NEXT_MARK} No game scheduled'
-                desc = f'TheSportsDB lists no coming game for {s.name} yet.'
+                title = f'{NEXT_MARK} No {event_word(s.league)} scheduled'
+                desc = f'TheSportsDB lists no coming {event_word(s.league)} for {s.name} yet.'
             block = lo
             while block < hi:
                 stop = min(hi, block - timedelta(hours=block.hour % 2, minutes=block.minute,
@@ -618,7 +626,7 @@ def _phase_note(phase: str, begin: datetime, stop: datetime, now: datetime) -> s
     if phase == PHASE_ON:
         return ''
     if phase == PHASE_AFTER:
-        return f'its listing ended {_when(stop, now)}; the game may be running long'
+        return f'its listing ended {_when(stop, now)}; it may be running long'
     if phase == PHASE_BEFORE:
         return f'its listing starts {_when(begin, now)}'
     if phase == PHASE_LIVE_NOW:
@@ -755,7 +763,7 @@ def playing_now(served: Served, now: datetime, event_id: int = None, before: tim
         return NowPlaying(why_none=(f"{name} was started early with Start broadcast, but no channel's guide lists it any more, "
                                     f'and it is not one Record would take from a channel\'s name either'))
     if event_id is not None:
-        name = event_game_name(events[0]) if events else 'the game'
+        name = event_game_name(events[0]) if events else f'the {event_word(served.league)}'
         return NowPlaying(why_none=(f"no channel's guide lists {name} any more, and it is not one Record would "
                                     "take from a channel's name either"))
     windows = [(e, event_window(e, named=named().get(e.id))) for e in events]
@@ -767,10 +775,10 @@ def playing_now(served: Served, now: datetime, event_id: int = None, before: tim
                 f'guides lists it right now'))
     for event, window in windows:
         if window is not None and window[0] > now:
-            return NowPlaying(why_none=f'no game is on right now. Next: {event_game_name(event)}, '
+            return NowPlaying(why_none=f'no {event_word(served.league, [event])} is on right now. Next: {event_game_name(event)}, '
                                        f'{_when(window[0], now)}'
                                        f'{_plays_from(event, window[0], before, now, named().get(event.id))}')
-    return NowPlaying(why_none='no game is on right now, and none is in the schedule')
+    return NowPlaying(why_none=f'no {event_word(served.league, events)} is on right now, and none is in the schedule')
 
 
 def _plays_from(event, shown: datetime, before: timedelta, now: datetime, named=None) -> str:
@@ -1139,7 +1147,7 @@ def set_league_channels(league_id: int, enabled: bool) -> Optional[bool]:
     whole, _teams = _follow_scope().get(league_id, (False, frozenset()))
     if enabled and not whole:
         db.session.rollback()
-        raise NotFollowed('Follow the whole league first: league channels carry every game in it.')
+        raise NotFollowed(f'Follow the whole league first: league channels carry every {event_word(league)} in it.')
     league.feed_league_channels = enabled
     if enabled:
         place_league_events(league, datetime.utcnow())
@@ -1211,7 +1219,7 @@ def moved_games(league: SportsLeague, events: list) -> list:
         if e.feed_moved_at is None or e.feed_number is None or e.feed_moved_from is None:
             continue
         other = by_id.get(e.feed_moved_by)
-        shared = f'the same time as {event_game_name(other)}' if other is not None else "another game's time"
+        shared = f'the same time as {event_game_name(other)}' if other is not None else f"another {event_word(league, [e])}'s time"
         out.append(f'{event_game_name(e)} moved from {league.name} {e.feed_moved_from} to {league.name} '
                    f'{e.feed_number}: TheSportsDB changed a start time and it came to {shared} on one '
                    f'channel. An IPTV player that has not refreshed its guide may still list it on '

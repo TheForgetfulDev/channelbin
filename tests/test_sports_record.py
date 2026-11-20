@@ -248,6 +248,90 @@ class PickTests(Case):
         self.assertIn('not sure enough which listing', r.get_json()['error'])
 
 
+class PickReasonTests(Case):
+    """Why a game's channel was picked, from the order that picked it (auto_rules.pick_reason(),
+    dev/changelog/1661), and that a recording says so."""
+
+    def why(self, rig):
+        from app import auto_rules
+        db.session.commit()
+        return auto_rules.game_sources(rig.event_id).why
+
+    def test_the_widest_listing_and_a_tie_no_health_check_has_broken(self):
+        rig = Rig()
+        a, b, c, d, e = (rig.channel() for _ in range(5))
+        rig.listing(a, title='PFL Early Show', start=rig.start - timedelta(minutes=30))
+        rig.listing(b, title='PFL Early Show', start=rig.start - timedelta(minutes=30))
+        for ch in (c, d, e):
+            rig.listing(ch)
+        why = self.why(rig)
+        self.assertEqual((why.listing, why.channel, why.listing_channels, why.game_channels, why.tied),
+                         ('widest', 'tie', 3, 5, 3))
+        self.assertIn('the one most channels carry: 3 of the 5 that list it, across 2 listings', why.text)
+        self.assertIn('3 share the best health score (50)', why.text)
+        self.assertIn('no health check yet', why.text)
+        self.assertEqual(why.extra()['picked']['score'], 50)
+
+    def test_the_best_health_score_alone(self):
+        rig = Rig()
+        rig.listing(rig.channel())
+        rig.listing(rig.channel(health_score=90.0))
+        why = self.why(rig)
+        self.assertEqual((why.listing, why.channel, why.score, why.tied), ('only', 'health', 90, 1))
+        self.assertIn('It is the only listing of it in your guide, on 2 channels.', why.text)
+        self.assertIn('this one has the best health score (90)', why.text)
+
+    def test_a_listing_at_the_start_with_a_wider_one_too_far_off(self):
+        rig = Rig()
+        rig.event.guide_start = rig.start
+        rig.listing(rig.channel('KFAA'))
+        for i in range(3):
+            rig.listing(rig.channel(f'Wide {i}'), start=rig.start + timedelta(minutes=95))
+        why = self.why(rig)
+        self.assertEqual((why.listing, why.channel), ('near', 'only'))
+        self.assertIn('on 1 of the 4 channels that list it. A listing on 3 channels starts too far', why.text)
+
+    def test_an_event_channel_pick_counts_the_names(self):
+        rig = Rig()
+        rig.name(rig.channel(name='1pm Gulls at Bears'))
+        rig.name(rig.channel(name='PFL 05: Gulls @ Bears 1:00 PM ET'), start=rig.start)
+        why = self.why(rig)
+        self.assertEqual((why.channel, why.game_channels), ('name', 2))
+        self.assertIn('a name that gives a time zone goes first', why.text)
+
+    def save(self, rig, entry):
+        db.session.commit()
+        with mock.patch('app.routes.recordings.schedule_recording'):
+            r = self.client.post('/recordings/new-json', data={
+                'name': 'PFL Football', 'url': 'http://example.test/live/1',
+                'start_time': local_input_value(entry.start_time), 'stop_time': local_input_value(entry.stop_time),
+                'channel_id': str(entry.channel_id), 'source_epg_id': str(entry.id),
+                'sports_event_id': str(rig.event_id), 'force': '1'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        from app.database import RECORDING_CREATED, RecordingEvent
+        return RecordingEvent.query.filter_by(recording_id=r.get_json()['id'], event_type=RECORDING_CREATED).one()
+
+    def test_a_save_from_record_says_why_on_the_recording(self):
+        rig = Rig()
+        rig.listing(rig.channel())
+        best = rig.listing(rig.channel(health_score=90.0))
+        ev = self.save(rig, best)
+        self.assertIn('Record picked this channel.', ev.detail)
+        self.assertIn('this one has the best health score (90)', ev.detail)
+        self.assertEqual(json.loads(ev.extra_data)['picked'],
+                         {'listing': 'only', 'channel': 'health', 'listing_channels': 2, 'game_channels': 2,
+                          'tied': 1, 'score': 90})
+
+    def test_a_channel_the_person_chose_instead_gets_no_reason_of_channelbins(self):
+        rig = Rig()
+        rig.listing(rig.channel(health_score=90.0))
+        rig.listing(rig.channel(), start=rig.start + timedelta(hours=6), airing='replay')
+        other = rig.listing(rig.channel('Elsewhere'), title='Some Other Show', strength='weak')
+        ev = self.save(rig, other)
+        self.assertNotIn('Record picked this channel', ev.detail)
+        self.assertNotIn('picked', json.loads(ev.extra_data))
+
+
 class SeatTests(Case):
     """Record on a league page gives the answer a rule's scheduling step gives when the picked
     listing's first channel is on an account with no connection in the window
@@ -318,10 +402,94 @@ class EventChannelTests(Case):
         rig.name(ch)
         r = self.pick(rig)
         self.assertEqual(r.status_code, 409)
-        self.assertIn('no start time ChannelBin can stand behind', r.get_json()['error'])
+        why = r.get_json()['error']
+        self.assertIn('this league goes by your guide, which has no listing of it', why)
+        # dev/docs/BUGS.md 2026-11-20: the one cause, never a list of what it might be.
+        self.assertNotIn('TheSportsDB gives no time', why)
+        self.assertNotIn(' or ', why)
         text = self.page(rig)
         self.assertRegex(text, r'class="btn btn-sm disabled" data-act="record" data-event="\d+" aria-disabled="true" '
-                               r'data-why="[^"]*no start time ChannelBin can stand behind')
+                               r'data-why="[^"]*this league goes by your guide, which has no listing of it')
+
+    def test_no_time_at_all_greys_record_naming_that_cause(self):
+        rig = Rig()
+        rig.event.start_at = None
+        ch = rig.channel(name='1pm Gulls at Bears')
+        rig.name(ch)
+        why = self.pick(rig).get_json()['error']
+        self.assertIn('TheSportsDB gives no time for it', why)
+        self.assertNotIn('goes by your guide', why)
+
+    def test_a_game_further_off_than_the_wait_with_no_listing_is_offered_on_thesportsdbs_time(self):
+        """dev/docs/BUGS.md 2026-11-20: UTEP at Air Force, greyed two days out with only event channels."""
+        rig = Rig(start=now_utc() + timedelta(hours=50))
+        ch = rig.channel(name='PFL 493 | Gulls vs. Bears (2099-01-01 20:00:05)')
+        rig.name(ch)
+        body = self.pick(rig).get_json()
+        self.assertEqual(body['kind'], 'event')
+        self.assertEqual(body['program']['start_time'], rig.start.strftime('%Y-%m-%dT%H:%M:%S'))
+        self.assertIn('the recording moves with it, unless you change its times below', body['notice']['text'])
+        self.assertNotIn('aria-disabled="true" data-why', self.page(rig).split('data-act="record"')[1][:200])
+
+    def save(self, rig, ch, start, stop):
+        with mock.patch('app.routes.recordings.schedule_recording'):
+            r = self.client.post('/recordings/new-json', data={
+                'name': 'Harborview Gulls at Ironvale Bears', 'url': 'http://example.test/live/1',
+                'start_time': local_input_value(start), 'stop_time': local_input_value(stop),
+                'channel_id': str(ch.id), 'sports_event_id': str(rig.event_id), 'force': '1'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        db.session.expire_all()
+        return db.session.get(Recording, r.get_json()['id'])
+
+    def moved(self, rig, rec):
+        from app import sports_follow
+        ev = db.session.get(SportsEvent, rig.event_id)
+        ev.previous_start, ev.start_at = ev.start_at, ev.start_at + timedelta(hours=1)
+        ev.start_changed_at = datetime.utcnow()
+        db.session.commit()
+        with mock.patch('app.routes.recordings._rearm_replanned'):
+            out = sports_follow.follow()
+        db.session.expire_all()
+        return out, db.session.get(Recording, rec.id)
+
+    def test_saved_at_records_times_on_thesportsdbs_time_it_moves_with_thesportsdb(self):
+        rig = Rig(start=now_utc() + timedelta(hours=50))
+        ch = rig.channel(name='1pm Gulls at Bears')
+        rig.name(ch)
+        db.session.commit()
+        rec = self.save(rig, ch, rig.start, rig.start + timedelta(hours=4))
+        self.assertEqual(rec.sports_start_from, 'tsdb')
+        self.assertEqual((rec.sports_window_start, rec.sports_window_stop), (rec.start_time, rec.stop_time))
+        out, rec = self.moved(rig, rec)
+        self.assertEqual(out['moved'], 1)
+        hour = timedelta(hours=1)
+        self.assertEqual((rec.start_time, rec.stop_time, rec.program_start_time),
+                         (rig.start + hour, rig.start + timedelta(hours=5), rig.start + hour))
+        self.assertEqual((rec.sports_window_start, rec.sports_window_stop), (rec.start_time, rec.stop_time))
+
+    def test_saved_at_times_a_person_chose_it_keeps_them(self):
+        rig = Rig(start=now_utc() + timedelta(hours=50))
+        ch = rig.channel(name='1pm Gulls at Bears')
+        rig.name(ch)
+        db.session.commit()
+        rec = self.save(rig, ch, rig.start - timedelta(minutes=30), rig.start + timedelta(hours=4))
+        self.assertEqual(rec.sports_start_from, 'tsdb')
+        self.assertIsNone(rec.sports_window_start)
+        out, rec = self.moved(rig, rec)
+        self.assertEqual((out['moved'], out['kept']), (0, 1))
+        self.assertEqual(rec.program_start_time, rig.start)
+
+    def test_saved_on_the_clock_its_channels_name_gives_it_never_follows_thesportsdb(self):
+        rig = Rig()
+        ch = rig.channel(name='PFL 05: Gulls @ Bears 1:00 PM ET')
+        rig.name(ch, start=rig.start)
+        db.session.commit()
+        rec = self.save(rig, ch, rig.start, rig.start + timedelta(hours=4))
+        self.assertEqual(rec.sports_start_from, 'name')
+        self.assertIsNone(rec.sports_window_start)
+        out, rec = self.moved(rig, rec)
+        self.assertEqual((out['moved'], out['kept']), (0, 0))
+        self.assertEqual(rec.program_start_time, rig.start)
 
     def test_saving_it_records_the_pick_and_links_the_game(self):
         rig = Rig()

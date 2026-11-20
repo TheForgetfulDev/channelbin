@@ -320,7 +320,8 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
         # at all, so this page could never offer to turn it back on.
         view['switchable'] = False
         view['switch_tip'] = 'Turned on and off on its league\'s page in Sports Schedules.'
-        from .sports_feed import (PHASE_AFTER, PHASE_BEFORE, PHASE_LIVE_NOW, PHASE_ON, live_now_offer,
+        from . import sports_words
+        from .sports_feed import (PHASE_AFTER, PHASE_BEFORE, PHASE_LIVE_NOW, PHASE_ON, event_word, live_now_offer,
                                   live_now_on)
         entry = sports.get(served.row.id, _NO_SPORTS)
         tuned, phase = _sports_tuned(entry, now, window)
@@ -355,7 +356,7 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
             view['sports_when'] = ''
             view['note'] = (f'Next: {following.title}, {day_label(following.start, now, tz)} at '
                             f'{format_local(following.start, "clock", tz=tz, h24=h24)}'
-                            if following is not None else 'No game is waiting for it')
+                            if following is not None else f'No {event_word(served.league)} is waiting for it')
             if following is not None and following.event is not None:
                 view['live'] = offer(following)
         else:
@@ -371,7 +372,8 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
         if row.left_out:
             # Not a fault: a tune-in from a player that kept it still plays (dev/changelog/1621).
             view['note'] = (f'Not in the channel list right now: {row.left_out}. It comes back as the same '
-                            f'channel when one of its games is that close. {view["note"]}')
+                            f'channel when one of its {sports_words.many(event_word(served.league))} is that '
+                            f'close. {view["note"]}')
     elif row.kind == output_feed.KIND_UP_NEXT:
         ch = row.row
         view['url'] = (url_for('sports.sports_page') if ch.everything
@@ -469,7 +471,7 @@ def _waiting_text(s) -> str:
         why = ''
     else:
         raise ValueError(f'Unknown reason a game is held "{s.screen_held}"')
-    game = f'Waiting for {s.waiting_for}' if s.waiting_for else 'No game scheduled'
+    game = f'Waiting for {s.waiting_for}' if s.waiting_for else 'Nothing scheduled'
     return f'{game}. {why}' if why else game
 
 

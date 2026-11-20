@@ -767,6 +767,26 @@ def _model_renamed_slot_guide(view, f):
     view.guide = list(view.guide) + extra
 
 
+def _model_guide_spellings(view, f):
+    """Event slots naming a game get a guide that lists it the way a guide spells it, where the
+    schedule it is matched against spells it another way: on one slot the away team with a state
+    written out in parentheses (`Hockey: Gulls (Ohio) at Bears`), on the next a practice session by
+    its short name (`Hockey: Bears P2`), turn about."""
+    share, seed = f.params['share'], view.world.seed
+    rows, extra, taken = [], [], 0
+    for row in view.rows:
+        m = _GAME_SLOT.search(row.name) if row.channel.kind == KIND_EVENT else None
+        if m and frac(seed, 'fault-spellings', view.name, row.channel.stream_id) < share:
+            title = f'{m[1]}: {m[2]} (Ohio) at {m[3]}' if taken % 2 == 0 else f'{m[1]}: {m[3]} P2'
+            taken += 1
+            tvg = row.tvg_id or f'spelled{row.channel.stream_id}.slot'
+            row = _row(row, tvg_id=tvg)
+            extra.append(GuideChannel(tvg, row.name, None, True, None, filler=title))
+        rows.append(row)
+    view.rows = rows
+    view.guide = list(view.guide) + extra
+
+
 def _model_shared_guide_id(view, f):
     target = next((g.guide_id for g in view.guide if g.has_programs), None)
     if target is None:
@@ -1118,6 +1138,13 @@ _KINDS = (
           'event slots naming a game get a filler guide whose blocks from before `hours` ago repeat the '
           'name the slot had before its game', {'share': (1.0, _share), 'hours': (1, _count(1))},
           apply=_model_renamed_slot_guide),
+    _kind('guide_spellings', SCOPE_PANEL, LAYER_MODEL, _ROWS + (EP_GUIDE,), OBSERVED,
+          'dev/changelog/1662, BUGS.md 2026-11-20 (both entries); ESPNU listed `Miami (Ohio) at Kent State` '
+          'for a school the schedule spells `Miami (OH)`, and 41 rows of one day\'s guide listed Formula 1 '
+          'practices as `Las Vegas P1`, `P2` and `P3`',
+          'event slots naming a game get a guide that spells it the guide\'s way: a team with its state '
+          'written out in parentheses, or a practice as `P2`', {'share': (1.0, _share)},
+          apply=_model_guide_spellings),
     _kind('guide_id_twins', SCOPE_PANEL, LAYER_MODEL, (EP_GUIDE,), MEASURED,
           'dev/changelog/1139 (2,297 channels), BUGS.md 2026-09-26 06:15 PM',
           'the guide lists a channel under a second id differing only in case, carrying '

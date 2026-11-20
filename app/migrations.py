@@ -3783,6 +3783,17 @@ def _m134_sports_follow(conn, cur):
     conn.commit()
 
 
+def _m136_recording_start_from(conn, cur):
+    """recordings.sports_start_from: where the start came from for a recording a league page's Record
+    made from an event channel's name (app/sports_follow.py, dev/changelog/1660). No backfill: an
+    earlier one was saved as a person's window (sports_window_start NULL), which nothing moves, so
+    where its start came from changes nothing for it. Re-runnable from the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()}
+    if cols and 'sports_start_from' not in cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN sports_start_from VARCHAR(8)')
+    conn.commit()
+
+
 def _m135_rule_sports_sessions(conn, cur):
     """auto_rules.sports_sessions: whether a rule about a league counts its practice, qualifying and
     shootouts among its games (app/auto_rules_sports.py, dev/changelog/1633). No backfill: before this a
@@ -4507,6 +4518,8 @@ SCHEMA_MIGRATIONS = [
      'follow its time', _m134_sports_follow),
     (135, 'auto_rules.sports_sessions: whether a rule about a league records its practice, qualifying '
      'and shootouts', _m135_rule_sports_sessions),
+    (136, 'recordings.sports_start_from: where a Record-made event-channel recording\'s start came from',
+     _m136_recording_start_from),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

@@ -313,7 +313,7 @@ class WaitingScreenToGameTests(_Waiting):
         resp.close()
         self.assertTrue(_wait(lambda: not s.live, 5))
         feed.flush_play_log()
-        self.assertIn('before the game came on', OutputFeedPlay.query.one().message)
+        self.assertIn('before it came on', OutputFeedPlay.query.one().message)
 
     def test_the_game_takes_the_configured_reserve_when_it_comes_on(self):
         self.t.sandbox_config(_cfg(reserve_seconds=2))

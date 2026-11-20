@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import or_
 
-from . import db
+from . import db, sports_words
 from .database import (
     SPORTS_AIRING_FIRST, SPORTS_AIRING_REPLAY, SPORTS_AIRING_UNKNOWN, SPORTS_MATCH_KIND_CHANNEL_NAME,
     SPORTS_MATCH_KIND_GUIDE, SPORTS_MATCH_STRONG, Channel, ChannelGroup, RecordingSports, SportsEvent, SportsLeague,
@@ -177,6 +177,7 @@ class GameIndex:
     named_by: dict = field(default_factory=dict)       # {event id: [Named]} strong, recordable
     held: dict = field(default_factory=dict)           # {event id: [Held]}
     rules: dict = field(default_factory=dict)          # {league id: sports_times.Rule, which time it goes by}
+    sports: dict = field(default_factory=dict)         # {league id: TheSportsDB's sport, for its word}
     now: datetime = None
     longest: dict = field(default_factory=dict)        # {league id: its longest strong listing}
 
@@ -210,8 +211,10 @@ class GameIndex:
             return out
         from .sports_times import Rules
         rules = Rules()
-        out.rules = {lg_id: rules.of(tsdb_id) for lg_id, tsdb_id in
-                     db.session.query(SportsLeague.id, SportsLeague.tsdb_id).filter(SportsLeague.id.in_(league_ids))}
+        for lg_id, tsdb_id, sport in db.session.query(SportsLeague.id, SportsLeague.tsdb_id, SportsLeague.sport).filter(
+                SportsLeague.id.in_(league_ids)):
+            out.rules[lg_id] = rules.of(tsdb_id)
+            out.sports[lg_id] = sport
         ids = sorted(out.games)
         rows = db.session.query(
             SportsMatch.event_id, SportsMatch.channel_id, SportsMatch.kind, SportsMatch.program_start_time,
@@ -341,6 +344,17 @@ class GameIndex:
                 Held(recording_id=rec.id, airing=link.airing, where=where, title=rec.program_title or '',
                      status=rule_status(rec.status, rec.gave_up_reason), rule_id=rec.rule_id))
 
+    # -- what a game is called ------------------------------------------------------------------
+
+    def one(self, game) -> str:
+        """The word for `game`: game, match, race or event (app/sports_words.py)."""
+        return sports_words.noun(self.sports.get(game.league_id), game.matchup)[0]
+
+    def words(self, league_id) -> tuple:
+        """(one, many) for a league's events as this index holds them."""
+        mine = [g for g in self.games.values() if g.league_id == league_id]
+        return sports_words.noun(self.sports.get(league_id), any(g.matchup for g in mine) if mine else None)
+
     # -- which game a listing is --------------------------------------------------------------
 
     def _one(self, found: dict, scope: Scope):
@@ -406,10 +420,13 @@ class EventPick:
 def event_pick(games, game):
     """(EventPick or None, why not). The channel is the healthiest that names the game, preferring
     one whose name gives a time zone; the start is that clock, else TheSportsDB's start in a league
-    that goes by it or covers both, once within its wait (app/sports_times.py, dev/changelog/1630).
-    With neither there is no start to stand behind (design 10): a league that goes by the guide has
-    no listing of this game to go by, and NASCAR's 00:00 placeholders and a name with a bare clock
-    land there too."""
+    that goes by it or covers both (app/sports_times.py, dev/changelog/1630). The league's wait
+    holds TheSportsDB's time back only while the guide lists the game: the wait exists so a far-off
+    game goes by its listing, and a game with no listing has nothing else to go by
+    (dev/changelog/1660). A recording made on TheSportsDB's time moves with it until it starts
+    (sports_follow). With neither there is no start to stand behind (design 10): a league that goes
+    by the guide has no listing of this game to go by, and NASCAR's 00:00 placeholders and a name
+    with a bare clock land there too."""
     from .sports_times import GO_GUIDE
     named = named_order(games, game)
     if not named:
@@ -424,10 +441,10 @@ def event_pick(games, game):
     elif rule is None or rule.go_by == GO_GUIDE:
         return None, ('An event channel names it, but its name gives no time zone, and this league goes by '
                       'your guide, which has no listing of it, so there is no start to stand behind.')
-    elif games.now is not None and games.now < game.start - rule.wait:
-        return None, (f"An event channel names it, but its name gives no time zone, and this league goes by "
-                      f"TheSportsDB's time only from {counted(rule.wait_hours, 'hour')} before a game, so there "
-                      f"is no start to stand behind yet.")
+    elif game.id in games.listed and games.now is not None and games.now < game.start - rule.wait:
+        return None, (f"An event channel names it, but its name gives no time zone, and while your guide lists "
+                      f"it this league goes by TheSportsDB's time only from {counted(rule.wait_hours, 'hour')} "
+                      f"before it, so there is no start to stand behind yet.")
     else:
         start, source = game.start, START_FROM_TSDB
     length = max(games.longest.get(game.league_id, timedelta(0)), DEFAULT_GAME_LENGTH)
@@ -528,6 +545,21 @@ def scope_of(rule) -> Scope | None:
                  skip_replays=bool(rule.sports_skip_replays),
                  event_channels=bool(rule.sports_event_channels),
                  sessions=bool(rule.sports_sessions))
+
+
+def rule_words(rule) -> tuple:
+    """(one, many) for the events of the league a rule names: its sport's word, read from the
+    shape of its stored events unless the rule names a team, which is always a side in a game or
+    a match. ('game', 'games') for a rule that names nothing. Two queries at most."""
+    if not rule.sports_league_id:
+        return sports_words.GAME
+    sport = db.session.query(SportsLeague.sport).filter(SportsLeague.id == rule.sports_league_id).scalar()
+    if rule.sports_team_tsdb_id:
+        return sports_words.noun(sport, True)
+    shapes = {bool(home or away) for home, away in db.session.query(
+        SportsEvent.home_team_id, SportsEvent.away_team_id).filter(
+        SportsEvent.league_id == rule.sports_league_id).distinct().limit(50)}
+    return sports_words.noun(sport, (True in shapes) if shapes else None)
 
 
 def about_text(rule) -> str | None:

@@ -705,7 +705,7 @@ UP_NEXT_CATEGORY = 'ChannelBin'
 
 
 #: Why a league's numbered sports channel is not in the channel list right now (FeedRow.left_out).
-LEFT_OUT_NO_GAME = 'it has no game in the {days} of guide the output sends'
+LEFT_OUT_NO_GAME = 'it has no {one} in the {days} of guide the output sends'
 
 
 def _own_rows(everything: bool, fcfg: dict) -> list:
@@ -721,7 +721,6 @@ def _own_rows(everything: bool, fcfg: dict) -> list:
     served = sports_feed.served_channels()
     days = guide_days(fcfg)
     with_games = sports_feed.numbered_with_games(served, datetime.utcnow(), days, sports_window(fcfg)[1])
-    no_game = LEFT_OUT_NO_GAME.format(days=counted(days, 'day'))
     out = []
     for ch in up_next:
         if ch.everything:
@@ -737,7 +736,8 @@ def _own_rows(everything: bool, fcfg: dict) -> list:
                 category=ch.league.name, logo_channel_id=None, row=ch, listings_channel_id=None,
                 on_output=ch.enabled, left_out=ch.left_out))
     for one in served:
-        left_out = '' if one.is_team or one.row.id in with_games else no_game
+        left_out = ('' if one.is_team or one.row.id in with_games
+                    else LEFT_OUT_NO_GAME.format(one=sports_feed.event_word(one.league), days=counted(days, 'day')))
         by_league.setdefault(one.league.id, (one.league, []))[1].append(FeedRow(
             feed_id=feed_id_for_sports(one.row.id), kind=KIND_SPORTS, num=0, name=one.name,
             category=one.league.name, logo_channel_id=None, row=one, listings_channel_id=None,
@@ -945,6 +945,8 @@ class Play:
     group: object = field(default=None, repr=False)
     why_none: str = ''
     sports: bool = False
+    # Why a sports play took its game from this channel (auto_rules.PickReason), for its log line.
+    picked: str = ''
     event_id: Optional[int] = None
     fault: bool = True
     #: A sports play taken from outside its listing's own time says so here (sports window,
@@ -1010,10 +1012,14 @@ def _resolve_sports_play(feed_id: int, row_id: int, allowed, exclude_ids, event_
             play.why_none = (f'your guide lists {game} on {counted(len(found.channels), "channel")} now, but '
                              f'none of those listings is one Record would pick for it')
             return play
-    play.member, why, _source = _sports_member(sources, blocked_account_ids_now(), allowed, exclude_ids,
-                                               live=True, viewer_id=viewer_id)
+    play.member, why, source = _sports_member(sources, blocked_account_ids_now(), allowed, exclude_ids,
+                                              live=True, viewer_id=viewer_id)
     if play.member is None:
         play.why_none = sports_drop_words(why, game, named=found.named is not None)
+    elif picked.why is not None:
+        # The reason is the first choice's; a play that walked past it says that instead.
+        play.picked = (picked.why.text if source is sources[0]
+                       else 'Not the first choice: an earlier channel in the order could not be used.')
     return play
 
 
@@ -1591,9 +1597,9 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False) ->
             _sessions.pop(session.id, None)
         return start_waiting(play, client, cfg, held=_screen_mod().HELD_NO_CONNECTION)
     _ensure_reaper()
-    log.info('Viewer %s from %s: %s playing channel %d (%s) on account %d%s', session.id,
+    log.info('Viewer %s from %s: %s playing channel %d (%s) on account %d%s%s', session.id,
              client, session.label, session.channel_id, session.channel_name, session.account_id,
-             f' ({play.note})' if play.note else '')
+             f' ({play.note})' if play.note else '', f' Why this channel: {play.picked}' if play.picked else '')
     return session
 
 
@@ -1901,7 +1907,7 @@ def _screen_note(session: RelaySession) -> str:
     if session.left_screen_at is None:
         what = f', waiting for {session.waiting_for}' if session.waiting_for else ''
         return f'Watched only the waiting screen, for {waited}{what}.'
-    return f'Was on the waiting screen for {waited} before the game came on.'
+    return f'Was on the waiting screen for {waited} before it came on.'
 
 
 def reserve_short_note(ring: Ring) -> str:
@@ -2742,7 +2748,8 @@ def start_waiting(play: Play, client: str, cfg: dict, held: str = None) -> Relay
         screen = _screen_of(play, cfg, held)
         path, still = _clip_for(cfg, row_id, screen)
     except ss.ClipFailed as exc:
-        why = play.why_none or 'the game cannot start here yet'
+        from .sports_feed import event_word
+        why = play.why_none or f'the {event_word(play.served.league)} cannot start here yet'
         message = f'Nothing to play for {play.label}: {why}. Its waiting screen could not be shown: {exc}.'
         _note_refused(play.feed_id, play.label, client, message)
         log.warning('Viewer from %s refused: %s', client, message)

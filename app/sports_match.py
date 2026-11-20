@@ -25,7 +25,7 @@ from datetime import datetime, time, timedelta
 
 from sqlalchemy import and_, or_
 
-from . import admission, db, event_names, sports_skips
+from . import admission, db, event_names, sports_skips, sports_words
 from .database import (
     Account, Channel, EPGEntry, SPORTS_AIRING_FIRST, SPORTS_AIRING_REPLAY, SPORTS_AIRING_UNKNOWN,
     SPORTS_MATCH_KIND_CHANNEL_NAME, SPORTS_MATCH_KIND_GUIDE, SPORTS_MATCH_STRONG, SPORTS_MATCH_WEAK, SportsEvent, SportsLeague,
@@ -34,6 +34,7 @@ from .database import (
 from .db_utils import chunked, retry_on_locked
 from .fmt_utils import counted
 from .program_titles import strip_marks, title_key
+from .us_states import state_spellings
 from .tz_utils import format_local, get_display_tz, is_24h
 
 log = logging.getLogger(__name__)
@@ -109,6 +110,10 @@ _SESSION_KINDS = (
     (SESSION_SPRINT, re.compile(r'\bsprint\b(?! cup)')),
 )
 _PRACTICE_NUMBER = re.compile(r'\b(?:practice|fp) ?([1-9])\b|\b([1-9])(?:st|nd|rd|th) (?:free )?practice\b')
+#: `P2` is Practice 2 in a motorsport guide listing (`FIA Formula 1: Las Vegas P2`), and only there:
+#: a padel tournament's tier is `P1` and a show's second part `P2`, so it is read only for a guide
+#: row of a motorsport league, never for an event's or a channel's name (dev/changelog/1662).
+_SHORT_PRACTICE = re.compile(r'\bp([1-3])\b')
 #: Supercars' `Qualifying Race 35`, `Top 10 Shootout Race 36`.
 _RACE_NUMBER = re.compile(r'\brace (\d+)\b')
 #: Words a session's name and its listings share whichever session it is, read past when comparing
@@ -126,13 +131,16 @@ class Session:
     number: int | None = None
 
 
-def session_of(text: str) -> Session:
-    """The session normalized text names, SESSION_RACE when it names none."""
+def session_of(text: str, short: bool = False) -> Session:
+    """The session normalized text names, SESSION_RACE when it names none. `short` also reads a
+    practice by its short name, `p2` (_SHORT_PRACTICE)."""
     for kind, pattern in _SESSION_KINDS:
         if pattern.search(text):
             found = (_PRACTICE_NUMBER if kind == SESSION_PRACTICE else _RACE_NUMBER).search(text)
             number = next((int(g) for g in found.groups() if g), None) if found else None
             return Session(kind, number)
+        if kind == SESSION_PRACTICE and short and (found := _SHORT_PRACTICE.search(text)):
+            return Session(SESSION_PRACTICE, int(found.group(1)))
     return Session(SESSION_RACE)
 
 
@@ -361,6 +369,9 @@ def _load_teams(lt: LeagueText, events: list, every_team: bool = False):
                 city = normalize(team.city)
             # A person's own names count whether or not the lookup has run (set_team_names).
             names += json.loads(team.own_names or '[]')
+        # `Miami (OH)` is `Miami (Ohio)` in a guide: a state in parentheses reads every way it is
+        # written (dev/changelog/1662).
+        names = [spelled for n in names if n for spelled in state_spellings(n)]
         folded = {normalize(n) for n in names if n and normalize(n)}
         every |= folded
         if tid in ids:
@@ -765,11 +776,11 @@ def _judge_matchup(event, lt: LeagueText, hits: list, trusted: bool, now: dateti
         elif checked:
             when = 'at the listed time' if abs(delta) <= AGREE else 'later the same day'
         elif held:
-            when = (f'near {clock(listed)}, where the guide lists it. The game had started at {clock(guide_start)} '
-                    f'when TheSportsDB moved it to {clock(event.start_at)}, and a game that has started keeps '
+            when = (f'near {clock(listed)}, where the guide lists it. It had started at {clock(guide_start)} '
+                    f'when TheSportsDB moved it to {clock(event.start_at)}, and one that has started keeps '
                     f'its start')
         elif behind:
-            when = (f'near {clock(behind)}, where the guide still lists it. TheSportsDB moved the game from '
+            when = (f'near {clock(behind)}, where the guide still lists it. TheSportsDB moved it from '
                     f'{clock(event.previous_start)} to {clock(event.start_at)}, and that is the time used')
         elif disagrees:
             when = (f'at {clock(guide_start)}, the time the guide lists. TheSportsDB lists '
@@ -833,7 +844,8 @@ def _race_words(text: str, lt: LeagueText) -> set:
 def _session_words(text: str, lt: LeagueText) -> set:
     """_race_words() less the session's own words and numbers, which are compared on their own: what
     is left says which race weekend it is."""
-    return {w for w in _race_words(text, lt) if w not in _SESSION_FILLER and not _SESSION_TOKEN.match(w)}
+    return {w for w in _race_words(text, lt) if w not in _SESSION_FILLER and not _SESSION_TOKEN.match(w)
+            and not (lt.league.sport in sports_words.RACE_SPORTS and _SHORT_PRACTICE.fullmatch(w))}
 
 
 def _nearest_alone(events: list, start: datetime):
@@ -920,11 +932,12 @@ def _judge_field_events(lt: LeagueText, events: list, rows: list, trusted: bool,
     of that session, and one that names none only ever of a race: a race-day replay once landed on
     the practice that was the only event on its day, 84 weak matches on prod (dev/changelog/1633)."""
     kinds = {e.id: event_session(e) for e in events}
+    short = lt.league.sport in sports_words.RACE_SPORTS
     hits = defaultdict(list)
     for row in rows:
         if lt.skips.says(sports_skips.KIND_RACE, row.text):
             continue
-        said = session_of(row.text)
+        said = session_of(row.text, short=short)
         if said.kind == SESSION_RACE:
             if row.minutes < lt.skips.minutes(sports_skips.LENGTH_RACE) or lt.evidence(row.text, row.category) is None:
                 continue
@@ -1162,9 +1175,9 @@ def _name_when(event, name_clock, strength: str, in_range: int, trusted: bool, c
         return 'on the date in its name, which gives no timezone', strength, False
     if level == event_names.LEVEL_NONE:
         if in_range > 1:
-            return (f'but its name gives no date and {in_range} games between these teams are within a week, so '
+            return (f'but its name gives no date and {in_range} meetings of these teams are within a week, so '
                     f'this is the nearest', SPORTS_MATCH_WEAK, False)
-        return 'and its name gives no date, so this is the only game between these teams within a week', strength, False
+        return 'and its name gives no date, so this is the only meeting of these teams within a week', strength, False
     raise ValueError(f'a name clock level nothing handles: {level!r}')
 
 

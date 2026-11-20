@@ -18,8 +18,8 @@ TheSportsDB at 8:15 PM, and a whole-game shift would have put the 8:00 listings 
 
 Read by every automated surface: the sports channels on the output feed
 (sports_match.listing_windows/airing_now), a league page's Record (sports_view.record_offer) and an
-event-channel pick (auto_rules_sports.event_pick). A recording made from the TV Guide or by hand keeps
-the times it was given.
+event-channel pick (auto_rules_sports.event_pick), where the wait holds only while the guide lists the
+game (dev/changelog/1660). A recording made from the TV Guide or by hand keeps the times it was given.
 
 Stored in config.yaml under sports_data.game_times: `go_by`, `cover_both_minutes` and `wait_hours`
 for the default, and `leagues`, keyed by TheSportsDB's league id, holding only the answers a league

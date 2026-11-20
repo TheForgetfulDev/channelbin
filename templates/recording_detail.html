@@ -1079,7 +1079,7 @@
       {% if sports.where %}{{ stat_row('Venue', sports.where) }}{% endif %}
       {% if sports.start %}
       {{ stat_row('Listed start', sports.start, sv_cls='warn',
-                  tip=('When TheSportsDB says the event starts. It is shown because it differs from the guide. ChannelBin made this recording for the game, so while it is scheduled its times follow the time its league goes by, and once it is recording its end moves later if TheSportsDB moves the start later, unless you change them.' if sports.follows else 'When TheSportsDB says the event starts. It is shown because it differs from the guide, and it never changes when this recording starts or stops: ChannelBin did not set its times, so it keeps the times it was given.')) }}
+                  tip=('When TheSportsDB says the event starts. It is shown because it differs from the guide. ChannelBin made this recording for the ' ~ sports.one ~ ', so while it is scheduled its times follow the time its league goes by, and once it is recording its end moves later if TheSportsDB moves the start later, unless you change them.' if sports.follows else 'When TheSportsDB says the event starts. It is shown because it differs from the guide, and it never changes when this recording starts or stops: ChannelBin did not set its times, so it keeps the times it was given.')) }}
       {% endif %}
       {% if sports.pair %}
       {#- Cover both's two recordings of one game (app/sports_view.py::_cover_pair, dev/changelog/1631).

@@ -110,7 +110,7 @@
      what the rule is doing about each. Read from auto_rules_view._sports_context(). #}
   <div class="card" data-section="games">
     <div class="card-head">
-      <h2>Expected games{% if sports.rows %} <span class="cnt">{{ sports.rows | length }}</span>{% endif %}</h2>
+      <h2>Expected {{ sports.many }}{% if sports.rows %} <span class="cnt">{{ sports.rows | length }}</span>{% endif %}</h2>
       {% if sports.league_url %}
       <div class="card-head-actions">
         <a class="btn btn-sm" href="{{ sports.league_url }}">{{ about }} on Sports Schedules <span class="arw">{{ icon('forward') }}</span></a>
@@ -119,17 +119,17 @@
     </div>
     <div class="card-body">
       {% if sports.rows %}
-      <p class="card-note">The games of {{ about }} in the next {{ sports.horizon }} days, from TheSportsDB, and
-        what this rule is doing about each. A game the guide does not list yet is normal days ahead. Times
+      <p class="card-note">The {{ sports.many }} of {{ about }} in the next {{ sports.horizon }} days, from TheSportsDB, and
+        what this rule is doing about each. {{ sports.a_one | capitalize }} the guide does not list yet is normal days ahead. Times
         are TheSportsDB's. {{ sports.trust }}</p>
       <div class="table-scroll">
         <table class="tbl tbl-cards rl-tbl">
-          <thead><tr><th>When</th><th>Game</th><th>Where it&rsquo;s on</th><th>This rule</th></tr></thead>
+          <thead><tr><th>When</th><th>{{ sports.one | capitalize }}</th><th>Where it&rsquo;s on</th><th>This rule</th></tr></thead>
           <tbody>
             {% for g in sports.rows %}
             <tr>
               <td data-label="When" class="rl-when"><span class="day">{{ g.when.day }}</span>{{ g.when.time }}{% if g.when.was %}<span class="was tip-plain" data-tip="{{ g.when.was_tip }}">{{ g.when.was }}</span>{% endif %}</td>
-              <td data-label="Game" class="rl-prog"><span class="t">{{ g.title }}</span>{% if g.postponed %}<span class="s text-warning">Postponed</span>{% endif %}{% if g.venue %}<span class="s">{{ g.venue }}</span>{% endif %}</td>
+              <td data-label="{{ sports.one | capitalize }}" class="rl-prog"><span class="t">{{ g.title }}</span>{% if g.postponed %}<span class="s text-warning">Postponed</span>{% endif %}{% if g.venue %}<span class="s">{{ g.venue }}</span>{% endif %}</td>
               <td data-label="Where it&rsquo;s on" class="rl-prog rl-cell"><span class="{{ 't' if g.where.open else 'sp-none' }}">{{ g.where.text }}</span>{% if g.where.sub %}<span class="s">{{ g.where.sub }}</span>{% endif %}{% if g.where.also %}<span class="s">{{ g.where.also }}</span>{% endif %}</td>
               <td data-label="This rule" class="rl-prog rl-cell">{{ m.status_badge(g.rule.badge[0], g.rule.badge[1]) }}
                 {%- for sub in g.rule.subs %}
@@ -143,10 +143,10 @@
         </table>
       </div>
       {% else %}
-      <p class="card-note">TheSportsDB lists no games of {{ about }} in the next {{ sports.horizon }} days, or its
+      <p class="card-note">TheSportsDB lists no {{ sports.many }} of {{ about }} in the next {{ sports.horizon }} days, or its
         schedule has not been fetched yet. Sports Schedules says which.</p>
       {% endif %}
-      <p class="sp-credit">Game details from TheSportsDB.</p>
+      <p class="sp-credit">{{ sports.one | capitalize }} details from TheSportsDB.</p>
     </div>
   </div>
   {% endif %}
@@ -193,7 +193,7 @@
         {% endif %}
       </div>
       <p class="card-note">The search is the rule: whatever it finds is what the rule records.{% if sports and sports.event_channels %}
-        A game the guide has no listing of is recorded from an event channel instead, which the search
+        {{ sports.a_one | capitalize }} the guide has no listing of is recorded from an event channel instead, which the search
         cannot find: its account, day and time filters apply to those channels, and its text, tag, group,
         category and length filters do not.{% endif %}</p>
     </div>
