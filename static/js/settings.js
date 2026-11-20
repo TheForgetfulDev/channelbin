@@ -761,6 +761,96 @@
   }
   window.addEventListener('scroll', syncSpy, { passive: true });
 
+  // ── Reverse-proxy check ───────────────────────────────────────────────
+  // Two reads of /api/settings/proxy-check (app/output_feed_view.py::proxy_check): one as
+  // the browser sends it, to see whether a proxy is there at all, and one with a planted
+  // X-Forwarded-For, to see what the proxy does with a value a visitor sent. The planted
+  // read alone cannot tell "no proxy" from "a proxy that passes it on", so it is believed
+  // only after the first read saw one. It explains and never touches the switch.
+  const PROXY_TONE = {
+    none: 'info', direct: 'info', right: 'ok', mismatch: 'warn', dropped: 'warn', passed: 'bad',
+  };
+  const proxyVerdict = (plain, probe) => {
+    if (!plain.proxied) return plain.configured || plain.wired ? 'direct' : 'none';
+    if (probe.probe === 'passed') return 'passed';
+    if (probe.probe === 'dropped') return 'dropped';
+    if (probe.probe === 'appended' || probe.probe === 'replaced') {
+      return plain.would.origin === window.location.origin ? 'right' : 'mismatch';
+    }
+    throw new Error(`Unknown proxy probe answer "${probe.probe}"`);
+  };
+  const proxySwitchLine = (plain, verdict) => {
+    if (plain.configured && plain.wired) return 'The switch is on.';
+    if (plain.configured) return 'The switch is on and waits for a restart.';
+    if (plain.wired) return 'The switch is off and waits for a restart.';
+    return verdict === 'right' ? 'The switch is off, and it is safe to turn on.' : 'The switch is off.';
+  };
+  const proxyText = (verdict, plain, probe) => {
+    const here = window.location.origin;
+    if (verdict === 'none') {
+      return 'No reverse proxy seen: this page came straight to ChannelBin. Leave the switch off, '
+        + 'unless you also reach ChannelBin through a proxy. Then open Settings through it and check again.';
+    }
+    if (verdict === 'direct') {
+      return 'This page came straight to ChannelBin, not through a proxy, so the switch changes nothing '
+        + 'for this visit. Open Settings through your proxy and check again to see that it works.';
+    }
+    if (verdict === 'passed') {
+      return 'Not safe yet. Your proxy passes on the X-Forwarded-For a browser sends instead of adding '
+        + 'the visitor\'s own address, so with the switch on anyone could claim any address and the login '
+        + 'lockout would never catch them. Change the proxy first (nginx: proxy_set_header '
+        + 'X-Forwarded-For $proxy_add_x_forwarded_for).';
+    }
+    if (verdict === 'dropped') {
+      return 'Not right yet. Your proxy sends no X-Forwarded-For, so even with the switch on ChannelBin '
+        + 'would see every visitor as the proxy\'s address and the login lockout would count everyone '
+        + 'as one. Your proxy needs to send it (nginx: proxy_set_header X-Forwarded-For '
+        + '$proxy_add_x_forwarded_for).';
+    }
+    if (verdict === 'mismatch') {
+      return `Not right yet. With the switch on, ChannelBin would think this page is at ${plain.would.origin}, `
+        + `but your browser is at ${here}, so IPTV players would be handed the wrong address. Your proxy `
+        + 'needs to send X-Forwarded-Proto and X-Forwarded-Host (nginx: proxy_set_header X-Forwarded-Proto '
+        + '$scheme and proxy_set_header X-Forwarded-Host $http_host).';
+    }
+    if (verdict === 'right') {
+      const how = probe.probe === 'appended' ? 'adds your address to X-Forwarded-For'
+        : 'writes X-Forwarded-For itself';
+      return `Looks right. Through your proxy, ChannelBin would see you as ${plain.would.client} at ${here}, `
+        + `and your proxy ${how}, which is safe.`;
+    }
+    throw new Error(`Unknown proxy verdict "${verdict}"`);
+  };
+  const proxyHops = (plain) => (plain.forwarded_for.length > 1
+    ? ` X-Forwarded-For carries ${plain.forwarded_for.length} addresses (${plain.forwarded_for.join(', ')}). `
+      + 'ChannelBin believes only the last, the one your nearest proxy added, so if another proxy sits '
+      + 'in front of it (Cloudflare, say), visitors show as that proxy\'s address.'
+    : '');
+  const proxyBtn = $('#proxy-check-btn');
+  const proxyOut = $('#proxy-check-result');
+  const showProxy = (tone, text) => {
+    proxyOut.className = `notice notice-${tone} proxy-check-result`;
+    proxyOut.textContent = text;
+    proxyOut.hidden = false;
+  };
+  proxyBtn?.addEventListener('click', async () => {
+    proxyBtn.disabled = true;
+    try {
+      const plain = await jsonFetch('/api/settings/proxy-check');
+      const probe = plain.proxied
+        ? await jsonFetch('/api/settings/proxy-check?probe=1',
+          { headers: { 'X-Forwarded-For': plain.planted } })
+        : null;
+      const verdict = proxyVerdict(plain, probe);
+      showProxy(PROXY_TONE[verdict],
+        `${proxyText(verdict, plain, probe)} ${proxySwitchLine(plain, verdict)}${proxyHops(plain)}`);
+    } catch (err) {
+      showProxy('warn', `The test could not run: ${err.message || 'no answer from ChannelBin'}.`);
+    } finally {
+      proxyBtn.disabled = false;
+    }
+  });
+
   // ── Boot ────────────────────────────────────────────────────────────────
   syncPicker();
   applyFilters();

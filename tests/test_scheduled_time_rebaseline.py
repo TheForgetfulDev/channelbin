@@ -121,8 +121,9 @@ class ScheduledWindowRebaselineTests(unittest.TestCase):
 
         ev = (RecordingEvent.query
               .filter_by(recording_id=rid, event_type=RECORDING_EDITED).one())
-        self.assertIn('09:15:00', ev.detail)
-        self.assertIn('09:25:00', ev.detail)
+        # In the display timezone (dev/docs/BUGS.md 2026-11-19 @ 09:45:31 PM ET).
+        from app.tz_utils import format_local
+        self.assertIn(f'{format_local(self.stop)} → {format_local(new_stop)}', ev.detail)
 
     def test_an_edit_that_changes_nothing_leaves_the_window_alone(self):
         rid = self._make_scheduled()

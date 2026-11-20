@@ -245,6 +245,22 @@ def profiles_list():
     )
 
 
+@profiles_bp.route('/api/profiles/record-choices')
+def record_dialog_profiles():
+    """The profiles the shared record dialog offers, read each time it opens, so one made
+    after a page loaded is in the list without a reload (guide.js::refreshRecordProfiles).
+    The page's own rendered list stays the dialog's fallback when this cannot be read."""
+    profiles = RecordingProfile.query.order_by(RecordingProfile.name).all()
+    return jsonify({'success': True, 'profiles': [{
+        'id': p.id,
+        'name': p.name,
+        'pre_padding_minutes': p.pre_padding_minutes,
+        'post_padding_minutes': p.post_padding_minutes,
+        # None = the profile leaves it to the global setting, as the select's data-move-full.
+        'move_when_account_full': p.move_when_account_full,
+    } for p in profiles]})
+
+
 @profiles_bp.route('/api/profiles', methods=['POST'])
 def create_profile():
     values, error = _read_profile_body()

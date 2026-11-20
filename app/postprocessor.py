@@ -13,7 +13,7 @@ from datetime import datetime
 from flask import has_app_context
 
 from .db_utils import release_idle_connection, retry_on_locked
-from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration, plural
+from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration, join_labels, plural
 from .fs_utils import ensure_dir
 from .proc_utils import (TIMELINE_GAP_KEEP_SECONDS, iter_stderr_error_lines, supervise_ffmpeg,
                          terminate_or_kill, write_concat_list)
@@ -85,6 +85,7 @@ _analysis_progress_lock = threading.Lock()
 # the text a user reads while waiting on one.
 ANALYSIS_PASS_HEALTH = 'capture health'
 ANALYSIS_PASS_TIMELINE = 'damage scan'
+ANALYSIS_PASS_TRACK_GAPS = 'picture and sound gaps'
 ANALYSIS_PASS_FORMATS = 'format survey'
 ANALYSIS_PASS_LOUDNESS = 'loudness'
 
@@ -102,15 +103,16 @@ def analysis_pass_plan(cfg, pp) -> list:
     analysis reads nothing, and the surfaces show no progress rather than an empty bar.
 
     The order is the order do_postprocess runs them, because _start_analysis_pass numbers a
-    pass by its place here: with health data on, the health pass and the damage scan come
-    before the format reads; with it off, the damage scan runs last, from inside the
-    re-encode decision, after the survey and the loudness pass it reads with.
+    pass by its place here: with health data on, the health pass, the damage scan and the
+    picture-and-sound gap read come before the format reads; with it off, the damage scan
+    runs last, from inside the re-encode decision, after the survey and the loudness pass it
+    reads with.
     """
     plan = []
     mp4 = pp.get('enabled') and pp.get('format', 'mp4').lower().lstrip('.') == 'mp4'
     gather = cfg['recording'].get('gather_health_data', True)
     if gather:
-        plan += [ANALYSIS_PASS_HEALTH, ANALYSIS_PASS_TIMELINE]
+        plan += [ANALYSIS_PASS_HEALTH, ANALYSIS_PASS_TIMELINE, ANALYSIS_PASS_TRACK_GAPS]
     if mp4:
         plan.append(ANALYSIS_PASS_FORMATS)
         if pp.get('loudness_normalize'):
@@ -2191,6 +2193,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             if cfg['recording'].get('gather_health_data', True):
                 timeline_scan = _scan_recording_timeline(recording_id, ts_path,
                                                          analysis_plan=analysis_plan)
+                _scan_track_gaps(recording_id, ts_path, analysis_plan=analysis_plan)
                 _run_format_analysis()
                 # Near-empty/slate detection (compute-only, no extra ffprobe) and the
                 # capture-quality score correction both depend on what the timeline scan just
@@ -4048,6 +4051,134 @@ def _scan_recording_timeline(recording_id, ts_path, analysis_plan=None):
 
     _commit_timeline_diagnostics()
     return damaged, metrics, summary
+
+
+# How many stretches of each kind a track-gap event names in its sentence, and lists in its
+# extra_data. The counts and totals always cover every one.
+TRACK_GAPS_NAMED = 5
+TRACK_GAPS_LISTED = 20
+_TRACK_GAPS_DETAIL_PREFIX = 'Picture and sound gaps: '
+
+
+def _track_gap_places(spans) -> str:
+    """'at 6m 3s for 4.7 s and at 7m 9s for 8.6 s', the first TRACK_GAPS_NAMED only."""
+    places = [f'at {fmt_duration(start, with_seconds=True)} for {end - start:.1f} s'
+              for start, end in spans[:TRACK_GAPS_NAMED]]
+    if len(spans) > TRACK_GAPS_NAMED:
+        places.append(f'{len(spans) - TRACK_GAPS_NAMED} more')
+    return join_labels(places)
+
+
+def track_gaps_summary(gaps: dict, joined_segments: int = 1) -> str:
+    """The track-gap event's sentence for probe.track_gaps()'s answer."""
+    has_video = gaps['video_stream'] is not None
+    has_audio = gaps['audio_stream'] is not None
+    parts = []
+
+    def _clause(spans, what):
+        total = sum(end - start for start, end in spans)
+        return (f'{what} for {total:.1f} s in {len(spans)} '
+                f'{plural(len(spans), "stretch", "stretches")} ({_track_gap_places(spans)})')
+
+    if gaps['both']:
+        parts.append(_clause(gaps['both'], 'Nothing on either track'))
+    if gaps['video_only']:
+        what = ('The picture stops with the sound playing on' if has_audio
+                else 'The picture stops (the file has no sound track)')
+        parts.append(_clause(gaps['video_only'], what))
+    if gaps['audio_only']:
+        what = ('The sound stops with the picture playing on' if has_video
+                else 'The sound stops (the file has no picture track)')
+        parts.append(_clause(gaps['audio_only'], what))
+    for kind, name, other in (('video', 'picture', 'sound'), ('audio', 'sound', 'picture')):
+        edge = gaps['edges'].get(kind)
+        if edge is None:
+            continue
+        if edge['empty']:
+            parts.append(f'The {name} track holds no packets at all')
+            continue
+        if edge['late']:
+            parts.append(f'The {name} starts {edge["late"]:.1f} s after the {other}')
+        if edge['early']:
+            parts.append(f'The {name} ends {edge["early"]:.1f} s before the {other}')
+    if not parts:
+        tracks = [name for name, present in (('picture', has_video), ('sound', has_audio))
+                  if present]
+        parts.append(f'none - the {join_labels(tracks)} '
+                     f'{plural(len(tracks), "runs", "run")} from start to end without a gap '
+                     f'over {gaps["gap_threshold"]} s')
+    summary = '. '.join(parts)
+    if gaps['truncated']:
+        summary += (f'. A track had more gaps than the scan lists, so the tracks are compared '
+                    f'only up to {fmt_duration(gaps["compared_until"], with_seconds=True)}')
+    if joined_segments > 1:
+        summary += (f'. Time lost between the {joined_segments} joined segments was closed '
+                    f'at the join and is not counted here - it is reported as Capture gaps')
+    return f'{_TRACK_GAPS_DETAIL_PREFIX}{summary}'
+
+
+def _scan_track_gaps(recording_id, ts_path, analysis_plan=None):
+    """Read the joined .ts for where the picture is missing, where the sound is, and where
+    both are, and record it as a DIAGNOSTICS event of kind 'track_gaps'. Returns
+    probe.track_gaps()'s dict, {} when the file could not be read.
+
+    Measurement only: nothing downstream acts on it. It exists to count how often a
+    recording has a stretch with nothing on either track - which converts to a still
+    picture over silence - on recordings made after the capture fixes of dev/changelog/1415
+    and 1423 (dev/changelog/1649). The numbers stay in extra_data until something sorts,
+    filters or displays them (CLAUDE.md, measurements that earn a column).
+    """
+    from . import db
+    from .database import DIAGNOSTICS, add_recording_event
+    from .probe import track_gaps
+
+    if not ts_path or not os.path.exists(ts_path):
+        log.warning('Recording %d: picture and sound gap read skipped, no file at %s',
+                    recording_id, ts_path)
+        return {}
+
+    # ffprobe is a non-idempotent side effect and stays OUTSIDE the retry closure below.
+    joined = _joined_segment_count(recording_id)
+    with _analysis_pass(recording_id, ANALYSIS_PASS_TRACK_GAPS, ts_path, analysis_plan) as hook:
+        gaps = track_gaps(ts_path, on_progress=hook)
+
+    extra = {'kind': 'track_gaps', 'joined_segments': joined}
+    if gaps:
+        detail = track_gaps_summary(gaps, joined)
+        extra.update({
+            'gap_threshold': gaps['gap_threshold'],
+            'video_stream': gaps['video_stream'],
+            'audio_stream': gaps['audio_stream'],
+            'audio_streams': gaps['audio_streams'],
+            'truncated': gaps['truncated'],
+            'compared_until_seconds': (round(gaps['compared_until'], 2)
+                                       if gaps['compared_until'] is not None else None),
+        })
+        for kind, edge in gaps['edges'].items():
+            extra[f'{kind}_empty'] = edge['empty']
+            extra[f'{kind}_late_seconds'] = round(edge['late'], 2)
+            extra[f'{kind}_early_seconds'] = round(edge['early'], 2)
+        for key in ('both', 'video_only', 'audio_only'):
+            spans = gaps[key]
+            extra[f'{key}_count'] = len(spans)
+            extra[f'{key}_seconds'] = round(sum(end - start for start, end in spans), 2)
+            extra[key] = [[round(start, 2), round(end, 2)]
+                          for start, end in spans[:TRACK_GAPS_LISTED]]
+    else:
+        # Observable failure path: an absent event would read as "never measured" and a
+        # silent one as "no gaps".
+        detail = (f'{_TRACK_GAPS_DETAIL_PREFIX}could not be measured - ffprobe could not read '
+                  f'the packets of {os.path.basename(ts_path)}')
+        extra['scan_failed'] = True
+    log.info('Recording %d: %s', recording_id, detail)
+
+    @retry_on_locked()
+    def _commit_track_gaps():
+        add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
+        db.session.commit()
+
+    _commit_track_gaps()
+    return gaps
 
 
 def _segment_formats(recording_id):

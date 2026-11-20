@@ -201,7 +201,8 @@ def create_app(config_overrides=None, start_scheduler=True):
 
     if cfg['flask'].get('behind_proxy'):
         from werkzeug.middleware.proxy_fix import ProxyFix
-        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+        from .config import PROXY_FIX_ARGS
+        app.wsgi_app = ProxyFix(app.wsgi_app, **PROXY_FIX_ARGS)
         # What this process is doing, as against what config.yaml says now: the key is read
         # here once, so a page asking "are the proxy's headers trusted" asks this.
         app.config['BEHIND_PROXY'] = True

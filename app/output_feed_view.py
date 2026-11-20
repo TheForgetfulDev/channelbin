@@ -2,13 +2,15 @@
 
 One function, page_context(), and a fixed number of queries whatever the guide holds: the
 catalog's own, the accounts, the sports channels' games, the listings on now for the channels
-being watched, and one page of Recent plays with its counts. Nothing here writes; the page's
-actions are app/routes/iptv_output.py.
+being watched, one page of Recent plays with its counts, and which version of the address
+notice was hidden. Nothing here writes; the page's actions are app/routes/iptv_output.py.
 
 The password never reaches this module's output. The Xtream card shows it through the settings
 reveal, and the two playlist addresses are handed over as templates with PASSWORD_SLOT where
 the password goes, so the page source holds no secret.
 """
+import json
+import logging
 from datetime import datetime, timedelta
 from urllib.parse import quote, urlsplit
 
@@ -16,11 +18,14 @@ from flask import url_for
 
 from . import connection_limits as connlim
 from . import output_feed
-from .config import MASK_SENTINEL, public_url
+from . import db
+from .config import MASK_SENTINEL, PROXY_FIX_ARGS, public_url
 from .database import (FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED, Account,
-                       EPGEntry, OutputFeedPlay)
+                       EPGEntry, OutputFeedPlay, UserPref)
 from .fmt_utils import counted, fmt_bytes, fmt_duration
 from .tz_utils import day_label, format_local, get_display_tz, is_24h
+
+log = logging.getLogger(__name__)
 
 STATE_ON = 'on'
 STATE_OFF = 'off'
@@ -38,11 +43,25 @@ PLAYS_PER_PAGE = 10
 #: rows its search and filters leave, so the server draws every row and hides all but the first.
 CHANNELS_PER_PAGE = 25
 
+#: The user pref holding which version of the "ChannelBin's address is not set" notice was
+#: hidden. A version, not a yes/no, so a release that changes what the notice says raises
+#: ADDRESS_NOTICE_VERSION and shows it once more (the group-create intro's pattern,
+#: dev/changelog/831). The page is handed both, so this is the one spelling of each.
+ADDRESS_NOTICE_PREF = 'iptv_address_notice_hidden_version'
+ADDRESS_NOTICE_VERSION = 1
+
 PROXY_UNSEEN = 'unseen'       # a reverse proxy's headers arrive and flask.behind_proxy is off
-PROXY_RESTART = 'restart'     # it was turned on in config.yaml and waits for a restart
+PROXY_RESTART = 'restart'     # it was turned on and waits for a restart
 #: The headers a reverse proxy adds to what it passes on.
 _PROXY_HEADERS = ('X-Forwarded-For', 'X-Forwarded-Proto', 'X-Forwarded-Host', 'X-Real-IP',
                   'Forwarded')
+#: What the Settings page's proxy check plants in X-Forwarded-For: a documentation address
+#: (RFC 5737) no visitor can really have, so finding it again says what the proxy did with it.
+PROXY_PROBE_ADDRESS = '203.0.113.7'
+PROBE_APPENDED = 'appended'   # the proxy added the visitor after the planted value
+PROBE_REPLACED = 'replaced'   # the proxy wrote its own value over it
+PROBE_PASSED = 'passed'       # the planted value came through as the last one: the proxy passed it on
+PROBE_DROPPED = 'dropped'     # no X-Forwarded-For at all: the proxy removed it and sends none
 PLAYS_ALL = 'all'
 
 #: What the IPTV Output page's mode setting says under each choice.
@@ -103,6 +122,67 @@ def proxy_state(cfg: dict, headers, wired: bool) -> str:
     if wired or not any(headers.get(name) for name in _PROXY_HEADERS):
         return ''
     return PROXY_RESTART if (cfg.get('flask') or {}).get('behind_proxy') else PROXY_UNSEEN
+
+
+def _forwarded_for(value) -> list:
+    return [part.strip() for part in str(value or '').split(',') if part.strip()]
+
+
+def proxy_check(environ, probe: bool) -> dict:
+    """What a request arrived with and what flask.behind_proxy would make of it, for the
+    Settings page's proxy check. Only the proxy headers are reported, never any other.
+
+    Read from the request as it arrived: with the setting already on, ProxyFix has rewritten
+    the environ and kept the originals under 'werkzeug.proxy_fix.orig', which are put back
+    before ProxyFix is run once more over a copy. Nothing here is applied to the request.
+
+    `probe` says the browser planted PROXY_PROBE_ADDRESS in X-Forwarded-For, and the answer
+    says what the proxy did with it: added the visitor after it (appended), wrote over it
+    (replaced), passed it on as the last value (passed), which is what lets a caller pick its
+    own address past the login lockout, or sent no X-Forwarded-For at all (dropped), which
+    leaves every visitor looking like the proxy even with the setting on. A request with no proxy in front also reads as
+    passed, so the page asks without the probe first and believes the probe only when that
+    first answer saw a proxy."""
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    from werkzeug.wrappers import Request
+
+    arrived = dict(environ)
+    arrived.update(environ.get('werkzeug.proxy_fix.orig') or {})
+    arrived.pop('werkzeug.proxy_fix.orig', None)
+    headers = Request(arrived).headers
+    found = {name: headers.get(name) for name in _PROXY_HEADERS if headers.get(name)}
+    seen = {}
+    ProxyFix(lambda env, start: seen.update(env) or [], **PROXY_FIX_ARGS)(dict(arrived), None)
+    direct, would = Request(arrived), Request(seen)
+    chain = _forwarded_for(found.get('X-Forwarded-For'))
+    if not probe:
+        planted = ''
+    elif not chain:
+        planted = PROBE_DROPPED
+    elif PROXY_PROBE_ADDRESS not in chain:
+        planted = PROBE_REPLACED
+    elif chain[-1] == PROXY_PROBE_ADDRESS:
+        planted = PROBE_PASSED
+    else:
+        planted = PROBE_APPENDED
+    return {
+        'proxied': bool(found), 'headers': found, 'forwarded_for': chain,
+        'direct': {'client': direct.remote_addr, 'origin': f'{direct.scheme}://{direct.host}'},
+        'would': {'client': would.remote_addr, 'origin': f'{would.scheme}://{would.host}'},
+        'probe': planted,
+    }
+
+
+def address_notice_hidden() -> bool:
+    """Whether this version of the address notice was hidden."""
+    pref = db.session.get(UserPref, ADDRESS_NOTICE_PREF)
+    try:
+        stored = int(json.loads(pref.value)) if pref and pref.value else 0
+    except (TypeError, ValueError, OverflowError):
+        log.warning('Stored %s %r is not a version number - showing the notice.',
+                    ADDRESS_NOTICE_PREF, pref.value)
+        stored = 0
+    return stored >= ADDRESS_NOTICE_VERSION
 
 
 def _connect(fcfg: dict, base: str) -> dict:
@@ -575,6 +655,8 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
         'redirects_some': output_feed.redirects_some(fcfg),
         'dormant': state != STATE_ON, 'mask': MASK_SENTINEL, 'bounds': output_feed.SETTING_BOUNDS,
         'address': address, 'proxy': proxy, 'channels_per_page': CHANNELS_PER_PAGE,
+        'address_notice': {'hidden': address['state'] == ADDRESS_UNSET and address_notice_hidden(),
+                           'pref': ADDRESS_NOTICE_PREF, 'version': ADDRESS_NOTICE_VERSION},
         'connect': _connect(fcfg, address['base']),
         'password_slot': PASSWORD_SLOT,
         'rows': views,

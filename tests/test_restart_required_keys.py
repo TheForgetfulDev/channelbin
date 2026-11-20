@@ -171,8 +171,8 @@ class SettingsSystemCardTests(ConfigSandbox):
         self.assertIn('Behind a reverse proxy', self.html)
 
     def test_it_renders_the_live_value(self):
-        row = self.html.split('data-path="flask.behind_proxy"', 1)[1].split('</div>\n</div>', 1)[0]
-        self.assertIn('value="true"', row)
+        row = self.html.split('data-path="flask.behind_proxy"', 1)[1].split('</label>', 1)[0]
+        self.assertIn('data-setting-path="flask.behind_proxy" checked', row)
 
 
 class SettingsBadgeTruthTests(unittest.TestCase):

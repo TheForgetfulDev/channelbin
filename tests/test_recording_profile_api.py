@@ -227,3 +227,41 @@ class ListPageTests(_Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RecordChoicesTests(_Base):
+    """GET /api/profiles/record-choices: the list the shared record dialog re-reads on every
+    open, so a profile made after a page loaded is offered without a reload
+    (dev/docs/BUGS.md 2026-11-19 @ 08:52:17 PM ET)."""
+
+    def test_lists_every_profile_by_name_with_what_the_dialog_reads(self):
+        self.make_profile(name='Zeta', pre_padding_minutes=5, post_padding_minutes=10,
+                          move_when_account_full=False)
+        self.make_profile(name='Alpha', move_when_account_full=True)
+        self.make_profile(name='Middle')
+        resp = self.client.get('/api/profiles/record-choices')
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual([p['name'] for p in data['profiles']], ['Alpha', 'Middle', 'Zeta'])
+        zeta = data['profiles'][2]
+        self.assertEqual(set(zeta), {'id', 'name', 'pre_padding_minutes', 'post_padding_minutes',
+                                     'move_when_account_full'})
+        self.assertEqual((zeta['pre_padding_minutes'], zeta['post_padding_minutes']), (5, 10))
+        self.assertIs(zeta['move_when_account_full'], False)
+        self.assertIs(data['profiles'][0]['move_when_account_full'], True)
+        self.assertIsNone(data['profiles'][1]['move_when_account_full'])
+
+    def test_a_profile_made_after_a_page_rendered_is_in_the_next_answer(self):
+        self.make_profile(name='First')
+        self.assertEqual(len(self.client.get('/api/profiles/record-choices')
+                             .get_json()['profiles']), 1)
+        self.assertEqual(self.post(name='Made later').status_code, 200)
+        names = [p['name'] for p in self.client.get('/api/profiles/record-choices')
+                 .get_json()['profiles']]
+        self.assertEqual(names, ['First', 'Made later'])
+
+    def test_every_page_with_the_dialog_is_told_where_to_read_it(self):
+        seed.make_channel(seed.make_account(), name='Chan', in_guide=True)
+        page = self.client.get('/guide').get_data(as_text=True)
+        self.assertIn('profileChoicesUrl: "/api/profiles/record-choices"', page)

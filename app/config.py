@@ -57,6 +57,11 @@ DEFAULT_XTREAM_DUMP_DIR = 'instance/xtream-dumps'
 # own sandboxed path (tests/support/app.py overrides flask.pidfile_path per TestApp).
 DEFAULT_PIDFILE_PATH = 'instance/channelbin.pid'
 
+# How flask.behind_proxy wraps the app (app/__init__.py): one proxy in front, whose
+# X-Forwarded-For / -Proto / -Host are believed and nothing further back. The Settings page's
+# proxy check runs ProxyFix with the same arguments to say what turning it on would do.
+PROXY_FIX_ARGS = {'x_for': 1, 'x_proto': 1, 'x_host': 1}
+
 # Fields that require a service restart to take effect (running code only reads these at
 # startup). Consulted by save_config()/record_config_changes() to decide whether a diffed
 # change should raise the "restart required" flag.
@@ -69,12 +74,13 @@ RESTART_REQUIRED_KEYS = {
     'channel_testing.window.dispatch_interval_minutes',
     'config_backup.enabled',
     'config_backup.backup_hour_et',
-    # flask.* and database.path are read-only in the GUI (behind_proxy renders in the
-    # System card; serve_mockups is raw-YAML-only), but the config.yaml tab writes them
-    # all the same - and each is read exactly once, inside create_app(), so an unflagged
-    # write reports success and silently does nothing. behind_proxy wires ProxyFix and
-    # serve_mockups registers a blueprint; neither is re-read per request
-    # (dev/changelog/586).
+    # The flask.* keys below and database.path are each read exactly once, inside
+    # create_app(), so an unflagged write reports success and silently does nothing. The
+    # GUI shows them read-only, but for flask.behind_proxy, a switch on the System card
+    # (routes/settings.py GUI_FLASK_KEYS); serve_mockups is raw-YAML-only; the config.yaml
+    # tab writes them all. behind_proxy wires ProxyFix and serve_mockups registers a
+    # blueprint; neither is re-read per request (dev/changelog/586). flask.public_url is not
+    # here: it is read per use (config.public_url()).
     'flask.port',
     'flask.host',
     'flask.debug',

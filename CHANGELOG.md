@@ -5,6 +5,34 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.46.0 - 2026-11-19
+
+Settings that explain the proxy and address, and where a recording's picture or sound goes
+missing.
+
+**Added**
+
+- Each recording's event log says where the picture stopped while the sound played on, where
+  the sound stopped, and where nothing was recorded on either track, with when and for how
+  long.
+- Behind a reverse proxy is a switch in Settings, with a Test button that, opened through the
+  proxy, says whether turning it on would work and whether the proxy is safe.
+
+**Changed**
+
+- Settings leads with ChannelBin's address, with examples and a plain note that it only changes
+  the address ChannelBin hands out and cannot lock you out. The port and host rows say why they
+  stay in config.yaml and how to fix a bad value.
+- The "ChannelBin's address is not set" notice on IPTV Output can be hidden.
+
+**Fixed**
+
+- A recording profile made after a page loaded now shows in the Record and Edit dialogs without
+  a reload. (#53)
+- Changing the profile while editing a scheduled recording now moves the start and end to the
+  new profile's padding, and says so when the times were set by hand and are kept. (#52)
+- Edit recording's events give the old and new times in your display timezone instead of UTC.
+
 ## 0.45.0 - 2026-11-19
 
 Preview ChannelBin's own channels, and follow a few teams of a league.

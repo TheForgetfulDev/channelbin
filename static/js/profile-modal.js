@@ -106,9 +106,10 @@ const RECORDING_PROFILE_SECTIONS = [
     title: 'Padding',
     fields: [
       { key: 'pre_padding_minutes', label: 'Pre-record padding', type: 'int', blankValue: 0,
-        meta: 'Starts this many minutes early. Applies only to recordings scheduled from ' +
-          'a TV Guide program, and only as a starting suggestion - you can still edit the ' +
-          'times before submitting. Blank counts as 0.' },
+        meta: 'Starts this many minutes early. Applies to recordings made from a guide ' +
+          'listing: when one is scheduled, and when an edit picks this profile while its times ' +
+          'are still the ones ChannelBin set. Only a starting suggestion - you can still edit ' +
+          'the times before saving. Blank counts as 0.' },
       { key: 'post_padding_minutes', label: 'Post-record padding', type: 'int', blankValue: 0,
         meta: 'Keeps recording this many minutes past the scheduled end, under the same ' +
           'terms as pre-record padding. Blank counts as 0.' },

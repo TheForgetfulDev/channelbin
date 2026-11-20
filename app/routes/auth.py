@@ -79,8 +79,9 @@ def login():
             'AUTH_LOGIN_LOCKOUT',
             title='Login lockout: too many failed attempts',
             body=('IP %s was locked out after %d failed login attempts. Locked out '
-                 'until %s. Client IP is only meaningful when flask.behind_proxy is '
-                 'enabled - otherwise every proxied request looks like one IP.'
+                 'until %s. Behind a reverse proxy, the IP is the visitor\'s own only when '
+                 '"Behind a reverse proxy" is on in Settings (System) - otherwise every '
+                 'visit through the proxy looks like one IP.'
                  % (ip, MAX_FAILURES, format_local(unlock_at))),
             source='auth',
         )

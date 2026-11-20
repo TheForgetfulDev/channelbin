@@ -1669,9 +1669,12 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .clone-type-opt.sel { border-color: var(--accent); background: var(--accent-soft); }
 .clone-type-opt input[type=radio] { accent-color: var(--accent); margin-right: 4px; }
 
-/* A notice whose text sits beside an action button rather than above it. */
+/* A notice whose text sits beside an action button rather than above it. The text takes the
+   width, so the button sits at the right edge however short the sentence is. */
 .notice-act { display: flex; align-items: flex-start; gap: 12px; }
-.notice-act > .btn { flex-shrink: 0; }
+.notice-act > :first-child { flex: 1; min-width: 0; }
+.notice-act > .btn, .notice-act > .notice-btns { flex-shrink: 0; }
+.notice-btns { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* Stacked radio choice with a description under each option (group-promote-modal.js's
    "which members may record" choices). Block-level labels, not the app's default inline
@@ -2466,6 +2469,8 @@ body.actbar-on #app-toast { bottom: 78px; }
   align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
 .fl-desc { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.45; }
 .fl-default { font-size: var(--fs-sm); color: var(--text-faint); margin-top: 3px; }
+.fl-eg { font-size: var(--fs-md); color: var(--text-muted); margin-top: 3px; }
+.fl-eg code { background: var(--bg2); border-radius: var(--radius-sm); padding: 0 5px; }
 .fl-default code { background: var(--bg2); border-radius: var(--radius-sm); padding: 0 5px; color: var(--text-muted); }
 /* DESIGN.md 15.1: the config key is always visible. Never hover-only - a phone
    has no hover, so a hover-only key is unreachable. */

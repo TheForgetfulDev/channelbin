@@ -62,21 +62,25 @@ def _pp(enabled=True, fmt='mp4', mode='damaged', loudness=False):
 class AnalysisPassPlanTests(unittest.TestCase):
     """Pure, no app: the denominator "pass N of M" is measured against."""
 
-    def test_the_ordinary_recording_runs_three_reads(self):
+    def test_the_ordinary_recording_runs_four_reads(self):
+        """The picture-and-sound gap read runs with health data, after the damage scan
+        (dev/changelog/1649)."""
         self.assertEqual(ppmod.analysis_pass_plan(_cfg(), _pp()),
                          [ppmod.ANALYSIS_PASS_HEALTH, ppmod.ANALYSIS_PASS_TIMELINE,
-                          ppmod.ANALYSIS_PASS_FORMATS])
+                          ppmod.ANALYSIS_PASS_TRACK_GAPS, ppmod.ANALYSIS_PASS_FORMATS])
 
     def test_loudness_leveling_adds_its_own_read(self):
         """dev/changelog/1184: the ebur128 pass runs only when leveling is on."""
         self.assertEqual(ppmod.analysis_pass_plan(_cfg(), _pp(loudness=True)),
                          [ppmod.ANALYSIS_PASS_HEALTH, ppmod.ANALYSIS_PASS_TIMELINE,
-                          ppmod.ANALYSIS_PASS_FORMATS, ppmod.ANALYSIS_PASS_LOUDNESS])
+                          ppmod.ANALYSIS_PASS_TRACK_GAPS, ppmod.ANALYSIS_PASS_FORMATS,
+                          ppmod.ANALYSIS_PASS_LOUDNESS])
 
     def test_an_mkv_conversion_runs_no_format_survey(self):
         """The survey serves the mp4 audio re-encode; an mkv conversion copies everything."""
         self.assertEqual(ppmod.analysis_pass_plan(_cfg(), _pp(fmt='mkv', loudness=True)),
-                         [ppmod.ANALYSIS_PASS_HEALTH, ppmod.ANALYSIS_PASS_TIMELINE])
+                         [ppmod.ANALYSIS_PASS_HEALTH, ppmod.ANALYSIS_PASS_TIMELINE,
+                          ppmod.ANALYSIS_PASS_TRACK_GAPS])
 
     def test_health_data_off_leaves_only_the_scan_the_reencode_decision_needs(self):
         """do_postprocess still scans in that case, or turning health data off would
@@ -361,6 +365,25 @@ class AnalysisWiringTests(unittest.TestCase):
         self.assertEqual(seen.get('pass_label'), ppmod.ANALYSIS_PASS_TIMELINE)
         self.assertEqual(seen.get('pass_number'), 2)
         self.assertAlmostEqual(seen.get('pct'), 25.0)
+        self.assertIsNone(ppmod.analysis_progress(self.rid))
+
+    def test_the_track_gap_read_publishes_while_it_reads(self):
+        """dev/changelog/1649: the gap read is a whole-file pass of its own and names
+        itself while it runs, like the two before it."""
+        seen = {}
+        plan = self.plan + [ppmod.ANALYSIS_PASS_TRACK_GAPS]
+
+        def _fake_gaps(path, **kwargs):
+            kwargs['on_progress'](3000)
+            seen.update(ppmod.analysis_progress(self.rid) or {})
+            return {}
+
+        with mock.patch.object(probemod, 'track_gaps', side_effect=_fake_gaps):
+            ppmod._scan_track_gaps(self.rid, self.path, analysis_plan=plan)
+
+        self.assertEqual(seen.get('pass_label'), ppmod.ANALYSIS_PASS_TRACK_GAPS)
+        self.assertEqual(seen.get('pass_number'), 3)
+        self.assertAlmostEqual(seen.get('pct'), 75.0)
         self.assertIsNone(ppmod.analysis_progress(self.rid))
 
     def test_a_scan_outside_the_phase_publishes_nothing(self):
