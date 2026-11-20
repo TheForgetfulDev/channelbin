@@ -190,13 +190,32 @@ class AdjustStopKeepsTheInstantTests(_FormCase):
         with mock.patch('app.routes.recordings.datetime') as fake_dt:
             fake_dt.utcnow.return_value = datetime(2027, 11, 7, 4, 0)
             fake_dt.fromisoformat = datetime.fromisoformat
-            with mock.patch('app.routes.recordings.schedule_recording'), \
-                    mock.patch('app.routes.recordings.unschedule_recording'):
+            with mock.patch('app.scheduler.reschedule_recording_stop'):
                 resp = self.t.client.post(f'/recordings/{rec.id}/adjust-stop', json={
                     'stop_time': '2027-11-07T01:30', 'stop_time_utc': '2027-11-07T06:30:00Z'})
         self.assertEqual(resp.status_code, 200, resp.get_json())
         db.session.expire_all()
         self.assertEqual(db.session.get(Recording, rec.id).stop_time, SECOND_130)
+
+    def test_moving_the_stop_arms_only_the_stop_job(self):
+        """The start has already happened: arming it again fires a start that skips itself
+        as already running, and tearing every job down also drops a pending retry/resume."""
+        rec = seed.make_recording(
+            status=REC_STATUS_IN_PROGRESS, name='Running', channel_id=self.ch.id,
+            start_time=datetime(2027, 11, 7, 3, 0), stop_time=datetime(2027, 11, 7, 5, 0))
+        db.session.commit()
+        with mock.patch('app.routes.recordings.datetime') as fake_dt:
+            fake_dt.utcnow.return_value = datetime(2027, 11, 7, 4, 0)
+            fake_dt.fromisoformat = datetime.fromisoformat
+            with mock.patch('app.scheduler.reschedule_recording_stop') as rearm_stop, \
+                    mock.patch('app.routes.recordings.schedule_recording') as schedule, \
+                    mock.patch('app.routes.recordings.unschedule_recording') as unschedule:
+                resp = self.t.client.post(f'/recordings/{rec.id}/adjust-stop', json={
+                    'stop_time': '2027-11-07T01:30', 'stop_time_utc': '2027-11-07T06:30:00Z'})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        rearm_stop.assert_called_once_with(rec.id, SECOND_130)
+        schedule.assert_not_called()
+        unschedule.assert_not_called()
 
 
 if __name__ == '__main__':
