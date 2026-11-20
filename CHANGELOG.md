@@ -5,6 +5,30 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.47.0 - 2026-11-20
+
+Record games no guide lists, and the right word for each sport.
+
+**Added**
+
+- A game's recording says in its events why its channel was picked out of every channel
+  carrying the game, and a sports channel on the IPTV output says the same when it starts
+  playing one. (#55)
+- Soccer, tennis, rugby and cricket say "match", everywhere a league's events are named. (#61)
+
+**Fixed**
+
+- A game with no guide listing, carried only by event channels, can be recorded on
+  TheSportsDB's time however far off it is, instead of only from 24 hours before. The
+  recording moves with TheSportsDB if the game is moved before it starts, and a greyed-out
+  Record names the one reason it has no start time. (#62)
+- Every motorsport league says "race" instead of "game" on its page, its rules, its
+  recordings' events and its sports channels on IPTV Output. (#56)
+- A school TheSportsDB names with a state abbreviation, like Miami (OH), is found in a listing
+  that spells the state out. (#64)
+- A practice listed as P1, P2 or P3 matches that practice instead of being read as the race.
+  (#65)
+
 ## 0.46.0 - 2026-11-19
 
 Settings that explain the proxy and address, and where a recording's picture or sound goes

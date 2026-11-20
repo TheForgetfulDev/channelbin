@@ -135,7 +135,7 @@ def rule_page(rule_id):
         abort(404)
     return render_template(
         'rule_detail.html', page_config=_page_config(),
-        sections=ctx.pop('sections'), section_names=auto_rules_view.SECTION_NAMES,
+        sections=ctx.pop('sections'), section_names=auto_rules_view.section_names(ctx.get('sports')),
         section_pref=read_section_pref(auto_rules_view.SECTIONS_PREF_KEY),
         sections_pref_key=auto_rules_view.SECTIONS_PREF_KEY, **ctx)
 

@@ -33,7 +33,7 @@ from sqlalchemy import func, or_, update
 from sqlalchemy.orm.exc import ObjectDeletedError
 from werkzeug.datastructures import MultiDict
 
-from . import admission, db
+from . import admission, db, sports_words
 from .database import (
     AutoRule, CANCEL_BEFORE_START, CANCEL_DURING_ANALYSIS, CANCEL_DURING_CAPTURE,
     CANCEL_DURING_CONVERSION, CANCEL_GROUP_CHANGE, Channel, ChannelGroup, EPGEntry,
@@ -50,7 +50,7 @@ from .database import (
     detach_recording_references,
 )
 from .db_utils import retry_on_locked
-from .fmt_utils import iso_seconds_or_none
+from .fmt_utils import counted, iso_seconds_or_none
 from .program_titles import title_key
 
 log = logging.getLogger(__name__)
@@ -375,6 +375,8 @@ class _Row:
     detail: str | None = None
     # TheSportsDB's id of a game recorded from an event channel; None on a listing's row.
     sports_event_tsdb_id: int | None = None
+    # Where that pick's start came from (auto_rules_sports.START_FROM_*).
+    sports_start_from: str | None = None
 
 
 @dataclass
@@ -476,7 +478,7 @@ def _row_snapshot(m: RuleMatch) -> _Row:
                 recording_id=m.recording_id, removed_status=m.removed_status,
                 removed_cancel_reason=m.removed_cancel_reason, channel_id=m.channel_id,
                 group_id=m.group_id, program_title=m.program_title, detail=m.detail,
-                sports_event_tsdb_id=m.sports_event_tsdb_id)
+                sports_event_tsdb_id=m.sports_event_tsdb_id, sports_start_from=m.sports_start_from)
 
 
 # ---------------------------------------------------------------------------
@@ -1415,6 +1417,9 @@ class _Judge:
         self.games = run.games if settings.scope is not None else None
         self.game_of = {}
         self.followers = set()
+        # {game id: its listings, best first} (auto_rules_sports.ranked_programs()), for the
+        # scheduled recording to say why its listing and channel (pick_reason()).
+        self.ranked = {}
 
     def games_first(self, programs):
         """For a rule that names a league: each game's keeper - of its listings that are not a
@@ -1424,10 +1429,12 @@ class _Judge:
         Everything else keeps its start order. A rule that names nothing is returned as it is."""
         if self.games is None:
             return programs
-        from .auto_rules_sports import keepers
+        from .auto_rules_sports import ranked_programs
         for p in programs:
             self.game_of[p.identity] = self.games.program_game(p, self.scope)
-        keep = keepers(programs, self.game_of)
+        self.ranked = ranked_programs(programs, self.game_of)
+        # keepers(): the first of each game's ranked listings.
+        keep = {ranked[0].identity for ranked in self.ranked.values()}
         followers = {p.identity for p in programs
                      if p.identity not in keep and self.game_of[p.identity][0] is not None
                      and any(self.game_of.get(k, (None,))[0] is self.game_of[p.identity][0]
@@ -1435,6 +1442,25 @@ class _Judge:
         self.followers = followers
         return ([p for p in programs if p.identity not in followers]
                 + [p for p in programs if p.identity in followers])
+
+    def why_picked(self, program, used, event=None):
+        """The PickReason for a recording of a game this rule is about, or None for a listing of
+        no game. A game's other listing, recorded as well as its keeper, says only why its channel."""
+        if self.games is None:
+            return None
+        if event is not None:
+            from .auto_rules_sports import named_order
+            named = named_order(self.games, event.game)
+            return name_reason(named) if named else None
+        game, _airing = self.game_of.get(program.identity, (None, None))
+        if game is None:
+            return None
+        ranked = self.ranked.get(game.id) or []
+        if ranked and ranked[0] is program:
+            return pick_reason(game, program, ranked, used)
+        channel, text, score, tied = channel_reason(program, used)
+        return PickReason(channel_text=text, channel=channel, listing_channels=len(program.showings), score=score,
+                          tied=tied)
 
     def note_created(self, program, holder, lead):
         """A recording this run made of a game is one the game's other listings, and its
@@ -1502,7 +1528,7 @@ class _Judge:
             if any(covers(rec.start, rec.stop, a, b) for a, b in spans):
                 where = f' on {h.where}' if h.where else ''
                 return (RULE_MATCH_SKIPPED_EXISTING,
-                        f'Same game, covered by the recording of "{h.title or rec.name}"{where}, '
+                        f'Same {self.games.one(game)}, covered by the recording of "{h.title or rec.name}"{where}, '
                         f'{self._when(rec.program_start or rec.start)}.')
         for row in self.picks:
             if row.recording_id is not None or not _pick_is_spoken_for(row, self.run.lib_by_id):
@@ -1513,7 +1539,7 @@ class _Judge:
             # off is another airing and cancels nothing here.
             if picked is game and abs(row.start - lead.start) <= PREGAME_SLACK:
                 return (RULE_MATCH_SKIPPED_EXISTING,
-                        f'Same game: you cancelled this rule\'s recording of '
+                        f'Same {self.games.one(game)}: you cancelled this rule\'s recording of '
                         f'"{row.program_title or game.title}", {self._when(row.start)}, so it is not '
                         'recorded from another listing either.')
         return None
@@ -1637,7 +1663,11 @@ def _schedule(rule_id, revision, program, row, settings, run, judge, event=None)
         s.group_name or s.channel_name for s in program.showings if s is not used)))
     where = (f'{used.group_name} (via {plan.get("member_name") or used.channel_name})'
              if args.get('group_id') else plan.get('channel_name') or used.channel_name)
-    detail = (_event_detail(event, when) if event is not None else f'Scheduled on {where}.')
+    detail = (_event_detail(event, when, judge.games.one(event.game)) if event is not None
+              else f'Scheduled on {where}.')
+    picked = judge.why_picked(program, used, event)
+    if picked is not None and picked.text:
+        detail += ' ' + picked.text
     if choice is not None and (choice.refused or choice.kept is not None):
         detail += ' ' + choice.sentence()
     if chosen_over:
@@ -1668,7 +1698,8 @@ def _schedule(rule_id, revision, program, row, settings, run, judge, event=None)
                    **({'passed_over_channel_ids': [s.channel_id for s in passed]} if passed else {}),
                    'warnings': sorted(plan.get('warnings', {})),
                    **({'sports_event_tsdb_id': event.game.tsdb_id, 'start_from': event.source}
-                      if event is not None else {})})
+                      if event is not None else {}),
+                   **(picked.extra() if picked is not None else {})})
         m = db.session.get(RuleMatch, row.id) if row is not None and row.id else None
         if m is None:
             m = RuleMatch(rule_id=rule_id, title_key=program.identity[0],
@@ -1868,21 +1899,22 @@ def seat_choice(program, profile_choice, cfg) -> SeatChoice:
                       max(0, len(candidates) - (MAX_SEAT_TRIES - 1)))
 
 
-def _event_detail(event, when) -> str:
+def _event_detail(event, when, one) -> str:
     """Why an event-channel recording exists and what its start rests on, said on its ledger row
     and its RECORDING_RULE_SCHEDULED event (DESIGN-sports-data.md 10)."""
     from .auto_rules_sports import START_FROM_NAME, START_FROM_TSDB
     head = (f'Read from the channel name "{event.named.said_by}", not a guide listing: the guide '
-            'has no listing of this game.')
+            f'has no listing of this {one}.')
     if event.named.source_name:
         head += (f' Recorded from "{event.named.channel_name}", the copy of that stream ChannelBin keeps, '
-                 'whose own name does not name the game.')
+                 f'whose own name does not name the {one}.')
     if event.source == START_FROM_NAME:
         return f'{head} Start: {when}, the time its name gives.'
     if event.source == START_FROM_TSDB:
         return (f'{head} Start not confirmed: the name gives no time zone, so this is TheSportsDB\'s '
-                f'time, {when}, which has matched your guide for this league. When the guide lists the '
-                'game, a listing this recording does not cover is scheduled too.')
+                f'time, {when}, which has matched your guide for this league. If TheSportsDB moves the {one} '
+                f'before it starts, this recording moves with it. When the guide lists the {one}, a listing this '
+                'recording does not cover is scheduled too.')
     raise ValueError(f'unknown event start source {event.source!r}')
 
 
@@ -1947,6 +1979,8 @@ class GamePick:
     event: object = None
     why: str = ''
     wider: '_Program' = None
+    # For WHY_NO_START, event_pick()'s own sentence: which start is missing and why.
+    said: str = ''
 
 
 #: A league page keeps a game all its day (sports_view), so its pick reads back that far.
@@ -1980,9 +2014,120 @@ class GameSources:
     """A game's pick and every showing it may be taken from, in the order to try them: the
     picked listing's showings first, in the order seat_choice() tries them (seat_order()), then
     the game's other listings in keepers' order, each the same way. A recording never leaves its
-    listing; a sports channel's play walks on past it when every showing of it fails."""
+    listing; a sports channel's play walks on past it when every showing of it fails. `why` is
+    the PickReason for the first of them."""
     pick: GamePick
     sources: list = field(default_factory=list)
+    why: 'PickReason' = None
+
+
+#: PickReason.listing: why this listing of the game, every value named in listing_reason().
+LISTING_ONLY = 'only'        # the guide has one listing of it
+LISTING_WIDEST = 'widest'    # the one most channels carry
+LISTING_NEAR = 'near'        # at the game's believed start, with a wider one too far from it
+#: PickReason.channel: why this channel of the listing, every value named in channel_reason().
+CHANNEL_ONLY = 'only'        # one channel has the listing
+CHANNEL_GROUP = 'group'      # a channel group goes ahead of single channels
+CHANNEL_HEALTH = 'health'    # the best health score, alone
+CHANNEL_TIE = 'tie'          # several share the best score: the first read
+CHANNEL_MOVED = 'moved'      # not the first choice: seat_choice() moved it, and says why itself
+CHANNEL_NAME = 'name'        # no listing: a channel whose name names the game
+
+
+@dataclass(frozen=True)
+class PickReason:
+    """Why a game is taken from one channel among those that carry it: a sentence for the
+    recording's create event, and the same facts for its `extra` (dev/changelog/1661). Built from
+    the order that made the pick (ranked_programs(), _programs(), named_order()), never a second
+    ranking."""
+    listing_text: str = ''
+    channel_text: str = ''
+    listing: str = ''
+    channel: str = ''
+    listing_channels: int = 0
+    game_channels: int = 0
+    score: int | None = None
+    tied: int = 0
+
+    @property
+    def text(self) -> str:
+        return f'{self.listing_text} {self.channel_text}'.strip()
+
+    def moved(self) -> 'PickReason':
+        """This reason for a recording seat_choice() moved off the first channel."""
+        return replace(self, channel_text='', channel=CHANNEL_MOVED, score=None, tied=0)
+
+    def extra(self) -> dict:
+        out = {'listing': self.listing, 'channel': self.channel, 'listing_channels': self.listing_channels,
+               'game_channels': self.game_channels, 'tied': self.tied}
+        out = {k: v for k, v in out.items() if v}
+        if self.score is not None:
+            out['score'] = self.score
+        return {'picked': out}
+
+
+def listing_reason(game, program, same) -> tuple:
+    """(LISTING_*, sentence) for `program`, the first of `same` - the game's listings it was ranked
+    among, in ranked_programs()' order."""
+    from .auto_rules_sports import near_start
+    n, total = len(program.showings), sum(len(p.showings) for p in same)
+    if len(same) == 1:
+        return LISTING_ONLY, f'It is the only listing of it in your guide, on {counted(n, "channel")}.'
+    widest = max(len(p.showings) for p in same)
+    if n == widest:
+        return LISTING_WIDEST, (f'Its listing is the one most channels carry: {n} of the {total} that list it, '
+                                f'across {counted(len(same), "listing")}.')
+    if near_start(game, program.lead.start):
+        return LISTING_NEAR, (f'Its listing starts when ChannelBin believes it starts, on {n} of the {total} channels '
+                              f'that list it. A listing on {widest} channels starts too far from that time.')
+    raise ValueError('a picked listing that is neither the widest nor at the start')
+
+
+def channel_reason(program, used) -> tuple:
+    """(CHANNEL_*, sentence, score, tied) for `used`, the showing of `program` a recording is made
+    from. The lead's reason is _programs()' order: a group, then health, then the first read."""
+    from .channel_groups import UNSCORED_NEUTRAL
+    n = len(program.showings)
+    if n == 1:
+        return CHANNEL_ONLY, 'It is the only channel with that listing.', None, 0
+    if used is not program.lead:
+        return CHANNEL_MOVED, '', None, 0
+    if used.group_id is not None:
+        return CHANNEL_GROUP, (f'Of the {n} channels with that listing, your channel group "{used.group_name}" goes '
+                               'first, since a group can switch channels if one fails.'), None, 0
+    tied = sum(1 for s in program.showings if s.group_id is None and s.score == used.score)
+    if tied == 1:
+        return CHANNEL_HEALTH, (f'Of the {n} channels with that listing, this one has the best health score '
+                                f'({used.score}).'), used.score, 1
+    untested = (f' {UNSCORED_NEUTRAL} is what a channel with no health check yet scores, so a health check would '
+                'tell them apart.' if used.score == UNSCORED_NEUTRAL else '')
+    return CHANNEL_TIE, (f'Of the {n} channels with that listing, {tied} share the best health score ({used.score}) '
+                         f'and nothing else tells them apart, so this is the first of them ChannelBin read.{untested}'
+                         ), used.score, tied
+
+
+def pick_reason(game, program, same, used=None) -> PickReason:
+    """The PickReason for a recording of `game` made from `used` (the lead when None), a showing of
+    `program`, which was ranked first among `same`."""
+    used = used or program.lead
+    listing, l_text = listing_reason(game, program, same)
+    channel, c_text, score, tied = channel_reason(program, used)
+    return PickReason(listing_text=l_text, channel_text=c_text, listing=listing, channel=channel,
+                      listing_channels=len(program.showings), game_channels=sum(len(p.showings) for p in same),
+                      score=score, tied=tied)
+
+
+def name_reason(named: list) -> PickReason:
+    """The PickReason for an event pick: `named` is named_order(), whose first is the pick's."""
+    n, best = len(named), named[0]
+    if n == 1:
+        text = 'It is the only channel whose name mentions it.'
+    else:
+        zone = ('a name that gives a time zone goes first, then ' if best.start is not None
+                and any(x.start is None for x in named) else '')
+        text = (f'Of the {n} channels whose names mention it, this one is first: {zone}the best health score '
+                f'({best.score}).')
+    return PickReason(channel_text=text, channel=CHANNEL_NAME, game_channels=n, score=best.score)
 
 
 def game_sources(event_id, now=None, cfg=None, listings=None):
@@ -2003,7 +2148,7 @@ def game_sources(event_id, now=None, cfg=None, listings=None):
 
     Reads only: no seat, no admission ticket, no row, so a page can ask it for "now". The
     route that records re-asks this, never the page."""
-    from .auto_rules_sports import GameIndex, Scope, name_pick, named_order, ranked_programs
+    from .auto_rules_sports import GameIndex, Scope, event_pick, name_pick, named_order, ranked_programs
     from .channel_search import GRAIN_AIRINGS, DimensionFilter, SearchContext, SearchState, default_standing_for
     from .config import load_config
     from .database import SportsEvent
@@ -2056,7 +2201,8 @@ def game_sources(event_id, now=None, cfg=None, listings=None):
                             channels=len(program.showings),
                             airing=games_of[program.identity][1],
                             wider=widest if len(widest.showings) > len(program.showings) else None)
-            return GameSources(pick, [s for p in ranked for s in seat_order(p)])
+            return GameSources(pick, [s for p in ranked for s in seat_order(p)],
+                               why=pick_reason(game, program, ranked))
     if listings is not None:
         return GameSources(GamePick(PICK_NONE, game=game, why=WHY_UNSURE if game.id in games.listed
                                     else WHY_UNLISTED))
@@ -2068,14 +2214,17 @@ def game_sources(event_id, now=None, cfg=None, listings=None):
             return GameSources(GamePick(PICK_NONE, game=game, why=WHY_ENDED))
         # Record takes the pick's channel; a play walks on down every channel naming the game
         # (dev/changelog/1643).
+        named = named_order(games, game)
         return GameSources(GamePick(PICK_EVENT, game=game, event=pick),
-                           [_event_showing(pick, n) for n in named_order(games, game)])
-    return GameSources(GamePick(PICK_NONE, game=game,
-                                why=WHY_NO_START if games.named_by.get(game.id) else WHY_UNLISTED))
+                           [_event_showing(pick, n) for n in named], why=name_reason(named))
+    if games.named_by.get(game.id):
+        return GameSources(GamePick(PICK_NONE, game=game, why=WHY_NO_START, said=event_pick(games, game)[1]))
+    return GameSources(GamePick(PICK_NONE, game=game, why=WHY_UNLISTED))
 
 
 #: How far an event pick's start may now read from where its recording sits before the rule says
-#: so: the recording keeps its slot either way, since nothing here moves one (design 10).
+#: so: nothing here moves one (design 10). A recording made on TheSportsDB's time is moved by
+#: sports_follow instead, after the check.
 _EVENT_DRIFT = timedelta(minutes=5)
 
 
@@ -2139,26 +2288,30 @@ def _merge_events(programs, followers, events) -> list:
 def _event_drift(row, game, games, judge, revision) -> str:
     """A sentence when an event-channel pick still SCHEDULED may be missed: its channel no longer
     names the game, or the start it can now stand behind reads differently. The recording keeps its
-    slot (TheSportsDB never moves one); the rule's last_problems says so every check, and the
-    recording's own event says so once. '' when nothing changed."""
-    from .auto_rules_sports import event_pick
+    slot; the rule's last_problems says so every check, and the recording's own event says so once.
+    '' when nothing changed, and for a start that differs on a pick made on TheSportsDB's time and
+    still on it: that recording moves with TheSportsDB (sports_follow, dev/changelog/1660), and says
+    so itself when it moves or when a person's times keep it."""
+    from .auto_rules_sports import START_FROM_TSDB, event_pick
     if _fate(row, judge.run.lib_by_id)[0] != REC_STATUS_SCHEDULED:
         return ''
     title = row.program_title or game.title
     names = {n.channel_id for n in games.named_by.get(game.id, ())}
     if row.channel_id not in names:
         reason = 'renamed'
-        sentence = (f'"{title}", {judge._when(row.start)}: its event channel no longer names the game, so '
+        sentence = (f'"{title}", {judge._when(row.start)}: its event channel no longer names the {games.one(game)}, so '
                     'the recording may catch whatever the channel shows next. It keeps its slot; check '
                     'the channel, or record the game from another one.')
     else:
         pick, _why = event_pick(games, game)
         if pick is None or abs(pick.start - row.start) <= _EVENT_DRIFT:
             return ''
+        if row.sports_start_from == START_FROM_TSDB and pick.source == START_FROM_TSDB:
+            return ''
         reason = 'start'
         sentence = (f'"{title}": its start now reads {judge._when(pick.start)}, not '
                     f'{judge._when(row.start)}, where the recording sits. It keeps its slot; move it if '
-                    'the game moved.')
+                    f'the {games.one(game)} moved.')
     if sentence not in (row.detail or ''):
         _note_event_drift(row, sentence, reason, judge, revision)
     return sentence
@@ -2863,11 +3016,12 @@ def _game_alert_after_run(rule_id, revision, settings, judge, now, state):
         return
     games = '; '.join(f'{g.title}, {_local(g.start, judge.run)}' for g in missing)
     _raise_standing(AUTO_RULE_GAME_UNLISTED, source,
-                    f'Auto-record rule "{settings.name}" has a game with nothing to record it from',
+                    f'Auto-record rule "{settings.name}" has {sports_words.a(judge.games.one(missing[0]))} with nothing '
+                    'to record it from',
                     f'{games}. {unrecordable_reason(missing, judge.scope, judge.games)} so this rule '
                     f'cannot record {"it" if len(missing) == 1 else "them"}. If a channel you know of carries '
                     f'{"it" if len(missing) == 1 else "one"}, record that channel by hand. This '
-                    'clears itself when a listing or an event channel appears, or the game starts.')
+                    'clears itself when a listing or an event channel appears, or it starts.')
     _unless_rule_moved(rule_id, revision)
 
 

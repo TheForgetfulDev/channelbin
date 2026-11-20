@@ -130,7 +130,7 @@ class ReadingTests(NameCase):
         for m in found:
             self.assertEqual((m.strength, m.airing), (SPORTS_MATCH_STRONG, SPORTS_AIRING_UNKNOWN))
             self.assertIsNone(m.program_start_time)
-            self.assertIn('its name gives no date, so this is the only game', m.reason)
+            self.assertIn('its name gives no date, so this is the only meeting', m.reason)
 
     def test_a_clock_with_no_timezone_counts_on_its_date(self):
         """`@ Nov 7 12:30 PM :Sportsnet+` is local to somewhere unknown, so only its date is used, and
@@ -457,7 +457,7 @@ class TimeTests(NameCase):
         self.assertEqual(self.named(tomorrow), [])
         (m,) = self.named(tonight)
         self.assertEqual(m.strength, SPORTS_MATCH_WEAK)
-        self.assertIn('2 games between these teams are within a week', m.reason)
+        self.assertIn('2 meetings of these teams are within a week', m.reason)
 
     def test_a_game_more_than_a_week_out_is_not_named_by_a_name_with_no_date(self):
         event = self.game(11, 12, start=NOW + timedelta(days=8))

@@ -11,6 +11,7 @@ import sys
 import unittest
 from unittest import mock
 from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -94,6 +95,37 @@ class MatchCase(unittest.TestCase):
     def trust(self, league):
         league.trust_sample, league.trust_agreed = 30, 30
         db.session.commit()
+
+
+class StateInParenthesesTests(MatchCase):
+    """A school TheSportsDB spells with a state's postal code in parentheses is the same school
+    with the state spelled out (dev/docs/BUGS.md 2026-11-20: `Miami (OH)` and `Miami (Ohio) at Kent
+    State`)."""
+
+    def setUp(self):
+        super().setUp()
+        for tid, full, nick in ((21, 'Harbor (OH)', 'Herons'), (22, 'Harbor (FL)', 'Storm'), (23, 'Ironvale State', 'Owls')):
+            self.teams[tid] = full
+            db.session.add(SportsTeam(tsdb_id=tid, full_name=full, names=json.dumps([full, nick]),
+                                      last_looked_up=NOW))
+        db.session.commit()
+
+    def test_the_spellings(self):
+        from app.us_states import state_spellings
+        self.assertEqual(state_spellings('Harbor (OH)'), ['Harbor (OH)', 'Harbor (Ohio)'])
+        self.assertEqual(state_spellings('Harbor (Ohio)'), ['Harbor (Ohio)', 'Harbor (OH)'])
+        self.assertEqual(state_spellings('Harbor (Fla.)'), ['Harbor (Fla.)', 'Harbor (FL)', 'Harbor (Florida)'])
+        for name in ('Ohio State', 'Washington', 'Harbor (Women)', 'Harbor', ''):
+            self.assertEqual(state_spellings(name), [name], name)
+
+    def test_the_state_spelled_out_matches_and_the_other_state_does_not(self):
+        game = self.game(23, 21)
+        other = self.game(23, 22, start=KICKOFF + timedelta(days=7), tsdb_id=991)
+        self.row('PFL Football', sub_title='Harbor (Ohio) at Ironvale State')
+        self.row('PFL Football', sub_title='Harbor (Fla.) at Ironvale State', start=KICKOFF + timedelta(days=7))
+        self.run_match()
+        self.assertEqual([m.program_sub_title for m in self.matches(game)], ['Harbor (Ohio) at Ironvale State'])
+        self.assertEqual([m.program_sub_title for m in self.matches(other)], ['Harbor (Fla.) at Ironvale State'])
 
 
 class LocalStationTests(MatchCase):
@@ -611,7 +643,7 @@ class StartedGameMovedTests(MatchCase):
         self.run_match(now=KICKOFF + timedelta(minutes=20))
         found = self.matches(self.event)
         self.assertEqual({(m.strength, m.airing) for m in found}, {(SPORTS_MATCH_STRONG, SPORTS_AIRING_FIRST)})
-        self.assertTrue(all('a game that has started keeps its start' in m.reason for m in found), found[0].reason)
+        self.assertTrue(all('and one that has started keeps its start' in m.reason for m in found), found[0].reason)
 
     def test_a_move_earlier_mid_game_changes_nothing(self):
         self.move(KICKOFF - timedelta(minutes=30))
@@ -980,6 +1012,28 @@ class SessionOfTests(unittest.TestCase):
                 ('Pretend Sprint Cup Series: Harbor 400', S(sports_match.SESSION_RACE))):
             self.assertEqual(sports_match.session_of(sports_match.normalize(text)), want, text)
 
+    def test_p1_p2_and_p3_are_practices(self):
+        """dev/docs/BUGS.md 2026-11-20: `FIA Formula 1: Las Vegas P2` was read as a race listing."""
+        S = sports_match.Session
+        for text, want in (
+                ('FIA Pretend Series: Harbor P1', S(sports_match.SESSION_PRACTICE, 1)),
+                ('FIA Pretend Series World Championship - FIA Pretend Series: Harbor P2', S(sports_match.SESSION_PRACTICE, 2)),
+                ('FIA Pretend Series: Harbor P3 ᴸᶦᵛᵉ', S(sports_match.SESSION_PRACTICE, 3)),
+                # Not a session: no fourth practice, and letters inside a word.
+                ('Pretend Series: Harbor P4', S(sports_match.SESSION_RACE)),
+                ('Pretend Series: Harbor GP2 Support', S(sports_match.SESSION_RACE)),
+                ('Pretend Series: Harbor MP3 Special', S(sports_match.SESSION_RACE))):
+            self.assertEqual(sports_match.session_of(sports_match.normalize(text), short=True), want, text)
+
+    def test_the_short_name_is_read_only_where_it_is_asked_for(self):
+        """An event's own name and a channel's name are never read this way: a padel tournament's
+        tier is `P1`."""
+        S = sports_match.Session
+        for text in ('Premier Padel Milano P1', 'FIA Pretend Series: Harbor P2'):
+            self.assertEqual(sports_match.session_of(sports_match.normalize(text)), S(sports_match.SESSION_RACE), text)
+        event = SimpleNamespace(home_team_id=0, away_team_id=0, name='Premier Padel Milano P1')
+        self.assertEqual(sports_match.event_session(event), S(sports_match.SESSION_RACE))
+
 
 class SessionTests(MatchCase):
     """Practice, qualifying, shootouts and sprints match as their own events (dev/changelog/1633), in
@@ -1025,6 +1079,26 @@ class SessionTests(MatchCase):
         self.assertEqual(race.guide_start, datetime(2099, 11, 22, 3, 55), "a session's listing never sets the race's")
         self.assertEqual(quali.guide_start, datetime(2099, 11, 21, 3, 0))
         self.assertIn('the qualifying, and the listing names this race weekend', self.matches(ev['q'])[0].reason)
+
+    def test_a_p2_listing_is_practice_2s_and_never_the_races(self):
+        """dev/docs/BUGS.md 2026-11-20: three channels listed `FIA Formula 1: Las Vegas P2` for 100
+        minutes, which was read as a race listing and matched nothing."""
+        ev = self.weekend()
+        self.row('FIA PSCS: Harbor P2', start=datetime(2099, 11, 20, 4, 0), minutes=100)
+        self.row('FIA PSCS: Harbor Grand Prix P3', start=datetime(2099, 11, 21, 0, 30), minutes=90)
+        self.run_match(now=datetime(2099, 11, 19, 12))
+        self.assertEqual({t for t, _s, _a in self.titles(ev['p2'])}, {'FIA PSCS: Harbor P2'})
+        self.assertEqual(self.titles(ev['p3']), {('FIA PSCS: Harbor Grand Prix P3', SPORTS_MATCH_STRONG,
+                                                  SPORTS_AIRING_FIRST)})
+        for key in ('p1', 'q', 'race'):
+            self.assertEqual(self.matches(ev[key]), [], key)
+
+    def test_p2_is_not_a_practice_in_a_league_that_is_not_a_motorsport(self):
+        tour = self.league(9004, 'Pretend Padel Tour', ['Pretend Padel Tour'], sport='Padel')
+        final = self.race('Harbor P2', datetime(2099, 11, 20, 4, 0), date(2099, 11, 19), tour)
+        self.row('Pretend Padel Tour: Harbor P2', start=datetime(2099, 11, 20, 4, 0), minutes=180)
+        self.run_match(now=datetime(2099, 11, 19, 12))
+        self.assertEqual([m.strength for m in self.matches(final)], [SPORTS_MATCH_STRONG])
 
     def test_matched_sessions_count_toward_the_leagues_trust(self):
         """Question 1(b) of dev/changelog/1629: F1 reaches 10 measured events in two weekends."""

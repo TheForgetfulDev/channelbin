@@ -189,7 +189,8 @@ RECORDING_SPORTS_LINKED             = 'RECORDING_SPORTS_LINKED'
 RECORDING_SPORTS_REMOVED            = 'RECORDING_SPORTS_REMOVED'
 # An auto-record rule recorded this game from an event channel, and what it read then changed:
 # the channel no longer names the game, or the start it can stand behind moved. The recording
-# keeps its slot, since TheSportsDB never moves one (DESIGN-sports-data.md 10, dev/changelog/1491);
+# keeps its slot (DESIGN-sports-data.md 10, dev/changelog/1491); one made on TheSportsDB's own time
+# moves with it instead and says RECORDING_SPORTS_RETIMED (dev/changelog/1660).
 # `extra['reason']` is `renamed` or `start`.
 RECORDING_RULE_GAME_CHANGED         = 'RECORDING_RULE_GAME_CHANGED'
 # ChannelBin moved an automated recording of a game (a rule's, or one a league page's Record made)
@@ -198,7 +199,7 @@ RECORDING_RULE_GAME_CHANGED         = 'RECORDING_RULE_GAME_CHANGED'
 # windows and both starts.
 RECORDING_SPORTS_RETIMED            = 'RECORDING_SPORTS_RETIMED'
 # The game's time moved, and this automated recording was left where it is: a person set its
-# times, so it is theirs (app/sports_follow.py). `extra['reason']` names why.
+# times, so it is theirs, or one of the other reasons app/sports_follow.py names in `extra['reason']`.
 RECORDING_SPORTS_TIME_KEPT          = 'RECORDING_SPORTS_TIME_KEPT'
 # Cover both with the two starts too far apart for one recording: ChannelBin scheduled, moved or
 # removed the second recording, the one in case the other time is right (Recording.sports_cover_for_id).
@@ -1084,6 +1085,12 @@ class Recording(db.Model):
     # a rule's recording keeps the same fact in RuleMatch.rec_start_time/rec_stop_time.
     sports_window_start = db.Column(db.DateTime)
     sports_window_stop = db.Column(db.DateTime)
+    # Where the start came from when a league page's Record made this recording from an event
+    # channel's name, with no guide listing (auto_rules_sports.START_FROM_*): one on TheSportsDB's
+    # time moves with it while its window is still ChannelBin's (app/sports_follow.py,
+    # dev/changelog/1660). NULL for every other recording; a rule's recording keeps the same fact
+    # in RuleMatch.sports_start_from.
+    sports_start_from = db.Column(db.String(8))
     # The recording this one is the second of: Cover both with the two starts too far apart for one
     # recording, so ChannelBin records the other start too, in case it is the right one. Written only
     # by app/sports_follow.py, which removes this recording when it is no longer needed.

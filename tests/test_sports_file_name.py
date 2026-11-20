@@ -438,7 +438,7 @@ class RecordingPageTests(unittest.TestCase):
         rec = self._rec(status='SCHEDULED')
         ctx = self._ctx(rec)
         self.assertEqual(ctx['state'], 'none')
-        self.assertIn('fill in if the game is matched before its file is written', ctx['note'])
+        self.assertIn('fill in if its event is matched before its file is written', ctx['note'])
 
     def test_an_unlinked_recording_with_no_template_says_nothing(self):
         self.assertIsNone(self._ctx(self._rec(template=None, status='SCHEDULED')))

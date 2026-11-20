@@ -606,6 +606,63 @@ class DuplicateCopyNameTests(_GuideCase):
         self.assertEqual(pick.named.channel_id, kept.id)
 
 
+class GuideSpellingTests(_GuideCase):
+    """The simulator's guide_spellings fault: a guide that spells a game its own way."""
+
+    def spelled(self, shape):
+        """(channel, match, its first listing still to come) for a slot the fault spelled as `shape`."""
+        aid = self.add_xtream()
+        self.sim.inject('guide_spellings', 'north-tv')
+        log = self.sync(aid)
+        self.assertEqual(log.status, 'SUCCESS', log.error_message)
+        for ch in Channel.query.filter_by(account_id=aid).all():
+            entry = (EPGEntry.query.filter(EPGEntry.channel_id == ch.id, EPGEntry.start_time > datetime.utcnow())
+                     .order_by(EPGEntry.start_time).first())
+            m = shape.match(entry.title) if entry is not None else None
+            if m:
+                return ch, m, entry
+        self.fail('the fault world carries no slot spelled that way')
+
+    def test_a_state_spelled_out_in_the_guide_is_the_school_the_schedule_abbreviates(self):
+        """Guards dev/docs/BUGS.md 2026-11-20 (`Miami (OH)` never found as `Miami (Ohio)`) through a
+        real sync."""
+        ch, m, entry = self.spelled(re.compile(r'^([A-Za-z]+): ([A-Za-z]+) \(Ohio\) at ([A-Za-z]+)$'))
+        sport, away, home = m.groups()
+        league = SportsLeague(tsdb_id=9104, name=sport, match_terms=json.dumps([sport]))
+        db.session.add(league)
+        for tid, team in ((941, home), (942, f'{away} (OH)')):
+            db.session.add(SportsTeam(tsdb_id=tid, full_name=team, names=json.dumps([team]), city='',
+                                      last_looked_up=self.now))
+        db.session.flush()
+        event = SportsEvent(tsdb_id=7005, league_id=league.id, name=f'{home} vs {away} (OH)', home_team_id=941,
+                            away_team_id=942, home_name=home, away_name=f'{away} (OH)', start_at=entry.start_time,
+                            local_date=entry.start_time.date())
+        db.session.add(event)
+        db.session.commit()
+        sports_match.run(pause=0)
+        db.session.expire_all()
+        self.assertGreater(SportsMatch.query.filter_by(event_id=event.id, channel_id=ch.id).count(), 0)
+
+    def test_a_practice_the_guide_calls_p2_is_practice_2(self):
+        """Guards dev/docs/BUGS.md 2026-11-20 (`Las Vegas P2` read as a race listing) through a real
+        sync."""
+        ch, m, entry = self.spelled(re.compile(r'^([A-Za-z]+): ([A-Za-z]+) P2$'))
+        sport, place = m.groups()
+        league = SportsLeague(tsdb_id=9105, name=sport, sport='Motorsport', match_terms=json.dumps([sport]))
+        db.session.add(league)
+        db.session.flush()
+        events = {}
+        for key, name, tsdb_id in (('p2', f'{place} Grand Prix Practice 2', 7006), ('race', f'{place} Grand Prix', 7007)):
+            events[key] = SportsEvent(tsdb_id=tsdb_id, league_id=league.id, name=name, start_at=entry.start_time,
+                                      local_date=entry.start_time.date())
+            db.session.add(events[key])
+        db.session.commit()
+        sports_match.run(pause=0)
+        db.session.expire_all()
+        self.assertGreater(SportsMatch.query.filter_by(event_id=events['p2'].id, channel_id=ch.id).count(), 0)
+        self.assertEqual(SportsMatch.query.filter_by(event_id=events['race'].id, channel_id=ch.id).count(), 0)
+
+
 class TeamChannelTests(_GuideCase):
     def test_a_providers_team_channel_is_not_read_as_a_game(self):
         """Guards dev/docs/BUGS.md 2026-11-08 01:18 through the simulator's team_channels fault: a team

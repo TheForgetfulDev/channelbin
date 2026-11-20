@@ -13,10 +13,16 @@ What is never moved:
   RuleMatch.rec_start_time/rec_stop_time, a Record recording's or a second recording's
   sports_window_start/stop. A recording whose window is not that one is left as it is, and its page
   says the game moved;
-- a recording made from no guide listing of the game (an event channel's name: its window is
-  the pick's already), except that a rule's one already under way ends later when TheSportsDB moves
-  the game later after its start (sports_times.name_late, dev/changelog/1643);
+- a recording made from no guide listing of the game on the time its event channel's name gives:
+  that clock is the channel's, and TheSportsDB's time says nothing about it;
 - the program times, which the game's link (sports_data.recording_matches) and retrack key on.
+
+A recording made from no guide listing on TheSportsDB's own time (an event channel whose name gives
+no time zone) has nothing but TheSportsDB to go by, so while it is SCHEDULED and its window is still
+ChannelBin's it moves with TheSportsDB's start, program times and all (dev/changelog/1660). Where its
+start came from is a stored fact, RuleMatch.sports_start_from or Recording.sports_start_from, never
+read off the recording's shape. A rule's one already under way ends later when TheSportsDB moves the
+game later after its start (sports_times.name_late, dev/changelog/1643).
 
 A recording already under way keeps its start, whatever TheSportsDB does: its end only ever moves
 later, to the end the league's answer now gives its listing (a game TheSportsDB moves later after it
@@ -32,12 +38,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-from . import db
+from . import db, sports_words
 from .database import (
     REC_STATUS_SCHEDULED, RECORDING_EDITED, RECORDING_SPORTS_RETIMED, RECORDING_SPORTS_SECOND, RECORDING_SPORTS_TIME_KEPT,
     RECORDING_START_NOT_ARMED, RULE_MATCH_SCHEDULED, WINDOW_OPEN_STATUSES, Recording, RecordingEvent,
     RecordingProfile, RecordingSports, RuleMatch, SportsEvent, SportsLeague, add_recording_event)
 from .db_utils import retry_on_locked
+from .auto_rules_sports import START_FROM_TSDB
 from .fmt_utils import counted, iso_seconds_or_none
 
 log = logging.getLogger(__name__)
@@ -55,19 +62,31 @@ SECOND_REMOVED = 'removed'
 #: end moved later.
 RETIMED_MOVED = 'moved'
 RETIMED_EXTENDED = 'extended'
-#: RECORDING_SPORTS_TIME_KEPT's extra['reason']: a person set the times, or the recording was already
-#: under way when the game's time moved.
+#: RECORDING_SPORTS_TIME_KEPT's extra['reason']: a person set the times, the recording was already
+#: under way when the game's time moved, or one of the reasons a recording made on TheSportsDB's
+#: time is not moved to its new one.
 KEPT_EDITED = 'edited'
 KEPT_UNDER_WAY = 'under_way'
+KEPT_LISTING_THERE = 'listing_there'   # its rule's ledger already holds a listing at the new start
+KEPT_POSTPONED = 'postponed'           # TheSportsDB marks the game postponed
+KEPT_OVER = 'over'                     # the new time has already passed
 
 #: The plan warnings that say the account has no connection for the window (auto_rules.NO_SEAT_WARNINGS).
 _NO_SEAT = ('connection_limit_warning', 'account_block_warning')
+
+#: _move_named()'s answer when a rule's ledger already holds the anchor the move would take.
+_BLOCKED = object()
 
 
 @dataclass
 class _Game:
     event: SimpleNamespace    # a SportsEvent's columns, read once: the pass rolls back between writes
     league: SimpleNamespace
+
+    @property
+    def one(self) -> str:
+        """The word for this event: game, match, race or event (app/sports_words.py)."""
+        return sports_words.noun(self.league.sport, bool(self.event.home_team_id or self.event.away_team_id))[0]
 
 
 @dataclass
@@ -202,6 +221,13 @@ def follow(recording_ids=None, now: datetime = None) -> dict:
             db.session.rollback()
             log.error('Recording %d: could not bring its end to its game\'s time', rec.id, exc_info=True,
                       extra={'recording_id': rec.id})
+    for rec in ctx.named_scheduled:
+        try:
+            _follow_named_scheduled(rec, ctx, run, counts)
+        except Exception:
+            db.session.rollback()
+            log.error('Recording %d: could not bring it to TheSportsDB\'s time for its game', rec.id,
+                      exc_info=True, extra={'recording_id': rec.id})
     for rec in ctx.named_running:
         try:
             _follow_named(rec, ctx, run, counts)
@@ -256,9 +282,16 @@ class _Context:
         links = {rid: tsdb for rid, tsdb in db.session.query(
             RecordingSports.recording_id, RecordingSports.tsdb_event_id).filter(
             RecordingSports.recording_id.in_(ids), RecordingSports.removed_at.is_(None))} if ids else {}
+        # A rule's recording from an event channel's name is its ledger row's game, whatever its
+        # link says: the link is found by how near the game starts, and the game may have moved.
+        anchored = {rid: tsdb for rid, tsdb in db.session.query(
+            RuleMatch.recording_id, RuleMatch.sports_event_tsdb_id).filter(
+            RuleMatch.recording_id.in_(ids), RuleMatch.action_taken == RULE_MATCH_SCHEDULED,
+            RuleMatch.sports_event_tsdb_id.isnot(None))} if ids else {}
         self.game_of = {}
         for r in recs:
-            tsdb = r.sports_record_tsdb_id if r.sports_record_tsdb_id is not None else links.get(r.id)
+            tsdb = (r.sports_record_tsdb_id if r.sports_record_tsdb_id is not None
+                    else anchored.get(r.id, links.get(r.id)))
             if tsdb is not None:
                 self.game_of[r.id] = tsdb
         games = {}
@@ -266,9 +299,10 @@ class _Context:
             for event, league in (db.session.query(SportsEvent, SportsLeague)
                                   .join(SportsLeague, SportsLeague.id == SportsEvent.league_id)
                                   .filter(SportsEvent.tsdb_id.in_(set(self.game_of.values())))):
-                games[event.tsdb_id] = _Game(_snap(event), SimpleNamespace(name=league.name, tsdb_id=league.tsdb_id))
+                games[event.tsdb_id] = _Game(_snap(event), SimpleNamespace(name=league.name, tsdb_id=league.tsdb_id,
+                                                                           sport=league.sport))
         self.games = games
-        followed, unlisted = [], []
+        followed, unlisted, waiting = [], [], []
         for r in recs:
             if self.game_of.get(r.id) not in games:
                 continue
@@ -276,27 +310,37 @@ class _Context:
                 followed.append(_snap(r))
             elif (r.status in WINDOW_OPEN_STATUSES and _running_kind(r) == KIND_RULE):
                 unlisted.append(_snap(r))
+            elif r.status == REC_STATUS_SCHEDULED:
+                waiting.append(_snap(r))
         self.primaries = [r for r in followed if r.status == REC_STATUS_SCHEDULED]
         self.running = [r for r in followed if r.status in WINDOW_OPEN_STATUSES]
-        ids = [r.id for r in followed + unlisted]
+        ids = [r.id for r in followed + unlisted + waiting]
         # A recording can carry more than one ledger row (a rule edited since); the SCHEDULED one is
         # the rule's window.
-        self.ledger, from_name = {}, set()
+        self.ledger, from_name, on_tsdb = {}, set(), set()
         if ids:
             for m in RuleMatch.query.filter(RuleMatch.recording_id.in_(ids),
                                             RuleMatch.action_taken == RULE_MATCH_SCHEDULED):
                 self.ledger.setdefault(m.recording_id, []).append((m.rec_start_time, m.rec_stop_time))
                 if m.sports_event_tsdb_id is not None and m.sports_event_tsdb_id == self.game_of.get(m.recording_id):
                     from_name.add(m.recording_id)
+                    if m.sports_start_from == START_FROM_TSDB:
+                        on_tsdb.add(m.recording_id)
         # A rule's recording from an event channel's name, under way: its ledger row is anchored on
         # the game itself (RuleMatch.sports_event_tsdb_id), the one fact that says so.
         self.named_running = [r for r in unlisted if r.id in from_name]
+        # Still to start, made on TheSportsDB's own time: a rule's by its ledger row, a Record one
+        # by its own column.
+        self.named_scheduled = [
+            r for r in waiting
+            if (r.id in on_tsdb if _running_kind(r) == KIND_RULE
+                else r.sports_record_tsdb_id is not None and r.sports_start_from == START_FROM_TSDB)]
         self.seconds = {}
         primary_ids = [r.id for r in self.primaries]
         if primary_ids:
             for s in Recording.query.filter(Recording.sports_cover_for_id.in_(primary_ids)):
                 self.seconds.setdefault(s.sports_cover_for_id, []).append(_snap(s))
-        every = followed + self.named_running + [s for group in self.seconds.values() for s in group]
+        every = followed + self.named_running + self.named_scheduled + [s for group in self.seconds.values() for s in group]
         self.profiles = {p.id: (timedelta(minutes=p.pre_padding_minutes or 0), timedelta(minutes=p.post_padding_minutes or 0))
                          for p in RecordingProfile.query.filter(RecordingProfile.id.in_(
                              {r.profile_id for r in every if r.profile_id is not None}))} if every else {}
@@ -465,7 +509,7 @@ def _follow_named(rec, ctx, run, counts):
         return
     start = rec.scheduled_start_time or rec.start_time
     ev = game.event
-    why = (f'TheSportsDB now has the game at {run.clock(ev.start_at)}, later than the '
+    why = (f'TheSportsDB now has the {game.one} at {run.clock(ev.start_at)}, later than the '
            f"{run.clock(rec.program_start_time)} the recording started from, and it changed that after the "
            f'recording had started, so it should end about {counted(_minutes(late), "minute")} later.')
     if not _owned_running(rec, ctx):
@@ -476,6 +520,53 @@ def _follow_named(rec, ctx, run, counts):
     if _extend(rec.id, KIND_RULE, start, rec.stop_time, stop, pad, game, run, None, why=why):
         counts['extended'] += 1
         _rearm_stop(rec.id, stop)
+
+
+def _follow_named_scheduled(rec, ctx, run, counts):
+    """A recording still to start that was made from an event channel's name on TheSportsDB's own
+    time: when TheSportsDB has the game at another time, the recording moves to it, the length its
+    pick gave it and its padding kept, and its program times with it, since they are the game's time
+    and no listing's. Nothing to do when TheSportsDB has no time to go by now or the league goes by
+    the guide now: no pick stands on TheSportsDB's time then. A postponed game and a new time
+    already over leave the recording where it is and say so once, as times a person set do."""
+    from .sports_data import event_shape_is_matchup
+    from .sports_times import GO_GUIDE
+    game = ctx.games[ctx.game_of[rec.id]]
+    ev = game.event
+    start = ev.start_at
+    if (start is None or start == rec.program_start_time
+            or (not event_shape_is_matchup(ev) and (start.hour, start.minute) == (0, 0))
+            or run.rules.of(game.league.tsdb_id).go_by == GO_GUIDE):
+        return
+    kind = _running_kind(rec)
+    pad = padding(rec, kind, ctx.profiles, ctx.stored)
+    program = (start, start + (rec.program_stop_time - rec.program_start_time))
+    # Unclamped, so a start already passed does not read as a new window on every pass.
+    window = (program[0] - pad[0], program[1] + pad[1])
+    current = (rec.start_time, rec.stop_time)
+    why = (f'TheSportsDB now has the {game.one} at {run.clock(start)}, not {run.clock(rec.program_start_time)}. This '
+           "recording was made from an event channel's name on TheSportsDB's time, with no guide listing to go "
+           'by, so it goes by TheSportsDB.')
+
+    def kept(whose=None, reason=KEPT_EDITED):
+        if _kept_new(rec.id, window):
+            _note_kept(rec.id, kind, game, run, None, window, why=why, whose=whose, reason=reason)
+            counts['kept'] += 1
+
+    if ev.postponed:
+        return kept(f'TheSportsDB marks the {game.one} postponed, and a postponed start is not one to record at',
+                    KEPT_POSTPONED)
+    if window[1] <= run.now:
+        return kept('that time is already over', KEPT_OVER)
+    if not _owner(rec, ctx)[1]:
+        return kept()
+    want = (max(window[0], run.now), window[1])
+    moved = _move_named(rec.id, kind, current, want, program, pad, game, run, why)
+    if moved is _BLOCKED:
+        kept('its rule already judged a listing of that title at that start', KEPT_LISTING_THERE)
+    elif moved:
+        counts['moved'] += 1
+        _rearm(rec.id, want[0], want[1], want[0] != current[0])
 
 
 def _kept(event) -> bool:
@@ -499,17 +590,17 @@ def _why(game, run, raw, listing) -> str:
     if rule.go_by == GO_GUIDE:
         return f"{game.league.name} goes by your guide, so it records the listing's times."
     if not acts(listed, tsdb, rule, run.now):
-        return (f"TheSportsDB's time is used only from {rule.wait_hours} hours before the game, so it records "
+        return (f"TheSportsDB's time is used only from {rule.wait_hours} hours before the {game.one}, so it records "
                 "the listing's times until then.")
     if raw == [listing]:
         if abs(tsdb - listing[0]) <= AGREE:
             return f"TheSportsDB and your guide agree on {clock(tsdb)}, so it records the listing's times."
-        return (f"TheSportsDB has the game at {clock(tsdb)}, too far from the listing's {clock(listing[0])} to be "
+        return (f"TheSportsDB has the {game.one} at {clock(tsdb)}, too far from the listing's {clock(listing[0])} to be "
                 "the same airing, so it records the listing's times.")
     verb = {GO_TSDB: 'goes by TheSportsDB', GO_BOTH: 'covers both times'}.get(rule.go_by)
     if verb is None:
         raise ValueError(f'unknown answer {rule.go_by!r}')
-    return f'TheSportsDB has the game at {clock(tsdb)} and the listing at {clock(listing[0])}; {game.league.name} {verb}.'
+    return f'TheSportsDB has the {game.one} at {clock(tsdb)} and the listing at {clock(listing[0])}; {game.league.name} {verb}.'
 
 
 def _collision(rec_id, start, stop, exclude) -> str:
@@ -609,6 +700,59 @@ def _move(rec_id, kind, old, new, pad, game, run, raw) -> bool:
     return _write()
 
 
+def _move_named(rec_id, kind, old, new, program, pad, game, run, why) -> bool:
+    """Move a SCHEDULED recording made on TheSportsDB's time to TheSportsDB's new time: its window,
+    its program times and ChannelBin's own record of both, in one unit. A rule's ledger row moves
+    its anchor start too, so the next check reads the recording where it now sits; when another
+    row of the rule already holds that anchor (a listing of the same title judged at that very
+    start), nothing moves and the answer is _BLOCKED, which the caller says on the recording."""
+    bump = _collision(rec_id, *new, exclude=rec_id)
+    clock = run.clock
+    tsdb_id = game.event.tsdb_id
+
+    @retry_on_locked()
+    def _write():
+        rec = db.session.get(Recording, rec_id, populate_existing=True)
+        if rec is None or rec.status != REC_STATUS_SCHEDULED or (rec.start_time, rec.stop_time) != old:
+            db.session.rollback()
+            return False
+        rows = []
+        if kind == KIND_RULE:
+            rows = [m for m in RuleMatch.query.filter_by(recording_id=rec_id, action_taken=RULE_MATCH_SCHEDULED)
+                    if (m.rec_start_time, m.rec_stop_time) == old and m.sports_event_tsdb_id == tsdb_id]
+            if not rows:
+                db.session.rollback()
+                return False
+            for m in rows:
+                if RuleMatch.query.filter(
+                        RuleMatch.rule_id == m.rule_id, RuleMatch.id != m.id, RuleMatch.title_key == m.title_key,
+                        RuleMatch.episode_key == m.episode_key,
+                        RuleMatch.program_start_time == program[0]).first() is not None:
+                    db.session.rollback()
+                    return _BLOCKED
+        elif (rec.sports_window_start, rec.sports_window_stop) != old:
+            db.session.rollback()
+            return False
+        rec.start_time = rec.scheduled_start_time = new[0]
+        rec.stop_time = rec.scheduled_stop_time = new[1]
+        rec.program_start_time, rec.program_stop_time = program
+        sentence = f'Moved to {clock(new[0])} to {clock(new[1])}, from {clock(old[0])} to {clock(old[1])}.'
+        for m in rows:
+            m.rec_start_time, m.rec_stop_time = new
+            m.program_start_time, m.program_stop_time = program
+            m.detail = f'{m.detail or ""} {sentence} {why}'.strip()
+            m.updated_at = datetime.utcnow()
+        if kind == KIND_RECORD:
+            rec.sports_window_start, rec.sports_window_stop = new
+        add_recording_event(rec_id, RECORDING_SPORTS_RETIMED, detail=f'{why} {sentence}{bump}',
+                            extra={**_extra(old, new, pad, game, run, RETIMED_MOVED), 'start_from': START_FROM_TSDB,
+                                   'program_start': iso_seconds_or_none(program[0])})
+        db.session.commit()
+        return True
+
+    return _write()
+
+
 def _kept_new(rec_id, want) -> bool:
     """Not said already for this window: the pass runs after every matcher run and rule check."""
     last = (RecordingEvent.query.filter_by(recording_id=rec_id, event_type=RECORDING_SPORTS_TIME_KEPT)
@@ -623,7 +767,7 @@ def _kept_new(rec_id, want) -> bool:
     return (extra.get('new_start'), extra.get('new_stop')) != (iso_seconds_or_none(want[0]), iso_seconds_or_none(want[1]))
 
 
-def _note_kept(rec_id, kind, game, run, raw, want, why=None):
+def _note_kept(rec_id, kind, game, run, raw, want, why=None, whose=None, reason=KEPT_EDITED):
     rec = db.session.get(Recording, rec_id)
     listing = _listing_of(rec) if rec is not None else None
     db.session.rollback()
@@ -633,8 +777,8 @@ def _note_kept(rec_id, kind, game, run, raw, want, why=None):
     # A Record recording with no window of ChannelBin's was saved at other times, changed since, or
     # made before ChannelBin kept the window it gave one; the sentence names all three, since a row
     # cannot tell which.
-    whose = ("its times were changed since its rule set them" if kind == KIND_RULE
-             else "ChannelBin did not set its times: they were chosen when it was saved or changed since")
+    whose = whose or ("its times were changed since its rule set them" if kind == KIND_RULE
+                      else "ChannelBin did not set its times: they were chosen when it was saved or changed since")
 
     @retry_on_locked()
     def _write():
@@ -644,8 +788,8 @@ def _note_kept(rec_id, kind, game, run, raw, want, why=None):
         add_recording_event(
             rec_id, RECORDING_SPORTS_TIME_KEPT,
             detail=(f'{why} ChannelBin would record {run.clock(want[0])} to {run.clock(want[1])}, but {whose}, so '
-                    'it is left as it is. Edit its times to record the game\'s.'),
-            extra={**_extra(None, want, None, game, run, 'kept'), 'reason': KEPT_EDITED})
+                    f"it is left as it is. Edit its times to record the {game.one}'s."),
+            extra={**_extra(None, want, None, game, run, 'kept'), 'reason': reason})
         db.session.commit()
 
     _write()
@@ -658,7 +802,7 @@ def _late_why(game, run, raw, listing) -> str:
     ev = game.event
     late = running_late(ev)
     if late:
-        return (f'TheSportsDB moved the game from {run.clock(ev.previous_start)} to {run.clock(ev.start_at)} after '
+        return (f'TheSportsDB moved the {game.one} from {run.clock(ev.previous_start)} to {run.clock(ev.start_at)} after '
                 f'it had started, so it should end about {counted(_minutes(late), "minute")} later.')
     return _why(game, run, raw, listing)
 
@@ -723,7 +867,7 @@ def _note_under_way(rec_id, game, run, start, want):
             return
         add_recording_event(
             rec_id, RECORDING_SPORTS_TIME_KEPT,
-            detail=(f"TheSportsDB now has the game starting at {clock(want[0])}, before this recording's start at "
+            detail=(f"TheSportsDB now has the {game.one} starting at {clock(want[0])}, before this recording's start at "
                     f'{clock(start)}, but it was already recording, so nothing changes: a recording under way keeps '
                     'its start, and its end never comes earlier.'),
             extra={**_extra(None, want, None, game, run, 'kept'), 'reason': KEPT_UNDER_WAY})
@@ -917,7 +1061,7 @@ def _rearm(rec_id, start, stop, start_moved):
     @retry_on_locked()
     def _note():
         add_recording_event(rec_id, RECORDING_START_NOT_ARMED,
-                            detail=('This recording was moved to its game\'s time, but its start could not be armed, '
+                            detail=('This recording was moved to its event\'s time, but its start could not be armed, '
                                     'so it will not start on its own. Restarting ChannelBin arms it.'))
         db.session.commit()
 

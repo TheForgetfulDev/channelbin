@@ -323,7 +323,7 @@ def set_live_now(event_id):
     except sports_feed.LiveNowRefused as exc:
         return jsonify({'error': str(exc)}), 409
     if done is None:
-        return jsonify({'error': 'That game is no longer in the schedule.'}), 404
+        return jsonify({'error': 'That event is no longer in the schedule.'}), 404
     if done['on']:
         log.info('Sports channels: broadcast started early for %s (event %d) on %s, until %s UTC',
                  done['game'], event_id, join_labels(done['channels']), done['until'])

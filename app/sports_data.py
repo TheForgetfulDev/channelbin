@@ -19,7 +19,7 @@ import requests
 from sqlalchemy import and_, case, or_, update
 from sqlalchemy.exc import SQLAlchemyError
 
-from . import db
+from . import db, sports_words
 from .config import load_config
 from .database import (
     REC_ENDED_STATUSES, RECORDING_SPORTS_LINKED, RECORDING_SPORTS_REMOVED, SPORTS_MATCH_KIND_CHANNEL_NAME, SPORTS_MATCH_KIND_GUIDE,
@@ -685,7 +685,7 @@ def _apply_team_next(row, league, answer, team_id, now):
         stored = SportsEvent.query.filter_by(tsdb_id=game['tsdb_id']).first() is not None
         _store_parsed(league, parsed, now)
         _ensure_team_rows(league, parsed, now)
-        said = f'Its next game, {game["name"]}, was already stored.' if stored else f'Found {game["name"]}, which the schedule had left out.'
+        said = f'Its next {sports_words.teamed(league.sport)}, {game["name"]}, was already stored.' if stored else f'Found {game["name"]}, which the schedule had left out.'
         _record_outcome(row, SPORTS_FETCH_OK, said, now)
         return
     if dropped:
@@ -695,9 +695,9 @@ def _apply_team_next(row, league, answer, team_id, now):
     if elsewhere:
         others = sorted({_text(r.get('strLeague')) for r in answer.rows if _text(r.get('strLeague'))})
         where = f', {join_labels(others)}' if others else ''
-        _record_outcome(row, SPORTS_FETCH_EMPTY, f'Its next game is in another league{where}.', now)
+        _record_outcome(row, SPORTS_FETCH_EMPTY, f'Its next {sports_words.teamed(league.sport)} is in another league{where}.', now)
         return
-    _record_outcome(row, SPORTS_FETCH_EMPTY, 'TheSportsDB lists no next game for this team.', now)
+    _record_outcome(row, SPORTS_FETCH_EMPTY, f'TheSportsDB lists no next {sports_words.teamed(league.sport)} for this team.', now)
 
 
 def _ensure_team_rows(league: SportsLeague, parsed: list, now: datetime):
@@ -869,10 +869,10 @@ def _apply_search(row, league, answer, name, now):
         others = sorted({_text(r.get('strLeague')) for r in answer.rows
                          if _int(r.get('idLeague')) != league.tsdb_id and _text(r.get('strLeague'))})
         where = f', {join_labels(others)}' if others else ''
-        _record_outcome(row, SPORTS_FETCH_EMPTY, f'TheSportsDB has a game named "{name}" {on} only in another '
-                        f'league{where}, so it is not a {league.name} game.', now)
+        _record_outcome(row, SPORTS_FETCH_EMPTY, f'TheSportsDB has a {sports_words.teamed(league.sport)} named "{name}" {on} only in another '
+                        f'league{where}, so it is not a {league.name} {sports_words.teamed(league.sport)}.', now)
         return
-    _record_outcome(row, SPORTS_FETCH_EMPTY, f'TheSportsDB has no game named "{name}" {on}.', now)
+    _record_outcome(row, SPORTS_FETCH_EMPTY, f'TheSportsDB has no {sports_words.teamed(league.sport)} named "{name}" {on}.', now)
 
 
 def capped_spans(league_id: int) -> list:

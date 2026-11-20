@@ -2884,7 +2884,8 @@ def _submitted_sports_template(form, name, entry):
 def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_id,
                                  group_id, profile_id, entry=None, blocks=None, link=None,
                                  sports_name_template=None, source=None, move_when_full=None,
-                                 sports_record_tsdb_id=None, sports_window=None):
+                                 sports_record_tsdb_id=None, sports_window=None, sports_start_from=None,
+                                 picked=None):
     """Create one SCHEDULED recording and arm its start - the one create path, shared by
     the record modal (new_recording_json), the bulk schedule (bulk_schedule_json) and
     auto-record rules (app/auto_rules.py), so none of them can drift in what a new
@@ -2895,6 +2896,9 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
     `sports_record_tsdb_id` is the game a league page's Record made it for, already checked by
     the caller (Recording.sports_record_tsdb_id). `sports_window` is (start, stop) when those are
     the times Record worked out for it, so it follows the game's time (Recording.sports_window_start).
+    `sports_start_from` is where an event-channel pick's start came from (Recording.sports_start_from).
+    `picked` is the auto_rules.PickReason for a person's create from a league page's Record: why
+    that channel, said on the create event (dev/changelog/1661).
 
     `entry` is the EPGEntry being recorded, or None for a manual URL. `blocks` is the
     account-block picker's {account_id: slots}, or None to set none. A start already in
@@ -2971,6 +2975,7 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
             # The start a recording made after its own start time is given, so it stays ChannelBin's.
             sports_window_start=start_utc if sports_window else None,
             sports_window_stop=sports_window[1] if sports_window else None,
+            sports_start_from=sports_start_from,
             metadata_description=metadata_description,
             metadata_category=metadata_category,
             metadata_rating=metadata_rating,
@@ -2987,10 +2992,11 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
                 db.session.rollback()
                 return None
         else:
+            why = f' Record picked this channel. {picked.text}' if picked is not None and picked.text else ''
             add_recording_event(
                 r.id, RECORDING_CREATED,
-                detail=f'Scheduled by hand from {RECORDING_SOURCES[source_key]}.',
-                extra={'source': source_key})
+                detail=f'Scheduled by hand from {RECORDING_SOURCES[source_key]}.{why}',
+                extra={'source': source_key, **(picked.extra() if picked is not None else {})})
         db.session.commit()
         return r
 
@@ -3122,10 +3128,11 @@ def new_recording_json():
     sports_event_raw = request.form.get('sports_event_id', '').strip()
     sports_record_tsdb_id = None
     sports_window = None
+    sports_start_from = None
     if entry is not None and sports_event_raw.isdecimal():
         # A league page's Record on a listing: marked as that game's only when the listing is
         # one the matcher found for it (dev/changelog/1630).
-        from ..sports_view import record_mark
+        from ..sports_view import record_mark, record_reason
         sports_record_tsdb_id = record_mark(int(sports_event_raw), entry)
         if sports_record_tsdb_id is not None:
             # Saved at the times Record worked out, the recording follows the game's time; at times
@@ -3138,13 +3145,23 @@ def new_recording_json():
     elif entry is None and sports_event_raw.isdecimal():
         # A league page's Record on a game only an event channel names (dev/changelog/1539): no
         # listing to snapshot, so the program times are the pick's, worked out again here from
-        # the event, as an auto-record rule's are (_plan_event_schedule). The window is the
-        # person's, like any recording's.
-        from ..sports_view import event_record_check
+        # the event, as an auto-record rule's are (_plan_event_schedule). Saved at the pick's times
+        # under the profile's padding, one on TheSportsDB's time moves with it; at times the person
+        # set, or on the time a channel's name gives, it keeps them (app/sports_follow.py,
+        # dev/changelog/1660).
+        from ..auto_rules_sports import START_FROM_TSDB
+        from ..edit_window import padding as profile_padding
+        from ..sports_follow import same_minute
+        from ..sports_view import event_record_check, record_reason
         entry, why = event_record_check(int(sports_event_raw), channel_id)
         if entry is None:
             return jsonify({'error': why}), 409
         sports_record_tsdb_id = entry.sports_event_tsdb_id
+        sports_start_from = entry.start_from
+        pre, post = profile_padding(profile_id)
+        if (sports_start_from == START_FROM_TSDB and same_minute(entry.start_time - pre, start_utc)
+                and same_minute(entry.stop_time + post, stop_utc)):
+            sports_window = (start_utc, stop_utc)
     rec = _create_scheduled_recording(
         cfg, name=name, url=url, start_utc=start_utc, stop_utc=stop_utc,
         channel_id=channel_id, group_id=group_id, profile_id=profile_id,
@@ -3152,7 +3169,10 @@ def new_recording_json():
         sports_name_template=_submitted_sports_template(request.form, name, entry),
         source=request.form.get('source'),
         move_when_full=move_when_full if move_known else None,
-        sports_record_tsdb_id=sports_record_tsdb_id, sports_window=sports_window)
+        sports_record_tsdb_id=sports_record_tsdb_id, sports_window=sports_window,
+        sports_start_from=sports_start_from,
+        picked=(record_reason(int(sports_event_raw), entry, group_id)
+                if sports_record_tsdb_id is not None else None))
     if sports_window is not None:
         # Cover both's second recording, when the two starts are too far apart for one.
         from ..sports_follow import follow_guarded

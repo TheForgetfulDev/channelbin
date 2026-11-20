@@ -229,7 +229,7 @@
   <div class="card sp-wide" data-section="matching" id="sp-matching" data-terms="{{ matching.terms | tojson | forceescape }}" data-teams="{{ matching.teams | tojson | forceescape }}">
     <div class="card-head"><h2>Matching your guide</h2></div>
     <div class="card-body">
-      <p class="card-note">ChannelBin finds this league's {{ many }} in your guide by reading each listing's title for two things: a name for the league (one of the names below) and, for a game, the names of both teams. When a listing has both, it counts as that {{ one }}.</p>
+      <p class="card-note">ChannelBin finds this league's {{ many }} in your guide by reading each listing's title for two things: a name for the league (one of the names below) and, for a {{ teamed }}, the names of both teams. When a listing has both, it counts as that {{ one }}.</p>
       <h3 class="sp-h3">Names for this league</h3>
       <div class="sp-terms">
         {% for t in matching.terms %}<span class="chip sp-term">{{ t }}<button class="chip-x" data-act="remove-term" data-term="{{ t }}" aria-label="Remove {{ t }}">{{ icon('close') }}</button></span>{% endfor %}
@@ -253,7 +253,7 @@
       <div class="sp-catbar"><button class="btn btn-sm" data-act="team-name">{{ icon('add') }}Add a name for a team</button></div>
       {% endif %}
       <h3 class="sp-h3">Categories (optional)</h3>
-      <p class="sp-hint sp-hint-top">If your provider has a category just for this league, such as "NFL Sunday Ticket", add it. A listing on a channel in that category counts as this league even when its title does not name it. A game still has to name both teams. Turn on Replays only for a category that only shows old {{ many }}.</p>
+      <p class="sp-hint sp-hint-top">If your provider has a category just for this league, such as "NFL Sunday Ticket", add it. A listing on a channel in that category counts as this league even when its title does not name it. {{ a_teamed | capitalize }} still has to name both teams. Turn on Replays only for a category that only shows old {{ many }}.</p>
       {% if matching.categories %}
       <div class="table-scroll">
         <table class="tbl tbl-cards rl-tbl">
@@ -306,7 +306,7 @@
   <div class="card" data-section="updates">
     <div class="card-head"><h2>Schedule updates</h2></div>
     <div class="card-body">
-      <p class="card-note">ChannelBin keeps this schedule current with a few calls to TheSportsDB a day, each one asking for about a week of {{ many }}, which TheSportsDB calls a round. A game a rule or Record is recording, or a sports channel is playing, is also asked for every 30 minutes from 2 hours before it until it ends, so a change made during it is seen. These are the latest, so you can see what it asked for and what came back.</p>
+      <p class="card-note">ChannelBin keeps this schedule current with a few calls to TheSportsDB a day, each one asking for about a week of {{ many }}, which TheSportsDB calls a round. {{ a_one | capitalize }} a rule or Record is recording, or a sports channel is playing, is also asked for every 30 minutes from 2 hours before it until it ends, so a change made during it is seen. These are the latest, so you can see what it asked for and what came back.</p>
       {% if updates %}
       <div class="table-scroll">
         <table class="tbl tbl-cards rl-tbl">
@@ -337,6 +337,7 @@
 
 {% block scripts %}
 <script type="application/json" id="sports-boot">{{ add_config | tojson }}</script>
+<script type="application/json" id="sports-words">{{ {'many': many, 'teamed': teamed} | tojson }}</script>
 <script>
 window.SPORTS_LEAGUE = {
   listUrl: {{ url_for('sports.sports_page') | tojson }},
