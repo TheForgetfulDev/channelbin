@@ -24,6 +24,7 @@ _OBSERVED = {}
 # The stored password. The harness answers the reveal with one of its own, so a page that
 # carried this one would show it without the script ever asking.
 STORED = 'sofa-remote-42'
+LAN = 'http://192.168.1.40:5000'
 
 
 @unittest.skipIf(shutil.which('node') is None or not os.path.isdir(JSDOM), 'node or jsdom not installed')
@@ -38,7 +39,9 @@ class IptvOutputScriptTests(FeedCase):
         super().setUp()
         self.alpha_feed = feed.feed_id_for_channel(self.alpha.id)
         self.session(self.alpha_feed)
-        html = self.client.get('/iptv-output').get_data(as_text=True)
+        # Opened on a LAN address, so ChannelBin's address being unset is the hideable notice
+        # rather than the localhost warning.
+        html = self.client.get('/iptv-output', base_url=LAN).get_data(as_text=True)
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, 'page.html'), 'w', encoding='utf-8') as fh:
                 fh.write(html)
@@ -101,7 +104,7 @@ class IptvOutputScriptTests(FeedCase):
         # The playlist address percent-encodes it; the Xtream password is copied as typed.
         self.assertIn('password=p%26w%3D1', self.obs['copied'][0])
         self.assertEqual(self.obs['copied'][1], 'p&w=1')
-        self.assertEqual(self.obs['copied'][2], 'http://localhost')
+        self.assertEqual(self.obs['copied'][2], LAN)
 
     def test_an_account_switch_posts_allow(self):
         self.assertEqual(self.obs['account_post'],
@@ -142,6 +145,17 @@ class IptvOutputScriptTests(FeedCase):
         self.assertEqual(self.obs['power_post']['body'],
                          {'path': 'integrations.output_feed.enabled', 'value': False})
 
+
+    def test_hide_stores_the_notice_version_then_redraws_the_cards(self):
+        """dev/changelog/1648: the address notice's Hide posts the version the page was
+        handed under the pref it names, then swaps the cards for the server's render."""
+        from app.output_feed_view import ADDRESS_NOTICE_PREF, ADDRESS_NOTICE_VERSION
+        self.assertEqual(self.obs['hide_offered'], {'pref': ADDRESS_NOTICE_PREF,
+                                                     'version': str(ADDRESS_NOTICE_VERSION)})
+        reqs = self.obs['hide_requests']
+        self.assertEqual(reqs[0], {'method': 'POST', 'path': f'/api/user-prefs/{ADDRESS_NOTICE_PREF}',
+                                   'body': {'value': ADDRESS_NOTICE_VERSION}})
+        self.assertIn('GET', [r['method'] for r in reqs[1:]])
 
 if __name__ == '__main__':
     unittest.main()

@@ -26,7 +26,7 @@ const PAGE = fs.readFileSync(`${DIR}/page.html`, 'utf8');
 
 const JS = ['util.js', 'guide.js'].map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
 
-function boot({ tz = null } = {}) {
+function boot({ tz = null, profileChoices = null, editWindow = null } = {}) {
   const errors = [];
   const vc = new VirtualConsole();
   vc.on('jsdomError', (e) => errors.push(`jsdomError: ${e.message}`));
@@ -34,6 +34,7 @@ function boot({ tz = null } = {}) {
 
   const nameRequests = [];
   const editPosts = [];
+  const editWindowRequests = [];
   const fetchStub = (target, init) => {
     const href = String(target);
     let payload = href.includes('/api/guide/epg') ? { channels: [] } : [];
@@ -47,6 +48,22 @@ function boot({ tz = null } = {}) {
     // An edit save always answers as one made after the recording moved, the window it is
     // on now riding along (app/routes/recordings.py::_window_moved_response).
     let status = 200;
+    // The dialog's per-open re-read of the profile list (dev/changelog/1651): answered only
+    // when a scenario hands a list over, 'fail' as a server error.
+    if (href.includes('/api/profiles/record-choices')) {
+      if (profileChoices === 'fail') {
+        status = 500;
+        payload = { error: 'boom' };
+      } else if (profileChoices) {
+        payload = { success: true, profiles: profileChoices };
+      }
+    }
+    // An edit's window to re-pad from (dev/changelog/1652): answered only when a scenario hands
+    // one over.
+    if (href.includes('/edit-window')) {
+      editWindowRequests.push(href);
+      if (editWindow) payload = { success: true, ...editWindow };
+    }
     if (href.includes('/edit-json')) {
       editPosts.push(Object.fromEntries(new URLSearchParams(String(init.body))));
       status = 409;
@@ -107,7 +124,7 @@ function boot({ tz = null } = {}) {
   const change = (el, v) => { el.value = v; el.dispatchEvent(new window.Event('change', { bubbles: true })); };
 
   return {
-    window, document, errors, $, nameRequests, editPosts,
+    window, document, errors, $, nameRequests, editPosts, editWindowRequests,
     typeName: (v) => type($('#modal-name'), v),
     nameValue: () => $('#modal-name').value,
     openModal: (prog, ch, opts) => window.openModal(prog, ch, opts),
@@ -132,6 +149,9 @@ function boot({ tz = null } = {}) {
     submit: () => $('#modal-form').dispatchEvent(
       new window.Event('submit', { bubbles: true, cancelable: true })),
     errorText: () => $('#modal-error').textContent.trim(),
+    profileOptions: () => [...$('#modal-profile').options].map((o) => [o.value, o.textContent.trim(), o.dataset.moveFull || '']),
+    profileValue: () => $('#modal-profile').value,
+    profileMap: () => window.eval('JSON.stringify(GUIDE_CONFIG.profiles)'),
     labels: () => ({ title: $('#modal-title').textContent.trim(),
                      submit: $('#modal-submit').textContent.trim() }),
   };
@@ -431,6 +451,110 @@ await record('edit_moved_refills', async () => {
            start: c.startValue(), stop: c.stopValue(), startUtc: c.dst('start').utc,
            opened: c.opened(), errorText: c.errorText(),
            modalOpen: c.$('#record-modal').style.display !== 'none' };
+});
+
+/* ── A profile made after the page loaded is in the dialog on its next open ──────────────
+   dev/changelog/1651: the select and GUIDE_CONFIG.profiles were rendered once with the page. */
+const LATER = [
+  { id: 1, name: 'Extend End Only', pre_padding_minutes: 0, post_padding_minutes: 15,
+    move_when_account_full: null },
+  { id: 2, name: 'Made later', pre_padding_minutes: 10, post_padding_minutes: 20,
+    move_when_account_full: true },
+];
+
+await record('profile_added_after_load', async () => {
+  const c = boot({ profileChoices: LATER });
+  const rendered = c.profileOptions();
+  c.openModal(PROG, { ...CH, default_profile_id: 2 });
+  const beforeAnswer = c.profileValue();
+  await settle(c.window);
+  await settle(c.window);
+  return { errors: c.errors, rendered, beforeAnswer, options: c.profileOptions(),
+           value: c.profileValue(), map: JSON.parse(c.profileMap()),
+           start: c.startValue(), stop: c.stopValue(), noteText: c.noteText() };
+});
+
+await record('profile_added_after_load_edit', async () => {
+  const c = boot({ profileChoices: LATER });
+  c.openModal({ ...EDIT, recording_profile_id: 2 }, CH);
+  await settle(c.window);
+  await settle(c.window);
+  return { errors: c.errors, value: c.profileValue(), start: c.startValue(), stop: c.stopValue() };
+});
+
+await record('profile_picked_before_answer', async () => {
+  const c = boot({ profileChoices: LATER });
+  c.openModal(PROG, { ...CH, default_profile_id: 2 });
+  c.selectProfile('1');
+  await settle(c.window);
+  await settle(c.window);
+  return { errors: c.errors, value: c.profileValue(), stop: c.stopValue() };
+});
+
+await record('profile_reread_fails', async () => {
+  const c = boot({ profileChoices: 'fail' });
+  c.openModal(PROG, CH);
+  await settle(c.window);
+  await settle(c.window);
+  return { errors: c.errors, options: c.profileOptions(), map: JSON.parse(c.profileMap()) };
+});
+
+/* ── Editing a recording: a profile change re-pads a window ChannelBin gave it ──────────────
+   dev/changelog/1652: an edit kept the old times whatever profile was picked, and said nothing. */
+const OWNED = { owned: true, from_game: false, start_time: PROG.start_time, stop_time: PROG.stop_time };
+
+await record('edit_repads_owned', async () => {
+  const c = boot({ editWindow: OWNED });
+  c.openModal(EDIT, CH);
+  await settle(c.window);
+  await settle(c.window);
+  const opened = [c.startValue(), c.stopValue(), c.noteVisible()];
+  c.selectProfile('1');
+  const picked = [c.startValue(), c.stopValue(), c.noteText()];
+  c.selectProfile('');
+  return { errors: c.errors, opened, picked, none: [c.startValue(), c.stopValue(), c.noteText()],
+           requests: c.editWindowRequests };
+});
+
+await record('edit_repads_from_game', async () => {
+  const c = boot({ editWindow: { ...OWNED, from_game: true, start_time: '2026-08-10T19:00:00' } });
+  c.openModal(EDIT, CH);
+  await settle(c.window);
+  await settle(c.window);
+  c.selectProfile('1');
+  const picked = [c.startValue(), c.stopValue()];
+  c.selectProfile('');
+  return { errors: c.errors, picked, noneText: c.noteText() };
+});
+
+await record('edit_hand_set_kept', async () => {
+  const c = boot({ editWindow: { owned: false, why: 'Its start and stop times were set by hand, so a profile\'s padding does not change them.' } });
+  c.openModal(EDIT, CH);
+  await settle(c.window);
+  await settle(c.window);
+  c.selectProfile('1');
+  return { errors: c.errors, start: c.startValue(), stop: c.stopValue(), noteText: c.noteText(),
+           noteVisible: c.noteVisible() };
+});
+
+await record('edit_typed_stop_then_profile', async () => {
+  const c = boot({ editWindow: OWNED });
+  c.openModal(EDIT, CH);
+  await settle(c.window);
+  await settle(c.window);
+  c.typeStop('2026-08-10T18:30');
+  c.selectProfile('1');
+  return { errors: c.errors, start: c.startValue(), stop: c.stopValue(), noteText: c.noteText() };
+});
+
+await record('edit_pick_before_answer', async () => {
+  const c = boot({ editWindow: OWNED });
+  c.openModal(EDIT, CH);
+  c.selectProfile('1');
+  const before = c.stopValue();
+  await settle(c.window);
+  await settle(c.window);
+  return { errors: c.errors, before, stop: c.stopValue(), noteText: c.noteText() };
 });
 
 console.log(JSON.stringify(out));

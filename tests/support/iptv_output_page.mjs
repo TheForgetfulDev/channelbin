@@ -207,4 +207,13 @@ await click(modalButton('Turn off'));
 await wait(40);
 out.power_post = requests.slice(mark).find((r) => r.method === 'POST') || null;
 
+/* Hide on the address notice stores the version the page was handed, under the pref it names,
+   then swaps the cards so the template draws the hidden state. */
+mark = requests.length;
+const hideBtn = d.querySelector('[data-act="hide-address-notice"]');
+out.hide_offered = hideBtn ? { pref: hideBtn.dataset.pref, version: hideBtn.dataset.version } : null;
+if (hideBtn) await click(hideBtn);
+await wait(40);
+out.hide_requests = requests.slice(mark).map((r) => ({ method: r.method, path: r.path, body: r.body }));
+
 console.log(JSON.stringify(out));

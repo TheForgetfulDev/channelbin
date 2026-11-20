@@ -5,7 +5,8 @@
    head's .modal-close by class, so keep each dialog's .modal > .modal-backdrop +
    .modal-panel > .modal-head shape (dev/changelog/1608). Requires `profiles`
    (RecordingProfile list) and `display_timezone` in the template context, plus a matching
-   `profiles: {...}` map in the page's GUIDE_CONFIG. #}
+   `profiles: {...}` map in the page's GUIDE_CONFIG. Both are only the starting list:
+   guide.js::refreshRecordProfiles re-reads it on every open (dev/changelog/1651). #}
 
 {% macro block_picker(prefix) -%}
 <details class="form-group form-disclose acct-block-pick" id="{{ prefix }}-blocks" style="display:none">

@@ -142,8 +142,12 @@ class _WindowMoved(Exception):
 
 def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
                                profile_id=_UNSET, channel_id=_UNSET, member_reason=None,
-                               opened=None, move_when_full=_UNSET):
+                               opened=None, move_when_full=_UNSET, repad=None):
     """Persist an edit to a SCHEDULED recording, then re-register its jobs.
+
+    `repad` (app/edit_window.py::Repad) is a profile change on a window ChannelBin gave the
+    recording: the stored fact that says so moves to the new profile's window in the same
+    commit, and a save at that window says it was the profile's padding (dev/changelog/1652).
 
     Only the mutate+commit is retried; the scheduler side effects must run
     exactly once, after the write has durably succeeded.
@@ -189,12 +193,31 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
         r.stop_time = stop_utc
         r.scheduled_start_time = start_utc
         r.scheduled_stop_time = stop_utc
+        if repad is not None:
+            from ..edit_window import apply as apply_repad
+            apply_repad(r, repad, (old_start, old_stop))
         if old_start != start_utc or old_stop != stop_utc:
-            db.session.add(RecordingEvent(
-                recording_id=r.id,
-                event_type=RECORDING_EDITED,
-                detail=f'Start/stop time edited: {old_start} → {start_utc}, {old_stop} → {stop_utc}',
-            ))
+            # In the display timezone: the recording page shows a detail as written.
+            moved = (f'{format_local(old_start)} → {format_local(start_utc)}, '
+                     f'{format_local(old_stop)} → {format_local(stop_utc)}')
+            if repad is not None and repad.matched:
+                # The minutes ride along: with no profile, the game's follower pads by the last
+                # padding ChannelBin gave the window (sports_follow._stored_padding).
+                whose = f'profile "{repad.profile_name}"' if repad.profile_name else 'no profile'
+                add_recording_event(
+                    r.id, RECORDING_EDITED,
+                    detail=(f'Start/stop time moved to the padding of {whose} '
+                            f'({repad.pre_minutes} min before and {repad.post_minutes} min after '
+                            f'{"the game" if repad.from_game else "the program"}): '
+                            f'{moved}'),
+                    extra={'repadded': True, 'pre_minutes': repad.pre_minutes,
+                           'post_minutes': repad.post_minutes})
+            else:
+                db.session.add(RecordingEvent(
+                    recording_id=r.id,
+                    event_type=RECORDING_EDITED,
+                    detail=f'Start/stop time edited: {moved}',
+                ))
         if (channel_id is not _UNSET and channel_id != r.channel_id
                 and r.status == REC_STATUS_SCHEDULED):
             new_ch = db.session.get(Channel, channel_id)
@@ -3577,6 +3600,9 @@ def edit_recording_json(recording_id):
         if warnings:
             return jsonify({'success': False, **warnings})
 
+    from ..edit_window import repad_for_save
+    repad = repad_for_save(rec, profile_id, start_utc, stop_utc)
+
     # The blocks are written after the edit, so an edit refused for a moved window leaves
     # them as they were too.
     try:
@@ -3584,7 +3610,7 @@ def edit_recording_json(recording_id):
             recording_id, name, url, start_utc, stop_utc, profile_id=profile_id,
             channel_id=channel_id if member_reason is not None else _UNSET,
             member_reason=member_reason, opened=opened,
-            move_when_full=move_when_full if move_known else _UNSET)
+            move_when_full=move_when_full if move_known else _UNSET, repad=repad)
     except _WindowMoved:
         db.session.rollback()
         current = db.session.get(Recording, recording_id)
@@ -3597,6 +3623,20 @@ def edit_recording_json(recording_id):
         rearm_waiting_starts()
 
     return jsonify({'success': True})
+
+
+@recordings_bp.route('/api/recordings/<int:recording_id>/edit-window')
+def recording_edit_window(recording_id):
+    """What the record dialog re-pads an edit from when its profile changes: the unpadded window
+    and that the times are still ChannelBin's, or why a profile change leaves them
+    (app/edit_window.py, dev/changelog/1652)."""
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return jsonify({'error': 'Recording not found.'}), 404
+    if rec.status != REC_STATUS_SCHEDULED:
+        return jsonify({'error': 'Only SCHEDULED recordings can be edited.'}), 400
+    from ..edit_window import answer
+    return jsonify({'success': True, **answer(rec)})
 
 
 @recordings_bp.route('/api/account-blocks/options')

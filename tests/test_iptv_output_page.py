@@ -140,7 +140,7 @@ class BehindProxyTests(_PageCase):
     def test_a_proxy_the_app_was_not_told_about_is_named_with_the_fix(self):
         connect = _region(self.proxied_page(), 'of-connect')
         self.assertIn('behind a reverse proxy and has not been told so', connect)
-        self.assertIn('flask.behind_proxy: true', connect)
+        self.assertIn('turn on "Behind a reverse proxy" in Settings', connect)
         self.assertIn('q=flask.behind_proxy', connect)
         # Named, never believed: the address is still the one the app itself can vouch for.
         self.assertIn('http://localhost', connect)
@@ -192,6 +192,70 @@ class AddressSettingTests(_PageCase):
             html = self.client.get(path).get_data(as_text=True)
             self.assertIn('https://channelbin.example.com', html, path)
             self.assertIn('http://192.168.1.1:5000', html, path)
+
+
+class AddressNoticeHideTests(_PageCase):
+    """dev/changelog/1648: the "ChannelBin's address is not set" notice can be hidden, by
+    version, and the localhost one cannot. No dev/docs/BUGS.md entry: a feature."""
+    LAN = 'http://192.168.1.40:5000'
+
+    def lan_page(self):
+        resp = self.client.get('/iptv-output', base_url=self.LAN)
+        self.assertEqual(resp.status_code, 200)
+        return _region(resp.get_data(as_text=True), 'of-connect')
+
+    def hide(self, version):
+        self.assertEqual(self.post(f'/api/user-prefs/{view.ADDRESS_NOTICE_PREF}',
+                                   {'value': version}).status_code, 200)
+
+    def test_the_notice_offers_hide_with_the_pref_and_version_it_stores(self):
+        connect = self.lan_page()
+        self.assertIn("ChannelBin's address is not set.", connect)
+        self.assertIn('data-act="hide-address-notice"', connect)
+        self.assertIn(f'data-pref="{view.ADDRESS_NOTICE_PREF}"', connect)
+        self.assertIn(f'data-version="{view.ADDRESS_NOTICE_VERSION}"', connect)
+        # The two buttons sit together at the notice's right edge (style.css .notice-btns).
+        self.assertRegex(connect, r'<div class="notice-btns"><button[^>]*data-act="hide-address-notice"')
+
+    def test_hidden_at_this_version_it_is_gone_and_the_foot_says_which_address(self):
+        self.hide(view.ADDRESS_NOTICE_VERSION)
+        connect = self.lan_page()
+        self.assertNotIn("ChannelBin's address is not set.", connect)
+        self.assertEqual(connect.count('The address is the one this page was opened on'), 2)
+        self.assertIn(f'<span class="v" data-copy-value>{self.LAN}</span>', connect)
+
+    def test_a_new_version_shows_it_again(self):
+        self.hide(view.ADDRESS_NOTICE_VERSION - 1)
+        self.assertIn("ChannelBin's address is not set.", self.lan_page())
+        with mock.patch.object(view, 'ADDRESS_NOTICE_VERSION', view.ADDRESS_NOTICE_VERSION + 1):
+            self.hide(view.ADDRESS_NOTICE_VERSION - 1)
+            self.assertIn("ChannelBin's address is not set.", self.lan_page())
+
+    def test_a_stored_value_that_is_not_a_version_shows_it(self):
+        for stored in ('soon', [1], 1e999):   # 1e999 is stored as Infinity, which int() overflows
+            self.hide(stored)
+            self.assertIn("ChannelBin's address is not set.", self.lan_page(), repr(stored))
+
+    def test_a_notice_button_sits_at_the_right_edge(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               'static', 'css', 'style.css'), encoding='utf-8') as f:
+            css = f.read()
+        self.assertRegex(css, r'\.notice-act > :first-child \{ flex: 1;')
+
+    def test_the_localhost_warning_is_never_hidden(self):
+        self.hide(view.ADDRESS_NOTICE_VERSION)
+        connect = _region(self.page(), 'of-connect')
+        self.assertIn('this page was opened at localhost', connect)
+        self.assertNotIn('hide-address-notice', connect)
+        self.assertNotIn('The address is the one this page was opened on', connect)
+
+    def test_a_set_address_has_no_notice_and_no_hidden_foot(self):
+        self.hide(view.ADDRESS_NOTICE_VERSION)
+        self.t.sandbox_config(dict(_cfg(password=SECRET), flask={'public_url': 'https://cb.example.com'}))
+        connect = self.lan_page()
+        self.assertNotIn('hide-address-notice', connect)
+        self.assertNotIn('The address is the one this page was opened on', connect)
+        self.assertIn("The address is ChannelBin's address from Settings.", connect)
 
 
 class ChannelPagingTests(_PageCase):

@@ -370,8 +370,10 @@ ever set. The table below is only the handful people change first.
 | `sync.epg_days_ahead` | 3 | Days of future EPG to import, and the width of the guide grid |
 | `display.timezone` | `America/New_York` | Any IANA timezone; all display times use it |
 | `display.time_format` | `12h` | `12h` or `24h` |
-| `flask.port` | 5000 | Web UI port |
-| `flask.host` | `0.0.0.0` | Bind address, see below |
+| `flask.port` | 5000 | Web UI port. config.yaml only: a wrong one leaves Settings unreachable to undo it |
+| `flask.host` | `0.0.0.0` | Bind address, see below. config.yaml only, for the same reason; not ChannelBin's address |
+| `flask.public_url` | none | ChannelBin's address (Settings, System): the server address IPTV Output shows and the start of push-notification links. Never where it listens |
+| `flask.behind_proxy` | False | "Behind a reverse proxy" (Settings, System), with a Test of your proxy under the switch; restart required |
 | `ffmpeg.extra_input_args` | `[]` | Extra ffmpeg arguments before `-i` |
 
 ## Network binding and exposure
@@ -427,13 +429,14 @@ Two related notes:
 - **Rotating `flask.secret_key`** (or deleting `instance/secret_key` so a new one is generated)
   invalidates every existing session cookie - it signs everyone, on every device, out at once.
   That is a legitimate way to force a re-login everywhere, not just an auth-gate detail.
-- **Lockout counts by client IP**, which is only the real visitor when `flask.behind_proxy` is on
-  *and* your reverse proxy appends to `X-Forwarded-For` rather than passing the client's own copy
-  through (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`, not
-  `$http_x_forwarded_for`). Forwarding it verbatim lets a caller present a fresh address per
-  attempt and never trip the lockout. With `behind_proxy` off, every request through a proxy looks
-  like one IP instead, so a single attacker can lock the whole LAN out of signing in for 15
-  minutes. Neither weakens the password itself; both are worth getting right before relying on the
+- **Lockout counts by client IP**, which is only the real visitor when "Behind a reverse proxy"
+  (Settings, System; `flask.behind_proxy`) is on *and* your reverse proxy appends to
+  `X-Forwarded-For` rather than passing the client's own copy through (nginx:
+  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`, not `$http_x_forwarded_for`).
+  Forwarding it verbatim lets a caller present a fresh address per attempt and never trip the
+  lockout. The Test button under the switch tells you which yours does. With the switch off, every
+  request through a proxy looks like one IP instead, so a single attacker can lock the whole LAN
+  out of signing in for 15 minutes. Neither weakens the password itself; both are worth getting right before relying on the
   lockout as more than a speed bump.
 - **`auth.cookie_secure`** is the switch for an always-HTTPS deployment (e.g. behind a
   TLS-terminating reverse proxy). Leave it `false` on a plain-HTTP LAN setup - a `Secure` cookie

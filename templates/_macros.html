@@ -258,7 +258,7 @@
   'channel': ('Channel can override', 'channels.channel_browser'),
   'account': ('Account can override', 'accounts.accounts_list'),
 } %}
-{% macro field_shell(path, label, description, restart=false, readonly=false, hay='', full=false, row_class='', tier=none, gated_by=none, overridable_by=none) %}
+{% macro field_shell(path, label, description, restart=false, readonly=false, hay='', full=false, row_class='', tier=none, gated_by=none, overridable_by=none, examples=none) %}
 {%- set changed = path and changed_paths is defined and path in changed_paths %}
 {%- set default_disp = '' if readonly else default_display(path) %}
 <div class="frow{{ ' full' if full else '' }}{{ ' ' ~ row_class if row_class else '' }}"{% if path %} data-path="{{ path }}"{% endif %}{% if path or tier %} data-tier="{{ tier or '' }}"{% endif %}{% if changed %} data-changed="true"{% endif %}{% if gated_by %} data-gated-by="{{ gated_by|join(' ') }}"{% endif %}
@@ -266,6 +266,7 @@
   <div class="fl">
     <div class="fl-label"><span class="fl-name">{{ label }}</span>{% if restart %} <span class="restart-badge">{{ icon('restart') }} restart required</span>{% endif %}{% if readonly %} <span class="restart-badge">read-only - edit in config.yaml</span>{% endif %}{% if overridable_by %} <a class="override-badge" href="{{ url_for(OVERRIDE_BADGES[overridable_by][1]) }}">{{ OVERRIDE_BADGES[overridable_by][0] }}</a>{% endif %}{% if gated_by %} <span class="gate-badge" hidden></span>{% endif %}{% if tier == 'advanced' %} <span class="tier-badge">Advanced</span>{% endif %}</div>
     <div class="fl-desc">{{ description }}</div>
+    {% if examples %}<div class="fl-eg">For example: {% for e in examples %}<code>{{ e }}</code>{{ ' or ' if loop.revindex == 2 else (', ' if not loop.last else '') }}{% endfor %}</div>{% endif %}
     {% if default_disp %}<div class="fl-default">Default: <code>{{ default_disp }}</code></div>{% endif %}
     {% if path %}<div class="fl-key">{{ path }}</div>{% endif %}
   </div>
@@ -273,9 +274,9 @@
 </div>
 {% endmacro %}
 
-{% macro field_text(path, label, description, value, nullable=false, restart=false, tier=none, gated_by=none, overridable_by=none) %}
-{% call field_shell(path, label, description, restart, tier=tier, gated_by=gated_by, overridable_by=overridable_by) %}
-<input type="text" data-setting-path="{{ path }}"{% if nullable %} data-nullable="true"{% endif %} value="{{ value if value is not none else '' }}">
+{% macro field_text(path, label, description, value, nullable=false, restart=false, tier=none, gated_by=none, overridable_by=none, placeholder=none, examples=none) %}
+{% call field_shell(path, label, description, restart, tier=tier, gated_by=gated_by, overridable_by=overridable_by, examples=examples) %}
+<input type="text" data-setting-path="{{ path }}"{% if nullable %} data-nullable="true"{% endif %}{% if placeholder %} placeholder="{{ placeholder }}"{% endif %} value="{{ value if value is not none else '' }}">
 {% endcall %}
 {% endmacro %}
 
@@ -354,8 +355,11 @@
   addChannelUrlBase: '/api/guide/channels/',  // + channel_id + /add
   newRecordingUrl: {{ url_for('recordings.new_recording') | tojson }},
   editRecordingUrlBase: '/recordings/',  // + id + /edit
+  editWindowUrlBase: '/api/recordings/',  // + id + /edit-window
   recDetailUrlBase: '/recordings/',  // + id
   recordSource: {{ source | tojson }},
+  // Re-read on every open; the map below and the select's options are its fallback.
+  profileChoicesUrl: {{ url_for('profiles.record_dialog_profiles') | tojson }},
   profiles: {
     {%- for p in profiles %}
     '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },

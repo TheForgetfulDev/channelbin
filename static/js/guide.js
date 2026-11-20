@@ -1684,9 +1684,9 @@ function openLengthSheet() {
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'FAILED', 'ABORTED', 'CONCATENATING',
                                   'ANALYZING', 'CONVERTING']);
 
-// Base (unpadded) EPG program start/stop, set by openModal() for the currently-open
-// new-recording modal - used to recompute padded times from scratch each time the
-// profile dropdown changes, rather than cumulatively re-padding an already-padded value.
+// Base (unpadded) start/stop the open modal pads from: a new recording's program, set by
+// openModal(), or an edit's window from loadEditWindow() - used to recompute padded times from
+// scratch each time the profile dropdown changes, rather than re-padding a padded value.
 let _modalBaseStartIso = null;
 let _modalBaseStopIso = null;
 let _modalPaddingApplicable = false;
@@ -1907,10 +1907,101 @@ function blockPickerPayload(prefix) {
   });
 }
 
+// The profile the open dialog meant to show - an edit's stored profile, a new recording's
+// channel default - kept even when the page's list lacks it, and whether the user has picked
+// one since the dialog opened.
+let _modalWantedProfileId = '';
+let _modalProfilePicked = false;
+
+// An edit re-pads like a new recording only while its times are still the ones ChannelBin gave
+// it, from the unpadded window the server names (app/edit_window.py, dev/changelog/1652).
+// Otherwise a profile change leaves the times and the padding note says why.
+let _modalIsEdit = false;
+let _modalEditRecId = null;
+let _modalPadFromGame = false;
+let _modalEditPadWhy = '';
+
+async function loadEditWindow(recId, token) {
+  _modalPaddingApplicable = false;
+  _modalEditPadWhy = '';
+  let data;
+  try {
+    data = await jsonFetch(`${GUIDE_CONFIG.editWindowUrlBase}${recId}/edit-window`);
+  } catch (e) {
+    if (token !== _modalOpenToken) return;
+    _modalEditPadWhy = `Its times could not be checked just now (${e.message}), so a profile's padding does not change them.`;
+    if (_modalProfilePicked) applyProfilePadding();
+    return;
+  }
+  if (token !== _modalOpenToken || !data) return;
+  if (data.owned) {
+    _modalBaseStartIso = data.start_time;
+    _modalBaseStopIso = data.stop_time;
+    _modalPadFromGame = Boolean(data.from_game);
+    _modalPaddingApplicable = true;
+  } else {
+    _modalEditPadWhy = data.why || '';
+  }
+  // A profile picked before the answer is padded now, as it would have been on the pick.
+  if (_modalProfilePicked) {
+    applyProfilePadding();
+    applyLateNote();
+  }
+}
+
+/* The dialog's profile list, read from the server on every open. The select and
+   GUIDE_CONFIG.profiles are rendered once with the page, so a profile made in another tab was
+   missing from Record until a reload (dev/changelog/1651). Both are rebuilt from the one
+   answer so they cannot disagree; a failed read keeps what the page rendered. */
+async function refreshRecordProfiles(token) {
+  const url = GUIDE_CONFIG.profileChoicesUrl;
+  const sel = document.getElementById('modal-profile');
+  if (!url || !sel) return;
+  let data;
+  try {
+    data = await jsonFetch(url);
+  } catch (e) {
+    console.warn(`Could not re-read the recording profiles, showing the page's list: ${e.message}`);
+    return;
+  }
+  if (token !== _modalOpenToken || !data || !Array.isArray(data.profiles)) return;
+  const before = sel.value;
+  const map = {};
+  [...sel.options].forEach((o) => { if (o.value) o.remove(); });
+  data.profiles.forEach((p) => {
+    const id = String(p.id);
+    map[id] = { prePaddingMinutes: p.pre_padding_minutes, postPaddingMinutes: p.post_padding_minutes };
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = p.name;
+    opt.dataset.moveFull = p.move_when_account_full == null ? '' : (p.move_when_account_full ? '1' : '0');
+    sel.appendChild(opt);
+  });
+  GUIDE_CONFIG.profiles = map;
+  const want = _modalProfilePicked ? before : _modalWantedProfileId;
+  const next = want && map[want] ? want : '';
+  sel.value = next;
+  if (_modalProfilePicked && want && !map[want]) {
+    showToast('The profile you picked was deleted, so this recording now uses no profile.',
+      { type: 'error' });
+  }
+  // An edit catching its select up to the stored profile is not a profile change.
+  if (next !== before && (!_modalIsEdit || _modalProfilePicked)) {
+    applyProfilePadding();
+    applyLateNote();
+  }
+  applyMoveChoice();
+}
+
 function applyProfilePadding() {
   const note = document.getElementById('modal-padding-note');
   if (!_modalPaddingApplicable || !_modalBaseStartIso || !_modalBaseStopIso) {
-    if (note) note.style.display = 'none';
+    if (note) {
+      // An edit whose times a profile change leaves says why, once a profile has been picked.
+      const why = _modalIsEdit && _modalProfilePicked ? _modalEditPadWhy : '';
+      note.textContent = why;
+      note.style.display = why ? '' : 'none';
+    }
     return;
   }
   const sel = document.getElementById('modal-profile');
@@ -1941,9 +2032,15 @@ function applyProfilePadding() {
     if (_modalStopEdited) keptParts.push('stop time');
 
     const sentences = [];
+    const profName = sel.options[sel.selectedIndex].text;
     if (paddingParts.length) {
-      const profName = sel.options[sel.selectedIndex].text;
       sentences.push(`Your recording profile, "${profName}", ${paddingParts.join(' and ')}. The times above include it.`);
+    } else if (_modalIsEdit && !(_modalStartEdited && _modalStopEdited)) {
+      // An edit's times moved back to the window itself: said, so the move is never silent.
+      const whose = _modalPadFromGame ? "the game's own time" : "the program's own times";
+      sentences.push(sel.value
+        ? `Your recording profile, "${profName}", adds no padding, so the times above are ${whose}.`
+        : `With no profile there is no padding, so the times above are ${whose}.`);
     }
     if (keptParts.length) {
       const verb = keptParts.length > 1 ? 'were' : 'was';
@@ -2143,23 +2240,33 @@ function openModal(prog, ch, opts = {}) {
   loadBlockPicker('modal', isEdit && !replaceRecId ? prog.recording_id : null);
 
   const profileSel = document.getElementById('modal-profile');
+  _modalProfilePicked = false;
+  _modalIsEdit = Boolean(isEdit && !replaceRecId);
+  _modalEditRecId = _modalIsEdit ? prog.recording_id : null;
+  _modalPadFromGame = false;
+  _modalEditPadWhy = '';
   if (profileSel) {
     if (isEdit) {
       _modalPaddingApplicable = false;
-      profileSel.value = (prog.recording_profile_id != null) ? String(prog.recording_profile_id) : '';
+      _modalBaseStartIso = null;
+      _modalBaseStopIso = null;
+      if (_modalIsEdit) loadEditWindow(prog.recording_id, _modalOpenToken);
+      _modalWantedProfileId = (prog.recording_profile_id != null) ? String(prog.recording_profile_id) : '';
+      profileSel.value = GUIDE_CONFIG.profiles[_modalWantedProfileId] ? _modalWantedProfileId : '';
       const note = document.getElementById('modal-padding-note');
       if (note) note.style.display = 'none';
     } else {
       _modalBaseStartIso = times ? times.start_time : prog.start_time;
       _modalBaseStopIso  = times ? times.stop_time : prog.stop_time;
       _modalPaddingApplicable = true;
-      const defaultProfileId = (ch && ch.default_profile_id != null) ? String(ch.default_profile_id) : '';
-      profileSel.value = GUIDE_CONFIG.profiles[defaultProfileId] ? defaultProfileId : '';
+      _modalWantedProfileId = (ch && ch.default_profile_id != null) ? String(ch.default_profile_id) : '';
+      profileSel.value = GUIDE_CONFIG.profiles[_modalWantedProfileId] ? _modalWantedProfileId : '';
       applyProfilePadding();
       // Set after the pre-selection, so only a profile the user picks renames the showing:
       // the server already named it with the pre-selected one.
       _modalNameProg = prog;
     }
+    refreshRecordProfiles(_modalOpenToken);
   }
 
   setMoveChoice(prog, isEdit && !replaceRecId);
@@ -2310,6 +2417,8 @@ async function submitModalForm(form, data) {
       if (!_modalStartEdited) modalTimes().start.set(new Date(`${e.data.start_time}Z`));
       if (!_modalStopEdited) modalTimes().stop.set(new Date(`${e.data.stop_time}Z`));
       setOpenedWindow(e.data.start_time, e.data.stop_time);
+      // The window the profile pads from may have moved with it.
+      if (_modalEditRecId) loadEditWindow(_modalEditRecId, _modalOpenToken);
     }
     showModalError(e.message || 'Request failed. Check your connection.', e.data && e.data.conflicts);
   }
@@ -3450,8 +3559,9 @@ document.addEventListener('DOMContentLoaded', function () {
   // The head's close button, the backdrop and Escape are wireModal's (recordModalEl).
   document.getElementById('modal-cancel').addEventListener('click', closeModal);
 
-  // Recompute padded start/stop when the profile selection changes (new recordings only) -
-  // but never for a field the user has since hand-edited (dev/docs/BUGS.md 2026-08-06).
+  // Recompute padded start/stop when the profile selection changes (a new recording, or an
+  // edit still at ChannelBin's window) - but never for a field the user has since hand-edited
+  // (dev/docs/BUGS.md 2026-08-06).
   const modalStartInput = document.getElementById('modal-start');
   const modalStopInput  = document.getElementById('modal-stop');
   if (modalStartInput) {
@@ -3461,6 +3571,7 @@ document.addEventListener('DOMContentLoaded', function () {
   const modalProfileSel = document.getElementById('modal-profile');
   if (modalProfileSel) {
     modalProfileSel.addEventListener('change', () => {
+      _modalProfilePicked = true;
       applyProfilePadding(); applyProfileName(); applyLateNote(); applyMoveChoice();
     });
   }

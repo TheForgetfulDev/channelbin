@@ -34,7 +34,7 @@ from types import SimpleNamespace
 
 from . import db
 from .database import (
-    REC_STATUS_SCHEDULED, RECORDING_SPORTS_RETIMED, RECORDING_SPORTS_SECOND, RECORDING_SPORTS_TIME_KEPT,
+    REC_STATUS_SCHEDULED, RECORDING_EDITED, RECORDING_SPORTS_RETIMED, RECORDING_SPORTS_SECOND, RECORDING_SPORTS_TIME_KEPT,
     RECORDING_START_NOT_ARMED, RULE_MATCH_SCHEDULED, WINDOW_OPEN_STATUSES, Recording, RecordingEvent,
     RecordingProfile, RecordingSports, RuleMatch, SportsEvent, SportsLeague, add_recording_event)
 from .db_utils import retry_on_locked
@@ -138,6 +138,22 @@ def record_window(sports_record_tsdb_id, entry, profile_id, now=None, rules=None
     pre = timedelta(minutes=(profile.pre_padding_minutes or 0) if profile else 0)
     post = timedelta(minutes=(profile.post_padding_minutes or 0) if profile else 0)
     return start - pre, stop + post
+
+
+def edit_window(recording_id, now=None):
+    """(kind, owned, (start, stop)) for a SCHEDULED recording the pass follows, read as the pass reads
+    it: which surface made it, whether its window is still the one ChannelBin gave it, and the unpadded
+    window the league's answer gives its listing. None for a recording the pass does not follow. An
+    edit's profile change re-pads from it (app/edit_window.py, dev/changelog/1652)."""
+    from .config import load_config
+    from .sports_times import Rules
+    now = now or datetime.utcnow()
+    ctx = _Context.read([recording_id], now)
+    rec = next((r for r in ctx.primaries if r.id == recording_id), None)
+    if rec is None:
+        return None
+    kind, owned = _owner(rec, ctx)
+    return kind, owned, game_windows(rec, ctx.games[ctx.game_of[rec.id]], Rules(load_config()), now)[0]
 
 
 def same_minute(a, b) -> bool:
@@ -298,13 +314,16 @@ class _Context:
 
 def _stored_padding(ids) -> dict:
     """{recording id: (pre, post)} from the last event in which ChannelBin set its window, for the
-    recordings with no profile to read it from. One query."""
+    recordings with no profile to read it from. One query. An edit that moved the window to a profile's
+    padding is one (its RECORDING_EDITED carries the minutes, app/edit_window.py); any other edit carries
+    none and is skipped."""
     if not ids:
         return {}
     out = {}
     for rid, extra in (db.session.query(RecordingEvent.recording_id, RecordingEvent.extra_data)
                        .filter(RecordingEvent.recording_id.in_(ids),
-                               RecordingEvent.event_type.in_((RECORDING_SPORTS_RETIMED, RECORDING_SPORTS_SECOND)))
+                               RecordingEvent.event_type.in_((RECORDING_SPORTS_RETIMED, RECORDING_SPORTS_SECOND,
+                                                              RECORDING_EDITED)))
                        .order_by(RecordingEvent.id)):
         try:
             data = json.loads(extra or '{}')

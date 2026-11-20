@@ -308,6 +308,15 @@
     }
   }
 
+  // Stored as the version the page was handed, so a release with a new notice shows it again.
+  async function hideAddressNotice(btn) {
+    await jsonFetch(`/api/user-prefs/${btn.dataset.pref}`, {
+      method: 'POST',
+      body: JSON.stringify({ value: Number(btn.dataset.version) }),
+    });
+    refresh(CARDS);
+  }
+
   const guarded = (fn) => (...args) => Promise.resolve(fn(...args)).catch(fail);
 
   document.addEventListener('click', (e) => {
@@ -325,6 +334,7 @@
     else if (act === 'tab') { view.tab = t.dataset.tab; applyTab(); }
     else if (act === 'show') { view.show = t.dataset.show; view.page = 1; applyFilter(); }
     else if (act === 'page') { view.page += Number(t.dataset.dir); applyFilter(); }
+    else if (act === 'hide-address-notice') guarded(hideAddressNotice)(t);
   });
   document.addEventListener('change', (e) => {
     const t = e.target;

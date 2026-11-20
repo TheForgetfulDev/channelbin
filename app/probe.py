@@ -1425,6 +1425,180 @@ def scan_timeline_jumps(filepath: str, min_jump: float = 0.5, timeout: int = 600
     return streams
 
 
+def _merge_spans(spans):
+    """Sorted (start, end) spans with every overlap merged. A joined file's decode timeline
+    can step backwards at a join, so a stream's holes are not guaranteed to arrive in order."""
+    out = []
+    for start, end in sorted(s for s in spans if s[1] > s[0]):
+        if out and start <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
+
+
+def _intersect_spans(a, b):
+    """The stretches inside both merged span lists."""
+    out, i, j = [], 0, 0
+    while i < len(a) and j < len(b):
+        start, end = max(a[i][0], b[j][0]), min(a[i][1], b[j][1])
+        if end > start:
+            out.append((start, end))
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out
+
+
+def _subtract_spans(a, b):
+    """The stretches of merged list `a` that merged list `b` does not cover."""
+    out = []
+    for start, end in a:
+        cursor = start
+        for b_start, b_end in b:
+            if b_end <= cursor or b_start >= end:
+                continue
+            if b_start > cursor:
+                out.append((cursor, b_start))
+            cursor = max(cursor, b_end)
+        if cursor < end:
+            out.append((cursor, end))
+    return out
+
+
+def split_track_gaps(video, audio, min_length: float = 0.0):
+    """(both, video_only, audio_only) for two tracks' holes, each a list of (start, end).
+
+    Only the overlap of a video hole and an audio hole is a stretch with nothing in it - a
+    frozen picture over silence once converted. The rest of each hole has the other track
+    playing through it, and closing that part would cut real picture or sound and move the
+    tracks against each other, the defect dev/changelog/1199 fixed.
+
+    A piece shorter than `min_length` is dropped. Two tracks that drop out together never
+    stop and resume on the same timestamp - a video and an audio packet are a few hundredths
+    of a second apart - so a clean both-track hole leaves a sliver of one track's hole at
+    each end, and counted, those slivers read as one-track gaps of 0.0 s."""
+    video, audio = _merge_spans(video), _merge_spans(audio)
+    return tuple([(start, end) for start, end in spans if end - start >= min_length]
+                 for spans in (_intersect_spans(video, audio), _subtract_spans(video, audio),
+                               _subtract_spans(audio, video)))
+
+
+def _jump_holes(jumps, origin):
+    """A stream's forward jumps (scan_timeline_jumps) as the stretches no packet covers,
+    in seconds from `origin`: from where the packet before the jump ends to the packet after
+    it. The packet's own length is not part of the hole, so a jump only one packet long
+    leaves nothing."""
+    holes = []
+    for prev, dts, cadence in jumps:
+        start = prev + (cadence if cadence and 0.0 < cadence < 1.0 else 0.0)
+        if dts > start:
+            holes.append((start - origin, dts - origin))
+    return holes
+
+
+def track_gaps(filepath: str, gap_threshold: float = 0.25, timeout: int = 600,
+               on_progress=None) -> dict:
+    """Where the picture is missing, where the sound is missing, and where both are, from one
+    whole-file read of every packet's decode timestamp (scan_timeline_jumps).
+
+    scan_video_timeline() measures the video alone, so a hole it reports may have sound
+    playing through it or may have nothing at all, and the two play very differently once
+    converted: the converter holds the last picture across a video hole either way
+    (dev/changelog/1199), so the first is a still picture with the program's sound and the
+    second a still picture over silence. Measured here so the second kind can be counted on
+    real recordings (dev/changelog/1649). Only a hole that is still in the file's timeline is
+    seen: time lost between joined segments was closed at the join and plays as nothing.
+
+    The first video and the first audio stream are compared, as tail_track_ends() does, on
+    their decode timestamps. A jump counts when it is over `gap_threshold`, the damage scan's
+    own threshold, so the two count the same video holes, and a piece of a split shorter than
+    it is dropped (split_track_gaps). A track that starts after the other or stops before it
+    is not a hole between two of its packets, so it is reported on its own, as `edges`.
+
+        origin          the earliest decode timestamp of the two streams; every place below
+                        is seconds from it
+        span_seconds    origin to the last decode timestamp of the two
+        video_stream, audio_stream  the stream indexes compared, None when the file has none
+        audio_streams   how many audio streams the file has
+        truncated       True when a stream had more jumps than scan_timeline_jumps lists;
+                        every list below then stops at `compared_until`, the place where the
+                        first such stream's list stops, so a hole past it on one track is
+                        never paired with a list that no longer sees the other
+        compared_until  seconds from origin, None when nothing was truncated
+        both, video_only, audio_only  [(start, end), ...] in file order
+        edges           {'video': {...}, 'audio': {...}} for each track the file has:
+                        'empty' True when it has no packet at all, 'late' the seconds it
+                        starts after the other track and 'early' the seconds it stops before
+                        it, each 0.0 when within gap_threshold
+
+    Returns {} on any failure, and when the file has neither a video nor an audio stream.
+    """
+    layout = stream_layout(filepath)
+    if not layout:
+        return {}
+    video_stream = next((i for i, (kind, _pid) in enumerate(layout) if kind == 'video'), None)
+    audio_indexes = [i for i, (kind, _pid) in enumerate(layout) if kind == 'audio']
+    audio_stream = audio_indexes[0] if audio_indexes else None
+    if video_stream is None and audio_stream is None:
+        return {}
+    scan = scan_timeline_jumps(filepath, min_jump=gap_threshold, timeout=timeout,
+                               on_progress=on_progress)
+    if not scan:
+        return {}
+    present = {kind: index for kind, index in (('video', video_stream), ('audio', audio_stream))
+               if index is not None}
+    read = {kind: scan.get(index) for kind, index in present.items() if scan.get(index)}
+    if not read:
+        return {}
+    origin = min(st['first_dts'] for st in read.values())
+    end = max(st['last_dts'] for st in read.values())
+
+    compared_until = None
+    for st in read.values():
+        if st.get('truncated') and st['jumps']:
+            cut = st['jumps'][-1][1] - origin
+            compared_until = cut if compared_until is None else min(compared_until, cut)
+
+    def _holes(kind):
+        st = read.get(kind)
+        holes = _jump_holes(st['jumps'], origin) if st else []
+        if compared_until is not None:
+            holes = [(start, min(stop, compared_until)) for start, stop in holes
+                     if start < compared_until]
+        return holes
+
+    edges = {}
+    for kind in present:
+        st = read.get(kind)
+        if st is None:
+            edges[kind] = {'empty': True, 'late': 0.0, 'early': 0.0}
+            continue
+        late = st['first_dts'] - origin
+        early = end - st['last_dts']
+        edges[kind] = {'empty': False,
+                       'late': late if late > gap_threshold else 0.0,
+                       'early': early if early > gap_threshold else 0.0}
+
+    both, video_only, audio_only = split_track_gaps(_holes('video'), _holes('audio'),
+                                                    min_length=gap_threshold)
+    return {
+        'origin': origin,
+        'span_seconds': end - origin,
+        'gap_threshold': gap_threshold,
+        'video_stream': video_stream,
+        'audio_stream': audio_stream,
+        'audio_streams': len(audio_indexes),
+        'truncated': compared_until is not None,
+        'compared_until': compared_until,
+        'both': both,
+        'video_only': video_only,
+        'audio_only': audio_only,
+        'edges': edges,
+    }
+
+
 def assess_seek_damage(filepath: str, *, joined_segments: int = 1, segment_rates=None,
                        on_progress=None) -> tuple:
     """Decide whether a recording's video timeline is damaged enough to break seeking.

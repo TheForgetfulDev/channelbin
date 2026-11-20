@@ -45,6 +45,12 @@ log = logging.getLogger(__name__)
 # two cannot disagree on the spelling (DESIGN.md 15.9).
 SETTINGS_VIEW_PREF = 'settings_show_advanced'
 
+# The flask.* keys a Settings control writes. The rest are read once at startup, and a wrong
+# port, host or secret key can leave the page unreachable or every session signed out, with
+# no page left to undo it from - so they are changed in config.yaml, and this route refuses
+# them whatever posts them (dev/changelog/1648).
+GUI_FLASK_KEYS = frozenset({'flask.public_url', 'flask.behind_proxy'})
+
 
 def _page_size_choice(value):
     """`search.page_size` as the int it is stored as, or None when it is not on the menu. The
@@ -294,6 +300,20 @@ def api_settings_get():
     return jsonify(mask_config(load_config()))
 
 
+@settings_bp.route('/api/settings/proxy-check')
+def api_settings_proxy_check():
+    """What this request arrived with from a reverse proxy, for the check beside the
+    "Behind a reverse proxy" switch. Read-only, and only the proxy headers are echoed.
+    `?probe=1` says the page planted output_feed_view.PROXY_PROBE_ADDRESS in
+    X-Forwarded-For; static/js/settings.js asks once without it and once with it."""
+    from .. import output_feed_view
+    facts = output_feed_view.proxy_check(request.environ, request.args.get('probe') == '1')
+    return jsonify({'success': True, **facts,
+                    'configured': bool((load_config().get('flask') or {}).get('behind_proxy')),
+                    'wired': bool(current_app.config.get('BEHIND_PROXY')),
+                    'planted': output_feed_view.PROXY_PROBE_ADDRESS})
+
+
 @settings_bp.route('/api/settings/field', methods=['POST'])
 def api_settings_field():
     """Save a single config field. Body: {path, value}."""
@@ -303,6 +323,10 @@ def api_settings_field():
 
     if not path:
         return jsonify({'error': 'Missing path'}), 400
+    if (path == 'flask' or path.startswith('flask.')) and path not in GUI_FLASK_KEYS:
+        return jsonify({'error': f'{path} is changed in config.yaml only'}), 400
+    if path == 'flask.behind_proxy' and not isinstance(value, bool):
+        return jsonify({'error': 'Say whether ChannelBin is behind a reverse proxy'}), 400
 
     # These new numeric settings drive supervised-conversion loops/timeouts; a negative or
     # absurd value would misbehave. Coerce to a non-negative int, and cap the poll interval

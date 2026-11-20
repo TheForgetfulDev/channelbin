@@ -4,8 +4,9 @@ dev/docs/BUGS.md 2026-10-15 @ 04:24:24 PM: "A video gap over 10 seconds converte
 and a video that stopped before its audio was not padded".
 
 Real ffmpeg on small synthesized local files. The conversion command is captured from
-do_postprocess (run_conversion_supervised stubbed) and then executed, the way
-tests/test_normalize_conversion.py does, so what is asserted is the file the command makes.
+do_postprocess (run_conversion_supervised stubbed, tests/support/conversion.py) and then
+executed, the way tests/test_normalize_conversion.py does, so what is asserted is the file the
+command makes.
 The GPU half is argv only: the suite's machine has no render node, and the lab job
 dev/tools/gpu-lab/jobs/gap-fill-matrix.sh is where those commands ran on the GPU.
 """
@@ -16,18 +17,16 @@ import subprocess
 import sys
 import unittest
 from datetime import datetime, timedelta
-from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import app.config as cfgmod  # noqa: E402
 import app.postprocessor as ppmod  # noqa: E402
 from app import db, toolchain  # noqa: E402
 from app.database import Recording, RecordingEvent, RecordingSegment, DIAGNOSTICS  # noqa: E402
-from app.postprocessor import ConversionResult, do_postprocess  # noqa: E402
 from app.proc_utils import TIMELINE_GAP_KEEP_SECONDS  # noqa: E402
 from tests.support import clips, seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
+from tests.support.conversion import postprocess_config, stubbed_postprocess  # noqa: E402
 
 _HAVE_FFMPEG = bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
 RATE = '30000/1001'
@@ -63,19 +62,7 @@ def _video_dts(path):
 
 
 def _config(**pp_overrides):
-    # duplicated from tests/test_normalize_conversion.py - a test module stays self-contained
-    pp = dict({'enabled': True, 'format': 'mp4', 'delete_source': False,
-               'reencode_mode': 'damaged', 'pre_output_timeout_seconds': 60,
-               'auto_restart': True, 'max_restart_attempts': 3, 'stall_seconds': 0,
-               'progress_interval_seconds': 5, 'video_encoder': 'software',
-               'video_codec': 'h264', 'max_height': 0, 'audio_channels': 'source',
-               'loudness_normalize': False, 'vaapi_decode': False}, **pp_overrides)
-    return cfgmod._deep_merge(cfgmod.load_config(), {'recording': {
-        'gather_health_data': False,
-        'move_on_complete': {'enabled': False},
-        'post_script': {'enabled': False},
-        'post_process': pp,
-    }})
+    return postprocess_config(**pp_overrides)
 
 
 def _build_sources(d):
@@ -131,27 +118,8 @@ class _GapCase(unittest.TestCase):
 
     def _convert(self, cfg, trial_rc=0):
         """Run do_postprocess with the encode stubbed; return the first command it would run."""
-        # duplicated from tests/test_normalize_conversion.py::_NormalizeCase._convert - the
-        # same capture, without that module's fixture clips
-        def attempt(app, rid, cmd, part_file, **kw):
-            with open(part_file, 'wb') as fh:
-                fh.write(b'p' * 64)
-            return ConversionResult(True, 'success', out_time=45.0)
-
-        def join(parts, output_path, *a, **k):
-            with open(output_path, 'wb') as fh:
-                fh.write(b'o' * 128)
-            return ppmod.PartJoinResult(True, 'success', parts=len(parts))
-
-        stub = mock.Mock(side_effect=attempt)
-        with mock.patch.object(cfgmod, 'load_config', return_value=cfg), \
-             mock.patch.object(ppmod, 'run_conversion_supervised', stub), \
-             mock.patch.object(ppmod, 'join_conversion_parts', join), \
-             mock.patch.object(ppmod, 'finalize_part', lambda part, *a, **k: 0.0), \
-             mock.patch.object(toolchain, '_run_gpu_trial',
-                               lambda *a, **k: (trial_rc, '')):
-            do_postprocess(self.t.app, self.rid, self.ts)
-        db.session.expire_all()
+        stub = stubbed_postprocess(self.t.app, self.rid, self.ts, cfg, out_time=45.0,
+                                   trial_rc=trial_rc)
         return stub.call_args_list[0][0][2]
 
     def _execute(self, cmd):

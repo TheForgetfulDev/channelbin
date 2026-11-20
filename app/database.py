@@ -737,8 +737,8 @@ REC_STATUS_PAUSED        = 'PAUSED'
 REC_STATUS_RETRYING      = 'RETRYING'
 REC_STATUS_CONCATENATING = 'CONCATENATING'
 # The post-capture analysis phase: the concat has committed its output and the app is
-# reading that finished file back (health probe, timeline damage scan, near-empty segment
-# detection). Whole-file reads that scale with size - ~124s each on a 17.9 GB capture - so
+# reading that finished file back (health probe, timeline damage scan, picture-and-sound gap
+# read, near-empty segment detection). Whole-file reads that scale with size - ~124s each on a 17.9 GB capture - so
 # this is not a moment, it is a window that reaches hours. It exists because CONCATENATING
 # used to stand for it, and a row saying "concatenating" while the concat has been finished
 # the whole time is the founding-thesis defect: an activity log that read "concat complete",

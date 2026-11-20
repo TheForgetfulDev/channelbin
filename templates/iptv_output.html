@@ -71,13 +71,17 @@
     {#- Only the body goes quiet while nothing is offered: the login can still be changed. #}
     <div class="card-body{{ ' of-inert' if dormant else '' }}"{{ ' inert' if dormant else '' }}>
       <p class="card-note">Add ChannelBin to an IPTV player (like TiviMate) the way you would add any IPTV provider. You can add it as an Xtream account or a standard m3u/xml playlist.</p>
-      {% if address.state == 'unset' %}
-      <div class="notice notice-info notice-act of-addr"><div><strong>ChannelBin's address is not set.</strong> Until it is, these details use the address this page was opened on, <strong>{{ address.base }}</strong>.</div><a class="btn btn-sm" href="{{ url_for('settings.settings', q='flask.public_url') }}">Set ChannelBin's address {{ icon('forward') }}</a></div>
+      {#- Only this notice can be hidden: the details work from other devices, so it is news,
+          not a fault. The localhost one below stays, since its details do not. Hidden by
+          version (output_feed_view.ADDRESS_NOTICE_VERSION), and the foot line still says
+          which address is used. -#}
+      {% if address.state == 'unset' and not address_notice.hidden %}
+      <div class="notice notice-info notice-act of-addr"><div><strong>ChannelBin's address is not set.</strong> Until it is, these details use the address this page was opened on, <strong>{{ address.base }}</strong>.</div><div class="notice-btns"><button class="btn btn-sm" data-act="hide-address-notice" data-tip="Hide this notice. It comes back only if a later version of ChannelBin has something new to say here." data-pref="{{ address_notice.pref }}" data-version="{{ address_notice.version }}">Hide</button><a class="btn btn-sm" href="{{ url_for('settings.settings', q='flask.public_url') }}">Set ChannelBin's address {{ icon('forward') }}</a></div></div>
       {% elif address.state == 'localhost' %}
       <div class="notice notice-warn notice-act of-addr"><div><strong>ChannelBin's address is not set, and this page was opened at localhost.</strong> That address only works on this computer, so an IPTV player on a TV or a phone cannot use the details below. Set ChannelBin's address to the one this computer has on your network.</div><a class="btn btn-sm" href="{{ url_for('settings.settings', q='flask.public_url') }}">Set ChannelBin's address {{ icon('forward') }}</a></div>
       {% endif %}
       {% if proxy == 'unseen' %}
-      <div class="notice notice-warn notice-act of-addr"><div><strong>ChannelBin is behind a reverse proxy and has not been told so.</strong> This page reached it through one, so ChannelBin sees the proxy in place of each visitor: an address below says http where yours may be https, and every IPTV player is listed under the proxy's address in place of its own. To fix both, set <code>flask.behind_proxy: true</code> in config.yaml and restart ChannelBin.</div><a class="btn btn-sm" href="{{ url_for('settings.settings', q='flask.behind_proxy') }}">Behind a reverse proxy {{ icon('forward') }}</a></div>
+      <div class="notice notice-warn notice-act of-addr"><div><strong>ChannelBin is behind a reverse proxy and has not been told so.</strong> This page reached it through one, so ChannelBin sees the proxy in place of each visitor: an address below says http where yours may be https, and every IPTV player is listed under the proxy's address in place of its own. To fix both, turn on "Behind a reverse proxy" in Settings and restart ChannelBin.</div><a class="btn btn-sm" href="{{ url_for('settings.settings', q='flask.behind_proxy') }}">Behind a reverse proxy {{ icon('forward') }}</a></div>
       {% elif proxy == 'restart' %}
       <div class="notice notice-warn of-addr"><div><strong>"Behind a reverse proxy" is turned on and waits for a restart.</strong> Until ChannelBin is restarted it still sees the proxy in place of each visitor: an address below says http where yours may be https, and every IPTV player is listed under the proxy's address.</div></div>
       {% endif %}
@@ -93,7 +97,7 @@
           <span class="a"><button class="btn btn-sm" data-act="copy" data-label="Username">{{ icon('copy') }}Copy</button></span></div>
         <div class="of-conn"><span class="k">Password</span><span class="v" data-secret-text="{{ password_slot }}">{{ mask }}</span>
           <span class="a"><button class="btn btn-sm btn-icon" data-act="reveal" aria-label="Show the password">{{ icon('reveal') }}</button><button class="btn btn-sm" data-act="copy" data-secret="{{ password_slot }}" data-label="Password">{{ icon('copy') }}Copy</button></span></div>
-        <p class="card-note of-conn-foot">{% if address.state == 'set' %}The address is ChannelBin's address from Settings. {% endif %}This login is only for IPTV players. It is not ChannelBin's own login, and a player is never asked for that one.</p>
+        <p class="card-note of-conn-foot">{% if address.state == 'set' %}The address is ChannelBin's address from Settings. {% elif address_notice.hidden %}The address is the one this page was opened on, since ChannelBin's address is not set in Settings. {% endif %}This login is only for IPTV players. It is not ChannelBin's own login, and a player is never asked for that one.</p>
       </div>
       <div class="of-conn-pane" role="tabpanel" data-pane="playlist" hidden>
         <p class="card-note">For a player that takes a playlist address instead. Paste the first as the playlist and the second as the guide (EPG). Use these or the Xtream account, not both.</p>
@@ -101,7 +105,7 @@
         <div class="of-conn"><span class="k">{{ label }}</span><span class="v" data-secret-text="{{ value }}">{{ value | replace(password_slot, mask) }}</span>
           <span class="a"><button class="btn btn-sm btn-icon" data-act="reveal" aria-label="Show the password">{{ icon('reveal') }}</button><button class="btn btn-sm" data-act="copy" data-secret="{{ value }}" data-label="{{ label }}">{{ icon('copy') }}Copy</button></span></div>
         {% endfor %}
-        <p class="card-note of-conn-foot">{% if address.state == 'set' %}The address is ChannelBin's address from Settings. {% endif %}Both addresses have the password inside them, so treat a copied one like the password itself.</p>
+        <p class="card-note of-conn-foot">{% if address.state == 'set' %}The address is ChannelBin's address from Settings. {% elif address_notice.hidden %}The address is the one this page was opened on, since ChannelBin's address is not set in Settings. {% endif %}Both addresses have the password inside them, so treat a copied one like the password itself.</p>
       </div>
     </div>
   </div>

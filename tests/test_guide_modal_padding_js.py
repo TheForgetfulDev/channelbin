@@ -409,3 +409,131 @@ class EditMovedRefillsTests(_Base, unittest.TestCase):
     def test_it_says_why_and_stays_open(self):
         self.assertIn('moved since this dialog opened', self.obs['errorText'])
         self.assertTrue(self.obs['modalOpen'])
+
+
+class ProfileAddedAfterLoadTests(_Base, unittest.TestCase):
+    """A profile made after the page loaded appears in the record dialog on its next open,
+    and a new recording on a channel whose default it is gets it and its padding
+    (dev/docs/BUGS.md 2026-11-19 @ 08:52:17 PM ET)."""
+    SCENARIO = 'profile_added_after_load'
+
+    def test_the_page_rendered_only_the_old_list(self):
+        self.assertEqual([o[0] for o in self.obs['rendered']], ['', '1'])
+
+    def test_the_new_profile_is_offered_after_the_reread(self):
+        self.assertEqual(self.obs['options'], [
+            ['', 'None (use global defaults)', ''],
+            ['1', 'Extend End Only', ''],
+            ['2', 'Made later', '1'],
+        ])
+
+    def test_the_padding_map_matches_the_select(self):
+        self.assertEqual(self.obs['map'], {
+            '1': {'prePaddingMinutes': 0, 'postPaddingMinutes': 15},
+            '2': {'prePaddingMinutes': 10, 'postPaddingMinutes': 20},
+        })
+
+    def test_the_channel_default_is_selected_and_padded(self):
+        self.assertEqual(self.obs['beforeAnswer'], '')
+        self.assertEqual(self.obs['value'], '2')
+        self.assertEqual(self.obs['start'], '2026-08-10T15:50')
+        self.assertEqual(self.obs['stop'], '2026-08-10T17:20')
+        self.assertIn('"Made later"', self.obs['noteText'])
+
+
+class ProfileAddedAfterLoadEditTests(_Base, unittest.TestCase):
+    """Editing a recording made with a profile this page never rendered shows that profile,
+    not None (dev/docs/BUGS.md 2026-11-19 @ 08:52:17 PM ET)."""
+    SCENARIO = 'profile_added_after_load_edit'
+
+    def test_the_stored_profile_is_selected(self):
+        self.assertEqual(self.obs['value'], '2')
+
+    def test_the_times_are_left_alone(self):
+        self.assertEqual((self.obs['start'], self.obs['stop']),
+                         ('2026-08-10T16:00', '2026-08-10T17:00'))
+
+
+class ProfilePickedBeforeAnswerTests(_Base, unittest.TestCase):
+    """A profile the user picks before the re-read answers stays picked."""
+    SCENARIO = 'profile_picked_before_answer'
+
+    def test_the_pick_survives(self):
+        self.assertEqual(self.obs['value'], '1')
+        self.assertEqual(self.obs['stop'], '2026-08-10T17:15')
+
+
+class ProfileRereadFailsTests(_Base, unittest.TestCase):
+    """When the list cannot be read, the dialog keeps the one the page rendered."""
+    SCENARIO = 'profile_reread_fails'
+
+    def test_the_rendered_list_stays(self):
+        self.assertEqual([o[0] for o in self.obs['options']], ['', '1'])
+        self.assertEqual(self.obs['map'], {'1': {'prePaddingMinutes': 0,
+                                                 'postPaddingMinutes': 15}})
+
+
+class EditRepadsOwnedTests(_Base, unittest.TestCase):
+    """Editing a recording still at the window ChannelBin gave it: picking a profile moves both
+    times to that profile's padding and says so, and None moves them back to the window
+    (dev/docs/BUGS.md 2026-11-19 @ 09:14:30 PM ET)."""
+    SCENARIO = 'edit_repads_owned'
+
+    def test_it_asks_for_this_recordings_window(self):
+        self.assertEqual([r.rsplit('/api/', 1)[1] for r in self.obs['requests']],
+                         ['recordings/79/edit-window'])
+
+    def test_opening_moves_nothing(self):
+        self.assertEqual(self.obs['opened'], ['2026-08-10T16:00', '2026-08-10T17:00', False])
+
+    def test_a_profile_pick_pads_and_says_so(self):
+        start, stop, note = self.obs['picked']
+        self.assertEqual((start, stop), ('2026-08-10T16:00', '2026-08-10T17:15'))
+        self.assertIn('ends this recording 15 minutes later', note)
+
+    def test_none_puts_the_window_back_and_says_so(self):
+        start, stop, note = self.obs['none']
+        self.assertEqual((start, stop), ('2026-08-10T16:00', '2026-08-10T17:00'))
+        self.assertIn("the program's own times", note)
+
+
+class EditRepadsFromGameTests(_Base, unittest.TestCase):
+    """A recording that follows its game pads from the game's time the server names."""
+    SCENARIO = 'edit_repads_from_game'
+
+    def test_it_pads_from_the_game(self):
+        self.assertEqual(self.obs['picked'], ['2026-08-10T15:00', '2026-08-10T17:15'])
+
+    def test_the_note_names_the_game(self):
+        self.assertIn("the game's own time", self.obs['noneText'])
+
+
+class EditHandSetKeptTests(_Base, unittest.TestCase):
+    """Times a person set are theirs: a profile change leaves them and the note says why."""
+    SCENARIO = 'edit_hand_set_kept'
+
+    def test_the_times_stay(self):
+        self.assertEqual((self.obs['start'], self.obs['stop']),
+                         ('2026-08-10T16:00', '2026-08-10T17:00'))
+
+    def test_the_note_says_why(self):
+        self.assertTrue(self.obs['noteVisible'])
+        self.assertIn('set by hand', self.obs['noteText'])
+
+
+class EditTypedStopThenProfileTests(_Base, unittest.TestCase):
+    """A time typed in the dialog survives a later profile pick, as on a new recording."""
+    SCENARIO = 'edit_typed_stop_then_profile'
+
+    def test_the_typed_stop_stays(self):
+        self.assertEqual(self.obs['stop'], '2026-08-10T18:30')
+        self.assertIn('left as entered', self.obs['noteText'])
+
+
+class EditPickBeforeAnswerTests(_Base, unittest.TestCase):
+    """A profile picked before the window arrives is padded when it does."""
+    SCENARIO = 'edit_pick_before_answer'
+
+    def test_the_pick_is_padded_once_the_window_arrives(self):
+        self.assertEqual(self.obs['before'], '2026-08-10T17:00')
+        self.assertEqual(self.obs['stop'], '2026-08-10T17:15')

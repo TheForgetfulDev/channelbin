@@ -1,0 +1,38 @@
+name: issue title
+
+# Keeps every issue's title starting with its kind: "[bug]: ..." or "[feature]: ...". The
+# issue forms prefill that prefix, but a prefilled title is only a default the reporter can
+# delete or retype, and GitHub has no way to lock it. So this puts it back afterwards, from
+# the label the form applied. It edits the title and says nothing on the issue.
+#
+# `labeled` is listed beside `opened` so the title is still fixed if a label arrives a moment
+# after the issue does, or is added by hand later.
+on:
+  issues:
+    types: [opened, edited, labeled]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  prefix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+      - name: Put the kind at the front of the title
+        # The title and labels are a stranger's text: they reach the script through the
+        # environment and are never written into the command below.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
+        run: |
+          want=$(bash .github/scripts/issue-title.sh)
+          if [ "$want" != "$ISSUE_TITLE" ]; then
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --title "$want"
+          fi

@@ -98,6 +98,9 @@
 /* A card's first group sits right under the card head, which already draws the rule. */
 .card-body > [data-sub]:first-child > .sec-sub { border-top: none; margin-top: 0; }
 .auth-password-form { padding: 6px 18px 16px; max-width: 340px; }
+/* The reverse-proxy check: a button, then the one line it answers with, the width of the card. */
+.proxy-check { padding: 6px 18px 16px; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
+.proxy-check-result { margin-bottom: 0; align-self: stretch; }
 
 /* ── The field row's own rules. The anatomy itself (.frow / .fl* / .fr-ctl /
       .restart-badge, and the ≤960px stack) lives in style.css as of
@@ -198,6 +201,7 @@
   .sec-card .card-head { padding: 10px 14px; }
   .sec-note { padding: 10px 14px 2px; }
   .sec-sub { padding: 14px 14px 2px; }
+  .proxy-check { padding: 6px 14px 14px; }
   .auth-password-form { padding: 6px 14px 16px; max-width: none; }
   .tier-more { padding: 10px 14px 12px; }
   .xtier .btn { margin-left: 0; }
@@ -428,7 +432,7 @@
       <div data-sub="measurement">
         <div class="sec-sub"><strong>Measurement and local contention</strong></div>
         {{ field_bool('recording.gather_health_data', 'Gather recording health data',
-           'After the segments are joined, run ffprobe on the final .ts file to capture resolution, fps, frame count, and bitrate. Runs before any format conversion. Disable to save time on very long recordings.', rec.get('gather_health_data', True), tier='advanced') }}
+           'After the segments are joined, read the final .ts file back before any conversion: its resolution, fps, frame count and bitrate, a scan for missing video, and where the picture, the sound or both are missing. Each is a read of the whole file. Disable to save time on very long recordings.', rec.get('gather_health_data', True), tier='advanced') }}
         {{ field_bool('recording.serialize_concat', 'Serialize concatenation',
            'Only run one join+conversion job at a time, and none while any recording is IN_PROGRESS. A queued job waits (segments are already safely on disk) rather than failing. Local CPU/disk contention control - unrelated to per-account connection limits.', rec.get('serialize_concat', False), tier='advanced') }}
       </div>
@@ -845,11 +849,32 @@
     {% endcall %}
 
     {% call section('system', 'System') %}
+      {#- ChannelBin's address first: it is the one row here anyone needs, and it is not the
+          bind address below it. Only it and the proxy switch are editable; the save route
+          refuses every other flask.* key (dev/changelog/1648). -#}
+      {{ field_text('flask.public_url', 'ChannelBin\'s address',
+         'The address your other devices use to reach ChannelBin, starting with http:// or https://. The IPTV Output page gives it to IPTV players as the server address, push notifications start every link with it, and anything else that has to tell a device where ChannelBin is uses it too. Safe to change at any time: it only changes the address ChannelBin hands out, never where ChannelBin listens, so it cannot cut you off from this page. Left blank, the IPTV Output page uses the address it was opened on, and push notifications carry no link. An IPTV player is always answered on the address it connected on, whatever is set here.',
+         fsk.get('public_url', ''), tier='basic', placeholder='https://channelbin.example.com',
+         examples=['https://channelbin.example.com', 'http://192.168.1.1:5000']) }}
+      {#- The test below reads /api/settings/proxy-check through static/js/settings.js. -#}
+      {{ field_bool('flask.behind_proxy', 'Behind a reverse proxy',
+         'Turn this on when you reach ChannelBin through a reverse proxy, like nginx, Caddy, Traefik or Nginx Proxy Manager. With it off, ChannelBin sees the proxy in place of each visitor: the IPTV Output page lists every IPTV player under the proxy\'s address, an IPTV player can be told ChannelBin is on http and port 80 when you reach it on https, and with the login gate on, the login page says the connection is not encrypted and everyone\'s wrong passwords count as one visitor\'s, so one person can lock everyone out for 15 minutes. Turning it on cannot lock you out: a visit straight to ChannelBin\'s own address carries no proxy headers, and nothing about it changes. Run the test below through your proxy first. To undo it, turn it off here and restart, or set flask.behind_proxy: false in config.yaml and restart.',
+         fsk.get('behind_proxy', False), restart=True, tier='advanced') }}
+      <div data-tier="advanced">
+      <div class="sec-sub">
+        <strong>Test the reverse proxy</strong>
+        Open Settings through your proxy and press Test. It looks at what the proxy adds to this page's requests and says whether turning on "Behind a reverse proxy" would work, and whether it would be safe. It only explains: it never changes the setting.
+      </div>
+      <div class="proxy-check">
+        <button type="button" class="btn btn-sm" id="proxy-check-btn">Test</button>
+        <div class="notice proxy-check-result" id="proxy-check-result" role="status" hidden></div>
+      </div>
+      </div>
       {{ field_readonly('flask.port', 'Flask port',
-         'Port the app listens on. Under Docker this is the container\'s port, and the one you browse to is whatever your compose file maps to it. Edit in the config.yaml tab; restart required.',
+         'The port ChannelBin listens on. Under Docker this is the container\'s port, and the one you browse to is whatever your compose file maps to it. Changed in the config.yaml tab only, on purpose: a wrong port leaves your browser nothing to connect to, and then this page could not be used to put it back. If that happens, edit config.yaml itself in ChannelBin\'s config folder (/config under Docker) with any text editor, put the port back, and restart ChannelBin. Restart required.',
          fsk.get('port', 5000), tier='advanced') }}
       {{ field_readonly('flask.host', 'Flask host',
-         'Bind address for the Flask server. Edit in the config.yaml tab; restart required.',
+         'The network address ChannelBin listens on. 0.0.0.0 means every address this computer has. This is not ChannelBin\'s address: that is the setting at the top of this card. Changed in the config.yaml tab only, on purpose: a wrong value can stop your browser reaching ChannelBin at all, and then this page could not be used to undo it. If that happens, edit config.yaml itself in ChannelBin\'s config folder (/config under Docker) with any text editor, set host back to 0.0.0.0, and restart ChannelBin. Restart required.',
          fsk.get('host', '0.0.0.0'), tier='advanced') }}
       {% if fsk.get('host', '0.0.0.0') in ('0.0.0.0', '', '::') %}
       {% call field_shell('', icon('warning') ~ ' Reachable from any device on this network',
@@ -858,11 +883,6 @@
           else 'and it has no authentication (see the Security section above to turn on the password gate).') ~
          ' If your reverse proxy runs on this same machine, you can set flask.host: 127.0.0.1 in the config.yaml tab to make the raw port unreachable except from the proxy. Do not do this if the proxy (or the devices you browse from) run on a different host - it will break access.', false, false, 'network exposure bind reachable lan security host', true, 'warn', tier='advanced') %}{% endcall %}
       {% endif %}
-      {{ field_text('flask.public_url', 'ChannelBin\'s address',
-         'The address other devices reach ChannelBin at. Type the whole address, starting with http:// or https://, like https://channelbin.example.com or http://192.168.1.1:5000. It is the server address the IPTV Output page tells you to type into an IPTV player, and the start of every link in a push notification. Leave it blank and the IPTV Output page shows the address it was opened on, and push notifications carry no link. An IPTV player is always answered on the address it connected on, whatever is set here.', fsk.get('public_url', ''), tier='basic') }}
-      {{ field_readonly('flask.behind_proxy', 'Behind a reverse proxy',
-         'Trust the X-Forwarded-* headers, so the app sees the real client IP and the real scheme (https) instead of the proxy\'s. Turn this on only when a reverse proxy actually fronts the app - with it off, an HTTPS visitor still looks like plain HTTP to the app, and the login page warns that the connection is unencrypted when it is not, and the IPTV Output page lists every IPTV player under the proxy\'s address. Your proxy must append to X-Forwarded-For rather than pass the client\'s own copy through (nginx: $proxy_add_x_forwarded_for), or a caller can present a fresh IP per attempt and never trip the login lockout. Edit in the config.yaml tab; restart required.',
-         fsk.get('behind_proxy', False)|string|lower, tier='advanced') }}
       {{ field_readonly('flask.debug', 'Debug mode',
          'Flask debug mode. Edit in the config.yaml tab; restart required.',
          fsk.get('debug', False)|string|lower, tier='advanced') }}

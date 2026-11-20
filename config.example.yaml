@@ -235,12 +235,15 @@ ffmpeg:
   concat_stall_seconds: 300                # give up if the output file stops growing this long; 0 disables
 
 flask:
+  # port and host are where ChannelBin listens, and are changed here only: a wrong value can
+  # stop your browser reaching ChannelBin, and then Settings could not put it back. Fix one by
+  # editing this file and restarting.
   port: 5000
-  host: 0.0.0.0                         # reachable from every device on your LAN (see README)
+  host: 0.0.0.0                         # reachable from every device on your LAN (see README); not ChannelBin's address - that is public_url
   debug: false
   secret_key: change-me-in-production   # left as-is → a generated key in instance/secret_key is used
-  behind_proxy: false                   # true ONLY when a reverse proxy fronts the app (trusts X-Forwarded-*); restart required
-  public_url: ''                        # ChannelBin's own address, whole: https://channelbin.example.com or http://192.168.1.1:5000 - links in push notifications, and the server address the IPTV Output page shows
+  behind_proxy: false                   # Settings > System > "Behind a reverse proxy": true when you reach ChannelBin through one (trusts X-Forwarded-*); restart required
+  public_url: ''                        # Settings > System > "ChannelBin's address", whole: https://channelbin.example.com or http://192.168.1.1:5000 - the server address the IPTV Output page shows, and links in push notifications. Never where ChannelBin listens
 
 # An optional password gate over the whole app: every page and API endpoint requires
 # signing in. One shared password, no usernames or roles - a door on something that was

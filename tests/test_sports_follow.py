@@ -671,3 +671,125 @@ class HookTests(Case):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EditRepadTests(Case):
+    """Editing a recording's profile on the record dialog (app/edit_window.py, dev/changelog/1652): a
+    window ChannelBin gave it moves to the new profile's padding, the stored fact moves with it, and the
+    follow pass then has nothing to do - before, the edit kept the old times and the next pass moved
+    them unannounced, with an event blaming the game's time (dev/docs/BUGS.md 2026-11-19 @ 09:14:30 PM ET)."""
+
+    def setUp(self):
+        super().setUp()
+        self.wide = RecordingProfile(name='Wide', pre_padding_minutes=30, post_padding_minutes=60)
+        db.session.add(self.wide)
+        db.session.commit()
+        self.wide_id = self.wide.id
+
+    def edit(self, rid, start, stop, profile_id):
+        r = self.t.client.post(f'/recordings/{rid}/edit-json', data={
+            'name': 'PFL Football', 'url': 'http://example.test/live/1',
+            'start_time': local_input_value(start), 'stop_time': local_input_value(stop),
+            'profile_id': '' if profile_id is None else str(profile_id), 'force': '1'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        db.session.expire_all()
+
+    def window_answer(self, rid):
+        r = self.t.client.get(f'/api/recordings/{rid}/edit-window')
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        return r.get_json()
+
+    def edited_events(self, rid):
+        from app.database import RECORDING_EDITED
+        return self.events(rid, RECORDING_EDITED)
+
+    def test_a_followed_record_recording_pads_from_the_games_time(self):
+        rid = self.recording()
+        self.follow()
+        got = self.window_answer(rid)
+        self.assertEqual((got['owned'], got['from_game']), (True, True))
+        self.assertEqual((got['start_time'], got['stop_time']),
+                         (self.tsdb.strftime('%Y-%m-%dT%H:%M:%S'), self.stop.strftime('%Y-%m-%dT%H:%M:%S')))
+
+    def test_saved_at_the_new_padding_it_stays_channelbins_and_the_pass_moves_nothing(self):
+        rid = self.recording()
+        self.follow()
+        want = (self.tsdb - timedelta(minutes=30), self.stop + timedelta(minutes=60))
+        self.edit(rid, *want, self.wide_id)
+        r = self.rec(rid)
+        self.assertEqual((r.start_time, r.stop_time), want)
+        self.assertEqual((r.sports_window_start, r.sports_window_stop), want)
+        (edited,) = self.edited_events(rid)
+        self.assertIn('padding of profile "Wide"', edited.detail)
+        self.assertIn('the game', edited.detail)
+        retimed = len(self.events(rid, RECORDING_SPORTS_RETIMED))
+        self.assertEqual(self.follow()['moved'], 0)
+        self.assertEqual(self.window(rid), want)
+        self.assertEqual(len(self.events(rid, RECORDING_SPORTS_RETIMED)), retimed)
+
+    def test_a_profile_change_at_the_old_times_is_the_persons_and_never_moved_later(self):
+        """The hidden second effect: the times left equal to the stored window, so the next pass read
+        them as ChannelBin's and moved them to the new padding."""
+        rid = self.recording()
+        self.follow()
+        old = self.window(rid)
+        self.edit(rid, *old, self.wide_id)
+        self.assertEqual(self.follow()['moved'], 0)
+        self.assertEqual(self.window(rid), old)
+        self.assertFalse(self.window_answer(rid)['owned'])
+
+    def test_a_rule_recordings_ledger_moves_with_the_padding(self):
+        rid = self.recording(kind='rule')
+        self.follow()
+        want = (self.tsdb - timedelta(minutes=30), self.stop + timedelta(minutes=60))
+        self.edit(rid, *want, self.wide_id)
+        m = RuleMatch.query.filter_by(recording_id=rid).one()
+        self.assertEqual((m.rec_start_time, m.rec_stop_time), want)
+        self.assertEqual(self.follow()['moved'], 0)
+        self.assertEqual(self.window(rid), want)
+
+    def test_moved_to_no_profile_it_keeps_no_padding(self):
+        """With no profile the pass pads by the last padding ChannelBin gave the window, and the edit's
+        is the last: none."""
+        rid = self.recording()
+        self.follow()
+        self.edit(rid, self.tsdb, self.stop, None)
+        self.follow()
+        self.assertEqual(self.window(rid), (self.tsdb, self.stop))
+        r = self.rec(rid)
+        self.assertEqual((r.sports_window_start, r.sports_window_stop), (self.tsdb, self.stop))
+
+    def test_a_tv_guide_recording_pads_from_its_listing_while_its_times_are_the_profiles(self):
+        rid = self.recording(kind='guide')
+        got = self.window_answer(rid)
+        self.assertEqual((got['owned'], got['from_game']), (True, False))
+        self.assertEqual(got['start_time'], self.listed.strftime('%Y-%m-%dT%H:%M:%S'))
+        moved = self.recording(kind='guide', window=(self.listed - PRE - timedelta(minutes=7), self.stop + POST))
+        got = self.window_answer(moved)
+        self.assertFalse(got['owned'])
+        self.assertIn('set by hand', got['why'])
+
+    def test_a_recording_from_no_listing_says_so(self):
+        rec = make_recording(status='SCHEDULED', name='By hand', channel_id=self.ch.id,
+                             start_time=self.listed, stop_time=self.stop)
+        db.session.commit()
+        got = self.window_answer(rec.id)
+        self.assertFalse(got['owned'])
+        self.assertIn('not made from a guide listing', got['why'])
+
+    def test_the_edit_events_name_times_in_the_display_timezone(self):
+        """The recording page shows an event's detail as written, and the edit wrote naive UTC
+        datetimes with no zone among Eastern times (dev/docs/BUGS.md 2026-11-19 @ 09:45:31 PM ET)."""
+        from app.tz_utils import format_local
+        rid = self.recording(kind='guide')
+        start, stop = self.listed - timedelta(minutes=30), self.stop + timedelta(minutes=60)
+        self.edit(rid, start, stop, self.wide_id)
+        later = start + timedelta(minutes=10)
+        self.edit(rid, later, stop, self.wide_id)
+        repadded, typed = self.edited_events(rid)
+        self.assertIn(f'→ {format_local(start)}', repadded.detail)
+        self.assertIn('Start/stop time edited:', typed.detail)
+        self.assertIn(f'→ {format_local(later)}', typed.detail)
+        for e in (repadded, typed):
+            self.assertNotIn(str(start), e.detail)
+            self.assertNotIn(str(later), e.detail)
