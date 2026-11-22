@@ -444,6 +444,21 @@ def api_settings_field():
             if problem:
                 return jsonify({'error': f'Health band cut points: {problem}'}), 400
 
+        # The host check job branches on this by name; a third value would be looked up
+        # only, with a warning, rather than doing what the person chose (app/host_checks.py).
+        if path == 'hosts.scheduled_check':
+            if value not in ('lookup', 'full'):
+                return jsonify({'error': 'Pick one of lookup, full'}), 400
+        # The gap between two host checks is what keeps a reseller from seeing its hosts
+        # tested in a burst (app/host_checks.py); under 10 seconds it no longer does that.
+        if path == 'hosts.check_spacing_seconds':
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                return jsonify({'error': 'Value must be a whole number'}), 400
+            if value < 10:
+                return jsonify({'error': 'Time between host checks must be at least 10 seconds'}), 400
+
         if path == 'channel_testing.failing_band':
             if value not in health_bands.FAILING_VALUES:
                 return jsonify({'error': 'Unknown band - pick one of '

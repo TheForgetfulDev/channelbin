@@ -183,8 +183,19 @@
   {%- endif %}
 {%- endmacro %}
 
+{# The account's streams skip the host or login its playlist carries, because the user turned
+   that row off (app/account_links.py, dev/changelog/1671). Neutral, not a warning: the user
+   chose it. One spelling for the Accounts list and the account page. #}
+{% macro account_playlist_badge(host_off, login_off, tip=true) -%}
+  {%- if host_off or login_off %}
+  {%- set what = 'host and login' if host_off and login_off else ('host' if host_off else 'login') %}
+  <span class="badge b-auto{% if tip %} tip-plain" data-tip="Playlist {{ what }} off.&#10;Streams on this account don't use the {{ what }} that come{{ '' if host_off and login_off else 's' }} with its playlist. They use the other ones listed on the account.{% endif %}">Playlist {{ what }} off</span>
+  {%- endif %}
+{%- endmacro %}
+
 {# The account is blocked right now (app/account_blocks.py, dev/changelog/1151). Always
-   carries its end time: a bare "Blocked" on an account reads as the provider having blocked
+   says until when - an end time, or "you unblock it" for a block with no end
+   (dev/changelog/1667): a bare "Blocked" on an account reads as the provider having blocked
    it. `blocks` is the account's entry from account_blocks.block_views(). #}
 {% macro account_block_badge(blocks, tip=true) -%}
   {%- set active = blocks | selectattr('active') | list %}

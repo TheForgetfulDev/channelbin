@@ -59,10 +59,25 @@ SCHEDULER_PASS_FAILED = 'SCHEDULER_PASS_FAILED'
 #: account next syncs on the new host or the user edits the list (dev/changelog/1168).
 ACCOUNT_HOST_ROLLED = 'ACCOUNT_HOST_ROLLED'
 
+#: The account's active stream host did not answer at its last full check (app/host_checks.py,
+#: dev/changelog/1674). Named because host_checks raises and clears it by type, per account.
+ACCOUNT_HOST_NOT_ANSWERING = 'ACCOUNT_HOST_NOT_ANSWERING'
+
+#: A standby host on the account started or stopped answering between two full checks. Named
+#: because host_checks raises it by type; one per change, so each is a line on Activity.
+ACCOUNT_HOST_ANSWER_CHANGED = 'ACCOUNT_HOST_ANSWER_CHANGED'
+
 #: A capture failed because the server refused the credentials of one of the account's
 #: listed logins (ffmpeg's 401/403). Named because app/account_links.py raises it by type,
 #: at most once per refusal cooldown window per login (dev/changelog/1169).
 ACCOUNT_LOGIN_REFUSED = 'ACCOUNT_LOGIN_REFUSED'
+
+#: A sync found the account's playlist on a different host or login than the row listed for
+#: it, and rewrote the row (app/account_links.py, dev/changelog/1670). Two types because the
+#: severity is the type's: the row is turned on, so new streams go out with a host or login
+#: the user did not pick (WARN) - or it is off, so nothing changes for streams (INFO).
+ACCOUNT_PLAYLIST_CHANGED = 'ACCOUNT_PLAYLIST_CHANGED'
+ACCOUNT_PLAYLIST_CHANGED_UNUSED = 'ACCOUNT_PLAYLIST_CHANGED_UNUSED'
 
 #: Recordings on two or more accounts of one provider stalled within a few minutes of each
 #: other - the provider's outage, said once per provider rather than once per recording
@@ -225,6 +240,11 @@ ALERT_TYPES = {
         'label': 'Live/VOD Filtering Refused (Collapse Guard)', 'severity': 'WARN',
         'self_clearing': True},
     'SYNC_STREAM_URLS_CONSTRUCTED': {'label': 'Stream URLs Constructed, Not Provided', 'severity': 'INFO'},
+    # app/stream_check.py: a stream check found the account itself not working (a refused
+    # login, an unreachable stream server, URLs the provider does not recognize). Cleared by
+    # the next check in which a channel plays (dev/changelog/1665).
+    'ACCOUNT_STREAM_CHECK_FAILED': {
+        'label': 'Account Stream Check Failed', 'severity': 'WARN', 'self_clearing': True},
     'SYNC_URL_CONSTRUCTION_BLOCKED': {
         'label': 'Cannot Build Stream URLs (No Format Set)', 'severity': 'WARN',
         'self_clearing': True},
@@ -288,6 +308,16 @@ ALERT_TYPES = {
     # the user editing the host list, dismisses it.
     ACCOUNT_HOST_ROLLED: {
         'label': 'Account Stream Host Rolled', 'severity': 'WARN', 'self_clearing': True},
+    # The active host did not answer at its last full check (dev/changelog/1674). WARN, not
+    # ERROR: streams still use it, and a host is swapped only when it stops resolving, so this
+    # is the user's cue to Make active another one. Self-clearing: the next full check that
+    # finds it answering, or the account moving to another active host, dismisses it.
+    ACCOUNT_HOST_NOT_ANSWERING: {
+        'label': 'Account Active Stream Host Not Answering', 'severity': 'WARN', 'self_clearing': True},
+    # A standby host started or stopped answering. INFO: nothing streams from it, so it is a
+    # line on the account's Activity card, not a problem; the user dismisses it.
+    ACCOUNT_HOST_ANSWER_CHANGED: {
+        'label': 'Account Standby Stream Host Answer Changed', 'severity': 'INFO'},
     # A listed login was refused by the server (401/403) and is skipped for the refusal
     # cooldown while another login on the account has a free seat (dev/changelog/1169).
     # WARN: the capture relaunches on another login at its next segment. NOT self-clearing,
@@ -297,6 +327,14 @@ ALERT_TYPES = {
     # per login instead, and the user dismisses it.
     ACCOUNT_LOGIN_REFUSED: {
         'label': 'Account Login Refused', 'severity': 'WARN'},
+    # A sync rewrote the playlist's own host or login row because the playlist changed; the
+    # switch beside it stayed where the user left it. One alert per change, so each is a line
+    # on the account's Activity card. Not self-clearing: it is a fact about one sync, not a
+    # standing condition, and the user dismisses it.
+    ACCOUNT_PLAYLIST_CHANGED: {
+        'label': 'Account Playlist Host or Login Changed (in use)', 'severity': 'WARN'},
+    ACCOUNT_PLAYLIST_CHANGED_UNUSED: {
+        'label': 'Account Playlist Host or Login Changed (turned off)', 'severity': 'INFO'},
     # Stalls on two or more accounts of one provider inside five minutes. WARN: every
     # recording restarts and fails over on its own; this is the one line that says the stalls
     # are one outage. Refreshed while the window keeps filling, never stacked. NOT

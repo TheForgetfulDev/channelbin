@@ -15,7 +15,7 @@ from ..database import (
     EpgChannelKey, Recording,
     ChannelTest, ChannelEvent, ChannelHealthExclusion, OnDemandTestJob, Tag,
     RecordingProfile, HealthCheckProfile, SportsMatch, detach_channel_references,
-    CHANNEL_REMOVED_FROM_GUIDE, CHANNEL_HEALTH_OVERRIDE_CHANGED,
+    CHANNEL_REMOVED_FROM_GUIDE,
     CHANNEL_NEEDING_STATUSES, REC_STATUS_SCHEDULED,
 )
 from ..accounts import (
@@ -33,6 +33,7 @@ from ..logo_cache import get_logo_cache_dir, resolve_logo_url
 from ..storage_dirs import manual_screenshot_paths
 from .. import fmt_utils
 from ..fmt_utils import counted
+from ..health_score import set_manual_adjustment
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +117,38 @@ _lifecycle_states_for_channels = lifecycle_states_for_channels
 #: became its second caller (dev/changelog/627); kept under the old local name so the call
 #: sites below and tests/test_sync_repoint.py's import still read as they did.
 _repoint_candidates_for_channels = repoint_candidates_for_channels
+
+
+def _stream_url_view(channel, cfg) -> dict:
+    """The Stream URL card (dev/changelog/1671): the URL the next stream on this channel would
+    be launched with, masked for show and whole for Copy, the login and host it would use, and
+    whether the playlist's own host or login is skipped - when it is, the playlist's URL is
+    shown as not used. A fixed handful of queries.
+
+    The shown URL is the Copy URL masked, so the two are always one URL. It used to be masked
+    on the playlist's raw form and re-normalized under the current mode, which showed the
+    playlist's host after a host swap, and a shape the stored URL may not have, beside a Copy
+    that handed out the stored one (dev/docs/BUGS.md 2026-11-21). The raw-form path stays only
+    as the fallback for a URL whose credentials mask_creds() cannot find in place."""
+    from ..account_links import (host_list, next_stream, next_stream_url, playlist_rows_off,
+                                 render_host, url_pair)
+    from ..url_utils import mask_creds
+    from .recordings import mask_creds_filter
+    account = channel.account
+    nxt = next_stream(account, cfg) if account is not None else None
+    copy_url = next_stream_url(channel.stream_url, channel.account_id, nxt)
+    shown = mask_creds(copy_url)
+    if shown == copy_url and url_pair(copy_url) is not None:
+        hosts, active = host_list(account.id) if account is not None else (frozenset(), None)
+        shown = render_host(mask_creds_filter(channel.stream_url, channel.raw_stream_url, account),
+                            hosts, active)
+    off = playlist_rows_off([account.id]).get(account.id) if account is not None else None
+    return {
+        'shown': shown,
+        'copy_url': copy_url,
+        'next': nxt,
+        'playlist_skipped': bool(off),
+    }
 
 
 def _unnormalizable_channel_ids(channels, cfg) -> set:
@@ -992,6 +1025,7 @@ def channel_detail(channel_id):
         repoint_candidate=repoint_candidate,
         duplicate_channels=duplicate_channels,
         duplicate_key=duplicate_key,
+        stream_view=_stream_url_view(channel, cfg),
         total_epg_count=total_epg_count,
         guide_source=guide_source,
         chan_epg_search_url=chan_epg_search_url,
@@ -1681,21 +1715,10 @@ def update_health_adjustment(channel_id):
         adjustment = int(data.get('adjustment') or 0)
     except (TypeError, ValueError):
         adjustment = 0
-    new_adjustment = max(-100, min(100, adjustment))
-    new_note = (data.get('note') or '').strip() or None
-    if new_adjustment != channel.manual_health_adjustment or new_note != channel.manual_health_note:
-        db.session.add(ChannelEvent(
-            channel_id=channel.id, event_type=CHANNEL_HEALTH_OVERRIDE_CHANGED,
-            detail=f'Manual adjustment changed {channel.manual_health_adjustment:+d} → {new_adjustment:+d}',
-            extra_data=json.dumps({
-                'old_adjustment': channel.manual_health_adjustment, 'new_adjustment': new_adjustment,
-                'old_note': channel.manual_health_note, 'new_note': new_note,
-            }),
-        ))
-    channel.manual_health_adjustment = new_adjustment
-    channel.manual_health_note = new_note
+    set_manual_adjustment(channel, adjustment, data.get('note'))
     db.session.commit()
-    return jsonify({'success': True, 'adjustment': new_adjustment, 'note': new_note or ''})
+    return jsonify({'success': True, 'adjustment': channel.manual_health_adjustment,
+                    'note': channel.manual_health_note or ''})
 
 
 # ---------------------------------------------------------------------------

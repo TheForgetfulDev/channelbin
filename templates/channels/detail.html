@@ -1066,13 +1066,28 @@
     <div class="card-head"><h2>Stream URL</h2></div>
     <div class="card-body">
       <div>
+        {# The URL the next stream would be launched with: on the active host, with the
+           credentials of the login it would take a seat on (routes/channels.py::
+           _stream_url_view, dev/changelog/1671). Every next-stream state is named. #}
+        {% set nxt = stream_view.next %}
         <div class="url-display">
-          <code id="stream-url-text" data-full-url="{{ channel.stream_url }}">{{ channel.stream_url | mask_creds(channel.raw_stream_url, channel.account) }}</code>
+          <code id="stream-url-text" data-full-url="{{ stream_view.copy_url }}">{{ stream_view.shown }}</code>
           <button class="btn btn-sm" data-act="copy-url" id="copy-btn" style="flex-shrink:0">Copy</button>
         </div>
-        {% if channel.raw_stream_url and channel.raw_stream_url != channel.stream_url %}
+        {% if nxt %}
+        {% if nxt.state == NEXT_STREAM.FREE %}
+        <div class="url-raw">The next stream will use {% if nxt.login %}login <strong>{{ nxt.login.name }}</strong>{% else %}the playlist's login{% endif %}{% if nxt.host %} on host <code>{{ nxt.host }}</code>{% endif %}.</div>
+        {% elif nxt.state == NEXT_STREAM.FULL %}
+        <div class="url-raw">No seat on {{ channel.account.name }} is free right now, so the next stream waits for one.</div>
+        {% elif nxt.state in (NEXT_STREAM.BLOCKED, NEXT_STREAM.UNUSABLE) %}
+        <div class="url-raw text-warning">Can't stream right now: {{ nxt.reason }}.</div>
+        {% else %}
+        <div class="url-raw">{{ nxt.state }}</div>
+        {% endif %}
+        {% endif %}
+        {% if channel.raw_stream_url and (stream_view.playlist_skipped or channel.raw_stream_url != channel.stream_url) %}
         <div class="url-raw">
-          Original: <code>{{ channel.raw_stream_url | mask_creds }}</code>
+          {{ 'In the playlist (not used)' if stream_view.playlist_skipped else 'Original' }}: <code>{{ channel.raw_stream_url | mask_creds }}</code>
         </div>
         {% endif %}
         <div class="url-meta">

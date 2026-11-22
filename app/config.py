@@ -749,9 +749,15 @@ _DEFAULTS = {
         # walk the list every few seconds. A second resolution failure inside the window is
         # logged and does not roll.
         'roll_cooldown_minutes': 10,
-        # How often the host_resolve_check job resolves every listed host (DNS only; it
-        # marks hosts good or bad on the account page and never rolls).
+        # How often the host_resolve_check job runs. It never rolls.
         'check_interval_hours': 6,
+        # What that scheduled run does (app/host_checks.py, dev/changelog/1674): 'lookup' asks
+        # DNS only and reaches no provider; 'full' also connects to each host and asks it for
+        # an answer, one host at a time. Check now / Check all are always the full check.
+        'scheduled_check': 'lookup',
+        # A full check waits 0.75-1.5x this long after one host before starting the next,
+        # whoever asked, so a reseller never sees its hosts tested in a burst.
+        'check_spacing_seconds': 60,
     },
     # An account's login list (app/account_links.py, dev/changelog/1169): the other
     # username/passwords the account accepts, each with its own seats.

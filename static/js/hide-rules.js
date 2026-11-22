@@ -17,9 +17,11 @@
      toasts below point at that banner rather than restating the refusal, because the
      reload every mutation already does is what paints it (dev/changelog/928).
 
-   The summary tiles (#hr-summary-body) are server-rendered from real Channel.hidden /
-   hidden_deferred aggregates - they are not recomputed here, and a reload is what keeps
-   them fresh after a mutation. The rules table and the account filter ARE rendered here,
+   The summary tiles (#hr-tiles) are server-rendered from real Channel.hidden /
+   hidden_deferred aggregates, and a reload is what keeps them fresh after a mutation. The
+   Account pills rescope them from the per-account split of those same aggregates the page
+   hands down (renderTiles) - a sum of server numbers, never a re-derivation of what is
+   hidden. The rules table and the account filter ARE rendered here,
    from the rules/accounts snapshot embedded in window.HIDE_RULES_CONFIG at page load -
    the same "render the collection in JS from an embedded config blob" shape
    static/js/channel-search.js already uses for its rail. */
@@ -29,7 +31,8 @@ const API_BASE = '/api/channel-hide-rules';
 
 const RULES = CFG.rules;          // page-load snapshot; a mutation reloads the page rather
                                    // than patching this, so it never goes stale mid-session
-let selectedAccounts = new Set(); // string keys: 'global' | '<account id>'. Empty = no filter.
+let selectedAccounts = new Set(); // string keys: 'global' | '<account id>'. Empty = no filter;
+                                   // 'global' never shares the set with an account id.
 let activeWizardOverlay = null;
 let lastWizKind = 'category';     // remembered across a Back navigation within one wizard session
 let lastCatMode = 'pick';
@@ -38,7 +41,6 @@ let categoriesCache = null;       // all categories, every account - fetched onc
 
 function accountById(id) { return CFG.accounts.find(a => a.id === id) || null; }
 function accountLabel(accountId) { return accountId == null ? 'All' : ((accountById(accountId) || {}).name || `Account ${accountId}`); }
-function accKey(accountId) { return accountId == null ? 'global' : String(accountId); }
 
 function reloadAfter(message, type) {
   showToast(message, type ? { type } : undefined);
@@ -61,8 +63,21 @@ function accountFilterOptions() {
   return [{ v: 'global', label: 'All' }].concat(CFG.accounts.map(a => ({ v: String(a.id), label: a.name })));
 }
 
+function pickedAccountIds() {
+  return Array.from(selectedAccounts).filter(v => v !== 'global').map(v => parseInt(v, 10));
+}
+
+// Two questions, so two kinds of pill that never combine (dev/changelog/1678). "All" lists
+// the rules written for every account, counted across every account. An account pill asks
+// what reaches that account - its own rules and the all-accounts ones - counted on that
+// account alone, summed when several are picked.
 function toggleAccountFilter(key) {
-  if (selectedAccounts.has(key)) selectedAccounts.delete(key); else selectedAccounts.add(key);
+  if (selectedAccounts.has(key)) {
+    selectedAccounts.delete(key);
+  } else {
+    if (key === 'global') selectedAccounts.clear(); else selectedAccounts.delete('global');
+    selectedAccounts.add(key);
+  }
   renderAll();
 }
 
@@ -109,20 +124,58 @@ const RULE_SORT_KEYS = {
   target: r => CFG.targetLabels[r.target] || r.target,
   pattern: r => r.pattern.toLowerCase(),
   account: r => accountLabel(r.account_id).toLowerCase(),
-  matches: r => r.match_count,
+  matches: r => { const c = scopedCounts(r); return c.counted ? (c.matched || 0) : -1; },
   on: r => r.enabled ? 1 : 0,
 };
 
 function rulesForSelection() {
   if (selectedAccounts.size === 0) return RULES.slice();
-  return RULES.filter(r => selectedAccounts.has(accKey(r.account_id)));
+  if (selectedAccounts.has('global')) return RULES.filter(r => r.account_id == null);
+  const picked = new Set(pickedAccountIds());
+  return RULES.filter(r => r.account_id == null || picked.has(r.account_id));
+}
+
+function accountChannels(id) { return (accountById(id) || {}).channels || 0; }
+
+// What one rule matches in the current scope. With no account pill picked (or "All") that is
+// the rule's own stored total; with accounts picked it is the stored per-account split summed
+// over the picked accounts the rule reaches. `counted` false means the rule has no
+// per-account split yet, which is not the same as matching nothing on those accounts.
+function scopedCounts(r) {
+  const ids = pickedAccountIds();
+  if (!ids.length) {
+    return { counted: true, matched: r.match_count, deferred: r.deferred_count, parts: [],
+      scopeTotal: r.account_id ? accountChannels(r.account_id) : CFG.totals.channels };
+  }
+  const reach = r.account_id == null ? ids : ids.filter(id => id === r.account_id);
+  const scopeTotal = reach.reduce((n, id) => n + accountChannels(id), 0);
+  if (!r.account_counts) return { counted: false, matched: null, deferred: 0, parts: [], scopeTotal, reach };
+  const parts = reach.map((id) => {
+    const c = r.account_counts[String(id)] || { matched: 0, deferred: 0 };
+    return { id, matched: c.matched, deferred: c.deferred };
+  });
+  return { counted: true, parts, scopeTotal, reach,
+    matched: parts.reduce((n, p) => n + p.matched, 0),
+    deferred: parts.reduce((n, p) => n + p.deferred, 0) };
+}
+
+function matchesCellHtml(r) {
+  const c = scopedCounts(r);
+  if (!c.counted) {
+    return '<span class="rule-match-n" data-tip="Not counted by account yet. It is counted the next time your rules are applied to your channels, at the latest when an account next syncs.">-</span>';
+  }
+  let tip = `${nf(c.matched)} of ${nf(c.scopeTotal)} channels in scope`;
+  if (c.reach) {
+    tip = `${nf(c.matched)} of ${nf(c.scopeTotal)} channels on ${joinLabels(c.reach.map(accountLabel))}`;
+    if (c.parts.length > 1) tip += `: ${c.parts.map(p => `${accountLabel(p.id)} ${nf(p.matched)}`).join(', ')}`;
+  }
+  const deferredHtml = c.deferred > 0
+    ? `<span class="rule-deferred-note" data-tip="${nf(c.deferred)} of these are in your TV Guide or a channel group, so they stay visible until you remove them from there.">+${nf(c.deferred)} kept visible</span>`
+    : '';
+  return `<span class="rule-match-n" data-tip="${escHtml(tip)}">${nf(c.matched)}</span>${deferredHtml}`;
 }
 
 function ruleRowHtml(r) {
-  const scopeTotal = r.account_id ? (accountById(r.account_id) || {}).channel_count || 0 : CFG.totalChannels;
-  const deferredHtml = r.deferred_count > 0
-    ? `<span class="rule-deferred-note" data-tip="${r.deferred_count} of these are in your TV Guide or a channel group, so they stay visible until you remove them from there.">+${nf(r.deferred_count)} kept visible</span>`
-    : '';
   const menuItems = r.target === 'category_exact'
     ? `<button class="menu-item danger" data-act="delete-rule" data-id="${r.id}">Delete rule</button>`
     : `<button class="menu-item" data-act="edit-rule" data-id="${r.id}">Edit</button><div class="sep"></div><button class="menu-item danger" data-act="delete-rule" data-id="${r.id}">Delete rule</button>`;
@@ -130,7 +183,7 @@ function ruleRowHtml(r) {
     <td data-label="Type"><span class="rule-target-badge t-${r.target}">${escHtml(CFG.targetLabels[r.target] || r.target)}</span></td>
     <td data-label="Pattern" class="rule-pattern">${escHtml(r.pattern)}</td>
     <td data-label="Account"><span class="rule-scope-badge">${escHtml(accountLabel(r.account_id))}</span></td>
-    <td data-label="Matches" class="num"><span class="rule-match-n" data-tip="${nf(r.match_count)} of ${nf(scopeTotal)} channels in scope">${nf(r.match_count)}</span>${deferredHtml}</td>
+    <td data-label="Matches" class="num">${matchesCellHtml(r)}</td>
     <td data-label="On"><label class="switch" data-tip="${r.enabled ? 'On - this rule is being applied' : 'Off - kept for later, not applied right now'}"><input type="checkbox" ${r.enabled ? 'checked' : ''} data-act="toggle-rule" data-id="${r.id}"><span class="knob"></span></label></td>
     <td style="text-align:right"><span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions for this rule">${icon('more')}</button><div class="menu pop-left">${menuItems}</div></span></td>
   </tr>`;
@@ -729,8 +782,36 @@ function openCategoryPicker(onBack) {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 document.getElementById('hr-add-btn').addEventListener('click', () => openAddRuleWizard());
 
+// The tiles follow the account pills: every account with none picked (or "All", which says
+// so, since the list beside it is then only the all-accounts rules), else the picked
+// accounts' own counts summed. "Rules active" counts the rules the list is showing.
+function renderTiles() {
+  const ids = pickedAccountIds();
+  const t = ids.length
+    ? ids.reduce((acc, id) => {
+      const a = accountById(id) || {};
+      return { channels: acc.channels + (a.channels || 0), hidden: acc.hidden + (a.hidden || 0),
+        deferred: acc.deferred + (a.deferred || 0) };
+    }, { channels: 0, hidden: 0, deferred: 0 })
+    : CFG.totals;
+  const scoped = rulesForSelection();
+  const sub = ids.length ? `channels on ${joinLabels(ids.map(accountLabel))}`
+    : (selectedAccounts.has('global') ? 'channels on every account' : 'channels');
+  const set = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+  set('hr-t-hidden', nf(t.hidden));
+  set('hr-t-hidden-s', sub);
+  set('hr-t-rules-on', String(scoped.filter(r => r.enabled).length));
+  set('hr-t-rules', String(scoped.length));
+  set('hr-t-deferred', nf(t.deferred));
+  set('hr-t-offered', nf(t.channels - t.hidden));
+  set('hr-t-offered-s', sub);
+  const tile = document.getElementById('hr-t-deferred-tile');
+  if (tile) tile.classList.toggle('warn', t.deferred > 0);
+}
+
 function renderAll() {
   renderScopeControl();
+  renderTiles();
   renderRulesSection();
 }
 renderAll();

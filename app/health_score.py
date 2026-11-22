@@ -205,6 +205,37 @@ def score_recording_metrics_quality(downtime_seconds: float, restart_count: int,
     return final, breakdown
 
 
+def set_manual_adjustment(channel, adjustment: int, note, why: str = '', extra=None,
+                          timestamp=None) -> bool:
+    """The one writer of Channel.manual_health_adjustment and manual_health_note: a person's
+    answer, written from the channel page's Settings, cleared by a health score reset, or set by a
+    move off the channel from Watching now (dev/changelog/1675). Clamps to -100..+100, adds the
+    CHANNEL_HEALTH_OVERRIDE_CHANGED event that says what moved and `why`, and does NOT commit:
+    the caller owns the retry_on_locked unit. False when nothing changed, and then no event."""
+    from . import db
+    from .database import ChannelEvent, CHANNEL_HEALTH_OVERRIDE_CHANGED
+
+    new_adjustment = max(-100, min(100, int(adjustment)))
+    new_note = (note or '').strip() or None
+    old_adjustment = channel.manual_health_adjustment or 0
+    old_note = channel.manual_health_note
+    if new_adjustment == old_adjustment and new_note == old_note:
+        return False
+    event = {'channel_id': channel.id, 'event_type': CHANNEL_HEALTH_OVERRIDE_CHANGED,
+             'detail': (f'Manual adjustment changed {old_adjustment:+d} \u2192 {new_adjustment:+d}'
+                        + (f' ({why})' if why else '')),
+             'extra_data': json.dumps({'old_adjustment': old_adjustment,
+                                       'new_adjustment': new_adjustment,
+                                       'old_note': old_note, 'new_note': new_note,
+                                       **(extra or {})})}
+    if timestamp is not None:
+        event['timestamp'] = timestamp
+    db.session.add(ChannelEvent(**event))
+    channel.manual_health_adjustment = new_adjustment
+    channel.manual_health_note = new_note
+    return True
+
+
 def _iso(dt):
     # duplicated from app/fmt_utils.py::iso_or_none - a breakdown may be handed an instant
     # that is already a string (replayed from stored JSON), which that helper would return

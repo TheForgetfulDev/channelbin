@@ -181,6 +181,7 @@ _STYLES = {
     'date':            ('%b %d, %Y',             '%b %d, %Y'),
     'time':            ('%I:%M %p %Z',           '%H:%M %Z'),
     'clock':           ('%-I:%M %p',             '%H:%M'),
+    'clock_sec':       ('%-I:%M:%S %p',          '%H:%M:%S'),
     'day_datetime':    ('%a %b %-d, %-I:%M %p %Z', '%a %b %-d, %H:%M %Z'),
     'weekday_time':    ('%a %-I:%M %p %Z',       '%a %H:%M %Z'),
     'short_datetime':  ('%-m/%-d/%y %-I:%M %p',  '%-m/%-d/%y %H:%M'),

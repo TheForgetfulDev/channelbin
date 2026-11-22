@@ -216,13 +216,16 @@ class SeatTests(_Case):
     def test_a_login_removed_while_held_keeps_its_seat_until_release(self):
         main, spare = self._list(('main', 'main', 'pw1', 1), ('spare', 'spare', 'pw2', 1))
         connlim.try_acquire(self.acc_id, 'recording', 11)
-        links.remove_login(self.acc_id, main)
-        self.assertTrue(connlim.try_acquire(self.acc_id, 'recording', 11),
+        connlim.try_acquire(self.acc_id, 'recording', 12)
+        self.assertEqual(self._pool(spare), [('recording', 12)])
+        links.remove_login(self.acc_id, spare)
+        self.assertTrue(connlim.try_acquire(self.acc_id, 'recording', 12),
                         'the held seat is still this account\'s - idempotent, not a second seat')
-        self.assertEqual(connlim.holder_counts(), {self.acc_id: 1})
+        self.assertEqual(connlim.holder_counts(), {self.acc_id: 2})
         url = 'http://h1.harbor.example/live/main/pw1/1.ts'
-        self.assertEqual(links.render_held_login(url, self.acc_id, 'recording', 11), (url, main))
+        self.assertEqual(links.render_held_login(url, self.acc_id, 'recording', 12), (url, spare))
         connlim.release(self.acc_id, 'recording', 11)
+        connlim.release(self.acc_id, 'recording', 12)
         self.assertEqual(connlim._holders, {})
 
     def test_preempting_a_test_strips_it_from_whichever_pool_it_sits_in(self):
@@ -321,22 +324,22 @@ class RefusalTests(_Case):
         main, spare = self._list(('main', 'main', 'pw1', 1), ('spare', 'spare', 'pw2', 1))
         connlim.try_acquire(self.acc_id, 'recording', 11)
         self.assertEqual(connlim.held_login_id('recording', 11), main)
-        self.assertEqual(connlim.reseat_if_refused(self.acc_id, 'recording', 11), main,
+        self.assertEqual(connlim.reseat_before_relaunch(self.acc_id, 'recording', 11), main,
                          'nothing refused: the seat stays')
         self._stamp_refused(main)
-        self.assertEqual(connlim.reseat_if_refused(self.acc_id, 'recording', 11), spare)
+        self.assertEqual(connlim.reseat_before_relaunch(self.acc_id, 'recording', 11), spare)
         self.assertEqual(self._pool(main), [])
         self.assertEqual(self._pool(spare), [('recording', 11)])
         # Another recording now holds spare's one seat: a refused login with nowhere to go
         # keeps its seat rather than stranding the recording.
         connlim.try_acquire(self.acc_id, 'recording', 12)
         self._stamp_refused(spare)
-        self.assertEqual(connlim.reseat_if_refused(self.acc_id, 'recording', 11), spare)
+        self.assertEqual(connlim.reseat_before_relaunch(self.acc_id, 'recording', 11), spare)
 
     def test_a_recording_with_no_login_seat_reseats_to_nothing(self):
         connlim.try_acquire(self.acc_id, 'recording', 11)
-        self.assertIsNone(connlim.reseat_if_refused(self.acc_id, 'recording', 11))
-        self.assertIsNone(connlim.reseat_if_refused(self.acc_id, 'recording', 404))
+        self.assertIsNone(connlim.reseat_before_relaunch(self.acc_id, 'recording', 11))
+        self.assertIsNone(connlim.reseat_before_relaunch(self.acc_id, 'recording', 404))
 
 
 class _Capture(RuntimeError):
@@ -425,14 +428,21 @@ class LaunchSiteTests(_Case):
 
 class ListWriterTests(_Case):
 
-    def test_add_validates_and_refuses_a_duplicate_username_or_name(self):
+    def test_add_validates_and_refuses_a_duplicate_credential_or_name(self):
+        """A username alone may repeat (the playlist's expired login and a working one often
+        share it, dev/changelog/1670); the same username AND password may not."""
         links.add_login(self.acc_id, 'main', 'main', 'pw1', 2)
+        links.add_login(self.acc_id, 'spare', 'spare', 'pw2', 1)
         for bad in (('', 'u', 'p', 1), ('x', '', 'p', 1), ('x', 'u', '', 1), ('x', 'u', 'p', 0),
-                    ('x', 'u', 'p', 'two'), ('x', 'a/b', 'p', 1), ('other', 'main', 'p', 1),
-                    ('MAIN', 'u2', 'p', 1)):
+                    ('x', 'u', 'p', 'two'), ('x', 'a/b', 'p', 1), ('other', 'spare', 'pw2', 1),
+                    ('SPARE', 'u2', 'p', 1)):
             with self.assertRaises(ValueError, msg=str(bad)):
                 links.add_login(self.acc_id, *bad)
-        self.assertEqual([lg.name for lg in links.logins_for_account(self.acc_id)], ['main'])
+        self.assertEqual([lg.name for lg in links.logins_for_account(self.acc_id)],
+                         ['main', 'spare'])
+        links.add_login(self.acc_id, 'renewed', 'spare', 'pw-new', 1)
+        self.assertEqual([lg.name for lg in links.logins_for_account(self.acc_id)],
+                         ['main', 'spare', 'renewed'])
 
     def test_a_character_that_would_change_how_the_url_is_read_is_refused(self):
         """dev/changelog/1243: render_login() splices the pair into the path raw, so a "?"
@@ -443,22 +453,22 @@ class ListWriterTests(_Case):
             with self.assertRaises(ValueError, msg=(username, password)) as caught:
                 links.add_login(self.acc_id, 'x', username, password, 1)
             self.assertIn('cannot contain', str(caught.exception))
-        main = links.add_login(self.acc_id, 'main', 'main', 'pw1', 1).id
+        main = links.add_login(self.acc_id, 'spare', 'spare', 'pw1', 1).id
         with self.assertRaises(ValueError):
-            links.update_login(self.acc_id, main, 'main', 'main', 'new#pw', 1)
+            links.update_login(self.acc_id, main, 'spare', 'spare', 'new#pw', 1)
         self.assertEqual(db.session.get(Login, main).password, 'pw1')
         # The characters a real password does carry still pass.
-        links.update_login(self.acc_id, main, 'main', 'Ma.in-1_2', 'p.W-x_9~!', 1)
+        links.update_login(self.acc_id, main, 'spare', 'Ma.in-1_2', 'p.W-x_9~!', 1)
         self.assertEqual(db.session.get(Login, main).password, 'p.W-x_9~!')
 
     def test_edit_keeps_the_password_when_blank_and_clears_the_stamp_on_a_new_credential(self):
-        main, = self._list(('main', 'main', 'pw1', 1))
+        _playlist, main = self._list(('main', 'main', 'pw1', 1), ('spare', 'main', 'pw1x', 1))
         self._stamp_refused(main)
         links.update_login(self.acc_id, main, 'primary', 'main', '', 3)
         db.session.expire_all()
         row = db.session.get(Login, main)
         self.assertEqual((row.name, row.username, row.password, row.max_connections),
-                         ('primary', 'main', 'pw1', 3))
+                         ('primary', 'main', 'pw1x', 3))
         self.assertIsNotNone(row.last_refused_at, 'same credentials: the refusal stands')
         links.update_login(self.acc_id, main, 'primary', 'main', 'pw9', 3)
         db.session.expire_all()
@@ -509,7 +519,10 @@ class RouteAndPageTests(_Case):
         self.assertIn('1 of 1 in use', html)
         self.assertIn('0 of 2 in use', html)
         self.assertIn('Skipped while another login has a free seat.', html)
-        self.assertIn('(logins: main, spare)', html)
+        # The playlist's own login (main/pw1, the URLs' pair) is listed first when the first
+        # login is added, so it is one of the logins the limit is read from
+        # (dev/changelog/1670).
+        self.assertIn('(logins: main, main, spare)', html)
         self.assertNotIn('(global)', html.split('Max connections')[1][:400])
         self.assertNotIn('harbor-secret-one', html)
         self.assertNotIn('harbor-secret-two', html)
@@ -548,10 +561,10 @@ class RouteAndPageTests(_Case):
     def _own_row(self, card):
         return card.split('data-login-row="own"')[1].split('</tr>')[0]
 
-    def _set_username(self, username):
+    def _set_username(self, username, password='harbor-own-secret'):
         acc = db.session.get(Account, self.acc_id)
         acc.username = username
-        acc.password = 'harbor-own-secret'
+        acc.password = password
         db.session.commit()
 
     def test_with_nothing_listed_the_accounts_own_login_is_a_row_with_its_seats(self):
@@ -588,8 +601,10 @@ class RouteAndPageTests(_Case):
         self.assertNotIn(' in use', row)
         self.assertIn('<span class="cnt">3</span>', card)
 
-    def test_a_listed_login_with_the_accounts_username_is_not_shown_twice(self):
-        self._set_username('main')
+    def test_a_listed_login_with_the_accounts_credentials_is_not_shown_twice(self):
+        """The match is on username AND password since dev/changelog/1670: a username may
+        repeat on an account, and the account's own login is the one with both."""
+        self._set_username('main', 'pw1')
         self._list(('main', 'main', 'pw1', 1), ('spare', 'spare', 'pw2', 2))
         card = self._card()
         self.assertNotIn('data-login-row="own"', card)
@@ -611,13 +626,15 @@ class RouteAndPageTests(_Case):
                                       'max_connections': 1})
         spare = resp.get_json()['login_id']
         resp = self.client.post(f'/api/accounts/{self.acc_id}/logins',
-                                json={'name': 'dup', 'username': 'main', 'password': 'x',
-                                      'max_connections': 1})
+                                json={'name': 'dup', 'username': 'main',
+                                      'password': 'harbor-secret-one', 'max_connections': 1})
         self.assertEqual(resp.status_code, 400)
         self.assertIn('already', resp.get_json()['error'])
 
+        # The first add listed the playlist's own login (main/pw1) ahead of it.
         body = self.client.get(f'/api/accounts/{self.acc_id}/logins').get_json()
-        self.assertEqual([lg['name'] for lg in body['logins']], ['main', 'spare'])
+        self.assertEqual([lg['name'] for lg in body['logins']], ['main', 'main', 'spare'])
+        playlist = body['logins'][0]['id']
         self.assertNotIn('harbor-secret-one', resp.get_data(as_text=True))
         self.assertFalse(any('password' in lg for lg in body['logins']))
 
@@ -628,7 +645,7 @@ class RouteAndPageTests(_Case):
         self.assertEqual(db.session.get(Login, main).password, 'harbor-secret-one')
         resp = self.client.post(f'/api/accounts/{self.acc_id}/logins/{spare}/move',
                                 json={'direction': 'up'})
-        self.assertEqual(resp.get_json()['order'], [spare, main])
+        self.assertEqual(resp.get_json()['order'], [playlist, spare, main])
         resp = self.client.post(f'/api/accounts/{self.acc_id}/logins/{spare}/move',
                                 json={'direction': 'sideways'})
         self.assertEqual(resp.status_code, 400)
@@ -636,7 +653,10 @@ class RouteAndPageTests(_Case):
         self.assertEqual(resp.status_code, 200, resp.get_json())
         resp = self.client.delete(f'/api/accounts/{self.acc_id}/logins/{spare}')
         self.assertEqual(resp.status_code, 404)
-        self.assertEqual([lg.name for lg in links.logins_for_account(self.acc_id)], ['primary'])
+        self.assertEqual([lg.name for lg in links.logins_for_account(self.acc_id)],
+                         ['main', 'primary'])
+        resp = self.client.delete(f'/api/accounts/{self.acc_id}/logins/{playlist}')
+        self.assertEqual(resp.status_code, 409, 'the playlist\'s own login is turned off, not removed')
 
     def test_the_seat_prefill_prefers_the_provider_reported_cap(self):
         self.acc.provider_max_connections = 4

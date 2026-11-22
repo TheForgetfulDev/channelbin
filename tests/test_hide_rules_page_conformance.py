@@ -88,7 +88,7 @@ class HideRulesPageTests(unittest.TestCase):
         # A JS object literal (bare keys, trailing comma before `}`), not strict JSON - quote
         # the four known keys and drop the trailing comma so json.loads can parse it. Each
         # VALUE is still real `| tojson` output, so this only reshapes the wrapper.
-        raw = re.sub(r'(rules|accounts|targetLabels|totalChannels):', r'"\1":', m.group(1))
+        raw = re.sub(r'(rules|accounts|targetLabels|totals):', r'"\1":', m.group(1))
         raw = re.sub(r',(\s*\})', r'\1', raw)
         return json.loads(raw)
 
@@ -102,7 +102,7 @@ class HideRulesPageTests(unittest.TestCase):
         self.assertNotIn('hr-summary-tile', self.html)
 
     def _tile_value(self, label):
-        m = re.search(re.escape(label) + r'</div><div class="m-v">([^<]*)</div>', self.html)
+        m = re.search(re.escape(label) + r'</div><div class="m-v"[^>]*>([^<]*)</div>', self.html)
         self.assertIsNotNone(m, f'{label!r} tile not found in rendered page')
         return m.group(1).strip()
 
@@ -113,12 +113,11 @@ class HideRulesPageTests(unittest.TestCase):
         self.assertEqual(self._tile_value('Hidden now'), '1')
         self.assertEqual(self._tile_value('Kept visible'), '1')
         self.assertEqual(self._tile_value('Still offered'), '2')
-        rules_active = self._tile_value_raw('Rules active')
-        self.assertTrue(rules_active.startswith('1 '), rules_active)   # enabled_rules
-        self.assertIn('/ 1<', rules_active)                            # total rules
+        rules_active = re.sub(r'<[^>]+>', '', self._tile_value_raw('Rules active'))
+        self.assertEqual(' '.join(rules_active.split()), '1 / 1')     # enabled / total
 
     def _tile_value_raw(self, label):
-        m = re.search(re.escape(label) + r'</div><div class="m-v">(.*?)</div>', self.html)
+        m = re.search(re.escape(label) + r'</div><div class="m-v"[^>]*>(.*?)</div><div class="m-s"', self.html)
         self.assertIsNotNone(m, f'{label!r} tile not found in rendered page')
         return m.group(1)
 
@@ -147,7 +146,18 @@ class HideRulesPageTests(unittest.TestCase):
         names = [a['name'] for a in cfg['accounts']]
         self.assertIn('Test Provider', names)
         self.assertIn('targetLabels', cfg)
-        self.assertEqual(cfg['totalChannels'], 3)
+        self.assertEqual(cfg['totals'], {'channels': 3, 'hidden': 1, 'deferred': 1})
+
+    def test_config_blob_splits_the_tiles_by_account(self):
+        """The Account pills rescope the tiles from these, so they have to be the same
+        Channel.hidden / hidden_deferred reads the tiles total (dev/changelog/1678)."""
+        acct = next(a for a in self._config()['accounts'] if a['id'] == self.acct_id)
+        self.assertEqual((acct['channels'], acct['hidden'], acct['deferred']), (3, 1, 1))
+
+    def test_tiles_carry_the_ids_the_account_pills_rewrite(self):
+        for tile_id in ('hr-t-hidden', 'hr-t-hidden-s', 'hr-t-rules-on', 'hr-t-rules',
+                        'hr-t-deferred', 'hr-t-deferred-tile', 'hr-t-offered', 'hr-t-offered-s'):
+            self.assertIn(f'id="{tile_id}"', self.html)
 
     def test_no_superseded_ui_classes(self):
         # DESIGN.md 3.4: .table is retired and .qbadge is the TV Guide's own compact badge,

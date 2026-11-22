@@ -184,17 +184,26 @@ class ListWriterTests(_Case):
         self.assertEqual(len(self._hosts()), 2)
 
     def test_the_active_host_is_refused_removal_while_another_is_listed(self):
+        self._list('a2.skyline.example', 'a3.skyline.example')
+        a2 = AccountHost.query.filter_by(account_id=self.acc_id, host='a2.skyline.example').one()
+        links.set_active_host(self.acc_id, a2.id)
+        with self.assertRaises(ValueError) as caught:
+            links.remove_host(self.acc_id, a2.id)
+        self.assertIn('Make another host active first', str(caught.exception))
+        other = AccountHost.query.filter_by(account_id=self.acc_id, host='a3.skyline.example').one()
+        self.assertEqual(links.remove_host(self.acc_id, other.id), 'a3.skyline.example')
+
+    def test_the_playlists_own_host_is_never_removed(self):
+        """dev/changelog/1670: the seeded host is the playlist's row; the next sync would list
+        it again, so it is turned off, never removed."""
         self._list('a2.skyline.example')
-        active = AccountHost.query.filter_by(account_id=self.acc_id, is_active=True).one()
-        with self.assertRaises(ValueError):
-            links.remove_host(self.acc_id, active.id)
-        other = AccountHost.query.filter_by(account_id=self.acc_id, is_active=False).one()
-        self.assertEqual(links.remove_host(self.acc_id, other.id), 'a2.skyline.example')
-        # Now the last one: removable, the list empties and the URLs stay.
-        before = self._stream_urls()
-        links.remove_host(self.acc_id, active.id)
-        self.assertEqual(self._hosts(), [])
-        self.assertEqual(self._stream_urls(), before)
+        seeded = AccountHost.query.filter_by(account_id=self.acc_id, host='a1.skyline.example').one()
+        self.assertTrue(seeded.from_playlist)
+        a2 = AccountHost.query.filter_by(account_id=self.acc_id, host='a2.skyline.example').one()
+        links.set_active_host(self.acc_id, a2.id)
+        with self.assertRaises(ValueError) as caught:
+            links.remove_host(self.acc_id, seeded.id)
+        self.assertIn('comes from the playlist', str(caught.exception))
 
     def test_make_active_rewrites_listed_urls_and_the_account_url_only_when_listed(self):
         self._list('a2.skyline.example')
@@ -585,18 +594,21 @@ class RouteAndPageTests(_Case):
         db.session.expire_all()
         self.assertEqual([h for h, a in self._hosts() if a], ['a2.skyline.example'])
 
-        active_old = AccountHost.query.filter_by(account_id=self.acc_id, host='a1.skyline.example').one()
-        resp = self.client.delete(f'/api/accounts/{self.acc_id}/hosts/{active_old.id}')
+        playlist = AccountHost.query.filter_by(account_id=self.acc_id, host='a1.skyline.example').one()
+        resp = self.client.delete(f'/api/accounts/{self.acc_id}/hosts/{playlist.id}')
+        self.assertEqual(resp.status_code, 409, 'the playlist\'s own host is turned off, not removed')
+        resp = self.client.post(f'/api/accounts/{self.acc_id}/hosts/{playlist.id}/activate')
         self.assertEqual(resp.status_code, 200, resp.get_json())
         resp = self.client.delete(f'/api/accounts/{self.acc_id}/hosts/{host_id}')
         self.assertEqual(resp.status_code, 200, resp.get_json())
-        self.assertEqual(self._hosts(), [])
+        self.assertEqual(self._hosts(), [('a1.skyline.example', True)])
         resp = self.client.delete(f'/api/accounts/{self.acc_id}/hosts/{host_id}')
         self.assertEqual(resp.status_code, 404)
 
     def test_removing_the_active_host_with_another_listed_is_a_409(self):
         self._list('a2.skyline.example')
-        active = AccountHost.query.filter_by(account_id=self.acc_id, is_active=True).one()
+        active = AccountHost.query.filter_by(account_id=self.acc_id, host='a2.skyline.example').one()
+        links.set_active_host(self.acc_id, active.id)
         resp = self.client.delete(f'/api/accounts/{self.acc_id}/hosts/{active.id}')
         self.assertEqual(resp.status_code, 409)
         self.assertIn('Make another host active first', resp.get_json()['error'])

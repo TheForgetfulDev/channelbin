@@ -4244,6 +4244,9 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .acst-acct:hover { color: var(--accent-text); text-decoration: none; }
 .acst-acct .nm { overflow-wrap: anywhere; }
 .tbl tr.acst-total td { font-weight: 600; border-top: 1px solid var(--border); }
+/* Nine sortable columns of short numbers under long names: held to one line, the headers alone
+   pushed the table past a 1280px window's card and into a sideways scroll (dev/changelog/1676). */
+.acst-tbl th { white-space: normal; vertical-align: bottom; }
 
 /* Cards in a grid: each pie and each trend is its own card, so every chart has a border
    that says where it ends. */

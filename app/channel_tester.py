@@ -39,6 +39,21 @@ _lock = threading.Lock()
 
 
 @dataclass
+class TestSignals:
+    """What the latest single test saw on its way to its verdict, for a caller that has to
+    tell a refused login from a dead channel (app/stream_check.py, dev/changelog/1665). The
+    ChannelTest row keeps the verdict and the masked error text; this keeps the raw signals,
+    in memory only, and only for the test just run.
+
+    stderr: ffmpeg's stderr from the last connection attempt that failed ('' when none did).
+    hung: that attempt was killed with the connection open and nothing received.
+    placeholder: the provider answered with its finite "channel offline" clip."""
+    stderr: str = ''
+    hung: bool = False
+    placeholder: bool = False
+
+
+@dataclass
 class RunState:
     """All mutable run state, guarded by _lock. _reset_run_state() swaps in a
     fresh instance at run start so every field (including any added later)
@@ -66,11 +81,18 @@ class RunState:
     # One flag, one meaning (CLAUDE.md): which kind of run this is. 'job' covers both
     # system and custom OnDemandTestJob runs (current_job_id set or None respectively);
     # 'pre_check' is a DESIGN-prerecord-checks.md §3 run, where current_job_id is always
-    # None and pre_check_recording_id names the recording being protected instead. Every
+    # None and pre_check_recording_id names the recording being protected instead.
+    # 'one_off' is a channel page's Test now; 'stream_check' is an account's stream check
+    # (app/stream_check.py), which names its account in stream_check_account_id. Every
     # render/branch site of run state must name both kinds explicitly, never infer the
     # kind from current_job_id being None/set.
     run_kind: str = 'job'
     pre_check_recording_id: Optional[int] = None
+    stream_check_account_id: Optional[int] = None
+
+    # The latest single test's raw failure signals - see TestSignals. Replaced at the start
+    # of every run_channel_test, so it never describes an earlier channel.
+    last_signals: TestSignals = field(default_factory=TestSignals)
 
     # Live visibility state
     log_entries: collections.deque = field(default_factory=lambda: collections.deque(maxlen=500))
@@ -128,6 +150,7 @@ class RunState:
         self.current_job_id = None
         self.run_kind = 'job'
         self.pre_check_recording_id = None
+        self.stream_check_account_id = None
         self.eta_seconds = None
 
 
@@ -258,6 +281,7 @@ def get_status() -> dict:
             'current_job_id': s.current_job_id,
             'run_kind': s.run_kind,
             'pre_check_recording_id': s.pre_check_recording_id,
+            'stream_check_account_id': s.stream_check_account_id,
             'logs': list(s.log_entries),
         }
 
@@ -677,6 +701,34 @@ def _defer_run_past_recording(job_id: int, ct_cfg: dict, reason: str) -> None:
     _append_log('WARN', f'Run deferred - {detail}')
 
 
+def _describe_run(run_kind: str, job_id: Optional[int], pre_check_recording_id: Optional[int],
+                  stream_check_account_id: Optional[int]) -> str:
+    """What the tester is busy with, as the subject of a sentence ("A manual channel test").
+    Every RunState.run_kind is named, so a skip always names the real thing holding the
+    tester. Needs an app context."""
+    from . import db
+    from .database import Account, OnDemandTestJob, Recording
+
+    if run_kind == 'pre_check':
+        rec = db.session.get(Recording, pre_check_recording_id or 0)
+        return (f'A pre-recording check for "{rec.name}"' if rec is not None
+                else 'A pre-recording check')
+    if run_kind == 'one_off':
+        return 'A manual channel test'
+    if run_kind == 'stream_check':
+        acct = db.session.get(Account, stream_check_account_id or 0)
+        return (f'The stream check of "{acct.name}"' if acct is not None
+                else 'Another account\'s stream check')
+    if run_kind == 'job':
+        if job_id is not None:
+            job = db.session.get(OnDemandTestJob, job_id)
+            if job is not None:
+                return f'Health check "{job.name}"'
+        return 'Another health check'
+    log.warning('Unknown tester run kind %r', run_kind)
+    return f'A tester run of an unknown kind ({run_kind})'
+
+
 def _record_skipped_for_busy_tester(app, job_id: int, running_kind: str,
                                     running_job_id: Optional[int],
                                     running_pre_check_recording_id: Optional[int]):
@@ -693,23 +745,12 @@ def _record_skipped_for_busy_tester(app, job_id: int, running_kind: str,
     """
     with app.app_context():
         from . import db
-        from .database import OnDemandTestJob, Recording
+        from .database import OnDemandTestJob
 
         skipped_job = db.session.get(OnDemandTestJob, job_id)
         skipped_name = skipped_job.name if skipped_job is not None else f'job {job_id}'
-
-        if running_kind == 'pre_check':
-            rec = db.session.get(Recording, running_pre_check_recording_id or 0)
-            running_desc = (f'A pre-recording check for "{rec.name}"' if rec is not None
-                             else 'A pre-recording check')
-        elif running_kind == 'one_off':
-            running_desc = 'A manual channel test'
-        elif running_job_id is not None:
-            running_job = db.session.get(OnDemandTestJob, running_job_id)
-            running_desc = (f'Health check "{running_job.name}"' if running_job is not None
-                             else 'Another health check')
-        else:
-            running_desc = 'Another health check'
+        running_desc = _describe_run(running_kind, running_job_id,
+                                     running_pre_check_recording_id, None)
 
     # The run log only. `_state.last_skip_reason` and `current_job_id` describe the run that
     # is currently going, and this skip belongs to a different job - writing them here would
@@ -1341,8 +1382,88 @@ def run_single_channel_test(app, channel_id: int) -> Optional[int]:
         _end_run()
 
 
+def run_channel_sample(app, account_id: int, channel_ids: List[int], settings: dict,
+                       wait_seconds: float, stop_after=None):
+    """Test `channel_ids` one at a time as an account's stream check (app/stream_check.py).
+
+    Returns (results, busy): `busy` is the sentence naming what already holds the tester when
+    nothing ran, else None. Each result is {'channel_id', 'test_id', 'signals'} - test_id
+    None when the test never ran (channel gone, no free seat, a block). `stop_after(result)`
+    is asked after each channel; a true answer ends the sample there. A user's Stop on the
+    health check page ends it too, as it ends any run.
+
+    One run of the tester like any other: it holds the one-run slot and the KIND_TESTER
+    ticket, each test takes the account's seat through run_channel_test() so a starting
+    recording preempts it, and the tested channels' groups settle once at the end
+    (_settle_group_formats). Never inside an app context of the caller's."""
+    with _lock:
+        busy = _state.is_running
+        if busy:
+            running = (_state.run_kind, _state.current_job_id, _state.pre_check_recording_id,
+                       _state.stream_check_account_id)
+        else:
+            _reset_run_state(run_kind='stream_check', label=f'stream check of account {account_id}')
+            _state.stream_check_account_id = account_id
+            _state.total_channels = len(channel_ids)
+            _state.nominal_channel_seconds = (float(settings['test_duration_seconds'])
+                                              + float(wait_seconds))
+    if busy:
+        with app.app_context():
+            return [], _describe_run(*running)
+
+    results = []
+    try:
+        _append_log('INFO', f'Stream check - up to {len(channel_ids)} channels to test')
+        for i, channel_id in enumerate(channel_ids):
+            if _is_stop_requested():
+                _append_log('WARN', f'Stream check stopped by user after {i} channels')
+                break
+            with app.app_context():
+                from . import db
+                from .database import Channel
+                ch = db.session.get(Channel, channel_id)
+                name = ch.name if ch is not None else ''
+                url = ch.stream_url if ch is not None else ''
+            with _lock:
+                _state.current_phase = 'testing'
+                _state.current_channel_id = channel_id
+                _state.current_channel_name = name
+                _state.current_channel_url = url
+                _state.current_test_started_at = None
+                _state.current_live_bytes = 0
+                _state.current_connect_attempt = 0
+            _append_log('INFO', f'[{i + 1}/{len(channel_ids)}] Testing: {name}')
+
+            test_id = run_channel_test(app, channel_id, defer_group_format=True,
+                                       settings=settings)
+            with _lock:
+                signals = _state.last_signals
+                _state.completed_channels = i + 1
+            results.append({'channel_id': channel_id, 'test_id': test_id, 'signals': signals})
+
+            if stop_after is not None and stop_after(results[-1]):
+                break
+            if i < len(channel_ids) - 1 and not _is_stop_requested():
+                with _lock:
+                    _state.current_phase = 'waiting'
+                    _state.current_channel_id = None
+                    _state.wait_started_at = datetime.utcnow()
+                    _state.wait_duration_seconds = float(wait_seconds)
+                _interruptible_sleep(wait_seconds)
+                with _lock:
+                    _state.wait_started_at = None
+                    _state.wait_duration_seconds = None
+    finally:
+        tested = [r['channel_id'] for r in results if r['test_id'] is not None]
+        if tested:
+            _settle_group_formats(app, tested)
+        _end_run()
+    return results, None
+
+
 def run_channel_test(app, channel_id: int, job_id: Optional[int] = None,
-                     defer_group_format: bool = False) -> Optional[int]:
+                     defer_group_format: bool = False,
+                     settings: Optional[dict] = None) -> Optional[int]:
     """Run a quality test for a single channel, respecting the channel's account
     connection limit (shared with recordings - see app/connection_limits.py).
 
@@ -1364,8 +1485,14 @@ def run_channel_test(app, channel_id: int, job_id: Optional[int] = None,
     parameter rather than a read of `job_id`, because "which health check produced this
     test" and "will somebody else settle the groups afterward" are two questions and one
     flag cannot mean both.
+
+    `settings` replaces the resolved health check settings for this one test (a dict shaped
+    like resolve_health_check_settings()' answer) - an account's stream check runs short
+    tests that are not any job's (app/stream_check.py).
     """
     from . import connection_limits as connlim
+    with _lock:
+        _state.last_signals = TestSignals()
     with app.app_context():
         from . import db
         from .database import Channel
@@ -1380,7 +1507,10 @@ def run_channel_test(app, channel_id: int, job_id: Optional[int] = None,
             # A block is not a limit being hit and must not read as one: the user asked for
             # the account to be left alone, and this skip is that request being honored.
             from .account_blocks import blocked_reason
-            blocked = blocked_reason(account_id, ch.account.name if ch.account else f'#{account_id}')
+            from .account_links import unusable_reason
+            name = ch.account.name if ch.account else f'#{account_id}'
+            # Every host or login turned off is the user's switch too (dev/changelog/1670).
+            blocked = unusable_reason(account_id, name) or blocked_reason(account_id, name)
             if blocked:
                 log.info('Channel %d: skipping test - %s', channel_id, blocked)
                 _append_log('INFO', f'Skipped test - {blocked}')
@@ -1398,7 +1528,8 @@ def run_channel_test(app, channel_id: int, job_id: Optional[int] = None,
 
     try:
         return _run_channel_test_inner(app, channel_id, job_id=job_id,
-                                       defer_group_format=defer_group_format)
+                                       defer_group_format=defer_group_format,
+                                       settings_override=settings)
     finally:
         with app.app_context():
             connlim.release(account_id, 'test', channel_id)
@@ -1408,10 +1539,11 @@ def run_channel_test(app, channel_id: int, job_id: Optional[int] = None,
 
 
 def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
-                            defer_group_format: bool = False):
+                            defer_group_format: bool = False,
+                            settings_override: Optional[dict] = None):
     """Run a quality test for a single channel and persist results to ChannelTest.
 
-    `defer_group_format`: see run_channel_test."""
+    `defer_group_format` and `settings_override`: see run_channel_test."""
     with app.app_context():
         from . import db
         from .config import load_config, resolve_ffmpeg_path
@@ -1439,7 +1571,8 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
             _state.current_channel_url = stream_url
         ct_cfg = cfg.get('channel_testing', {})
         job = db.session.get(OnDemandTestJob, job_id) if job_id else None
-        settings = resolve_health_check_settings(ct_cfg, job.profile if job else None)
+        settings = (settings_override if settings_override is not None
+                    else resolve_health_check_settings(ct_cfg, job.profile if job else None))
         duration = settings['test_duration_seconds']
         screenshots_enabled = settings['screenshots_enabled']
         screenshot_dir = image_dir(cfg, SCREENSHOTS)
@@ -1615,6 +1748,9 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
 
                 stderr_thread.join(timeout=2.0)
                 stderr_snippet = _extract_stderr_error(list(stderr_buf))
+                with _lock:
+                    _state.last_signals = TestSignals(
+                        stderr='\n'.join(stderr_buf), hung=exit_code_before_kill is None)
 
                 # ffmpeg exited because the stream host did not resolve: the one failure
                 # that rolls the account's host list (app/account_links.py). Rate-limited
@@ -1801,6 +1937,8 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
                 # endpoint.
                 source_duration = _probe_source_container_duration(stream_url, _append_log)
                 if source_duration is not None:
+                    with _lock:
+                        _state.last_signals.placeholder = True
                     connected = False
                     status = TEST_STATUS_FAILED
                     placeholder_msg = (

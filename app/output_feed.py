@@ -118,8 +118,8 @@ STATES = (STATE_STARTING, STATE_STREAMING, STATE_WAITING, STATE_SHOWING, STATE_S
 
 # Why a session ended. Every terminal path names one, and REASON_TEXT is what the dashboard
 # shows for it - a stream that stops says why, or it is a number nobody can explain
-# (CLAUDE.md principle 1). FAILED_OVER and MOVED_FOR_RECORDING are the non-terminal entries: each
-# is recorded in the session's history (its moves) while the session goes on.
+# (CLAUDE.md principle 1). FAILED_OVER, MOVED_FOR_RECORDING and MOVED_BY_HAND are the non-terminal
+# entries: each is recorded in the session's history (its moves) while the session goes on.
 REASON_CLIENT_GONE = 'client_gone'
 REASON_CLIENT_TOO_SLOW = 'client_too_slow'
 REASON_BUFFER_TOO_SMALL = 'buffer_too_small'
@@ -131,6 +131,7 @@ REASON_CONNECT_TIMEOUT = 'connect_timeout'
 REASON_LAUNCH_FAILED = 'launch_failed'
 REASON_FAILED_OVER = 'failed_over'
 REASON_MOVED_FOR_RECORDING = 'moved_for_recording'
+REASON_MOVED_BY_HAND = 'moved_by_hand'
 REASON_NO_MEMBER = 'no_member'
 REASON_SHUTDOWN = 'shutdown'
 REASON_DISABLED = 'disabled'
@@ -161,6 +162,7 @@ REASON_TEXT = {
     REASON_LAUNCH_FAILED: 'Could not start.',
     REASON_FAILED_OVER: 'Moved to another channel in the group.',
     REASON_MOVED_FOR_RECORDING: 'Moved to another channel - a recording needed the connection.',
+    REASON_MOVED_BY_HAND: 'Moved to another channel by hand, from Watching now.',
     REASON_NO_MEMBER: 'Nothing left to play - every channel in the group failed or is unavailable.',
     REASON_SHUTDOWN: 'Cut - the app is restarting.',
     REASON_DISABLED: 'Cut - the IPTV output was turned off.',
@@ -1327,6 +1329,11 @@ class RelaySession:
     last_data_mono: Optional[float] = None
     last_read_mono: Optional[float] = None
     bytes_sent: int = 0
+    # {account_id: seconds} each account's ffmpeg ran for this play, and the one running now as
+    # (proc, account_id, started_mono). Closed per ffmpeg, so a play that moved credits each
+    # account its own part; a waiting screen or Up next picture opens none (_close_phase_locked).
+    account_seconds: dict = field(default_factory=dict)
+    _phase: Optional[tuple] = field(default=None, repr=False)
     # Members that died this play, so a failover never returns to one (section 4.5).
     failed_ids: set = field(default_factory=set)
     failovers: list = field(default_factory=list)    # [(from name, to name, why)]
@@ -1427,6 +1434,8 @@ class RelaySession:
             'screen_state': self.screen_state, 'screen_held': self.screen_held,
             'left_screen_at': self.left_screen_at,
             'screen_seconds': round(self._screen_seconds(now), 1),
+            'move_offered': move_offer(self) == MOVE_OFFERED,
+            'move_why': MOVE_NOWHERE_TEXT if move_offer(self) == MOVE_NOWHERE else '',
         }
 
     def _screen_seconds(self, now: float) -> float:
@@ -1434,6 +1443,23 @@ class RelaySession:
         if self.state == STATE_WAITING and self.started_mono:
             return max(0.0, now - self.started_mono)
         return self.screen_seconds
+
+
+# What Watching now offers a play for "Move to another channel" (move_by_hand, dev/changelog/1675).
+MOVE_OFFERED = 'offered'          # a group or a sports channel playing a channel: there is somewhere to go
+MOVE_NOWHERE = 'nowhere'          # a single channel: nothing else plays it, and the menu says so
+MOVE_NO_CHANNEL = 'no_channel'    # ChannelBin's own picture, or ended: no channel to move off
+MOVE_NOWHERE_TEXT = 'A single channel, so there is nowhere to move it'
+
+
+def move_offer(session: 'RelaySession') -> str:
+    """One of the MOVE_* answers for `session` as it stands. Whether a move can start this
+    instant (another swap in flight) is move_by_hand()'s to say."""
+    if not session.live or session.own_picture:
+        return MOVE_NO_CHANNEL
+    if session.state not in (STATE_STARTING, STATE_STREAMING):
+        raise ValueError(f'Unknown play state "{session.state}"')
+    return MOVE_OFFERED if session.fails_over else MOVE_NOWHERE
 
 
 _lock = threading.Lock()
@@ -1675,7 +1701,9 @@ def _launch(session: RelaySession, member, cfg, first: bool = True,
         if first and hold:
             raise _SeatHeld()
         account_name = member.account.name if member.account else f'account {member.account_id}'
-        blocked = blocked_reason(member.account_id, account_name, capital=True)
+        from .account_links import unusable_reason
+        blocked = (unusable_reason(member.account_id, account_name, capital=True)
+                   or blocked_reason(member.account_id, account_name, capital=True))
         if blocked:
             detail = f'{blocked}.'
         else:
@@ -1741,7 +1769,7 @@ def _launch(session: RelaySession, member, cfg, first: bool = True,
             _finish(session, REASON_LAUNCH_FAILED, detail=detail)
         raise FeedRefused(f'Could not start ffmpeg: {detail}', 500)
 
-    reader = _adopt(session, proc)
+    reader = _adopt(session, proc, account_id=member.account_id)
     if reader is None:
         # The seat taken above is this play's whatever _finish() released before it.
         connlim.release(member.account_id, 'viewer', session.id)
@@ -1751,13 +1779,30 @@ def _launch(session: RelaySession, member, cfg, first: bool = True,
         raise FeedRefused(REASON_TEXT[REASON_CLIENT_GONE], 409)
 
 
-def _adopt(session: RelaySession, proc: subprocess.Popen) -> Optional[threading.Thread]:
+def _close_phase_locked(session: RelaySession, proc: Optional[subprocess.Popen] = None) -> None:
+    """Credit the provider ffmpeg the play is timing to its account, and stop timing it. With
+    `proc`, only when that is the ffmpeg being timed: a swapped-out ffmpeg's reader can drain
+    after the next one was adopted, and must not close the new one's time. Caller holds _lock."""
+    phase = session._phase
+    if phase is None or (proc is not None and phase[0] is not proc):
+        return
+    session._phase = None
+    _proc, account_id, started = phase
+    session.account_seconds[account_id] = (session.account_seconds.get(account_id, 0.0)
+                                           + max(0.0, time.monotonic() - started))
+
+
+def _adopt(session: RelaySession, proc: subprocess.Popen,
+           account_id: Optional[int] = None) -> Optional[threading.Thread]:
     """Make a just-started ffmpeg the session's and start its reader, or kill it and return
     None. The session may have ended while ffmpeg was launching: a recording took the seat, or
     the IPTV player closed the response and _finish() is tearing down or has torn down. A
     session _finish() has claimed is still live until its teardown is done, so the claim is
     what is tested: an ffmpeg adopted after _finish() read the session's process would be one
-    nothing ever kills (dev/docs/BUGS.md 2026-11-13)."""
+    nothing ever kills (dev/docs/BUGS.md 2026-11-13).
+
+    `account_id` is the account a provider ffmpeg plays from, and its run is timed against it;
+    ChannelBin's own clip passes None and is timed against nothing."""
     reader = threading.Thread(target=_read_loop, args=(session, proc), daemon=True,
                               name=f'relay-{session.id}')
     with _lock:
@@ -1766,6 +1811,9 @@ def _adopt(session: RelaySession, proc: subprocess.Popen) -> Optional[threading.
             session.proc = proc
             session.reader = reader
             session.launched_mono = time.monotonic()
+            _close_phase_locked(session)
+            if account_id is not None:
+                session._phase = (proc, account_id, session.launched_mono)
             # Before the reader starts, and after the last one was joined (every swap stops and
             # drains the old ffmpeg first), so the mark sits exactly between the two sources.
             session.ring.mark()
@@ -1799,6 +1847,9 @@ def _read_loop(session: RelaySession, proc: subprocess.Popen) -> None:
                 if session.state == STATE_STARTING and session.live:
                     session.state = STATE_STREAMING
     finally:
+        # The pipe's end is the ffmpeg's end: killed at a swap or a stop, or the feed ran out.
+        with _lock:
+            _close_phase_locked(session, proc)
         try:
             out.close()
         except OSError:
@@ -1870,6 +1921,8 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
             session.reason = reason
             session.detail = detail
             session.ended_at = datetime.utcnow()
+            # Its reader may still be draining past the join's timeout, or be this thread.
+            _close_phase_locked(session)
     finally:
         session._teardown_lock.release()
     if not was_waiting and reason != REASON_SHUTDOWN:
@@ -1894,7 +1947,9 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
                                             _moves_note(session), play_notes(session),
                                             reserve_short_note(session.ring)) if x),
             'seconds': int(max(0.0, time.monotonic() - session.started_mono)) if session.started_mono else 0,
-            'bytes_sent': session.bytes_sent, 'moves': len(session.failovers)})
+            'bytes_sent': session.bytes_sent, 'moves': len(session.failovers),
+            'account_seconds': json.dumps({str(aid): round(secs, 1) for aid, secs
+                                           in sorted(session.account_seconds.items())})})
     return True
 
 
@@ -2167,9 +2222,13 @@ def _prune_plays() -> None:
 
     @retry_on_locked()
     def _prune():
+        # Never the highest id: SQLite hands the next row max(id) + 1 (no AUTOINCREMENT), so
+        # deleting it would re-issue an id account_stats' play watermark has already passed,
+        # and that play would never be counted (dev/changelog/1676).
+        newest = db.session.query(db.func.max(OutputFeedPlay.id)).scalar_subquery()
         gone = OutputFeedPlay.query.filter(
-            OutputFeedPlay.at < datetime.utcnow() - timedelta(days=PLAY_LOG_DAYS)).delete(
-                synchronize_session=False)
+            OutputFeedPlay.at < datetime.utcnow() - timedelta(days=PLAY_LOG_DAYS),
+            OutputFeedPlay.id < newest).delete(synchronize_session=False)
         db.session.commit()
         return gone
 
@@ -2526,7 +2585,9 @@ def _member_died(session: RelaySession, reason: str, detail: str) -> None:
             session._failing_over = False
 
 
-def _failover(session: RelaySession, reason: str, detail: str) -> None:
+def _failover(session: RelaySession, reason: str, detail: str):
+    """Take `session` off the channel it is on and onto the best one left, in place. The channel
+    it lands on, or None when nothing would start and the play ended REASON_NO_MEMBER."""
     from .config import load_config
 
     from .alerts import create_alert, has_open_alert
@@ -2553,7 +2614,7 @@ def _failover(session: RelaySession, reason: str, detail: str) -> None:
                                      f'IPTV output: nothing left to play for {session.label}',
                                      body=f'An IPTV player watching {session.label} was cut: {detail}.',
                                      source=source)
-                return
+                return None
             member = play.member
             try:
                 _launch(session, member, cfg, first=False)
@@ -2561,13 +2622,13 @@ def _failover(session: RelaySession, reason: str, detail: str) -> None:
                 log.warning('Viewer %s: cannot fail over to "%s": %s', session.id, member.name,
                             exc.message)
                 if not session.live:
-                    return
+                    return None
                 session.failed_ids.add(member.id)
                 continue
             break
         with _lock:
             if not session.live:
-                return
+                return None
             session.state = STATE_STARTING
             session.last_data_mono = None
             session.failovers.append((failed_name, member.name, reason))
@@ -2575,19 +2636,24 @@ def _failover(session: RelaySession, reason: str, detail: str) -> None:
         log.warning('Viewer %s: "%s" %s - moved to "%s"', session.id, failed_name, why,
                     member.name)
 
-        if session.group_id is None:
+        if session.group_id is not None:
             # A sports channel has no group whose timeline could carry this. The move is in
             # the session's own history, which the dashboard shows, and in the log above.
-            return
-        _log_viewer_move(session.group_id, member.id,
-                         f'An IPTV player watching through the IPTV output was moved from '
-                         f'"{failed_name}" to "{member.name}": "{failed_name}" {why}.')
+            _log_viewer_move(session.group_id, member.id,
+                             f'An IPTV player watching through the IPTV output was moved from '
+                             f'"{failed_name}" to "{member.name}": "{failed_name}" {why}.')
+        return member
 
 
 def _died_phrase(reason: str) -> str:
+    """Why a play left a channel, as the words after the channel's name."""
     if reason == REASON_CONNECT_TIMEOUT:
         return 'sent nothing in time'
-    return 'stopped delivering'
+    if reason == REASON_FFMPEG_EXITED:
+        return 'stopped delivering'
+    if reason == REASON_MOVED_BY_HAND:
+        return 'was left by hand, from Watching now'
+    raise ValueError(f'No words for why a play left a channel: "{reason}"')
 
 
 def move_text(from_name: str, to_name: str, reason: str) -> str:
@@ -2596,7 +2662,153 @@ def move_text(from_name: str, to_name: str, reason: str) -> str:
     if reason == REASON_MOVED_FOR_RECORDING:
         return (f'Moved from "{from_name}" to "{to_name}": a recording needed the connection '
                 f'"{from_name}" was using.')
+    if reason == REASON_MOVED_BY_HAND:
+        return f'Moved from "{from_name}" to "{to_name}" by hand, from Watching now.'
     return f'Moved from "{from_name}" to "{to_name}": "{from_name}" {_died_phrase(reason)}.'
+
+
+# What a move by hand did with the channel it left (MoveResult.outcome).
+MOVE_ENDED = 'ended'              # nothing else would start, so the play ended; nothing written
+MOVE_ADJUSTED = 'adjusted'        # moved, and the channel left now has HAND_MOVE_ADJUSTMENT
+MOVE_ALREADY = 'already'          # moved; the channel left already had it, so nothing was written
+MOVE_CHANNEL_GONE = 'channel_gone'    # moved; the channel left is no longer in the database
+MOVE_UNSAVED = 'unsaved'          # moved, but the adjustment could not be written (`error`)
+
+
+class MoveResult:
+    """What move_by_hand() did: the channel the play left, the name of the one it is on now ('' for
+    MOVE_ENDED), and one of the MOVE_* outcomes above."""
+
+    def __init__(self, from_id: int, from_name: str, to_name: str, outcome: str, error: str = ''):
+        self.from_id, self.from_name, self.to_name = from_id, from_name, to_name
+        self.outcome, self.error = outcome, error
+
+
+#: The score adjustment a move by hand writes on the channel it leaves: the lowest there is, so
+#: every ranking that reads the score tries it last until a person sets it back on its page. A
+#: ranking, not a filter: with nothing else left it is still used.
+HAND_MOVE_ADJUSTMENT = -100
+HAND_MOVE_NOTE = ('An IPTV player was moved off this channel by hand, from Watching now. Set the '
+                  'score adjustment back to 0 in Settings on this page to rank it normally again.')
+
+
+def move_by_hand(session_id: str) -> MoveResult:
+    """Take a live play off the channel it is playing and onto the next best one that plays what
+    it asked for, as a failover does, at a person's word from Watching now (dev/changelog/1675).
+    The channel it leaves is never returned to for the rest of the play (failed_ids), and gets
+    HAND_MOVE_ADJUSTMENT, so a new play, a recording and a group's ranking all try it last
+    until the adjustment is set back. Needs an app context.
+
+    Raises FeedRefused, with the play left exactly as it was, when there is nowhere to go: a
+    single channel, ChannelBin's own picture, a play already changing what it plays, or no
+    other channel that could take it right now. Only once another channel is found is the
+    current one stopped - the provider allows one connection, so the two cannot overlap."""
+    session = get_session(session_id)
+    if session is None or not session.live:
+        raise FeedRefused('That play has already ended.', 404)
+    offer = move_offer(session)
+    if offer == MOVE_NO_CHANNEL:
+        raise FeedRefused('That play is showing ChannelBin\'s own picture, not a channel.', 409)
+    if offer == MOVE_NOWHERE:
+        raise FeedRefused(f'{session.label} is a single channel, so there is nowhere to move it.', 409)
+    if offer != MOVE_OFFERED:
+        raise ValueError(f'Unknown move offer "{offer}"')
+    busy = FeedRefused('That play is changing channel right now. Try again in a moment.', 409)
+    if session.app is None or not session._swap_lock.acquire(blocking=False):
+        raise busy
+    try:
+        with _lock:
+            free = (session.live and not session._failing_over and not session._moving
+                    and not session._finishing and session.proc is not None
+                    and session.state in (STATE_STARTING, STATE_STREAMING))
+            if free:
+                # The failover guard: the reaper and a dying member leave the play alone while
+                # it changes channel, as they do for any failover.
+                session._failing_over = True
+        if not free:
+            raise busy
+        from_id, from_name = session.channel_id, session.channel_name
+        try:
+            _next_channel_or_refuse(session)
+            # The channel _failover() returns belongs to a session it has closed: the play's
+            # own fields carry the name.
+            moved = _failover(session, REASON_MOVED_BY_HAND, '') is not None
+        except FeedRefused:
+            raise
+        except Exception as exc:                        # noqa: BLE001 - one play, never left half-moved
+            if session.proc is not None:
+                raise
+            # _failover() had already stopped the channel: a play left live with no ffmpeg
+            # is skipped by the reaper and would hold its seat forever, so it ends by name.
+            log.exception('Viewer %s: moving %s off "%s" by hand failed', session.id,
+                          session.label, from_name)
+            _finish(session, REASON_LAUNCH_FAILED,
+                    detail=f'moving it off "{from_name}" failed: {mask_creds_in_text(str(exc))}')
+            moved = False
+        finally:
+            with _lock:
+                session._failing_over = False
+    finally:
+        session._swap_lock.release()
+    if not moved:
+        return MoveResult(from_id, from_name, '', MOVE_ENDED)
+    return _avoid_left_channel(from_id, from_name, session.channel_name)
+
+
+def _next_channel_or_refuse(session: RelaySession) -> None:
+    """Raise FeedRefused unless another channel could take the play right now: one that plays
+    what it asked for, on the play's own account or one with a connection free. Asked before
+    anything is stopped, so a refusal leaves the play on the channel it is on. resolve_play()
+    already prefers a channel whose account has a connection free over a better-ranked one on a
+    full account (seat_standing, dev/changelog/1642), so a full account at the top of its answer
+    means every one is full."""
+    from .config import load_config
+    exclude = frozenset(session.failed_ids | {session.channel_id})
+    play = resolve_play(session.feed_id, load_config(), exclude_ids=exclude,
+                        event_id=session.event_id, viewer_id=session.id, preview=session.preview)
+    stays = f'It stays on "{session.channel_name}".'
+    if play is None or play.member is None:
+        raise FeedRefused(f'No other channel can play {session.label} right now. {stays}', 409)
+    member = play.member
+    if member.account_id == session.account_id:
+        return
+    standing = _viewer_standing({member.account_id}, session.id).get(member.account_id)
+    if standing != connlim.SEAT_FREE:
+        account = member.account.name if member.account else f'account {member.account_id}'
+        raise FeedRefused(f'The next channel that plays it, "{member.name}", is on {account}, '
+                          f'which has no connection free right now. {stays}', 409)
+
+
+def _avoid_left_channel(from_id: int, from_name: str, to_name: str) -> MoveResult:
+    """Write HAND_MOVE_ADJUSTMENT on the channel a move by hand left. The play has already
+    moved, so a write that fails is said in the result and the log, never raised."""
+    from sqlalchemy.exc import SQLAlchemyError
+    from . import db
+    from .database import Channel
+    from .db_utils import retry_on_locked
+    from .health_score import set_manual_adjustment
+
+    @retry_on_locked()
+    def _adjust_and_commit():
+        channel = db.session.get(Channel, from_id)
+        if channel is None:
+            return MOVE_CHANNEL_GONE
+        if (channel.manual_health_adjustment or 0) == HAND_MOVE_ADJUSTMENT:
+            return MOVE_ALREADY
+        set_manual_adjustment(channel, HAND_MOVE_ADJUSTMENT, HAND_MOVE_NOTE,
+                              why='an IPTV player was moved off it by hand, from Watching now',
+                              extra={'cause': 'hand_move'})
+        db.session.commit()
+        return MOVE_ADJUSTED
+
+    try:
+        outcome = _adjust_and_commit()
+    except SQLAlchemyError as exc:
+        db.session.rollback()
+        log.exception('Channel %d: the play moved off it, but its score adjustment could not be '
+                      'written', from_id)
+        return MoveResult(from_id, from_name, to_name, MOVE_UNSAVED, error=str(exc))
+    return MoveResult(from_id, from_name, to_name, outcome)
 
 
 def _moves_note(session: 'RelaySession') -> str:

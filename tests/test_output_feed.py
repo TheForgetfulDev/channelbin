@@ -702,6 +702,85 @@ class ReaperJudgementTests(_FeedCase):
         self.assertEqual(session.reason, feed.REASON_CLIENT_TOO_SLOW)
 
 
+class PlayTimeByAccountTests(_FeedCase):
+    """dev/changelog/1676: a play times each provider ffmpeg against the account it plays
+    from, so Streamed to IPTV players credits each account its own part of a play."""
+
+    def _session(self):
+        session = feed.RelaySession(
+            id=f'pt{id(self)}', feed_id=2, label='channel 1 (One)', client='10.0.0.2',
+            group_id=None, channel_id=1, channel_name='One', account_id=self.account.id,
+            ring=feed.Ring(feed.READ_CHUNK * 2, 0), started_mono=time.monotonic())
+        with feed._lock:
+            feed._sessions[session.id] = session
+        return session
+
+    def test_a_swapped_out_readers_end_leaves_the_next_ffmpegs_time_running(self):
+        """The old ffmpeg's reader can drain after the next one was adopted: closing "whatever
+        is running" there would cut the new account's time short."""
+        session = self._session()
+        old, new = object(), object()
+        session._phase = (new, self.account.id, time.monotonic() - 2.0)
+        with feed._lock:
+            feed._close_phase_locked(session, old)
+        self.assertIsNotNone(session._phase)
+        self.assertEqual(session.account_seconds, {})
+        with feed._lock:
+            feed._close_phase_locked(session, new)
+        self.assertIsNone(session._phase)
+        self.assertAlmostEqual(session.account_seconds[self.account.id], 2.0, delta=0.5)
+
+    def test_channelbins_own_clip_is_timed_against_no_account(self):
+        """A waiting screen or Up next picture uses no provider connection: adopting its ffmpeg
+        closes the provider ffmpeg's time and opens none."""
+        session = self._session()
+        session._phase = (object(), self.account.id, time.monotonic() - 3.0)
+        proc = subprocess.Popen([sys.executable, '-c', 'pass'], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE)
+        reader = feed._adopt(session, proc)
+        self.assertIsNotNone(reader)
+        reader.join(5)
+        proc.wait(5)
+        self.assertIsNone(session._phase)
+        self.assertEqual(set(session.account_seconds), {self.account.id})
+        self.assertAlmostEqual(session.account_seconds[self.account.id], 3.0, delta=0.5)
+
+    def test_a_provider_ffmpeg_is_timed_until_its_pipe_ends(self):
+        session = self._session()
+        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.0)'],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+        reader = feed._adopt(session, proc, account_id=self.account.id)
+        self.assertEqual(session._phase[1], self.account.id)
+        reader.join(5)
+        proc.wait(5)
+        self.assertIsNone(session._phase)
+        # From launch to the pipe's end: the sleep, plus an interpreter start a busy box slows.
+        self.assertGreaterEqual(session.account_seconds[self.account.id], 0.9)
+        self.assertLess(session.account_seconds[self.account.id], 5.0)
+
+    def test_the_ended_plays_line_carries_the_split_with_the_running_part_closed(self):
+        """_finish closes the ffmpeg still being timed before the play's line is written: its
+        reader may outlive the join, or be the thread finishing it."""
+        import json
+        from app.database import OutputFeedPlay
+        session = self._session()
+        session._phase = (object(), self.account.id, time.monotonic() - 4.0)
+        session.account_seconds = {999: 10.0}
+        self.assertTrue(feed._finish(session, feed.REASON_CLIENT_GONE))
+
+        def written():
+            # The writer thread may already hold the line; flush whatever is still queued.
+            feed.flush_play_log()
+            return _fresh_count(lambda: OutputFeedPlay.query.filter_by(kind=feed.FEED_PLAY_ENDED)) == 1
+
+        self.assertTrue(_wait(written, 5))
+        db.session.expire_all()
+        row = OutputFeedPlay.query.filter_by(kind=feed.FEED_PLAY_ENDED).one()
+        split = json.loads(row.account_seconds)
+        self.assertEqual(split['999'], 10.0)
+        self.assertAlmostEqual(split[str(self.account.id)], 4.0, delta=0.5)
+
+
 class LivePickPrefersAFreeAccountTests(_FeedCase):
     """dev/changelog/1642 (A1): a play's own pick of a group's member prefers one on an account
     with a connection free, as a recording's start does; a page asking what would play is told
@@ -1197,6 +1276,39 @@ class RelayFailoverTests(_Relay):
         self.assertIn('needed the connection', group_event.detail)
         self.assertEqual(group_event.channel_id, b.id)
 
+    def test_a_moved_play_credits_each_account_its_own_part(self):
+        """dev/changelog/1676: a play's log row kept only the account it ended on, so the time
+        it spent on the first account would have gone to the second. Each ffmpeg's run is
+        credited to its own account, and the parts add up to no more than the play."""
+        import json
+        from app.database import OutputFeedPlay
+        other, a, b, group, rec = self._two_account_group()
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 3)
+        session = self._session()
+        # A second on each account: ffmpeg's opening burst can deliver the first chunks in
+        # milliseconds, and a part that short rounds to 0.0 on the play's line.
+        time.sleep(1.0)
+        self._preempt(rec)
+        self.assertTrue(_wait(lambda: bool(session.failovers), 15), session)
+        self._read(resp, 3)
+        time.sleep(1.0)
+        resp.close()
+        self.assertTrue(_wait(lambda: not session.live, 5))
+
+        def written():
+            # The writer thread may already hold the line; flush whatever is still queued.
+            feed.flush_play_log()
+            return _fresh_count(lambda: OutputFeedPlay.query.filter_by(kind=feed.FEED_PLAY_ENDED)) == 1
+
+        self.assertTrue(_wait(written, 5))
+        db.session.expire_all()
+        row = OutputFeedPlay.query.filter_by(kind=feed.FEED_PLAY_ENDED).one()
+        split = {int(k): v for k, v in json.loads(row.account_seconds).items()}
+        self.assertEqual(set(split), {self.account.id, other.id}, row.account_seconds)
+        self.assertTrue(all(v >= 0.8 for v in split.values()), split)
+        self.assertLessEqual(sum(split.values()), row.seconds + 1.0)
+
     def test_the_recording_holds_its_seat_before_the_move_asks_for_one(self):
         """dev/changelog/1642: the move starts only once the recording's acquire is done, so it
         can never take back the seat being freed for the recording."""
@@ -1340,6 +1452,222 @@ class RelayFailoverTests(_Relay):
         self.assertIn('Recording on', resp.get_json()['error'])
         alert = Alert.query.filter_by(alert_type='FEED_NO_MEMBER').one()
         self.assertIn('Game feeds', alert.title)
+
+
+class HandMoveTests(_Relay):
+    """Watching now's "Move to another channel" (output_feed.move_by_hand, dev/changelog/1675):
+    a play moves off the channel it is on at a person's word, never comes back to it, and the
+    channel it left is passed over by everything else until its score adjustment is set back.
+    When there is nowhere to go the play is left exactly as it was."""
+
+    def _group(self, accounts=None):
+        other = make_account('Other', max_connections=1)
+        a = self._clip_channel('Feed a', clip='a.ts')
+        b = self._clip_channel('Feed b', clip='b.ts', account=accounts or other)
+        a.health_score, b.health_score = 90.0, 50.0
+        group = make_group('Game feeds', members=[a, b])
+        db.session.commit()
+        return other, a, b, group
+
+    def _move(self, session, expect=200):
+        resp = self.client.post(f'/api/iptv-output/plays/{session.id}/move')
+        self.assertEqual(resp.status_code, expect, resp.get_json())
+        return resp.get_json()
+
+    def test_a_move_puts_the_play_on_the_next_channel_and_marks_the_one_it_left(self):
+        from app.database import Channel, ChannelEvent, CHANNEL_HEALTH_OVERRIDE_CHANGED
+        other, a, b, group = self._group()
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        self.assertEqual(session.channel_id, a.id)
+        old_proc = session.proc
+        body = self._move(session)
+        self.assertTrue(body['success'])
+        self.assertEqual(body['moved_to'], 'Feed b')
+        self.assertIn('score adjustment of -100, so it is tried last', body['message'])
+        self.assertTrue(body['adjusted'])
+        self.assertIsNotNone(old_proc.poll(), 'the channel it left is stopped')
+        self.assertTrue(session.live)
+        self.assertEqual((session.channel_id, session.account_id), (b.id, other.id))
+        self.assertEqual(connlim._holders.get(other.id), [('viewer', session.id)])
+        self.assertEqual(connlim._holders.get(self.account.id, []), [])
+        self.assertEqual(session.failovers, [('Feed a', 'Feed b', feed.REASON_MOVED_BY_HAND)])
+        self.assertEqual(feed.move_text(*session.failovers[0]),
+                         'Moved from "Feed a" to "Feed b" by hand, from Watching now.')
+        self.assertIn(a.id, session.failed_ids)
+        before = session.bytes_sent
+        self._read(resp, 2)
+        self.assertGreater(session.bytes_sent, before, 'the same response plays on')
+        db.session.expire_all()
+        left = db.session.get(Channel, a.id)
+        self.assertEqual(left.manual_health_adjustment, feed.HAND_MOVE_ADJUSTMENT)
+        self.assertEqual(left.manual_health_note, feed.HAND_MOVE_NOTE)
+        event = ChannelEvent.query.filter_by(channel_id=a.id,
+                                             event_type=CHANNEL_HEALTH_OVERRIDE_CHANGED).one()
+        self.assertIn('-100', event.detail)
+        self.assertIn('moved off it by hand', event.detail)
+        self.assertEqual(db.session.get(Channel, b.id).manual_health_adjustment, 0)
+        group_event = ChannelGroupEvent.query.filter_by(group_id=group.id,
+                                                        event_type=GROUP_VIEWER_FAILOVER).one()
+        self.assertIn('by hand', group_event.detail)
+
+    def test_the_next_play_of_the_group_starts_on_the_channel_it_did_not_leave(self):
+        _other, a, b, group = self._group()
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        self._move(self._session())
+        resp.close()
+        self.assertTrue(_wait(lambda: not feed.live_sessions(), 5))
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        self.assertEqual(self._session().channel_id, b.id,
+                         'the -100 puts the channel it left below one scored 50')
+
+    def test_a_second_move_never_returns_to_the_channel_it_left(self):
+        _other, a, b, group = self._group()
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        self._move(session)
+        proc = session.proc
+        body = self._move(session, expect=409)
+        self.assertIn('No other channel', body['error'])
+        self.assertIn('stays on "Feed b"', body['error'])
+        self.assertIs(session.proc, proc)
+        self.assertEqual(session.channel_id, b.id)
+        self.assertEqual(len(session.failovers), 1)
+
+    def test_with_nowhere_to_go_the_play_and_the_channel_are_left_alone(self):
+        from app.database import Channel
+        other, a, b, group = self._group()
+        self.assertTrue(connlim.try_acquire(other.id, 'recording', 4242))
+        self.addCleanup(connlim.release, other.id, 'recording', 4242)
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        proc = session.proc
+        body = self._move(session, expect=409)
+        self.assertIn('"Feed b"', body['error'])
+        self.assertIn('no connection free', body['error'])
+        self.assertIsNone(proc.poll(), 'nothing was stopped')
+        self.assertIs(session.proc, proc)
+        self.assertEqual((session.channel_id, session.failovers, session.failed_ids), (a.id, [], set()))
+        self.assertFalse(session._failing_over)
+        db.session.expire_all()
+        self.assertEqual(db.session.get(Channel, a.id).manual_health_adjustment, 0)
+        before = session.bytes_sent
+        self._read(resp, 2)
+        self.assertGreater(session.bytes_sent, before)
+
+    def test_a_move_goes_past_a_channel_on_a_full_account_to_one_with_a_connection_free(self):
+        """The pick's own preference for a free account (resolve_play, dev/changelog/1642) is
+        what passes "Feed b" over; the move must not refuse on the better-ranked full one."""
+        other = make_account('Other', max_connections=1)
+        third = make_account('Third', max_connections=1)
+        a = self._clip_channel('Feed a', clip='a.ts')
+        b = self._clip_channel('Feed b', clip='b.ts', account=other)
+        c = self._clip_channel('Feed c', clip='b.ts', account=third)
+        a.health_score, b.health_score, c.health_score = 90.0, 50.0, 30.0
+        group = make_group('Game feeds', members=[a, b, c])
+        db.session.commit()
+        self.assertTrue(connlim.try_acquire(other.id, 'recording', 4242))
+        self.addCleanup(connlim.release, other.id, 'recording', 4242)
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        self.assertEqual(session.channel_id, a.id)
+        body = self._move(session)
+        self.assertEqual(body['moved_to'], 'Feed c')
+        self.assertEqual((session.channel_id, session.account_id), (c.id, third.id))
+        self.assertEqual(connlim._holders.get(third.id), [('viewer', session.id)])
+
+    def test_an_error_after_the_old_channel_stopped_ends_the_play_by_name(self):
+        from unittest import mock
+        other, a, b, group = self._group()
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        old_proc = session.proc
+        with mock.patch.object(feed, '_launch', side_effect=RuntimeError('boom')):
+            body = self._move(session, expect=409)
+        self.assertIn('Nothing else would start, so the play ended.', body['error'])
+        self.assertIn('boom', body['error'])
+        self.assertIsNotNone(old_proc.poll())
+        self.assertFalse(session.live, 'a play with no ffmpeg is never reaped, so it is ended here')
+        self.assertEqual(session.reason, feed.REASON_LAUNCH_FAILED)
+        self.assertEqual(connlim._holders.get(self.account.id, []), [])
+        self.assertFalse(session._failing_over)
+        self.assertFalse(session._swap_lock.locked())
+
+    def test_a_move_on_the_same_account_keeps_its_seat(self):
+        self.account.max_connections = 1
+        _other, a, b, group = self._group(accounts=self.account)
+        resp = self._play(feed.feed_id_for_group(group.id))
+        self._read(resp, 1)
+        session = self._session()
+        self._move(session)
+        self.assertEqual((session.channel_id, session.account_id), (b.id, self.account.id))
+        self.assertEqual(connlim._holders.get(self.account.id), [('viewer', session.id)])
+
+    def test_a_single_channel_says_there_is_nowhere_to_go(self):
+        from app.database import Channel
+        ch = self._clip_channel('Paced')
+        ch.in_guide = True
+        db.session.commit()
+        resp = self._play(feed.feed_id_for_channel(ch.id))
+        self._read(resp, 1)
+        session = self._session()
+        self.assertEqual(feed.move_offer(session), feed.MOVE_NOWHERE)
+        self.assertEqual(session.to_dict()['move_why'], feed.MOVE_NOWHERE_TEXT)
+        proc = session.proc
+        body = self._move(session, expect=409)
+        self.assertIn('single channel', body['error'])
+        self.assertIs(session.proc, proc)
+        db.session.expire_all()
+        self.assertEqual(db.session.get(Channel, ch.id).manual_health_adjustment, 0)
+
+
+class MoveOfferTests(_FeedCase):
+    """What Watching now offers a play built by hand, with no ffmpeg (dev/changelog/1675)."""
+
+    def _session(self, **kw):
+        fields = dict(id=f'm{time.monotonic_ns()}', feed_id=2, label='group 1 (Game)',
+                      client='10.0.0.2', group_id=1, channel_id=1, channel_name='One',
+                      account_id=self.account.id, ring=feed.Ring(1024, 0),
+                      started_mono=time.monotonic(), fails_over=True,
+                      state=feed.STATE_STREAMING)
+        fields.update(kw)
+        session = feed.RelaySession(**fields)
+        with feed._lock:
+            feed._sessions[session.id] = session
+        return session
+
+    def test_each_kind_of_play_gets_its_own_answer(self):
+        self.assertEqual(feed.move_offer(self._session()), feed.MOVE_OFFERED)
+        self.assertEqual(feed.move_offer(self._session(fails_over=False)), feed.MOVE_NOWHERE)
+        self.assertEqual(feed.move_offer(self._session(state=feed.STATE_WAITING)),
+                         feed.MOVE_NO_CHANNEL)
+        self.assertEqual(feed.move_offer(self._session(state=feed.STATE_SHOWING)),
+                         feed.MOVE_NO_CHANNEL)
+        self.assertEqual(feed.move_offer(self._session(state=feed.STATE_STOPPED)),
+                         feed.MOVE_NO_CHANNEL)
+        with self.assertRaises(ValueError):
+            feed.move_offer(self._session(state='SOMETHING_NEW'))
+
+    def test_a_play_already_changing_channel_is_refused_and_left_alone(self):
+        session = self._session(app=self.t.app, proc=object())
+        self.addCleanup(setattr, session, 'proc', None)
+        session._failing_over = True
+        resp = self.client.post(f'/api/iptv-output/plays/{session.id}/move')
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn('changing channel', resp.get_json()['error'])
+        self.assertTrue(session._failing_over, 'the failover in flight still owns its flag')
+        self.assertEqual(session.failovers, [])
+
+    def test_an_unknown_play_is_404(self):
+        resp = self.client.post('/api/iptv-output/plays/nope/move')
+        self.assertEqual(resp.status_code, 404)
 
 
 class SportsRelayTests(_Relay):

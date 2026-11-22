@@ -6,10 +6,15 @@ login of its (`login:<id>:refused`) and the provider it is on (`provider:<id>:*`
 blocks set on it. Until dev/changelog/1475 the card listed only syncs, which the Sync history
 table beside it already listed run by run; the table stays the full sync ledger, and this is
 the recent story of everything, cut down by the history-filter chips (app/history_filter.py).
+Since dev/changelog/1665 it also lists the account's finished stream checks, and since
+dev/changelog/1671 the last time the user turned each of its hosts and logins on or off - the
+row's own `switched_at`, so a switch moved twice shows its latest move only. Since
+dev/changelog/1672 it lists the blocks set on a login the account holds, too.
 
-Four queries however long the account's history - the syncs, the account's login ids, the
-alerts and the blocks, all over the last `ACTIVITY_DAYS` days - plus one for the recordings
-a block was tied to. Every entry is
+Eight queries however long the account's history - the syncs, the account's login ids, the
+alerts, the blocks, the login blocks, the stream checks and the host and login switches, all
+over the last
+`ACTIVITY_DAYS` days - plus one for the recordings a block was tied to. Every entry is
 `{'kind', 'ts', 'obj', ...}` with `kind` one of `KINDS`; the template branches on it
 and names every kind explicitly.
 """
@@ -20,7 +25,9 @@ from datetime import datetime, timedelta
 from sqlalchemy import or_
 
 from . import db
-from .database import Account, AccountBlock, AccountLogin, AccountSyncLog, Alert, Recording
+from .account_blocks import NO_END
+from .database import (Account, AccountBlock, AccountHost, AccountLogin, AccountStreamCheck,
+                       AccountSyncLog, Alert, Login, LoginBlock, Recording, STREAM_CHECK_DONE)
 from .history_filter import ALL
 
 #: How far back the card reaches. Beyond it the Sync history table has the syncs and the
@@ -30,16 +37,21 @@ ACTIVITY_DAYS = 30
 #: Entries shown at first, and added by each "Show more".
 ACTIVITY_PAGE = 12
 
-KIND_SYNC, KIND_ALERT, KIND_BLOCK = 'sync', 'alert', 'block'
-KINDS = (KIND_SYNC, KIND_ALERT, KIND_BLOCK)
+KIND_SYNC, KIND_ALERT, KIND_BLOCK, KIND_STREAM_CHECK = 'sync', 'alert', 'block', 'stream_check'
+KIND_SWITCH, KIND_LOGIN_BLOCK = 'switch', 'login_block'
+KINDS = (KIND_SYNC, KIND_ALERT, KIND_BLOCK, KIND_STREAM_CHECK, KIND_SWITCH, KIND_LOGIN_BLOCK)
 
 ACTIVITY_FILTERS = (
     (ALL, 'All'),
     ('syncs', 'Syncs'),
     ('alerts', 'Alerts'),
     ('blocks', 'Blocks'),
+    ('checks', 'Stream checks'),
+    ('switches', 'Hosts and logins'),
 )
-BUCKET_OF_KIND = {KIND_SYNC: 'syncs', KIND_ALERT: 'alerts', KIND_BLOCK: 'blocks'}
+BUCKET_OF_KIND = {KIND_SYNC: 'syncs', KIND_ALERT: 'alerts', KIND_BLOCK: 'blocks',
+                  KIND_STREAM_CHECK: 'checks', KIND_SWITCH: 'switches',
+                  KIND_LOGIN_BLOCK: 'blocks'}
 
 #: An alert's dot on the card, by severity (app/alerts.py's four). A severity this table does
 #: not know reads as a warning, never as fine.
@@ -97,12 +109,56 @@ def entries(account: Account, now: datetime | None = None) -> list:
         rec = recs.get(b.recording_id) if b.recording_id is not None else None
         # A block tied to a recording reads that recording's window live (app/account_blocks.py);
         # one the recording no longer exists for has no window to show and says so.
+        # An account block with no stop holds until the user unblocks it (dev/changelog/1667).
         start = b.start_time if b.recording_id is None else (rec.start_time if rec else None)
         stop = b.stop_time if b.recording_id is None else (rec.stop_time if rec else None)
+        no_end = b.recording_id is None and b.stop_time is None
         out.append({'kind': KIND_BLOCK, 'ts': b.created_at, 'obj': b, 'recording': rec,
-                    'start': start, 'stop': stop,
-                    'active': bool(start and stop and start <= now < stop),
+                    'start': start, 'stop': stop, 'no_end': no_end,
+                    'active': bool(start and start <= now and (no_end or (stop and now < stop))),
                     'over': bool(stop and stop <= now)})
+
+    # A block on a login this account holds (dev/changelog/1672): every holder lists it, since
+    # it keeps ChannelBin off the login on each of them. An Unblock moves its stop to the
+    # moment it was ended, so the line says how long it really held.
+    login_blocks = (db.session.query(LoginBlock, Login.name)
+                    .join(Login, Login.id == LoginBlock.login_id)
+                    .join(AccountLogin, AccountLogin.login_id == LoginBlock.login_id)
+                    .filter(AccountLogin.account_id == account.id,
+                            LoginBlock.created_at >= since).all())
+    for b, name in login_blocks:
+        stop = b.stop_time or NO_END
+        out.append({'kind': KIND_LOGIN_BLOCK, 'ts': b.created_at, 'obj': b, 'login': name,
+                    'start': b.start_time, 'stop': b.stop_time, 'no_end': b.stop_time is None,
+                    'active': b.start_time <= now < stop})
+
+    # Finished checks only: an open one is the page's banner, and has no result to list yet.
+    from .stream_check import view as stream_check_view
+    checks = (AccountStreamCheck.query
+              .filter(AccountStreamCheck.account_id == account.id,
+                      AccountStreamCheck.status == STREAM_CHECK_DONE,
+                      AccountStreamCheck.finished_at >= since)
+              .order_by(AccountStreamCheck.finished_at.desc()).all())
+    for c in checks:
+        v = stream_check_view(c, now)
+        out.append({'kind': KIND_STREAM_CHECK, 'ts': c.finished_at, 'obj': c, 'view': v,
+                    'dot': v['summary_tone'] if v['summary_tone'] != 'faint' else 'warn'})
+
+    # The user's own switch moves: a faint dot, like a block, since the user chose it. A
+    # login's switch is this account's only. A sync that makes a row name another host or
+    # login clears its time (account_links.list_playlist_rows), so no line names one the user
+    # never switched.
+    hosts = (AccountHost.query
+             .filter(AccountHost.account_id == account.id, AccountHost.switched_at >= since)
+             .all())
+    out += [{'kind': KIND_SWITCH, 'ts': h.switched_at, 'what': 'host', 'name': h.host,
+             'on': h.enabled} for h in hosts]
+    logins = (db.session.query(AccountLogin.switched_at, AccountLogin.enabled, Login.name)
+              .join(Login, Login.id == AccountLogin.login_id)
+              .filter(AccountLogin.account_id == account.id, AccountLogin.switched_at >= since)
+              .all())
+    out += [{'kind': KIND_SWITCH, 'ts': at, 'what': 'login', 'name': name, 'on': on}
+            for at, on, name in logins]
 
     out.sort(key=lambda e: e['ts'], reverse=True)
     return out

@@ -13,7 +13,10 @@ The properties guarded here, each of which fails in its own way:
   * a block added while a recording is running moves a group recording to a member on
     another account, and the member it left is neither scored, demoted nor burned; with no
     alternative the recording stays and says so, once;
-  * the routes set, bound and end blocks, and a recording or account delete takes its blocks
+  * an account block may have no end: it holds until the user unblocks it, every surface
+    says "until you unblock it" in place of an end time, and a start waiting on it re-asks
+    at the poll cap (dev/changelog/1667);
+  * the routes set and end blocks, and a recording or account delete takes its blocks
     with it.
 
 Runs against a throwaway temp SQLite DB - never the live dvr.db.
@@ -141,6 +144,59 @@ class BlockWindowTests(_Case):
         self.assertIsNotNone(until)
         self.assertAlmostEqual((until - datetime.utcnow()).total_seconds(), 90 * 60, delta=5)
         self.assertIsNone(blocks.free_at(self.spare_id))
+
+
+class NoEndBlockTests(_Case):
+    """A block set "Until I unblock it" (dev/changelog/1667)."""
+
+    def test_a_block_with_no_end_covers_every_future_window_until_unblocked(self):
+        bid = blocks.add_account_block(self.tv_id, None)
+        self.assertIsNone(db.session.get(AccountBlock, bid).stop_time)
+        far = datetime.utcnow() + timedelta(days=400)
+        self.assertEqual(blocks.blocked_account_ids([self.tv_id]), {self.tv_id})
+        self.assertEqual(blocks.blocked_account_ids([self.tv_id], at=far), {self.tv_id})
+        self.assertEqual(blocks.blocked_account_ids(
+            [self.tv_id], start=far, stop=far + timedelta(hours=1)), {self.tv_id})
+        self.assertTrue(blocks.no_end(blocks.free_at(self.tv_id)))
+        self.assertEqual(blocks.blocked_reason(self.tv_id, 'TV Account', capital=True),
+                         'Account "TV Account" is blocked until you unblock it')
+        blocks.end_account_block(bid)
+        self.assertEqual(blocks.blocked_account_ids([self.tv_id], at=far), set())
+
+    def test_a_timed_block_ending_first_does_not_free_an_account_with_no_end_block(self):
+        self._block(self.tv_id, minutes=10)
+        blocks.add_account_block(self.tv_id, None)
+        self.assertTrue(blocks.no_end(blocks.free_at(self.tv_id)))
+
+    def test_a_start_waiting_on_it_retries_at_the_poll_cap(self):
+        blocks.add_account_block(self.tv_id, None)
+        rid = self._scheduled(channel_id=self.ch_tv_id)
+        with mock.patch('app.scheduler.reschedule_recording_start') as resched, \
+             mock.patch.object(recorder, '_launch_segment'):
+            recorder.start_recording(self.t.app, rid)
+        retry_at = resched.call_args[0][1]
+        self.assertAlmostEqual((retry_at - datetime.utcnow()).total_seconds(),
+                               recorder.BLOCK_WAIT_MAX_POLL_SECONDS, delta=5)
+        db.session.expire_all()
+        self.assertEqual(db.session.get(Recording, rid).status, REC_STATUS_SCHEDULED)
+        self.assertIn('until you unblock it', _block_deferrals(rid)[0].detail)
+
+    def test_the_route_sets_one_and_the_pages_say_until_you_unblock_it(self):
+        resp = self.t.client.post(f'/api/accounts/{self.tv_id}/blocks',
+                                  json={'until_unblocked': True})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(resp.get_json()['message'],
+                         'Account "TV Account" is blocked until you unblock it.')
+        row = AccountBlock.query.one()
+        self.assertIsNone(row.stop_time)
+        self.assertIsNone(row.recording_id)
+
+        listing = self.t.client.get('/accounts').get_data(as_text=True)
+        self.assertEqual(listing.count('Blocked until you unblock it'), 1)
+        page = self.t.client.get(f'/accounts/{self.tv_id}').get_data(as_text=True)
+        self.assertIn('Until you unblock it', page)
+        self.assertIn(f'data-block-id="{row.id}"', page)
+        self.assertIn('until you unblock it. Still in force.', page)
 
 
 class SlotRefusalTests(_Case):
@@ -352,10 +408,17 @@ class RouteTests(_Case):
         self.assertIn('blocked until', resp.get_json()['message'])
         self.assertEqual(blocks.blocked_account_ids([self.tv_id]), {self.tv_id})
 
-    def test_a_block_is_bounded(self):
+    def test_a_timed_block_may_run_past_a_day(self):
         resp = self.t.client.post(f'/api/accounts/{self.tv_id}/blocks',
-                                  json={'minutes': 25 * 60})
-        self.assertEqual(resp.status_code, 400)
+                                  json={'minutes': 3 * 24 * 60})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        stop = AccountBlock.query.one().stop_time
+        self.assertAlmostEqual((stop - datetime.utcnow()).total_seconds(), 3 * 86400, delta=5)
+
+    def test_a_block_needs_a_length_or_no_end(self):
+        for body in ({}, {'minutes': 'soon'}, {'until_unblocked': 'yes'}, {'minutes': -5}):
+            resp = self.t.client.post(f'/api/accounts/{self.tv_id}/blocks', json=body)
+            self.assertEqual(resp.status_code, 400, body)
         self.assertEqual(AccountBlock.query.count(), 0)
 
     def test_unblock_ends_it_and_rearms_waiting_starts(self):

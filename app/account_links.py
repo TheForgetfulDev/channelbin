@@ -28,13 +28,28 @@ shared seats from both (`account_blocks.pool_taken()`). Sharing is only within a
 leaving one, or joining one the other holder is not on, drops the share. Nothing links by
 itself.
 
+**The playlist's own rows and the switches** (dev/changelog/1670). Every sync lists the host
+and the username/password most of the playlist's stream URLs carry as rows on the account
+(`AccountHost.from_playlist`, `Login.playlist_account_id`), beside the ones the user added,
+and every row has an on/off switch (`AccountHost.enabled`, `AccountLogin.enabled`, the latter
+per account so a shared login can be off on one holder only). Listing the playlist's rows is
+what lets the render reach every URL: `render_host()` swaps only a listed host and
+`render_login()` only a listed pair. A row that is off is never used for a new stream: an off
+host is never the active one, and an off login takes no seat. With every switch on, an
+account streams exactly as it did before its playlist's rows were listed - its playlist login's
+seats are the account's own Max connections. The row follows the playlist and the switch
+follows the user: a sync that finds the playlist's host or login changed rewrites the row,
+never its switch, and says so on the account's Activity card.
+
 An account with no host rows, no login rows and no provider behaves byte for byte as it did
 before the tables existed.
 
-This module is the ONE writer of the lists and of `Account.provider_id` (CLAUDE.md, participation-switch rule): the rows
-are the user's judgment about which names reach the same server and which credentials it
-accepts, and nothing adds to, edits or removes from a list but the functions here, called
-from the explicit user action. `AccountHost.is_active` / `activated_at` and
+This module is the ONE writer of the lists, the switches and `Account.provider_id` (CLAUDE.md,
+participation-switch rule): the rows are the user's judgment about which names reach the same
+server and which credentials it accepts, and nothing adds to, edits or removes from a list
+but the functions here, called from the explicit user action - or, for the playlist's own
+rows, from the sync, which records what the playlist says and never moves a switch the user
+set. `AccountHost.is_active` / `activated_at` and
 `Login.last_refused_at` / `last_refused_detail` are state the app writes - which of the
 user's own declared equivalents is dialed right now, and which one the server last refused -
 and `last_resolved_at` / `last_resolve_error` are the DNS probe's stamps. All are selection
@@ -269,14 +284,286 @@ def current_host(account_id: int) -> Optional[str]:
         Channel.account_id == account_id).yield_per(2000))
 
 
+def url_pair(url: Optional[str]) -> Optional[tuple]:
+    """The (username, password) a stream URL's user/pass/id triplet carries, or None for a URL
+    without one (a radio mount, a third-party feed). The same parse render_login() splices."""
+    if not url:
+        return None
+    from urllib.parse import urlsplit
+    from .accounts import _STREAM_URL_RE
+    m = _STREAM_URL_RE.match(urlsplit(url).path)
+    return None if m is None else (m.group('user'), m.group('password'))
+
+
+def playlist_facts(account_id: int) -> dict:
+    """{'host', 'pair', 'stream_host'} in one pass over the account's channels: the host and
+    the (username, password) most of the playlist's own stream URLs carry - `raw_stream_url`,
+    what the provider sent, since `stream_url` already carries the rendered host - and the
+    host most of the stream URLs carry now, which a sync stamps on Account.stream_host. Each
+    is None when no URL has one. About as costly as current_host(), which it replaces in the
+    sync."""
+    from .database import Channel
+    hosts: Counter = Counter()
+    pairs: Counter = Counter()
+    rendered: Counter = Counter()
+    for stream_url, raw_url in (db.session.query(Channel.stream_url, Channel.raw_stream_url)
+                                .filter(Channel.account_id == account_id).yield_per(2000)):
+        source = raw_url or stream_url
+        host = host_of(source)
+        if host:
+            hosts[host] += 1
+        pair = url_pair(source)
+        if pair:
+            pairs[pair] += 1
+        now_host = host_of(stream_url)
+        if now_host:
+            rendered[now_host] += 1
+
+    def top(counts):
+        return counts.most_common(1)[0][0] if counts else None
+    return {'host': top(hosts), 'pair': top(pairs), 'stream_host': top(rendered)}
+
+
+#: A change list_playlist_rows() reports: which row, the old and new value (a host, or a
+#: username - never a password), and whether the row is turned on.
+PLAYLIST_HOST, PLAYLIST_LOGIN = 'host', 'login'
+
+
+def list_playlist_rows(account_id: int, host: Optional[str], pair: Optional[tuple]) -> list:
+    """List the playlist's host and login as rows on the account, or bring the rows in line
+    with what the playlist says now (dev/changelog/1670). Called by the sync once its channels
+    are written, with playlist_facts()'s answer, and by the first manual add on an account no
+    sync has listed yet. The row follows the playlist; the switch beside it never moves here.
+
+    - **Host.** The first listing marks the row already carrying that host as the playlist's,
+      or adds one, on (the active host when it is the only one). A changed host rewrites the
+      playlist's row - or, when the new host is already a row of the user's, marks that one
+      and leaves the old row as an ordinary host the user may remove.
+    - **Login.** The first listing adopts a login the account already holds with that
+      username and password (it keeps its own name and seats), or adds one whose seats are the
+      account's own Max connections. Added beside logins of the user's that the playlist's is
+      not one of, it starts off: turning it on would add seats the user never set. A changed
+      username or password rewrites the playlist's row and clears its refusal stamp.
+    - Any change to the host list re-renders the account's stream URLs, and an active host
+      that is off hands the role to the first host that is on.
+
+    Returns [{'what', 'old', 'new', 'on'}] for each change to a row already listed (a first
+    listing is not a change), in one commit; the caller says each one aloud."""
+    from .database import AccountHost
+
+    @retry_on_locked()
+    def _list_and_commit():
+        now = datetime.utcnow()
+        changes = []
+        if host:
+            rows = (AccountHost.query.filter_by(account_id=account_id)
+                    .order_by(AccountHost.position, AccountHost.id).all())
+            mine = [r for r in rows if r.from_playlist]
+            for extra in mine[1:]:
+                extra.from_playlist = False
+            cur = mine[0] if mine else None
+            existing = next((r for r in rows if r.host == host), None)
+            relisted = False
+            if cur is None:
+                if existing is not None:
+                    existing.from_playlist = True
+                else:
+                    db.session.add(AccountHost(
+                        account_id=account_id, host=host, from_playlist=True,
+                        position=max((r.position for r in rows), default=-1) + 1,
+                        is_active=not rows, created_at=now))
+                    relisted = bool(rows)
+            elif cur.host != host:
+                old = cur.host
+                if existing is not None:
+                    cur.from_playlist = False
+                    existing.from_playlist = True
+                    on = existing.enabled
+                else:
+                    cur.host = host
+                    cur.last_resolved_at = None
+                    cur.last_resolve_error = None
+                    # The user's flip was of the old host: the row now names another, and the
+                    # Activity card must not say the new one was turned off (dev/changelog/1671).
+                    cur.switched_at = None
+                    on = cur.enabled
+                changes.append({'what': PLAYLIST_HOST, 'old': old, 'new': host, 'on': on})
+                relisted = True
+            if relisted:
+                db.session.flush()
+                rows = (AccountHost.query.filter_by(account_id=account_id)
+                        .order_by(AccountHost.position, AccountHost.id).all())
+                active = next((r for r in rows if r.is_active), None)
+                target = active
+                if active is None or not active.enabled:
+                    target = next((r for r in rows if r.enabled), active)
+                if target is not None:
+                    _apply_active(account_id, target.host, now)
+        if pair:
+            changes.extend(_list_playlist_login(account_id, pair, now))
+        db.session.commit()
+        return changes
+
+    had_logins = bool(logins_for_account(account_id)) if pair else True
+    changes = _list_and_commit()
+    if not had_logins:
+        from . import connection_limits as connlim
+        connlim.fold_account_pool(account_id)
+    return changes
+
+
+def _is_sync_listed(login) -> bool:
+    """A playlist login the sync added itself - no seat count of its own, so its seats are the
+    account's - as against one the user typed that the sync adopted, which keeps the user's
+    number. The sync rewrites only the first kind; the second stays the user's
+    (dev/changelog/1670)."""
+    return login.playlist_account_id is not None and login.max_connections is None
+
+
+def _list_playlist_login(account_id: int, pair: tuple, now: datetime) -> list:
+    """list_playlist_rows()'s login half, inside its transaction (no commit). Returns the
+    change list (empty for a first listing or no change)."""
+    from .database import AccountLogin, Login
+    username, password = pair
+
+    def first_listing():
+        """Adopt a held login carrying the pair, or add one; returns whether it is on."""
+        held = logins_for_account(account_id)
+        match = next((lg for lg in held if (lg.username, lg.password) == pair), None)
+        if match is not None:
+            if match.playlist_account_id is None:
+                match.playlist_account_id = account_id
+            return bool(db.session.query(AccountLogin.enabled).filter_by(
+                account_id=account_id, login_id=match.id).scalar())
+        row = Login(name=username[:100], username=username, password=password,
+                    max_connections=None, playlist_account_id=account_id,
+                    created_at=now, updated_at=now)
+        db.session.add(row)
+        db.session.flush()
+        positions = [p for (p,) in db.session.query(AccountLogin.position)
+                     .filter(AccountLogin.account_id == account_id).all()]
+        db.session.add(AccountLogin(account_id=account_id, login_id=row.id, enabled=not held,
+                                    position=max(positions, default=-1) + 1))
+        return not held
+
+    own = Login.query.filter_by(playlist_account_id=account_id).first()
+    if own is None:
+        first_listing()
+        return []
+    if db.session.query(AccountLogin).filter_by(account_id=account_id,
+                                                login_id=own.id).first() is None:
+        positions = [p for (p,) in db.session.query(AccountLogin.position)
+                     .filter(AccountLogin.account_id == account_id).all()]
+        db.session.add(AccountLogin(account_id=account_id, login_id=own.id,
+                                    position=max(positions, default=-1) + 1))
+        db.session.flush()
+    if (own.username, own.password) == pair:
+        return []
+    old_user = own.username
+    change = {'what': PLAYLIST_LOGIN, 'old': old_user, 'new': username,
+              'password_only': old_user == username}
+    taken = next((lg for lg in logins_for_account(account_id)
+                  if lg.id != own.id and (lg.username, lg.password) == pair), None)
+    if _is_sync_listed(own) and taken is None:
+        if own.name == old_user:
+            own.name = username[:100]
+        own.username = username
+        own.password = password
+        own.last_refused_at = None
+        own.last_refused_detail = None
+        own.updated_at = now
+        # As for a rewritten host: the flip was of the old login (dev/changelog/1671).
+        db.session.query(AccountLogin).filter(AccountLogin.login_id == own.id).update(
+            {AccountLogin.switched_at: None}, synchronize_session=False)
+        # And so was a block: it kept ChannelBin off the old username for whatever was
+        # watching on it, which the new one is not, and left in place the Activity card would
+        # name the new username as the one blocked (dev/changelog/1672). A new password on
+        # the same username is the same login, so its block stays.
+        if not change['password_only']:
+            from .account_blocks import drop_login_blocks, login_blocks_at
+            change['block_ended'] = bool(login_blocks_at(None, [own.id]))
+            drop_login_blocks([own.id])
+        change['on'] = bool(db.session.query(AccountLogin.enabled).filter_by(
+            account_id=account_id, login_id=own.id).scalar())
+        return [change]
+    # The row stops being the playlist's. One the user typed stays theirs, untouched; one the
+    # sync added is superseded by a login of the user's carrying the new pair, and goes - or,
+    # when another account still holds it, stays with that account with a seat count of its own.
+    if _is_sync_listed(own):
+        _release_sync_listed(own, account_id)
+    else:
+        own.playlist_account_id = None
+    db.session.flush()
+    change['on'] = first_listing()
+    return [change]
+
+
+def _release_sync_listed(login, account_id: int) -> None:
+    """Inside the caller's unit: a sync-added playlist login that no longer stands for the
+    playlist leaves `account_id`; it is deleted when no other account holds it, and otherwise
+    stays with them as an ordinary login carrying the seats it had. A seat held on it keeps its
+    pool until it releases, as for any removed login."""
+    from .database import AccountLogin
+    seats = configured_seats([login])[login.id]
+    db.session.query(AccountLogin).filter_by(account_id=account_id, login_id=login.id).delete(
+        synchronize_session=False)
+    still_held = db.session.query(AccountLogin).filter(AccountLogin.login_id == login.id).count()
+    if still_held:
+        login.max_connections = seats
+        login.playlist_account_id = None
+    else:
+        from .account_blocks import drop_login_blocks
+        drop_login_blocks([login.id])
+        db.session.delete(login)
+
+
+def playlist_change_line(change: dict) -> str:
+    """The Activity line for one change list_playlist_rows() reported, e.g. "The playlist's
+    login changed from k8x2expired to zz91old. It stays turned off, so streams won't use it."
+    Hosts and usernames only, never a password."""
+    noun = 'host' if change['what'] == PLAYLIST_HOST else 'login'
+    if change.get('password_only'):
+        head = f'The playlist\'s login {change["new"]} has a new password.'
+    else:
+        head = f'The playlist\'s {noun} changed from {change["old"]} to {change["new"]}.'
+    if change['on']:
+        tail = f'It\'s turned on, so new streams can use the new {noun}.'
+    else:
+        tail = 'It stays turned off, so streams won\'t use it.'
+    if change.get('block_ended'):
+        tail += f' The block on {change["old"]} ended with it.'
+    return f'{head} {tail}'
+
+
+def note_playlist_changes(account_id: int, account_name: str, changes: list) -> None:
+    """One alert per change, so each lands on the account's Activity card (its source is the
+    account's own). A row that is on raises the warning - new streams go out with a host or
+    login the user did not pick - and one that is off the information. Never raises: the sync
+    calling this has already written the rows."""
+    from .alerts import ACCOUNT_PLAYLIST_CHANGED, ACCOUNT_PLAYLIST_CHANGED_UNUSED, create_alert
+    for change in changes:
+        line = playlist_change_line(change)
+        log.warning('Account %d (%s): %s', account_id, account_name, line)
+        try:
+            create_alert(ACCOUNT_PLAYLIST_CHANGED if change['on'] else ACCOUNT_PLAYLIST_CHANGED_UNUSED,
+                         title=f'{account_name}: {line}',
+                         body=(f'A sync of {account_name} found its playlist\'s stream URLs on a '
+                               f'different {"host" if change["what"] == PLAYLIST_HOST else "login"}. '
+                               f'{line} The switch is where you left it; change it on the '
+                               f'account page.'),
+                         source=f'account:{account_id}:playlist-changed')
+        except Exception:
+            log.exception('Account %d: could not raise the playlist-changed alert', account_id)
+
+
 # ── The writer: the list is the user's ──────────────────────────────────────────────────
 
 def add_host(account_id: int, raw_host: str):
-    """Append a host to the account's list. The first add seeds the list with the host the
-    account's stream URLs carry today as the active one (design §3.2), so the list always
-    contains what is already true; the host just added becomes active only when it IS that
-    host, or when the account has no channels yet to read one from. Returns the new row.
-    Raises ValueError for a bad name or one already listed."""
+    """Append a host to the account's list. On an account no sync has listed the playlist's
+    host for yet, the first add lists it first, as the playlist's row and the active host
+    (design §3.2), so the list always contains what is already true; the host just added
+    becomes active only when it IS that host, or when the account has no channels yet to read
+    one from. Returns the new row. Raises ValueError for a bad name or one already listed."""
     from .database import AccountHost
     host = normalize_host(raw_host)
 
@@ -290,17 +577,18 @@ def add_host(account_id: int, raw_host: str):
         position = (max((r.position for r in rows), default=-1)) + 1
         if not rows:
             # The seeded host carries no activated_at: it has been the host all along,
-            # and "active since <when the list was made>" would say otherwise.
-            seed = current_host(account_id)
+            # and "active since <when the list was made>" would say otherwise. It is the
+            # playlist's own host, read from what the provider sent, as a sync lists it.
+            seed = playlist_facts(account_id)['host']
             if seed and seed != host:
                 db.session.add(AccountHost(account_id=account_id, host=seed, position=position,
-                                           is_active=True, created_at=now))
+                                           is_active=True, from_playlist=True, created_at=now))
                 position += 1
                 row = AccountHost(account_id=account_id, host=host, position=position,
                                   created_at=now)
             else:
                 row = AccountHost(account_id=account_id, host=host, position=position,
-                                  is_active=True, created_at=now)
+                                  is_active=True, from_playlist=seed == host, created_at=now)
         else:
             row = AccountHost(account_id=account_id, host=host, position=position, created_at=now)
         db.session.add(row)
@@ -325,6 +613,9 @@ def remove_host(account_id: int, host_id: int) -> str:
         row = db.session.get(AccountHost, host_id)
         if row is None or row.account_id != account_id:
             raise LookupError('Host not found.')
+        if row.from_playlist:
+            raise ValueError(f'{row.host} comes from the playlist, so it can\'t be removed - '
+                             f'the next sync would list it again. Turn it off instead.')
         others = AccountHost.query.filter(AccountHost.account_id == account_id,
                                           AccountHost.id != host_id).count()
         if row.is_active and others:
@@ -349,11 +640,64 @@ def set_active_host(account_id: int, host_id: int) -> dict:
     row = db.session.get(AccountHost, host_id)
     if row is None or row.account_id != account_id:
         raise LookupError('Host not found.')
+    if not row.enabled:
+        raise ValueError(f'{row.host} is turned off. Turn it on first.')
     summary = _activate(account_id, row.host)
     _clear_rolled_alert(account_id)
     log.info('Account %d: host %s made active by hand (%d stream URLs rewritten)',
              account_id, row.host, summary['channels'])
     return summary
+
+
+def set_host_enabled(account_id: int, host_id: int, enabled: bool) -> dict:
+    """The user's switch on one host (dev/changelog/1670). Turning the active host off hands
+    the active role to the next host that is on, and rewrites the account's URLs onto it, in
+    the same unit; with no other host on, the account can stream nothing until one is turned
+    on (connection_limits refuses every new seat and unusable_reason() says why) and the
+    URLs stay where they are. Turning a host on while the active one is off makes it active.
+    A stream already running keeps going; a recording's next segment reads the URL the
+    handover wrote. Returns {'host', 'enabled', 'active', 'channels', 'moved'} - `moved` when
+    the active role changed hands. Raises LookupError."""
+    from .database import AccountHost
+    enabled = bool(enabled)
+
+    @retry_on_locked()
+    def _switch_and_commit():
+        rows = (AccountHost.query.filter_by(account_id=account_id)
+                .order_by(AccountHost.position, AccountHost.id).all())
+        row = next((r for r in rows if r.id == host_id), None)
+        if row is None:
+            raise LookupError('Host not found.')
+        active = next((r for r in rows if r.is_active), None)
+        out = {'host': row.host, 'enabled': enabled, 'active': active.host if active else None,
+               'channels': 0, 'moved': False}
+        if row.enabled == enabled:
+            return out
+        now = datetime.utcnow()
+        row.enabled = enabled
+        row.switched_at = now
+        target = None
+        if not enabled and row.is_active:
+            target = _next_on_host(rows, row)
+        elif enabled and (active is None or not active.enabled):
+            target = row
+        if target is not None:
+            summary = _apply_active(account_id, target.host, now)
+            out.update({'active': target.host, 'channels': summary['channels'],
+                        'moved': active is None or target.host != active.host})
+        db.session.commit()
+        return out
+
+    out = _switch_and_commit()
+    _clear_rolled_alert(account_id)
+    if out['moved'] or not enabled:
+        from .host_checks import reassess_active
+        reassess_active(account_id)
+    log.info('Account %d: host %s turned %s%s', account_id, out['host'],
+             'on' if enabled else 'off',
+             f' - {out["active"]} is now the active host ({out["channels"]} stream URLs '
+             f'rewritten)' if out['moved'] else '')
+    return out
 
 
 def delete_hosts_for_account(account_id: int) -> int:
@@ -385,8 +729,8 @@ def roll_host_for_channel(channel_id: int, trigger: str,
 
 def roll_host(account_id: int, trigger: str, recording_id: Optional[int] = None,
               cfg: Optional[dict] = None) -> Optional[dict]:
-    """Move the account onto the next listed host that resolves, because the active one
-    stopped resolving (design §4.4). Returns the summary dict when it rolled - or when the
+    """Move the account onto the next listed host that is turned on and resolves, because the
+    active one stopped resolving (design §4.4). Returns the summary dict when it rolled - or when the
     active host resolves but stream URLs were found stranded on another listed host and
     moved back (`repaired: True`, `old_host: None`) - and None when it changed nothing:
     nothing listed to roll to, inside the cooldown, or no listed host resolves.
@@ -400,7 +744,9 @@ def roll_host(account_id: int, trigger: str, recording_id: Optional[int] = None,
     cfg = cfg or load_config()
     cooldown = timedelta(minutes=float((cfg.get('hosts') or {}).get('roll_cooldown_minutes', 10)))
 
-    rows = (AccountHost.query.filter_by(account_id=account_id)
+    # A host the user turned off is never rolled onto (dev/changelog/1670), and an active
+    # host that is off means every host is: there is nothing to roll to.
+    rows = (AccountHost.query.filter_by(account_id=account_id, enabled=True)
             .order_by(AccountHost.position, AccountHost.id).all())
     if len(rows) < 2:
         return None
@@ -435,7 +781,14 @@ def roll_host(account_id: int, trigger: str, recording_id: Optional[int] = None,
         _last_roll_attempt[account_id] = mono
 
     idx = rows.index(active)
-    order = rows[idx + 1:] + rows[:idx] + [active]
+    # A host that answered at its last full check is tried before one never tested, and that
+    # before one that did not answer (app/host_checks.py, dev/changelog/1674). The trigger and
+    # the lookups are unchanged: this only decides which resolving host the roll reaches first.
+    # sorted() is stable, so list order still breaks ties; the active one stays last.
+    from .host_checks import rank
+    ranks = rank([r.host for r in rows])
+    others = sorted(rows[idx + 1:] + rows[:idx], key=lambda r: ranks.get(r.host, 1))
+    order = others + [active]
     account = db.session.get(Account, account_id)
     name = account.name if account else f'account {account_id}'
     chosen = None
@@ -494,6 +847,8 @@ def roll_host(account_id: int, trigger: str, recording_id: Optional[int] = None,
             _log_recording_roll(recording_id, None, active.host, summary['channels'])
         return summary
 
+    passed = [r.host for r in rows[idx + 1:] + rows[:idx]
+              if r is not chosen and ranks.get(r.host, 1) == 2 and ranks.get(chosen.host, 1) < 2]
     summary = _activate(account_id, chosen.host)
     old = active.host
     summary.update({'old_host': old, 'trigger': trigger})
@@ -507,7 +862,12 @@ def roll_host(account_id: int, trigger: str, recording_id: Optional[int] = None,
               f'({summary["channels"]:,} channels'
               + (', and the account\'s own URL' if summary['account_urls'] else '')
               + f'). {old} is still on the list, marked as failing, for you to remove or '
-              f'keep. A running recording picks the new host up at its next segment.'))
+              f'keep. A running recording picks the new host up at its next segment.'
+              + (f' Passed over because they did not answer at their last check: '
+                 f'{", ".join(passed)}.' if passed else '')
+              + (f' {chosen.host} did not answer at its last check either, but it was the only '
+                 f'host left that resolves, so streams may fail.'
+                 if ranks.get(chosen.host, 1) == 2 else '')))
     if recording_id is not None:
         _log_recording_roll(recording_id, old, chosen.host, summary['channels'])
     return summary
@@ -517,38 +877,60 @@ def _activate(account_id: int, host: str) -> dict:
     """Flip `is_active` to `host` and rewrite every stream URL on the account whose host is
     listed, plus the account's own URLs when their host is listed, in one retry unit. Shared
     by the roll and the user's Make active. Returns {'host', 'channels', 'account_urls'}."""
-    from .database import Account, AccountHost
 
     @retry_on_locked()
     def _activate_and_commit():
-        rows = AccountHost.query.filter_by(account_id=account_id).all()
-        hosts = frozenset(r.host for r in rows)
-        now = datetime.utcnow()
-        for r in rows:
-            if r.host == host:
-                if not r.is_active:
-                    r.is_active = True
-                    r.activated_at = now
-            elif r.is_active:
-                r.is_active = False
-        changed = rerender_stream_urls(account_id, hosts, host, now)
-        account_urls = 0
-        account = db.session.get(Account, account_id)
-        if account is not None:
-            for col in ('base_url', 'm3u_url', 'epg_url'):
-                value = getattr(account, col)
-                rendered = render_host(value, hosts, host) if value else value
-                if rendered != value:
-                    setattr(account, col, rendered)
-                    account_urls += 1
-            # The URLs on a listed host all moved, so the stamped stream host moves with
-            # them; one on a host outside the list did not move and keeps it.
-            if account.stream_host in hosts:
-                account.stream_host = host
+        summary = _apply_active(account_id, host, datetime.utcnow())
         db.session.commit()
-        return {'host': host, 'channels': changed, 'account_urls': account_urls}
+        return summary
 
-    return _activate_and_commit()
+    summary = _activate_and_commit()
+    from .host_checks import reassess_active
+    reassess_active(account_id)
+    return summary
+
+
+def _apply_active(account_id: int, host: str, now: datetime) -> dict:
+    """_activate()'s work inside the caller's transaction (no commit), so a writer that also
+    flips a switch moves both in one unit."""
+    from .database import Account, AccountHost
+    rows = AccountHost.query.filter_by(account_id=account_id).all()
+    hosts = frozenset(r.host for r in rows)
+    for r in rows:
+        if r.host == host:
+            if not r.is_active:
+                r.is_active = True
+                r.activated_at = now
+        elif r.is_active:
+            r.is_active = False
+    changed = rerender_stream_urls(account_id, hosts, host, now)
+    account_urls = 0
+    account = db.session.get(Account, account_id)
+    if account is not None:
+        for col in ('base_url', 'm3u_url', 'epg_url'):
+            value = getattr(account, col)
+            rendered = render_host(value, hosts, host) if value else value
+            if rendered != value:
+                setattr(account, col, rendered)
+                account_urls += 1
+        # The URLs on a listed host all moved, so the stamped stream host moves with
+        # them; one on a host outside the list did not move and keeps it.
+        if account.stream_host in hosts:
+            account.stream_host = host
+    return {'host': host, 'channels': changed, 'account_urls': account_urls}
+
+
+def _next_on_host(rows, after) -> Optional[object]:
+    """The host to hand the active role to when `after` stops being usable: the next one in
+    list order that is turned on, wrapping around, preferring one the DNS probe has not seen
+    fail. None when no other host is on. Pure over the rows."""
+    if after in rows:
+        idx = rows.index(after)
+        order = rows[idx + 1:] + rows[:idx]
+    else:
+        order = list(rows)
+    on = [r for r in order if r.enabled and r is not after]
+    return next((r for r in on if not r.last_resolve_error), on[0] if on else None)
 
 
 def rerender_stream_urls(account_id: int, hosts, host: str, now: Optional[datetime] = None) -> int:
@@ -636,21 +1018,48 @@ def resolve_host(host: str, timeout: float = RESOLVE_TIMEOUT_SECONDS) -> tuple[b
     return False, result.get('error') or 'did not resolve'
 
 
-def _stamp_resolve_verdicts(verdicts: dict) -> None:
+def _stamp_resolve_verdicts(verdicts: dict, trigger: str = 'roll',
+                            ms: Optional[dict] = None) -> None:
     """Write {host_id: (ok, error)} onto the rows. Resolved: last_resolved_at moves and the
     error clears; failed: the error is recorded and the last good time is kept, so the page
-    can say "failed since"."""
+    can say "failed since". Each name also gets a lookup row in host_checks (`ms`, by host
+    id, is how long it took when the caller timed it), so the card's verdict follows the
+    newest thing anything learned about the name."""
     from .database import AccountHost
+    from .host_checks import record_lookups
     if not verdicts:
         return
+    ms = ms or {}
 
     @retry_on_locked()
     def _stamp_and_commit():
         now = datetime.utcnow()
+        by_host = {}
         for host_id, (ok, error) in verdicts.items():
             row = db.session.get(AccountHost, host_id)
             if row is None:
                 continue
+            if ok:
+                row.last_resolved_at = now
+                row.last_resolve_error = None
+            else:
+                row.last_resolve_error = (error or 'did not resolve')[:255]
+            by_host[row.host] = (ok, error, ms.get(host_id))
+        db.session.commit()
+        return by_host
+
+    record_lookups(_stamp_and_commit(), trigger)
+
+
+def stamp_lookup(host: str, ok: bool, error: Optional[str]) -> None:
+    """A full check looked `host` up: stamp every row listing that name, as the lookup-only
+    probe does (app/host_checks.py)."""
+    from .database import AccountHost
+
+    @retry_on_locked()
+    def _stamp_and_commit():
+        now = datetime.utcnow()
+        for row in AccountHost.query.filter_by(host=host).all():
             if ok:
                 row.last_resolved_at = now
                 row.last_resolve_error = None
@@ -661,11 +1070,15 @@ def _stamp_resolve_verdicts(verdicts: dict) -> None:
     _stamp_and_commit()
 
 
-def check_hosts(account_ids: Optional[Iterable[int]] = None) -> dict:
-    """The `host_resolve_check` job (design §4.5): resolve every listed host and stamp the
-    verdict. DNS only, and it never rolls - its one job is the account page's list, so a
-    list going bad is visible before a recording finds out. Returns
+def check_hosts(account_ids: Optional[Iterable[int]] = None, app=None) -> dict:
+    """The `host_resolve_check` job (design §4.5). With `hosts.scheduled_check: lookup` (the
+    default) it resolves every listed host and stamps the verdict - DNS only, nothing reaches
+    a provider. With `full`, and an `app` to run the worker in, it puts every listed host name
+    in the one host-check line instead (app/host_checks.py), paced like any other check, and
+    returns {'queued', ...}. It never rolls either way - its one job is the account page's
+    list, so a list going bad is visible before a recording finds out. Returns
     {'checked', 'failed', 'accounts'}."""
+    from .config import load_config
     from .database import AccountHost
     q = AccountHost.query
     if account_ids is not None:
@@ -674,8 +1087,23 @@ def check_hosts(account_ids: Optional[Iterable[int]] = None) -> dict:
             return {'checked': 0, 'failed': 0, 'accounts': 0}
         q = q.filter(AccountHost.account_id.in_(ids))
     rows = q.order_by(AccountHost.account_id, AccountHost.position).all()
-    verdicts = {row.id: resolve_host(row.host) for row in rows}
-    _stamp_resolve_verdicts(verdicts)
+    mode = (load_config().get('hosts') or {}).get('scheduled_check', 'lookup')
+    if mode == 'full' and app is not None:
+        from .host_checks import TRIGGER_SCHEDULED, request
+        result = request(app, [row.host for row in rows], TRIGGER_SCHEDULED)
+        log.info('Host check (full): %d host(s) put in line, %d left out as checked in the last '
+                 '10 minutes', len(result['added']), len(result['recent']))
+        return {'checked': 0, 'failed': 0, 'accounts': len({row.account_id for row in rows}),
+                'queued': len(result['added'])}
+    if mode not in ('lookup', 'full'):
+        log.warning('hosts.scheduled_check is %r, which is neither lookup nor full; looking '
+                    'the hosts up only', mode)
+    verdicts, ms = {}, {}
+    for row in rows:
+        started = time.perf_counter()
+        verdicts[row.id] = resolve_host(row.host)
+        ms[row.id] = round((time.perf_counter() - started) * 1000)
+    _stamp_resolve_verdicts(verdicts, 'scheduled', ms)
     failed = sum(1 for ok, _ in verdicts.values() if not ok)
     accounts = len({row.account_id for row in rows})
     if failed:
@@ -738,23 +1166,227 @@ def logins_for_accounts(account_ids: Iterable[int]) -> dict:
     return out
 
 
-def login_seats_for_accounts(account_ids: Iterable[int]) -> dict:
-    """{account_id: [(login_id, max_connections, last_refused_at), ...] in position order}
+def _default_max_connections(cfg: Optional[dict]) -> int:
+    if cfg is None:
+        from .config import load_config
+        cfg = load_config()
+    return (cfg.get('accounts') or {}).get('default_max_connections', 1)
+
+
+def login_seats_for_accounts(account_ids: Iterable[int], cfg: Optional[dict] = None) -> dict:
+    """{account_id: [(login_id, usable seats, last_refused_at), ...] in position order}
     - what the connection counter needs to size and walk an account's pools, columns only.
-    An account with no logins maps to [] (one pool, sized by the account, as before)."""
-    from .database import AccountLogin, Login
+    An account with no logins maps to [] (one pool, sized by the account, as before).
+
+    The ONE reader of a login's seat count. A playlist login with no number of its own
+    (`max_connections` NULL) has the seats of the account whose playlist it is - that
+    account's Max connections, or the global default - so an account whose only login is its
+    playlist's counts exactly what it counted before the row was listed. A login that is off
+    on an account is listed for it with 0 seats, never left out: left out, an account whose
+    logins are all off would read as holding none and fall back to its own pool, which
+    launches the playlist's credentials (dev/changelog/1670)."""
+    from sqlalchemy.orm import aliased
+    from .database import Account, AccountLogin, Login
     ids = {a for a in account_ids if a is not None}
     out: dict = {a: [] for a in ids}
     if not ids:
         return out
+    owner = aliased(Account)
     rows = (db.session.query(AccountLogin.account_id, Login.id, Login.max_connections,
-                             Login.last_refused_at)
+                             Login.last_refused_at, AccountLogin.enabled, owner.max_connections)
             .join(Login, Login.id == AccountLogin.login_id)
+            .outerjoin(owner, owner.id == Login.playlist_account_id)
             .filter(AccountLogin.account_id.in_(ids))
             .order_by(AccountLogin.account_id, AccountLogin.position, Login.id).all())
-    for account_id, login_id, seats, refused_at in rows:
+    default = None
+    for account_id, login_id, seats, refused_at, enabled, owner_max in rows:
+        if not enabled:
+            seats = 0
+        elif seats is None:
+            if owner_max is None and default is None:
+                default = _default_max_connections(cfg)
+            seats = owner_max or default
         out[account_id].append((login_id, seats, refused_at))
     return out
+
+
+def configured_seats(logins: Iterable, cfg: Optional[dict] = None) -> dict:
+    """{login_id: seats} for Login rows, as configured and before any account's switch - what
+    a page says a login is good for. A playlist login's is its account's Max connections or
+    the global default, as login_seats_for_accounts() resolves it. One query at most."""
+    from .database import Account
+    rows = list(logins)
+    owners = {lg.playlist_account_id for lg in rows
+              if lg.max_connections is None and lg.playlist_account_id is not None}
+    limits = dict(db.session.query(Account.id, Account.max_connections)
+                  .filter(Account.id.in_(owners)).all()) if owners else {}
+    default = None
+    out = {}
+    for lg in rows:
+        seats = lg.max_connections
+        if seats is None:
+            seats = limits.get(lg.playlist_account_id)
+            if not seats:
+                if default is None:
+                    default = _default_max_connections(cfg)
+                seats = default
+        out[lg.id] = seats
+    return out
+
+
+def hosts_all_off(account_ids: Iterable[int]) -> set:
+    """Of `account_ids`, the ones that list hosts and have every one of them turned off: no
+    stream may go out on such an account (dev/changelog/1670). One grouped query."""
+    from sqlalchemy import case, func
+    from .database import AccountHost
+    ids = {a for a in account_ids if a is not None}
+    if not ids:
+        return set()
+    on = func.sum(case((AccountHost.enabled.is_(True), 1), else_=0))
+    return {aid for aid, n_on in (db.session.query(AccountHost.account_id, on)
+                                  .filter(AccountHost.account_id.in_(ids))
+                                  .group_by(AccountHost.account_id).all())
+            if not n_on}
+
+
+def logins_all_off(account_ids: Iterable[int]) -> set:
+    """Of `account_ids`, the ones that hold logins and have every one of them turned off for
+    that account. One grouped query."""
+    from sqlalchemy import case, func
+    from .database import AccountLogin
+    ids = {a for a in account_ids if a is not None}
+    if not ids:
+        return set()
+    on = func.sum(case((AccountLogin.enabled.is_(True), 1), else_=0))
+    return {aid for aid, n_on in (db.session.query(AccountLogin.account_id, on)
+                                  .filter(AccountLogin.account_id.in_(ids))
+                                  .group_by(AccountLogin.account_id).all())
+            if not n_on}
+
+
+#: unusable_reasons()'s two answers: what is turned off on an account that can stream nothing.
+UNUSABLE_HOSTS = 'hosts'
+UNUSABLE_LOGINS = 'logins'
+
+
+def unusable_reasons(account_ids: Iterable[int]) -> dict:
+    """{account_id: UNUSABLE_HOSTS | UNUSABLE_LOGINS} for the accounts among `account_ids`
+    that cannot take a new stream because the user turned every host, or every login, off.
+    Hosts are named first: with no host on, which login is on does not matter. Two queries."""
+    ids = {a for a in account_ids if a is not None}
+    hosts = hosts_all_off(ids)
+    out = {a: UNUSABLE_HOSTS for a in hosts}
+    out.update({a: UNUSABLE_LOGINS for a in logins_all_off(ids - hosts)})
+    return out
+
+
+def describe_unusable(account_name: str, which: str, capital: bool = False) -> str:
+    """The one phrase every surface uses for an account with every host or every login off.
+    `capital` for the start of a sentence."""
+    noun = 'host' if which == UNUSABLE_HOSTS else 'login'
+    head = 'Every' if capital else 'every'
+    return f'{head} {noun} on account "{account_name}" is turned off'
+
+
+def unusable_reason(account_id: int, account_name: str, capital: bool = False) -> Optional[str]:
+    """describe_unusable() for an account that can stream nothing because every host or
+    every login on it is turned off, else None - for a refusal that has to say why rather
+    than blame the connection limit, checked before the block's and the limit's wording."""
+    which = unusable_reasons([account_id]).get(account_id)
+    return None if which is None else describe_unusable(account_name, which, capital)
+
+
+def playlist_rows_off(account_ids: Iterable[int]) -> dict:
+    """{account_id: {'host': bool, 'login': bool}} for the accounts among `account_ids` whose
+    playlist host or playlist login row is turned off - what the Accounts list's badge reads
+    (dev/changelog/1671). An account with both on, or with neither listed yet, is absent. Two
+    queries however many accounts."""
+    from .database import AccountHost, AccountLogin, Login
+    ids = {a for a in account_ids if a is not None}
+    out: dict = {}
+    if not ids:
+        return out
+    for (aid,) in (db.session.query(AccountHost.account_id)
+                   .filter(AccountHost.account_id.in_(ids), AccountHost.from_playlist.is_(True),
+                           AccountHost.enabled.is_(False)).all()):
+        out.setdefault(aid, {'host': False, 'login': False})['host'] = True
+    for (aid,) in (db.session.query(AccountLogin.account_id)
+                   .join(Login, Login.id == AccountLogin.login_id)
+                   .filter(AccountLogin.account_id.in_(ids),
+                           Login.playlist_account_id == AccountLogin.account_id,
+                           AccountLogin.enabled.is_(False)).all()):
+        out.setdefault(aid, {'host': False, 'login': False})['login'] = True
+    return out
+
+
+#: next_stream()'s answers: a seat is free; every seat is taken; the account is blocked; the
+#: user turned every host or every login off.
+NEXT_FREE, NEXT_FULL, NEXT_BLOCKED, NEXT_UNUSABLE = 'free', 'full', 'blocked', 'unusable'
+
+
+def next_stream(account, cfg: Optional[dict] = None) -> Optional[dict]:
+    """What the next stream on `account` would be launched with right now - for the account
+    page's Logins card and the channel page (dev/changelog/1671). None for an account that
+    lists no host and no login, whose streams go out exactly as the playlist says.
+
+    {'state': NEXT_*, 'login': the Login row or None, 'host': the active host or None,
+     'reason': the sentence for NEXT_UNUSABLE and NEXT_BLOCKED - describe_unusable()'s and
+     account_blocks.blocked_reason()'s, the words every refusal uses, 'copy_login': the login
+     the channel page's Copy renders - the next seat's, or while no seat is free the first
+     login that is on and not blocked, or None when there is none}. The login is the one
+    connection_limits.try_acquire() would seat it on (next_seat(), the same pick). Advisory:
+    a seat can be taken between this read and a launch. A fixed handful of queries."""
+    from . import connection_limits as connlim
+    logins = logins_for_account(account.id)
+    hosts, active = host_list(account.id)
+    if not logins and not hosts:
+        return None
+    # The streams' own host when it is not on the list: a swap does not move those URLs, so
+    # they go out where they are, not on the active host.
+    unlisted = account.stream_host and account.stream_host not in hosts
+    out = {'state': NEXT_FREE, 'login': None, 'copy_login': None,
+           'host': account.stream_host if unlisted else (active or account.stream_host),
+           'reason': None}
+    which = unusable_reasons([account.id]).get(account.id)
+    if which is not None:
+        out.update(state=NEXT_UNUSABLE, host=None,
+                   reason=describe_unusable(account.name, which))
+        return out
+    free, login_id = connlim.next_seat(account.id, cfg)
+    if not free:
+        from .account_blocks import blocked_reason, login_blocks_at
+        from .database import AccountLogin
+        blocked = blocked_reason(account.id, account.name)
+        # What Copy hands out while no seat is free: the first login that is on and not
+        # blocked, never the playlist's credentials the user turned off, nor a login a TV is
+        # watching on (dev/changelog/1672). None when there is no such login, as when every
+        # login is off.
+        enabled = {lid for lid, on in db.session.query(AccountLogin.login_id, AccountLogin.enabled)
+                   .filter(AccountLogin.account_id == account.id).all() if on}
+        on = [lg for lg in logins if lg.id in enabled]
+        blocked_ids = {b.login_id for b in login_blocks_at(None, enabled)} if on else set()
+        free_of_block = [lg for lg in on if lg.id not in blocked_ids]
+        out.update(state=NEXT_BLOCKED if blocked else NEXT_FULL, reason=blocked,
+                   copy_login=next(iter(free_of_block), None))
+        return out
+    out['login'] = out['copy_login'] = next((lg for lg in logins if lg.id == login_id), None)
+    return out
+
+
+def next_stream_url(url: Optional[str], account_id: int, nxt: Optional[dict]) -> Optional[str]:
+    """`url` (a channel's stored stream URL, already on the active host) with the credentials
+    of next_stream()'s `copy_login` rendered in, as a launch would render them - what the
+    channel page's Copy hands out. `url` unchanged when there is none."""
+    if not url or not nxt or nxt.get('copy_login') is None:
+        return url
+    return render_login(url, logins_for_account(account_id), nxt['copy_login'])
+
+
+def login_enabled(account_id: int, login_id: int) -> bool:
+    """Whether `login_id` is turned on for `account_id` (False for one it does not hold)."""
+    from .database import AccountLogin
+    return bool(db.session.query(AccountLogin.enabled).filter(
+        AccountLogin.account_id == account_id, AccountLogin.login_id == login_id).scalar())
 
 
 def refusal_cooldown(cfg: Optional[dict] = None) -> timedelta:
@@ -827,24 +1459,48 @@ def _validate_login_fields(name: str, username: str, password: Optional[str],
     return name, username, password, seats
 
 
+def _check_login_unique(existing, name: str, username: str, password: str) -> None:
+    """Refuse a login whose username AND password another login on the account already has -
+    two rows for one credential would count its seats twice - or whose name one of the user's
+    own logins already has. A username alone may repeat: the playlist's expired login and the
+    working one the user added often share it (dev/changelog/1670). A playlist login's name is
+    its username, not the user's choice, so it never blocks a name."""
+    if any((lg.username, lg.password) == (username, password) for lg in existing):
+        raise ValueError(f'A login with the username {username} and that password is '
+                         f'already on the list.')
+    if any(lg.name.lower() == name.lower() and lg.playlist_account_id is None
+           for lg in existing):
+        raise ValueError(f'A login named {name} is already on the list.')
+
+
 def add_login(account_id: int, name: str, username: str, password: str, max_connections):
     """Append a login to the account's list. Returns the new row. Raises ValueError for a
-    missing field, a bad seat count, or a username already listed on this account."""
+    missing field, a bad seat count, or a credential or name already listed on this account.
+
+    On an account holding no login yet, the playlist's own login is listed first, on, as a
+    sync would list it (dev/changelog/1670): adding a second login must not take away the
+    first. When the login typed IS the playlist's, it becomes the playlist's row itself."""
     from .database import AccountLogin, Login
     name, username, password, seats = _validate_login_fields(
         name, username, password, max_connections, password_required=True)
+    adopt = False
+    if not logins_for_account(account_id) and Login.query.filter_by(
+            playlist_account_id=account_id).first() is None:
+        pair = playlist_facts(account_id)['pair']
+        if pair == (username, password):
+            adopt = True
+        elif pair is not None:
+            list_playlist_rows(account_id, None, pair)
 
     @retry_on_locked()
     def _add_and_commit():
         existing = logins_for_account(account_id)
-        if any(lg.username == username for lg in existing):
-            raise ValueError(f'A login with the username {username} is already on the list.')
-        if any(lg.name.lower() == name.lower() for lg in existing):
-            raise ValueError(f'A login named {name} is already on the list.')
+        _check_login_unique(existing, name, username, password)
         positions = [p for (p,) in db.session.query(AccountLogin.position)
                      .filter(AccountLogin.account_id == account_id).all()]
         now = datetime.utcnow()
         row = Login(name=name, username=username, password=password, max_connections=seats,
+                    playlist_account_id=account_id if adopt else None,
                     created_at=now, updated_at=now)
         db.session.add(row)
         db.session.flush()
@@ -856,6 +1512,8 @@ def add_login(account_id: int, name: str, username: str, password: str, max_conn
     row = _add_and_commit()
     log.info('Account %d: login "%s" (%s, %d seats) added to its list', account_id, row.name,
              row.username, row.max_connections)
+    from . import connection_limits as connlim
+    connlim.fold_account_pool(account_id)
     return row
 
 
@@ -878,12 +1536,20 @@ def update_login(account_id: int, login_id: int, name: str, username: str,
         if row is None:
             raise LookupError('Login not found.')
         others = [lg for lg in logins_for_account(account_id) if lg.id != login_id]
-        if any(lg.username == username for lg in others):
-            raise ValueError(f'A login with the username {username} is already on the list.')
-        if any(lg.name.lower() == name.lower() for lg in others):
-            raise ValueError(f'A login named {name} is already on the list.')
+        _check_login_unique(others, name, username, password or row.password)
         credentials_changed = (row.username != username
                                or (password is not None and password != '' and row.password != password))
+        if _is_sync_listed(row):
+            # The sync rewrites it from the playlist, and its seats are the account's Max
+            # connections; an edit would be undone by the next sync, or would pin a number the
+            # account form no longer moves (dev/changelog/1670).
+            raise ValueError('This login comes from the playlist, so it follows the playlist '
+                             'and its seats are the account\'s Max connections. Turn it off '
+                             'and add your own login instead.')
+        if credentials_changed and row.playlist_account_id is not None:
+            # A login the user typed that the sync adopted: new credentials make it no longer
+            # the playlist's, and it stays the user's (dev/changelog/1670).
+            row.playlist_account_id = None
         row.name = name
         row.username = username
         if password:
@@ -916,11 +1582,21 @@ def remove_login(account_id: int, login_id: int) -> str:
         row = db.session.get(Login, login_id) if held is not None else None
         if row is None:
             raise LookupError('Login not found.')
+        if row.playlist_account_id == account_id and _is_sync_listed(row):
+            raise ValueError(f'Login "{row.name}" comes from the playlist, so it can\'t be '
+                             f'removed - the next sync would list it again. Turn it off '
+                             f'instead.')
+        if row.playlist_account_id == account_id:
+            # A login the user typed that the sync adopted: removing it is the user's call,
+            # and the next sync lists the playlist's login as a row of its own.
+            row.playlist_account_id = None
         name = row.name
         db.session.delete(held)
         still_held = db.session.query(AccountLogin).filter(
             AccountLogin.login_id == login_id, AccountLogin.account_id != account_id).count()
         if not still_held:
+            from .account_blocks import drop_login_blocks
+            drop_login_blocks([login_id])
             db.session.delete(row)
         db.session.commit()
         return name
@@ -956,11 +1632,48 @@ def move_login(account_id: int, login_id: int, direction: str) -> list:
     return _move_and_commit()
 
 
+def set_login_enabled(account_id: int, login_id: int, enabled: bool) -> dict:
+    """The user's switch on one login, for this account only (dev/changelog/1670): a shared
+    login stays as it was on its other holders. A login that is off takes no new seat on the
+    account; a stream already seated on it keeps going, and a recording's next segment moves
+    to another login that is on when one has a free seat
+    (connection_limits.reseat_before_relaunch). Returns {'login', 'enabled'}. Raises
+    LookupError for a login the account does not hold."""
+    from .database import AccountLogin, Login
+    enabled = bool(enabled)
+
+    @retry_on_locked()
+    def _switch_and_commit():
+        held = db.session.query(AccountLogin).filter_by(account_id=account_id,
+                                                        login_id=login_id).first()
+        row = db.session.get(Login, login_id) if held is not None else None
+        if row is None:
+            raise LookupError('Login not found.')
+        if held.enabled != enabled:
+            held.enabled = enabled
+            held.switched_at = datetime.utcnow()
+            db.session.commit()
+        return {'login': row.name, 'enabled': enabled}
+
+    out = _switch_and_commit()
+    log.info('Account %d: login "%s" turned %s', account_id, out['login'],
+             'on' if enabled else 'off')
+    return out
+
+
 def delete_logins_for_account(account_id: int) -> int:
     """Drop the account's login rows inside the caller's delete unit (no commit here): the
     join rows, and every login no other account holds. Returns the count of logins
-    deleted."""
+    deleted.
+
+    The account's playlist login, when another account still holds it, stays with that
+    account as an ordinary login carrying the seat count it had (dev/changelog/1670): its
+    seats were this account's Max connections, which goes with the account."""
     from .database import AccountLogin, Login
+    for row in Login.query.filter_by(playlist_account_id=account_id).all():
+        if row.max_connections is None:
+            row.max_connections = configured_seats([row])[row.id]
+        row.playlist_account_id = None
     held = [lid for (lid,) in db.session.query(AccountLogin.login_id)
             .filter(AccountLogin.account_id == account_id).all()]
     AccountLogin.query.filter_by(account_id=account_id).delete(synchronize_session=False)
@@ -971,6 +1684,8 @@ def delete_logins_for_account(account_id: int) -> int:
     orphans = [lid for lid in held if lid not in still_held]
     if not orphans:
         return 0
+    from .account_blocks import drop_login_blocks
+    drop_login_blocks(orphans)
     return Login.query.filter(Login.id.in_(orphans)).delete(synchronize_session=False)
 
 
@@ -1152,9 +1867,18 @@ def _drop_shares_off_provider(account, provider_id: Optional[int]) -> list:
             Account.provider_id == provider_id, Account.id.in_(others)).all()}
     dropped = []
     for row in mine:
-        if set(holders.get(row.login_id, [])) - {account.id} - with_me:
-            login = db.session.get(Login, row.login_id)
-            dropped.append(login.name if login else f'#{row.login_id}')
+        away = set(holders.get(row.login_id, [])) - {account.id} - with_me
+        if not away:
+            continue
+        login = db.session.get(Login, row.login_id)
+        dropped.append(login.name if login else f'#{row.login_id}')
+        if login is not None and login.playlist_account_id == account.id:
+            # The account's own playlist login stays with it - its next sync would list it
+            # again - and the accounts it was shared with let it go (dev/changelog/1670).
+            db.session.query(AccountLogin).filter(
+                AccountLogin.login_id == row.login_id,
+                AccountLogin.account_id.in_(away)).delete(synchronize_session=False)
+        else:
             db.session.delete(row)
     return dropped
 
@@ -1313,10 +2037,12 @@ def share_login(login_id: int, account_id: int):
             raise ValueError(f'A login can be shared only between accounts on the same '
                              f'provider. Put {target.name} on the same provider first.')
         existing = logins_for_account(account_id)
-        if any(lg.username == login.username for lg in existing):
+        if any((lg.username, lg.password) == (login.username, login.password) for lg in existing):
             raise ValueError(f'{target.name} already has a login with the username '
-                             f'{login.username}.')
-        if any(lg.name.lower() == login.name.lower() for lg in existing):
+                             f'{login.username} and that password.')
+        if login.playlist_account_id is None and any(
+                lg.name.lower() == login.name.lower() and lg.playlist_account_id is None
+                for lg in existing):
             raise ValueError(f'{target.name} already has a login named {login.name}.')
         positions = [p for (p,) in db.session.query(AccountLogin.position)
                      .filter(AccountLogin.account_id == account_id).all()]

@@ -169,11 +169,14 @@
 </div>
 {% endif %}
 
-<div class="dash-pulse">
-  <div class="mtile"><div class="m-k">Hidden now</div><div class="m-v">{{ '{:,}'.format(hidden_count) }}</div><div class="m-s">channels</div></div>
-  <div class="mtile"><div class="m-k">Rules active</div><div class="m-v">{{ enabled_rules }} <span style="font-size:var(--fs-lg);color:var(--text-faint);font-weight:400;">/ {{ rules | length }}</span></div><div class="m-s">enabled / total</div></div>
-  <div class="mtile{{ ' warn' if deferred_count else '' }}" data-tip="Matched by a rule, but kept visible because they're in your TV Guide or a channel group."><div class="m-k">Kept visible</div><div class="m-v">{{ '{:,}'.format(deferred_count) }}</div><div class="m-s">in guide or a group</div></div>
-  <div class="mtile"><div class="m-k">Still offered</div><div class="m-v">{{ '{:,}'.format(total_channels - hidden_count) }}</div><div class="m-s">channels</div></div>
+{# The tiles open on every account. Picking Account pills below rescopes them in
+   hide-rules.js::renderTiles(), from the per-account counts in HIDE_RULES_CONFIG - the one
+   updater after first paint, and it writes these same numbers back when the pills clear. #}
+<div class="dash-pulse" id="hr-tiles">
+  <div class="mtile"><div class="m-k">Hidden now</div><div class="m-v" id="hr-t-hidden">{{ '{:,}'.format(hidden_count) }}</div><div class="m-s" id="hr-t-hidden-s">channels</div></div>
+  <div class="mtile"><div class="m-k">Rules active</div><div class="m-v"><span id="hr-t-rules-on">{{ enabled_rules }}</span> <span style="font-size:var(--fs-lg);color:var(--text-faint);font-weight:400;">/ <span id="hr-t-rules">{{ rules | length }}</span></span></div><div class="m-s">enabled / total</div></div>
+  <div class="mtile{{ ' warn' if deferred_count else '' }}" id="hr-t-deferred-tile" data-tip="Matched by a rule, but kept visible because they're in your TV Guide or a channel group."><div class="m-k">Kept visible</div><div class="m-v" id="hr-t-deferred">{{ '{:,}'.format(deferred_count) }}</div><div class="m-s">in guide or a group</div></div>
+  <div class="mtile"><div class="m-k">Still offered</div><div class="m-v" id="hr-t-offered">{{ '{:,}'.format(total_channels - hidden_count) }}</div><div class="m-s" id="hr-t-offered-s">channels</div></div>
 </div>
 
 <div class="scope-row">
@@ -190,7 +193,7 @@ window.HIDE_RULES_CONFIG = {
   rules: {{ rules_json | tojson }},
   accounts: {{ accounts_json | tojson }},
   targetLabels: {{ target_labels | tojson }},
-  totalChannels: {{ total_channels }},
+  totals: {{ totals_json | tojson }},
 };
 </script>
 <script src="{{ url_for('static', filename='js/hide-rules.js') }}"></script>

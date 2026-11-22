@@ -8,6 +8,7 @@ The ledger half: each segment's wall clock is credited to the account of the cha
 captured it; nothing unfinished is folded until it finishes; a fold is idempotent; a
 deleted source row's contribution stays; days are local; a timezone change rebuilds.
 """
+import json
 import logging
 import os
 import sys
@@ -20,7 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app import account_stats, admission, db  # noqa: E402
 from app.config import load_config as _real_load_config  # noqa: E402
 from app.database import (AccountStatDay, AccountStatState, ChannelEvent, ChannelTest,  # noqa: E402
-                          CHANNEL_ADDED_TO_GUIDE,
+                          CHANNEL_ADDED_TO_GUIDE, FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED,
+                          FEED_PLAY_REFUSED, OutputFeedPlay,
                           RecordingSegment, CHANNEL_FAILOVER_HEALTH_OBSERVATION,
                           CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION)
 from app.fmt_utils import fmt_duration  # noqa: E402
@@ -265,6 +267,115 @@ class LocalDayTests(_LedgerCase):
         self.assertIn('Resuming an interrupted', '\n'.join(logs.output))
         db.session.expire_all()
         self.assertIsNotNone(db.session.get(AccountStatState, 1).rebuilt_at)
+
+
+class PlayFoldTests(_LedgerCase):
+    """dev/changelog/1676: Streamed to IPTV players folds each ended play's per-account split
+    into the ledger, on the local day the play started."""
+
+    def play(self, split, first_at=T0, kind=FEED_PLAY_ENDED, account=None):
+        row = OutputFeedPlay(kind=kind, at=first_at + timedelta(hours=1), first_at=first_at,
+                             feed_id=1, account_id=(account or self.b).id,
+                             account_seconds=None if split is None else json.dumps(
+                                 {str(k.id): v for k, v in split.items()}))
+        db.session.add(row)
+        db.session.commit()
+        return row
+
+    def test_a_moved_play_credits_each_account_its_part_not_the_account_it_ended_on(self):
+        self.play({self.a: 1800.0, self.b: 600.0}, account=self.b)
+        account_stats.refresh_ledger()
+        self.assertEqual(self.totals(self.a)['output_seconds'], 1800.0)
+        self.assertEqual(self.totals(self.b)['output_seconds'], 600.0)
+
+    def test_a_play_is_credited_on_the_local_day_it_started(self):
+        self.play({self.a: 60.0}, first_at=datetime(2026, 9, 10, 3, 30))
+        account_stats.refresh_ledger()
+        self.assertEqual(self.day(self.a, '2026-09-09').output_seconds, 60.0)
+        self.assertIsNone(self.day(self.a, '2026-09-10'))
+
+    def test_plays_with_no_split_are_passed_with_nothing(self):
+        """A refused play, a redirect, and a play written before the split was kept."""
+        self.play({})
+        self.play(None)
+        self.play(None, kind=FEED_PLAY_REFUSED)
+        last = self.play(None, kind=FEED_PLAY_REDIRECTED)
+        account_stats.refresh_ledger()
+        self.assertEqual(self.totals(self.a)['output_seconds'], 0)
+        self.assertEqual(self.totals(self.b)['output_seconds'], 0)
+        db.session.expire_all()
+        self.assertEqual(db.session.get(AccountStatState, 1).play_watermark, last.id)
+        self.assertEqual(account_stats.pending_rows(), 0)
+
+    def test_second_refresh_adds_nothing_and_a_pruned_play_stays_counted(self):
+        row = self.play({self.a: 300.0})
+        self.assertEqual(account_stats.pending_rows(), 1)
+        account_stats.refresh_ledger()
+        db.session.delete(db.session.get(OutputFeedPlay, row.id))
+        db.session.commit()
+        account_stats.refresh_ledger()
+        self.assertEqual(self.totals(self.a)['output_seconds'], 300.0)
+
+    def test_an_unreadable_split_is_passed_out_loud(self):
+        row = OutputFeedPlay(kind=FEED_PLAY_ENDED, at=T0, first_at=T0, feed_id=1,
+                             account_seconds='not json')
+        db.session.add(row)
+        db.session.commit()
+        self.play({self.a: 30.0})
+        with self.assertLogs('app.account_stats', logging.WARNING) as logs:
+            account_stats.refresh_ledger()
+        self.assertIn(f'play {row.id} has an unreadable account split', '\n'.join(logs.output))
+        self.assertEqual(self.totals(self.a)['output_seconds'], 30.0)
+
+    def test_a_timezone_rebuild_refolds_the_plays(self):
+        self.play({self.a: 60.0}, first_at=datetime(2026, 9, 10, 3, 30))
+        account_stats.refresh_ledger()
+        with mock.patch('app.config.load_config', _tz_config('UTC')):
+            with self.assertLogs('app.account_stats', logging.WARNING):
+                account_stats.refresh_ledger()
+        self.assertIsNone(self.day(self.a, '2026-09-09'))
+        self.assertEqual(self.day(self.a, '2026-09-10').output_seconds, 60.0)
+
+
+def _output_config(tz_name, enabled):
+    def _load(*args, **kwargs):
+        cfg = _tz_config(tz_name)(*args, **kwargs)
+        cfg.setdefault('integrations', {}).setdefault('output_feed', {})['enabled'] = enabled
+        return cfg
+    return _load
+
+
+class StreamedStatShownTests(_LedgerCase):
+    """dev/changelog/1676: Streamed to IPTV players shows while the output is on, and while
+    any account has time on it; an install that never used the output gets no column."""
+
+    LABEL = 'Streamed to IPTV players'
+
+    def page(self, enabled, url=None):
+        # The route binds load_config at import, so its own name is patched as well.
+        load = _output_config(self.TZ, enabled)
+        with mock.patch('app.config.load_config', load), \
+                mock.patch('app.routes.accounts.load_config', load):
+            return self.t.client.get(url or f'/accounts/{self.a.id}').get_data(as_text=True)
+
+    def test_off_and_never_used_shows_nothing(self):
+        self.assertEqual(stat_values(self.page(False), self.LABEL), [])
+        self.assertNotIn('Streamed to players', self.page(False, '/accounts'))
+
+    def test_on_shows_it_even_at_zero(self):
+        self.assertEqual(len(stat_values(self.page(True), self.LABEL)), 1)
+        self.assertIn('Streamed to players', self.page(True, '/accounts'))
+
+    def test_off_but_used_shows_the_time_in_every_window(self):
+        db.session.add(OutputFeedPlay(kind=FEED_PLAY_ENDED, at=T0, first_at=T0, feed_id=1,
+                                      account_seconds=json.dumps({str(self.a.id): 5400.0})))
+        db.session.commit()
+        self.assertEqual(stat_values(self.page(False), self.LABEL), [fmt_duration(5400)])
+        self.assertEqual(len(stat_values(self.page(False, f'/accounts/{self.a.id}?w=7d'),
+                                         self.LABEL)), 1)
+        listing = self.page(False, '/accounts')
+        self.assertIn('Streamed to players', listing)
+        self.assertIn('data-output="5400.0"', listing)
 
 
 class WindowAndTrendTests(_LedgerCase):

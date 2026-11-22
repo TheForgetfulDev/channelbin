@@ -105,12 +105,14 @@ class GuideChannel:
     `filler` is a title the guide repeats in place of programs, as some guide sources do for
     an event channel: its own name, block after block (the filler_guide fault). `former` is
     (title, hours): the blocks that started more than `hours` before now repeat that title, the
-    name the slot had before it was renamed for its game (the renamed_slot_guide fault)."""
-    __slots__ = ('guide_id', 'display_name', 'station', 'has_programs', 'icon', 'filler', 'former')
+    name the slot had before it was renamed for its game (the renamed_slot_guide fault). `desc` is
+    the description every filler block carries (the description_only_games fault)."""
+    __slots__ = ('guide_id', 'display_name', 'station', 'has_programs', 'icon', 'filler', 'former', 'desc')
 
-    def __init__(self, guide_id, display_name, station, has_programs, icon, filler=None, former=None):
+    def __init__(self, guide_id, display_name, station, has_programs, icon, filler=None, former=None, desc=None):
         self.guide_id, self.display_name, self.station = guide_id, display_name, station
         self.has_programs, self.icon, self.filler, self.former = has_programs, icon, filler, former
+        self.desc = desc
 
 
 class PanelLineup:

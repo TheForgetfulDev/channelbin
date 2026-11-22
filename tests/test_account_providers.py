@@ -72,9 +72,14 @@ class _Case(unittest.TestCase):
         return provider.id
 
     def _shared_main(self):
-        """skyline on both accounts, login `main` (1 seat) added on curated and shared."""
+        """skyline on both accounts, login `main` (1 seat) added on curated and shared. Its
+        credentials are not the ones in the URLs, so it is never curated's playlist login
+        (dev/changelog/1670): curated lists that one first, and it is turned off here, so
+        curated reaches the backend through the shared login alone - the guide-service case."""
         pid = self._provider(self.cur_id, self.dir_id)
-        main = links.add_login(self.cur_id, 'main', 'main', 'pw1', 1).id
+        main = links.add_login(self.cur_id, 'main', 'backend', 'pwB', 1).id
+        playlist = Login.query.filter_by(playlist_account_id=self.cur_id).one().id
+        links.set_login_enabled(self.cur_id, playlist, False)
         links.share_login(main, self.dir_id)
         db.session.expire_all()
         return pid, main

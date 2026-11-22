@@ -481,7 +481,7 @@ class Provider:
                 if not g.has_programs:
                     continue
                 if g.filler:
-                    blocks = filler_programs(g.filler, start, end)
+                    blocks = filler_programs(g.filler, start, end, g.desc)
                     if g.former:
                         title, hours = g.former
                         cut = self.now() - _dt.timedelta(hours=hours)

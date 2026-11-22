@@ -328,6 +328,7 @@
     else if (act === 'login') openLogin(t);
     else if (act === 'power') guarded(setPower)(t.dataset.to);
     else if (act === 'stop') stopPlay(t);
+    else if (act === 'move-play') movePlay(t).then((asked) => { if (asked) refresh(CARDS); });
     else if (act === 'live-now') goLiveNow(t).then((changed) => { if (changed) refresh(); });
     else if (act === 'channel-now') channelNow(t, e);
     else if (act === 'preview') previewFrom(t);

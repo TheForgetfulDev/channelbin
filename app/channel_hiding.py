@@ -621,6 +621,12 @@ def refresh_rule_stats(rules=None) -> int:
     patterns against 0.893s for the same ten asked separately. Disabled rules are counted
     too: a rule that is switched off still gets to say what it would hide.
 
+    Each count is also kept per account in `account_counts`, so the page can answer "what
+    does this rule hide on this account" (dev/changelog/1678). The category GROUP BY already
+    carries the account; the name scan groups by it, one row per account where it gave one
+    row, which took the six name rules on 179,221 channels from 0.19s to 0.25s.
+    `match_count` / `deferred_count` are the sums.
+
     Does NOT commit - the caller owns the commit, same convention as `recompute()`.
     """
     rules = load_rules(enabled_only=False) if rules is None else list(rules)
@@ -651,15 +657,16 @@ def refresh_rule_stats(rules=None) -> int:
             names = {row[0] for row in db.session.execute(
                 select(Channel.category_name)
                 .where(Channel.category_name.op('GLOB')(rule.pattern)).distinct()).all()}
-        total = deferred = 0
+        by_account = {}
         for (account_id, category_name), (count, prot) in per_category.items():
             if category_name not in names:
                 continue
             if rule.account_id is not None and account_id != rule.account_id:
                 continue
-            total += count
-            deferred += prot
-        rule.match_count, rule.deferred_count, rule.counted_at = total, deferred, now
+            got = by_account.setdefault(account_id, [0, 0])
+            got[0] += count
+            got[1] += prot
+        _store_counts(rule, by_account, now)
 
     name_rules = [r for r in rules if r.target == HIDE_TARGET_NAME_GLOB]
     if name_rules:
@@ -668,13 +675,27 @@ def refresh_rule_stats(rules=None) -> int:
             matched = match_predicate(rule.target, rule.pattern, rule.account_id)
             columns.append(func.sum(case((matched, 1), else_=0)))
             columns.append(func.sum(case((and_(matched, protected), 1), else_=0)))
-        totals = db.session.execute(select(*columns).select_from(Channel)).one()
+        rows = db.session.execute(
+            select(Channel.account_id, *columns).group_by(Channel.account_id)).all()
         for i, rule in enumerate(name_rules):
-            rule.match_count = int(totals[i * 2] or 0)
-            rule.deferred_count = int(totals[i * 2 + 1] or 0)
-            rule.counted_at = now
+            by_account = {}
+            for row in rows:
+                count, prot = int(row[1 + i * 2] or 0), int(row[2 + i * 2] or 0)
+                if count:
+                    by_account[row[0]] = [count, prot]
+            _store_counts(rule, by_account, now)
 
     return len(rules)
+
+
+def _store_counts(rule, by_account, now):
+    """Write one rule's per-account counts and the totals they sum to. An account the rule
+    matches nothing on is left out of `account_counts`, and reads back as zero."""
+    kept = {account_id: pair for account_id, pair in by_account.items() if pair[0]}
+    rule.match_count = sum(pair[0] for pair in kept.values())
+    rule.deferred_count = sum(pair[1] for pair in kept.values())
+    rule.account_counts = json.dumps({str(a): kept[a] for a in sorted(kept)})
+    rule.counted_at = now
 
 
 def refresh_rule_stats_and_commit() -> None:
@@ -691,6 +712,28 @@ def refresh_rule_stats_and_commit() -> None:
         db.session.commit()
 
     _refresh_and_commit()
+
+
+def backfill_rule_account_counts() -> None:
+    """Discharge migration 143's obligation: count every rule by account, so the Hide Channels
+    page has a number for an account the moment the column exists rather than at each
+    account's next sync. Run from create_app() before the scheduler starts, with no ticket for
+    the reason `apply_default_rules()` takes none. A recount, stamped in the same commit as
+    the work, so a crash between the two re-runs it harmlessly."""
+    from .migrations import (_BF_HIDE_RULE_ACCOUNT_COUNTS, finish_obligation,
+                             obligation_pending)
+    if not obligation_pending(_BF_HIDE_RULE_ACCOUNT_COUNTS):
+        return
+
+    @retry_on_locked()
+    def _count_and_commit():
+        n = refresh_rule_stats()
+        finish_obligation(_BF_HIDE_RULE_ACCOUNT_COUNTS)
+        db.session.commit()
+        return n
+
+    n = _count_and_commit()
+    log.info('Counted %d hide rule(s) by account for the Hide Channels page.', n)
 
 
 # ---------------------------------------------------------------------------

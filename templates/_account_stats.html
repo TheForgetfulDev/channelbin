@@ -161,6 +161,9 @@
     {{ notice(s) }}
     <div class="statlist">
       <div class="srow"><span class="sk">Recorded time</span><span class="sv tip-plain" data-tip="{{ s.tips.capture }}{{ s.window_note }}">{{ capture(w.capture_seconds) }}</span></div>
+      {%- if s.show_output %}
+      <div class="srow"><span class="sk">Streamed to IPTV players</span><span class="sv tip-plain" data-tip="{{ s.tips.output }}{{ s.window_note }}">{{ capture(w.output_seconds) }}</span></div>
+      {%- endif %}
       <div class="srow"><span class="sk">Recordings</span><span class="sv tip-plain" data-tip="{{ s.tips.recordings }}{{ s.window_note }}">{{ num(w.recordings) }}</span></div>
       <div class="srow"><span class="sk">Stalls during capture</span><span class="sv tip-plain" data-tip="{{ s.tips.stalls }}{{ s.window_note }}">{{ num(w.stalls) }}</span></div>
       <div class="srow"><span class="sk">Failed away from</span><span class="sv tip-plain" data-tip="{{ s.tips.failovers }}{{ s.window_note }}">{{ num(w.failovers_away) }}</span></div>
@@ -182,6 +185,7 @@
 {%- set SORTS = [
   ('name', 'Account', 'capture'),
   ('capture', 'Recorded time', 'capture'),
+] + ([('output', 'Streamed to players', 'output')] if s.show_output else []) + [
   ('recordings', 'Recordings', 'recordings'),
   ('stalls', 'Stalls', 'stalls'),
   ('failovers', 'Failed away from', 'failovers'),
@@ -190,7 +194,7 @@
   ('rate', 'Pass rate', 'rate'),
 ] -%}
 <div class="acst-top"><h2>Usage</h2>{{ window_chips(s, 'acct-stats') }}</div>
-<p class="acst-scope">Recorded time, stalls, failovers and health checks {% if s.window == 'all' %}across all time{% else %}in the last {{ s.window_label }}{% endif %}. The guide and group shares, and the numbers on each account above, are always current.</p>
+<p class="acst-scope">Recorded time, {% if s.show_output %}time streamed to IPTV players, {% endif %}stalls, failovers and health checks {% if s.window == 'all' %}across all time{% else %}in the last {{ s.window_label }}{% endif %}. The guide and group shares, and the numbers on each account above, are always current.</p>
 {{ notice(s) }}
 <div class="card acst-table-card">
   <div class="card-head"><h2>By account</h2>
@@ -217,12 +221,15 @@
         <tbody>
           {%- for a in s.accounts %}{% set w = s.windowed[a.id] %}
           <tr data-id="{{ a.id }}" data-order="{{ loop.index0 }}" data-name="{{ a.name | lower }}"
-              data-capture="{{ w.capture_seconds }}" data-recordings="{{ w.recordings }}"
+              data-capture="{{ w.capture_seconds }}"{% if s.show_output %} data-output="{{ w.output_seconds }}"{% endif %} data-recordings="{{ w.recordings }}"
               data-stalls="{{ w.stalls }}" data-failovers="{{ w.failovers_away }}"
               data-passed="{{ w.checks_passed }}" data-failed="{{ w.checks_failed }}"
               data-rate="{{ '' if w.pass_rate is none else w.pass_rate }}">
             <td data-label="Account"><a class="acst-acct" href="{{ url_for('accounts.account_detail', account_id=a.id) }}"><span class="color-dot" style="background:{{ a.color }}"></span><span class="nm">{{ a.name }}</span></a></td>
             <td class="num" data-label="Recorded time"><span class="tip-plain" data-tip="{{ s.tips.capture }}">{{ capture(w.capture_seconds) }}</span></td>
+            {%- if s.show_output %}
+            <td class="num" data-label="Streamed to players"><span class="tip-plain" data-tip="{{ s.tips.output }}">{{ capture(w.output_seconds) }}</span></td>
+            {%- endif %}
             <td class="num" data-label="Recordings"><span class="tip-plain" data-tip="{{ s.tips.recordings }}">{{ num(w.recordings) }}</span></td>
             <td class="num" data-label="Stalls"><span class="tip-plain" data-tip="{{ s.tips.stalls }}">{{ num(w.stalls) }}</span></td>
             <td class="num" data-label="Failed away from"><span class="tip-plain" data-tip="{{ s.tips.failovers }}">{{ num(w.failovers_away) }}</span></td>
@@ -236,6 +243,9 @@
           <tr class="acst-total">
             <td data-label="Account">All accounts</td>
             <td class="num" data-label="Recorded time">{{ capture(t.capture_seconds) }}</td>
+            {%- if s.show_output %}
+            <td class="num" data-label="Streamed to players">{{ capture(t.output_seconds) }}</td>
+            {%- endif %}
             <td class="num" data-label="Recordings">{{ num(t.recordings) }}</td>
             <td class="num" data-label="Stalls">{{ num(t.stalls) }}</td>
             <td class="num" data-label="Failed away from">{{ num(t.failovers_away) }}</td>

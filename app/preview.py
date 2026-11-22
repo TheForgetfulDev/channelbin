@@ -490,6 +490,11 @@ def _launch(channel_id: int, purpose: str, reencode: bool = False) -> PreviewSes
     verb = 'preview' if purpose == PURPOSE_WATCH else 'capture a screenshot'
     if not connlim.try_acquire(channel.account_id, 'preview', session.id):
         from .account_blocks import blocked_reason
+        from .account_links import unusable_reason
+        off = unusable_reason(channel.account_id, account.name, capital=True)
+        if off:
+            _finish(session, REASON_LAUNCH_FAILED, detail='every host or login turned off')
+            raise PreviewRefused(f'{off}. Turn one on on its account page to {verb} here.', 409)
         blocked = blocked_reason(channel.account_id, account.name, capital=True)
         if blocked:
             _finish(session, REASON_LAUNCH_FAILED, detail='account blocked')

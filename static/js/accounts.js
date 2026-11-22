@@ -72,6 +72,11 @@
       case 'examples-remove':
         window.removeExamples();
         return;
+      case 'hosts-check':
+        // One host at a time on the server's line (app/host_checks.py); the live refresh
+        // follows it, since each check moves the account signature.
+        postHostCheck(`/api/accounts/${id}/hosts/check`);
+        return;
       case 'delete':
         confirmDeleteAccount({
           id: id,
@@ -87,6 +92,19 @@
         console.warn('unhandled account row action', act);
     }
   }
+
+  function postHostCheck(url) {
+    jsonFetch(url, { method: 'POST' })
+      .then((res) => { showToast(res.message || 'Done.', { durationMs: 8000 }); refreshList({ announceEnd: false }); })
+      .catch((err) => showToast(err.message || 'Could not start the check.', { type: 'error' }));
+  }
+
+  document.addEventListener('click', (e) => {
+    const all = e.target.closest('[data-hosts-check-all]');
+    if (all && !all.disabled) { postHostCheck('/api/accounts/hosts/check'); return; }
+    const stop = e.target.closest('[data-hosts-check-stop]');
+    if (stop) postHostCheck('/api/accounts/hosts/check/stop');
+  });
 
   document.addEventListener('click', (e) => {
     const item = e.target.closest('.arow .menu-item[data-act]');
@@ -123,7 +141,7 @@
   //      drift while nothing changes. Skipped in a background tab, where nobody reads them.
   // A refresh waits while a row's menu or phone sheet is open - swapping the row out from
   // under an open menu would close it mid-choice - and the next poll simply asks again.
-  const LIVE_REGIONS = ['#acct-live', '#acct-total', '#acct-sync-all'];
+  const LIVE_REGIONS = ['#acct-live', '#acct-total', '#acct-sync-all', '#acct-host-check'];
   const RERENDER_MS = 60 * 1000;
   let renderedAt = Date.now();
   let inFlight = false;

@@ -198,6 +198,21 @@ class PlayLogTests(_Case):
                             'label': 'x', 'client': 'c'}])
         self.assertEqual([p.feed_id for p in OutputFeedPlay.query.all()], [2])
 
+    def test_the_newest_line_is_never_pruned_so_its_id_is_never_issued_again(self):
+        """dev/changelog/1676: with no AUTOINCREMENT, deleting the highest id hands it to the
+        next play, below the account stats' play watermark, and that play is never counted.
+        A refusal run bumped in place keeps a low id recent while the newest row ages."""
+        old = datetime.utcnow() - timedelta(days=feed.PLAY_LOG_DAYS + 1)
+        db.session.add(OutputFeedPlay(kind=FEED_PLAY_REFUSED, at=datetime.utcnow(), first_at=old,
+                                      feed_id=1, message='m'))
+        db.session.add(OutputFeedPlay(kind=FEED_PLAY_ENDED, at=old, first_at=old, feed_id=2))
+        db.session.commit()
+        newest = db.session.query(db.func.max(OutputFeedPlay.id)).scalar()
+        feed._last_prune_mono = None
+        feed._prune_plays()
+        db.session.expire_all()
+        self.assertIsNotNone(db.session.get(OutputFeedPlay, newest))
+
     def test_every_reason_has_its_text(self):
         for reason in (feed.REASON_TAKEN_OFF, feed.REASON_STOPPED):
             self.assertTrue(feed.REASON_TEXT[reason])

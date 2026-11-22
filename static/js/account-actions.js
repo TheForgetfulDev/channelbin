@@ -227,19 +227,60 @@ function buildDeleteAccountModal(opts, readers) {
   });
 }
 
-/* Block the account for a while (app/account_blocks.py, dev/changelog/1151): nothing in
-   ChannelBin opens a stream on it until the block ends, so a TV can watch live on it.
-   Timed only - a block exists so nobody has to remember to turn anything back on. The
-   server bounds it at `maxHours`. `limit` is the account's connection limit; the slot count
-   is only asked for above one. */
+/* Block the account (app/account_blocks.py, dev/changelog/1151): nothing in ChannelBin opens
+   a stream on it until the block ends, so a TV can watch live on it. Timed, or with no end at
+   all - "Until I unblock it" holds until the user takes it off (dev/changelog/1667), and
+   every surface that shows the block says so in place of an end time. `limit` is the
+   account's connection limit; the slot count is only asked for above one. */
 const BLOCK_DURATIONS = [[30, '30 minutes'], [60, '1 hour'], [120, '2 hours'], [180, '3 hours'],
   [240, '4 hours']];
 
-function confirmBlockAccount(opts = {}) {
-  const limit = Number(opts.limit || 1);
-  const maxHours = Number(opts.maxHours || 24);
+/* The "For" choices both block dialogs offer - the account's and a login's take one body
+   shape (routes/accounts.py::_block_stop). Returns {html, wire(body) -> payload()}: `html`
+   goes in the dialog, `wire` hooks its fields up once the dialog body exists and hands back
+   the function that reads them into the request body. */
+function blockForFields(unblockWhere) {
   const durations = BLOCK_DURATIONS.map(([m, label]) =>
     `<option value="${m}"${m === 120 ? ' selected' : ''}>${label}</option>`).join('');
+  const html =
+    fieldRow({ label: 'For', control:
+      `<select id="block-for" class="form-control">${durations}` +
+      '<option value="until">Until a time...</option>' +
+      '<option value="unblocked">Until I unblock it</option></select>' }) +
+    '<div id="block-until-row" style="display:none">' +
+    fieldRow({ label: 'Until', control:
+      '<input type="datetime-local" id="block-until" class="form-control">' +
+      '<input type="hidden" id="block-until-utc">' +
+      '<div class="text-muted small" id="block-until-note" style="display:none; margin-top:4px;"></div>' }) +
+    '</div>';
+  const unblockedNote =
+    '<p class="text-muted small" id="block-unblocked-note" style="display:none; margin-top:8px">' +
+    `This block has no end time. It stays until you choose Unblock ${unblockWhere}.</p>`;
+  const wire = (body) => {
+    const forSel = body.querySelector('#block-for');
+    const untilRow = body.querySelector('#block-until-row');
+    // The until field keeps the instant it stands for and says which pass of a repeated hour
+    // it means (util.js::wallTimeField); the instant is posted beside the text as until_utc.
+    const untilWall = wallTimeField(body.querySelector('#block-until'), {
+      hidden: body.querySelector('#block-until-utc'), note: body.querySelector('#block-until-note') });
+    const note = body.querySelector('#block-unblocked-note');
+    forSel.addEventListener('change', () => {
+      untilRow.style.display = forSel.value === 'until' ? '' : 'none';
+      note.style.display = forSel.value === 'unblocked' ? '' : 'none';
+    });
+    return () => {
+      if (forSel.value === 'until') {
+        return { until: body.querySelector('#block-until').value, until_utc: untilWall.utc() };
+      }
+      if (forSel.value === 'unblocked') return { until_unblocked: true };
+      return { minutes: Number(forSel.value) };
+    };
+  };
+  return { html, unblockedNote, wire };
+}
+
+function confirmBlockAccount(opts = {}) {
+  const limit = Number(opts.limit || 1);
   let slots = '';
   if (limit > 1) {
     const choices = [`<option value="">All ${limit} connections</option>`];
@@ -247,34 +288,17 @@ function confirmBlockAccount(opts = {}) {
     slots = fieldRow({ label: 'Connections', control:
       `<select id="block-slots" class="form-control">${choices.join('')}</select>` });
   }
+  const fields = blockForFields('on the account\'s page');
   const body = document.createElement('div');
   body.innerHTML =
-    `<p>Keep ChannelBin off <strong>${escHtml(opts.name || '')}</strong> for a while, so a ` +
-    'TV can watch live on it.</p>' +
-    fieldRow({ label: 'For', control:
-      `<select id="block-for" class="form-control">${durations}` +
-      '<option value="until">Until a time...</option></select>' }) +
-    '<div id="block-until-row" style="display:none">' +
-    fieldRow({ label: 'Until', control:
-      '<input type="datetime-local" id="block-until" class="form-control">' +
-      '<input type="hidden" id="block-until-utc">' +
-      '<div class="text-muted small" id="block-until-note" style="display:none; margin-top:4px;"></div>' }) +
-    '</div>' + slots +
+    `<p>Keep ChannelBin off <strong>${escHtml(opts.name || '')}</strong>, so a ` +
+    'TV can watch live on it.</p>' + fields.html + slots + fields.unblockedNote +
     '<p class="text-muted small" style="margin-top:8px">No recording, failover, health check ' +
     'or preview uses the account until then. A channel group records from members on other ' +
     'accounts; a recording with nowhere else to go waits for the block to end. A recording ' +
     'already running on it moves to another member if it has one. If another account reaches ' +
-    'the same provider account, block that one too. At most ' +
-    `${maxHours} hours.</p>`;
-  const forSel = body.querySelector('#block-for');
-  const untilRow = body.querySelector('#block-until-row');
-  // The until field keeps the instant it stands for and says which pass of a repeated hour
-  // it means (util.js::wallTimeField); the instant is posted beside the text as until_utc.
-  const untilWall = wallTimeField(body.querySelector('#block-until'), {
-    hidden: body.querySelector('#block-until-utc'), note: body.querySelector('#block-until-note') });
-  forSel.addEventListener('change', () => {
-    untilRow.style.display = forSel.value === 'until' ? '' : 'none';
-  });
+    'the same provider account, block that one too.</p>';
+  const payloadOf = fields.wire(body);
 
   buildModal({
     title: 'Block account use',
@@ -285,12 +309,7 @@ function confirmBlockAccount(opts = {}) {
         label: 'Block account use',
         class: 'btn btn-primary',
         onClick: (close) => {
-          const payload = {};
-          if (forSel.value === 'until') {
-            payload.until = body.querySelector('#block-until').value;
-            payload.until_utc = untilWall.utc();
-          }
-          else payload.minutes = Number(forSel.value);
+          const payload = payloadOf();
           const slotSel = body.querySelector('#block-slots');
           if (slotSel && slotSel.value) payload.slots = Number(slotSel.value);
           jsonFetch(`/api/accounts/${opts.id}/blocks`, {

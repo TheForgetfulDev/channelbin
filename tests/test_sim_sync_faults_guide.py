@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import accounts, db, sports_match  # noqa: E402
 from app.config import load_config  # noqa: E402
-from app.database import (SPORTS_MATCH_KIND_CHANNEL_NAME, Channel, EPGEntry,  # noqa: E402
+from app.database import (SPORTS_MATCH_KIND_CHANNEL_NAME, SPORTS_MATCH_STRONG, Channel, EPGEntry,  # noqa: E402
                           EpgAlternateEntry, EpgSource, EpgSourceChannel, SportsEvent, SportsLeague,
                           SportsMatch, SportsTeam, XtreamAccount)
 from app.epg_sources import add_url_source  # noqa: E402
@@ -661,6 +661,48 @@ class GuideSpellingTests(_GuideCase):
         db.session.expire_all()
         self.assertGreater(SportsMatch.query.filter_by(event_id=events['p2'].id, channel_id=ch.id).count(), 0)
         self.assertEqual(SportsMatch.query.filter_by(event_id=events['race'].id, channel_id=ch.id).count(), 0)
+
+
+class DescriptionOnlyGameTests(_GuideCase):
+    def test_a_game_named_only_in_the_description_is_found(self):
+        """Guards dev/docs/BUGS.md 2026-11-21 10:13 PM through a real sync and the simulator's
+        description_only_games fault: a title naming the league alone, no sub-title, and the game
+        only in the description's opening sentence still matches the game, strong, saying where
+        the teams came from."""
+        aid = self.add_xtream()
+        self.sim.inject('description_only_games', 'north-tv')
+        log = self.sync(aid)
+        self.assertEqual(log.status, 'SUCCESS', log.error_message)
+        shape = re.compile(r'^The ([A-Za-z]+) host the ([A-Za-z]+) in ([A-Za-z]+) regular-season play')
+        found = None
+        for entry in (EPGEntry.query.join(Channel, Channel.id == EPGEntry.channel_id)
+                      .filter(Channel.account_id == aid, EPGEntry.start_time > datetime.utcnow(),
+                              EPGEntry.title.like('Live: %')).order_by(EPGEntry.start_time)):
+            m = shape.match(entry.description or '')
+            if m and not entry.sub_title:
+                found = entry, m
+                break
+        self.assertIsNotNone(found, 'the fault world carries no slot described that way')
+        entry, m = found
+        home, away, sport = m.groups()
+        self.assertEqual(entry.title, f'Live: {sport}')
+        league = SportsLeague(tsdb_id=9106, name=sport, match_terms=json.dumps([sport]))
+        db.session.add(league)
+        for tid, team in ((961, home), (962, away)):
+            db.session.add(SportsTeam(tsdb_id=tid, full_name=team, names=json.dumps([team]), city='',
+                                      last_looked_up=self.now))
+        db.session.flush()
+        event = SportsEvent(tsdb_id=7008, league_id=league.id, name=f'{home} vs {away}', home_team_id=961,
+                            away_team_id=962, home_name=home, away_name=away, start_at=entry.start_time,
+                            local_date=entry.start_time.date())
+        db.session.add(event)
+        db.session.commit()
+        sports_match.run(pause=0)
+        db.session.expire_all()
+        at_start = SportsMatch.query.filter_by(event_id=event.id, channel_id=entry.channel_id,
+                                               program_start_time=entry.start_time).one()
+        self.assertEqual(at_start.strength, SPORTS_MATCH_STRONG)
+        self.assertIn("in its description's first sentence", at_start.reason)
 
 
 class TeamChannelTests(_GuideCase):

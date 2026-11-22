@@ -11,7 +11,7 @@ from sqlalchemy import func
 from .. import db
 from ..fmt_utils import iso_or_none
 from ..database import (
-    Channel, ChannelTest, OnDemandTestJob, HealthCheckProfile,
+    Account, Channel, ChannelTest, OnDemandTestJob, HealthCheckProfile,
     ChannelGroup, Recording,
     TEST_STATUS_COMPLETED, TEST_STATUS_CANCELLED, TEST_STATUS_FAILED,
     OD_JOB_STATUS_QUEUED, OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING,
@@ -323,8 +323,9 @@ def _tally(tests):
 def get_active_run_summary():
     """Summary of the currently active channel-test run, for the Live Dashboard widget.
     Returns None if no run is active. run_kind names which kind: an OnDemandTestJob run
-    (the automatic guide run is the is_system job) or a pre-recording health check
-    (DESIGN-prerecord-checks.md §3), which belongs to no job at all."""
+    (the automatic guide run is the is_system job), a pre-recording health check
+    (DESIGN-prerecord-checks.md §3), which belongs to no job at all, or an account's stream
+    check (app/stream_check.py). A one-off Test now is shown on its channel page only."""
     from ..channel_tester import get_status
     status = get_status()
     if not status['is_running']:
@@ -345,6 +346,26 @@ def get_active_run_summary():
             'eta_seconds': status['eta_seconds'],
             'tested_count': 0, 'pass_count': 0, 'warn_count': 0, 'fail_count': 0,
         }
+
+    if status['run_kind'] == 'stream_check':
+        acct = db.session.get(Account, status.get('stream_check_account_id') or 0)
+        if acct is None:
+            return None
+        return {
+            'active': True,
+            'kind': 'stream_check',
+            'name': f'Stream check: {acct.name}',
+            'detail_url': url_for('accounts.account_detail', account_id=acct.id),
+            'completed_channels': status['completed_channels'],
+            'total_channels': status['total_channels'] or 1,
+            'run_started_at': status['run_started_at'],
+            'eta_seconds': status['eta_seconds'],
+            'tested_count': 0, 'pass_count': 0, 'warn_count': 0, 'fail_count': 0,
+        }
+
+    if status['run_kind'] == 'one_off':
+        # Test now on a channel page: the channel page is its surface, not this widget.
+        return None
 
     job = db.session.get(OnDemandTestJob, status.get('current_job_id') or 0)
     if job is None:

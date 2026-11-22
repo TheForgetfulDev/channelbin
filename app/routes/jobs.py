@@ -76,8 +76,8 @@ RECURRING_META = {
     'account_stats_fold': ('Account Stats Update', '/accounts',
                            'Adds the last hour\'s usage to each account\'s numbers.'),
     'host_resolve_check': ('Stream Host Check', '/settings?q=hosts',
-                           'Checks that each account\'s stream servers can still be '
-                           'found.'),
+                           'Checks each account\'s stream hosts: a lookup only, or the '
+                           'full check if Settings says so.'),
     'auto_rule_sweep': ('Auto-record Rules', '/rules',
                         'Schedules what your auto-record rules match.'),
     'sports_worker': ('Sports Schedules', '/sports',
@@ -434,8 +434,9 @@ def _check_guard(ct_cfg: dict, od) -> dict:
 def _build_job_list():
     """Return a list of job dicts for the jobs page/API."""
     from ..scheduler import get_scheduler
+    from .. import db
     from ..database import (
-        Recording, OnDemandTestJob, Account, EpgSource,
+        Recording, OnDemandTestJob, Account, AccountStreamCheck, EpgSource,
         REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
         OD_JOB_STATUS_SCHEDULED, WINDOW_OPEN_STATUSES,
     )
@@ -501,6 +502,14 @@ def _build_job_list():
     od_jobs = ({o.id: o for o in
                 OnDemandTestJob.query.filter(OnDemandTestJob.id.in_(od_ids)).all()}
                if od_ids else {})
+    # A waiting stream check's retry (app/stream_check.py): {check id: account name}.
+    check_ids = {int(m.group(1)) for m in
+                 (re.match(r'^stream_check_(\d+)$', j.id) for j in other_jobs) if m}
+    check_accounts = ({cid: (aid, name) for cid, aid, name in
+                       db.session.query(AccountStreamCheck.id, Account.id, Account.name)
+                       .join(Account, Account.id == AccountStreamCheck.account_id)
+                       .filter(AccountStreamCheck.id.in_(check_ids))}
+                      if check_ids else {})
 
     items = []
 
@@ -826,6 +835,32 @@ def _build_job_list():
                 'schedule_description': 'deferred past a recording, a channel test run '
                                         'or another sync',
                 'edit_url': f'/accounts/{account_id}/edit',
+                'run_url': None,
+                'skip_url': None,
+                'overlap': 'green',
+            })
+            continue
+
+        # A waiting stream check's retry: stream_check_<check id>. Run Now is not offered -
+        # the account page's Test a few channels is that button.
+        m = re.match(r'^stream_check_(\d+)$', job.id)
+        if m:
+            owner = check_accounts.get(int(m.group(1)))
+            account_name = owner[1] if owner else 'a deleted account'
+            items.append({
+                '_start_utc': next_run_utc,
+                '_end_utc': next_run_utc,
+                '_next_run_utc': next_run_utc,
+                'id': job.id,
+                'display_name': f'Stream check retry: {account_name}',
+                'type': 'one_off',
+                'next_run_utc': next_run_utc.isoformat(),
+                'next_run_et': _fmt_et(next_run_utc),
+                'next_run_relative': _relative(next_run_utc),
+                'stop_run_et': None,
+                'schedule_description': 'waiting for the channel tester, a recording or a '
+                                        'block on the account',
+                'edit_url': f'/accounts/{owner[0]}' if owner else None,
                 'run_url': None,
                 'skip_url': None,
                 'overlap': 'green',

@@ -147,10 +147,13 @@ class LocalStationTests(MatchCase):
         self.run_match()
         self.assertEqual(self.matches(event), [])
 
-    def test_the_description_is_never_read(self):
-        """Description text gave 775 rows for one game in the investigation."""
+    def test_a_description_naming_the_game_past_its_opening_is_not_read(self):
+        """Description text gave 775 rows for one game in the investigation: only the opening clause
+        is read (dev/docs/BUGS.md 2026-11-21 10:13 PM, design 6.7)."""
         event = self.game(2, 1)
-        self.row('PFL Football', description='The Harborview Gulls visit the Ironvale Bears.')
+        self.row('PFL Football', description='Football action from around the league. The Harborview Gulls '
+                                             'visit the Ironvale Bears.')
+        self.row('PFL Football', description='Week 11 rolls on as the Harborview Gulls visit the Ironvale Bears.')
         self.run_match()
         self.assertEqual(self.matches(event), [])
 
@@ -194,6 +197,142 @@ class LocalStationTests(MatchCase):
         self.run_match()
         self.assertEqual([m.channel_id for m in self.matches(one)], [ch_a.id])
         self.assertEqual([m.channel_id for m in self.matches(two)], [ch_b.id])
+
+
+class DescriptionOpeningTests(MatchCase):
+    """A local station that names its game only in the description's opening clause, under a title
+    that names the league and no team: every local NFL listing on two of prod's accounts on
+    2026-11-22 (dev/docs/BUGS.md 2026-11-21 10:13 PM, design 6.7). Each shape is a real row's, with
+    the pretend league's teams."""
+
+    def setUp(self):
+        super().setUp()
+        self.teams[31] = 'St. Clair Kings'
+        db.session.add(SportsTeam(tsdb_id=31, full_name='St. Clair Kings', names=json.dumps(['St. Clair Kings', 'Kings']),
+                                  city='St. Clair', last_looked_up=NOW))
+        self.teams[32] = 'Harbor (OH)'
+        db.session.add(SportsTeam(tsdb_id=32, full_name='Harbor (OH)', names=json.dumps(['Harbor (OH)']),
+                                  last_looked_up=NOW))
+        db.session.commit()
+
+    def described(self, description, title='Live: PFL Football', **kw):
+        return self.row(title, description=description, **kw)
+
+    def test_the_opening_clause_names_the_game(self):
+        event = self.game(2, 1)
+        self.trust(self.football)
+        self.described('The Ironvale Bears host the Harborview Gulls in PFL regular-season play at Ironvale '
+                       'Field. Harborview arrives at 3-6 after dropping their last game.')
+        self.run_match()
+        (m,) = self.matches(event)
+        self.assertEqual(m.strength, SPORTS_MATCH_STRONG)
+        self.assertEqual(m.airing, SPORTS_AIRING_FIRST)
+        self.assertEqual(m.reason, "Matched on the league named in the listing, both teams by name in its "
+                                   "description's first sentence, at the listed time.")
+        self.assertEqual(m.program_title, 'PFL Football')
+
+    def test_the_shapes_the_guides_write(self):
+        cases = [
+            'The Harborview Gulls face the Ironvale Bears in PFL regular-season play in Mexico City.',
+            'The Ironvale Bears meet the Harborview Gulls at Ironvale Field. Ironvale relies on its defense.',
+            'The Ironvale Bears meet Harborview Gulls at Ironvale Field.',
+            'The Bears host the Gulls in PFL North regular-season play at Ironvale Field.',
+            'The No. 5 Ironvale Bears (8-2, 5-2 North) host the No.11 Harborview Gulls (4-6, 2-5) in Ironvale.',
+            'The Harborview Gulls visit the Ironvale Bears for a PFL North game.',
+            'The Harborview Gulls take on the Ironvale Bears.',
+        ]
+        for i, description in enumerate(cases):
+            with self.subTest(description):
+                event = self.game(2, 1, start=KICKOFF + timedelta(days=7 * i), tsdb_id=700 + i)
+                self.described(description, start=KICKOFF + timedelta(days=7 * i))
+                self.run_match(now=NOW + timedelta(days=7 * i))
+                self.assertEqual([m.strength for m in self.matches(event)], [SPORTS_MATCH_STRONG])
+
+    def test_a_period_inside_a_team_name_does_not_end_the_sentence(self):
+        event = self.game(31, 1)
+        self.described('The Harborview Gulls visit the St. Clair Kings in PFL regular-season play.')
+        self.run_match()
+        self.assertEqual(len(self.matches(event)), 1)
+
+    def test_an_initial_inside_a_team_name_does_not_end_the_sentence(self):
+        """TheSportsDB stores schools like `Stephen F. Austin`; its period ended either team early
+        (dev/docs/BUGS.md 2026-11-21 10:50 PM)."""
+        self.teams[33] = 'Port J. Ridge'
+        db.session.add(SportsTeam(tsdb_id=33, full_name='Port J. Ridge', names=json.dumps(['Port J. Ridge']),
+                                  last_looked_up=NOW))
+        db.session.commit()
+        first = self.game(33, 1)
+        second = self.game(2, 33, start=KICKOFF + timedelta(days=7), tsdb_id=991)
+        self.described('The Port J. Ridge Lumberjacks host the Harborview Gulls in PFL play.')
+        self.described('The Ironvale Bears host the Port J. Ridge Lumberjacks in PFL play.',
+                       start=KICKOFF + timedelta(days=7))
+        self.run_match()
+        self.assertEqual(len(self.matches(first)), 1)
+        self.run_match(now=NOW + timedelta(days=7))
+        self.assertEqual(len(self.matches(second)), 1)
+
+    def test_a_short_sentence_before_it_is_not_its_opening(self):
+        """The first team never reaches past the first sentence, however short that sentence is."""
+        event = self.game(2, 1)
+        self.described('The big one. The Harborview Gulls visit the Ironvale Bears.')
+        self.described('The Comets fell. The Gulls host the Bears in PFL play.')
+        self.run_match()
+        self.assertEqual(self.matches(event), [])
+
+    def test_a_state_in_parentheses_is_part_of_the_name_and_a_record_is_not(self):
+        """`Miami (Ohio)` stays the school's name (dev/changelog/1662); `(8-2, 5-2 North)` is dropped."""
+        event = self.game(2, 32)
+        self.described('The Harbor (Ohio) Herons (8-2, 5-2 North) visit the Ironvale Bears (4-6) in PFL play.')
+        self.run_match()
+        self.assertEqual(len(self.matches(event)), 1)
+
+    def test_a_city_after_the_second_team_is_not_read_as_a_team(self):
+        """The clause ends where the venue begins, so `Saint-Rémy` there is not the Comets."""
+        event = self.game(1, 4)
+        self.described('The Harborview Gulls host the Ironvale Bears at Saint-Rémy Arena.')
+        self.run_match()
+        self.assertEqual(self.matches(event), [])
+
+    def test_the_same_sentence_under_a_title_with_no_league_does_not_match(self):
+        """On the 24-hour accounts the sentence shape also opens a film's and a comedy show's
+        descriptions."""
+        event = self.game(2, 1)
+        self.described('The Ironvale Bears host the Harborview Gulls in a game neither can afford to lose.',
+                       title='The Big Game')
+        self.run_match()
+        self.assertEqual(self.matches(event), [])
+
+    def test_a_tied_category_alone_does_not_read_the_description(self):
+        event = self.game(2, 1)
+        db.session.add(SportsLeagueCategory(league_id=self.football.id, category_name='PFL Sunday Ticket'))
+        db.session.commit()
+        self.described('The Ironvale Bears host the Harborview Gulls in PFL regular-season play.',
+                       title='Sunday Ticket 4', channel=self.channel(category='PFL Sunday Ticket'))
+        self.run_match()
+        self.assertEqual(self.matches(event), [])
+
+    def test_a_title_that_names_a_team_is_not_overruled_by_the_description(self):
+        event = self.game(2, 1)
+        self.game(13, 4, tsdb_id=990)
+        self.described('The Ironvale Bears host the Harborview Gulls in PFL regular-season play.',
+                       title='PFL Football - Panthers Week')
+        self.run_match()
+        self.assertEqual(self.matches(event), [])
+
+    def test_an_old_game_replayed_far_from_the_game_does_not_match(self):
+        event = self.game(2, 1)
+        self.described('The Ironvale Bears meet the Harborview Gulls during week 10 of the 2099 PFL season.',
+                       title='PFL Football', start=KICKOFF - timedelta(days=3))
+        self.run_match(now=KICKOFF - timedelta(days=3, hours=6))
+        self.assertEqual(self.matches(event), [])
+
+    def test_the_listings_dialog_shows_a_described_listing_a_length_kept_out(self):
+        from zoneinfo import ZoneInfo
+        event = self.game(2, 1)
+        self.described('The Ironvale Bears host the Harborview Gulls in PFL regular-season play.', minutes=60)
+        self.described('The Northgate Panthers host the Saint-Rémy Comets in PFL regular-season play.', minutes=60)
+        got = sports_match.skipped_listings(event.id, ZoneInfo('UTC'), False, sports_skips.SkipRules())
+        self.assertEqual([(g['title'], g['channels']) for g in got], [('Live: PFL Football', 1)])
 
 
 class FalseMatchTests(MatchCase):

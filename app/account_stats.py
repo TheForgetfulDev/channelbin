@@ -14,7 +14,7 @@ Two kinds, and the split is the design:
   `health_recompute.py` leaves it baked into a stored score.
 
 How the ledger is filled (`refresh_ledger`): each source table - recording segments,
-channel tests, channel events - is read above its watermark on `AccountStatState`, bucketed
+channel tests, channel events, IPTV output plays - is read above its watermark on `AccountStatState`, bucketed
 by the local day it started, ADDED to the day rows, and the watermark moved, all in one
 commit. Adding is safe precisely because the watermark moves in the same transaction as the
 counts: a crash loses both or neither. Nothing ever subtracts.
@@ -27,6 +27,7 @@ row that is still running is folded on a later pass once it has its final number
 - a test is finished when `test_ended_at` is set. Tests a restart interrupted are closed as
   CANCELLED at startup (app/scheduler.py), so none stays open forever.
 - an event is final when it is written.
+- a play is final when it is written: the output's log writes a play once, when it ended.
 
 What each source contributes:
 
@@ -39,12 +40,16 @@ What each source contributes:
   says nothing about the channel and counts in neither.
 - **event** -> `failovers_away`, for the four health observations a recording writes when
   it has to leave a channel (`FAILOVER_EVENT_TYPES`).
+- **play** -> `output_seconds`, from an ended play's `account_seconds`: how long each
+  account's ffmpeg ran for it, on the day the play started (dev/changelog/1676). A play with
+  no split (refused, redirected, or written before the split was kept) adds nothing.
 
 Rows whose channel is gone (deleted before they were folded) are passed with no account to
 credit. A **rebuild** (`rebuild_ledger`, run automatically when the display timezone
 changes, since every day boundary moved) truncates and refolds from the rows that still
 exist, so it is the one path that forgets pruned history.
 """
+import json
 import logging
 import threading
 from bisect import bisect_right
@@ -59,7 +64,8 @@ from .channel_groups import DEFAULT_FAILING_STREAK_THRESHOLD, guide_scope_channe
 from .channel_search import effective_health, health_band_expr
 from .database import (Account, AccountStatDay, AccountStatState, Channel, ChannelEvent,
                        ChannelGroup, ChannelGroupMember, ChannelTest, EPGEntry,
-                       Recording, RecordingSegment, REC_ENDED_STATUSES,
+                       OutputFeedPlay, Recording, RecordingSegment, REC_ENDED_STATUSES,
+                       FEED_PLAY_ENDED,
                        CHANNEL_FAILOVER_HEALTH_OBSERVATION,
                        CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION,
                        CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION,
@@ -94,7 +100,9 @@ INLINE_FOLD_LIMIT = 10_000
 _INLINE_LOCK_WAIT_SECONDS = 5
 
 _LEDGER_COLUMNS = ('capture_seconds', 'segments', 'recordings', 'stalls',
-                   'checks_passed', 'checks_failed', 'failovers_away')
+                   'checks_passed', 'checks_failed', 'failovers_away', 'output_seconds')
+# The ledger's durations; every other column is a count.
+_SECONDS_COLUMNS = frozenset({'capture_seconds', 'output_seconds'})
 
 # Held across read-watermark -> fold -> commit. The watermark comparison inside one
 # transaction makes a fold idempotent, but two folders reading the same watermark before
@@ -117,7 +125,7 @@ def _state():
 
 def _new_state(tz_name):
     state = AccountStatState(id=1, segment_watermark=0, test_watermark=0, event_watermark=0,
-                             tz_name=tz_name)
+                             play_watermark=0, tz_name=tz_name)
     db.session.add(state)
     return state
 
@@ -238,6 +246,37 @@ def _fold_events(state, tz, inc, limit):
     return ceiling, False
 
 
+def _fold_plays(state, tz, inc, limit):
+    """Add ended plays above the watermark to `inc`, each account's part on the local day
+    the play started. A play row is written once, when the play ended, so every row is final
+    and the watermark moves to the ceiling as `_fold_events` does."""
+    wm = state.play_watermark
+    ceiling = db.session.query(func.max(OutputFeedPlay.id)).scalar() or 0
+    if ceiling <= wm:
+        return wm, False
+    rows = (db.session.query(OutputFeedPlay.id, OutputFeedPlay.first_at,
+                             OutputFeedPlay.account_seconds)
+            .filter(OutputFeedPlay.id > wm, OutputFeedPlay.id <= ceiling,
+                    OutputFeedPlay.kind == FEED_PLAY_ENDED,
+                    OutputFeedPlay.account_seconds.isnot(None))
+            .order_by(OutputFeedPlay.id).limit(limit).all())
+    for r in rows:
+        try:
+            split = json.loads(r.account_seconds)
+            parts = [(int(aid), float(secs)) for aid, secs in split.items()]
+        except (ValueError, TypeError, AttributeError) as exc:
+            log.warning('Account stats: play %d has an unreadable account split (%s), so its '
+                        'time is credited to no account', r.id, exc)
+            continue
+        day = _local_day(r.first_at, tz)
+        for account_id, secs in parts:
+            if secs > 0:
+                inc[(account_id, day)]['output_seconds'] += secs
+    if len(rows) == limit:
+        return rows[-1].id, True
+    return ceiling, False
+
+
 _DAY_COLUMNS = ('account_id', 'day') + _LEDGER_COLUMNS
 # The fold reads Channel.account_id in an earlier statement than this one, and Python's
 # sqlite3 opens no transaction for a SELECT, so an account delete can commit in between.
@@ -270,9 +309,10 @@ def _fold_chunk(tz, tz_name, limit):
         seg_wm, seg_more = _fold_segments(state, tz, inc, limit)
         test_wm, test_more = _fold_tests(state, tz, inc, limit)
         event_wm, event_more = _fold_events(state, tz, inc, limit)
+        play_wm, play_more = _fold_plays(state, tz, inc, limit)
         passed = ((seg_wm - state.segment_watermark) + (test_wm - state.test_watermark)
-                  + (event_wm - state.event_watermark))
-        more = seg_more or test_more or event_more
+                  + (event_wm - state.event_watermark) + (play_wm - state.play_watermark))
+        more = seg_more or test_more or event_more or play_more
         rebuild_finished = not more and state.rebuild_started_at is not None and (
             state.rebuilt_at is None or state.rebuilt_at < state.rebuild_started_at)
 
@@ -287,7 +327,7 @@ def _fold_chunk(tz, tz_name, limit):
             # already holds - a statement per day row would scale with the history folded.
             db.session.execute(_UPSERT, [
                 {'account_id': account_id, 'day': day,
-                 **{c: (counts.get(c, 0) if c == 'capture_seconds' else int(counts.get(c, 0)))
+                 **{c: (counts.get(c, 0) if c in _SECONDS_COLUMNS else int(counts.get(c, 0)))
                     for c in _LEDGER_COLUMNS}}
                 for (account_id, day), counts in inc.items()])
 
@@ -295,6 +335,7 @@ def _fold_chunk(tz, tz_name, limit):
         state.segment_watermark = max(state.segment_watermark, seg_wm)
         state.test_watermark = max(state.test_watermark, test_wm)
         state.event_watermark = max(state.event_watermark, event_wm)
+        state.play_watermark = max(state.play_watermark, play_wm)
         now = datetime.utcnow()
         state.refreshed_at = now
         if rebuild_finished:
@@ -317,6 +358,7 @@ def _reset_for_rebuild(tz_name, reason):
         state.segment_watermark = 0
         state.test_watermark = 0
         state.event_watermark = 0
+        state.play_watermark = 0
         state.tz_name = tz_name
         state.rebuild_started_at = datetime.utcnow()
         db.session.commit()
@@ -343,8 +385,9 @@ def _fold_all(tz, tz_name, progress=None):
     elif state is not None and state.rebuild_started_at is not None and (
             state.rebuilt_at is None or state.rebuilt_at < state.rebuild_started_at):
         log.warning('Resuming an interrupted account stats ledger rebuild (started %s UTC) '
-                    'from segment %d, test %d, event %d', state.rebuild_started_at,
-                    state.segment_watermark, state.test_watermark, state.event_watermark)
+                    'from segment %d, test %d, event %d, play %d', state.rebuild_started_at,
+                    state.segment_watermark, state.test_watermark, state.event_watermark,
+                    state.play_watermark)
     total = 0
     while True:
         passed, more = _fold_chunk(tz, tz_name, FOLD_CHUNK)
@@ -388,6 +431,7 @@ def pending_rows():
     seg_wm = state.segment_watermark if state else 0
     test_wm = state.test_watermark if state else 0
     event_wm = state.event_watermark if state else 0
+    play_wm = state.play_watermark if state else 0
     segs = db.session.query(func.count(RecordingSegment.id)).filter(RecordingSegment.id > seg_wm)
     seg_stop = _first_unfinished_segment_id(seg_wm)
     if seg_stop is not None:
@@ -398,7 +442,9 @@ def pending_rows():
         tests = tests.filter(ChannelTest.id < test_stop)
     return (segs.scalar() + tests.scalar()
             + db.session.query(func.count(ChannelEvent.id))
-            .filter(ChannelEvent.id > event_wm).scalar())
+            .filter(ChannelEvent.id > event_wm).scalar()
+            + db.session.query(func.count(OutputFeedPlay.id))
+            .filter(OutputFeedPlay.id > play_wm).scalar())
 
 
 def _catch_up_notice():
@@ -512,8 +558,7 @@ def window_bounds(window, today):
 
 
 def _empty_totals():
-    totals = {c: 0 for c in _LEDGER_COLUMNS}
-    totals['capture_seconds'] = 0.0
+    totals = {c: (0.0 if c in _SECONDS_COLUMNS else 0) for c in _LEDGER_COLUMNS}
     totals['pass_rate'] = None
     return totals
 
@@ -544,6 +589,14 @@ def windowed_stats(account_ids, window, today):
     for totals in out.values():
         _with_pass_rate(totals)
     return out
+
+
+def ever_streamed(account_ids):
+    """Whether any of `account_ids` has ever streamed to an IPTV player, in one query."""
+    if not account_ids:
+        return False
+    return db.session.query(exists().where(AccountStatDay.account_id.in_(account_ids),
+                                           AccountStatDay.output_seconds > 0)).scalar()
 
 
 def _week_start(d):

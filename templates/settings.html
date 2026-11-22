@@ -529,7 +529,11 @@
         {{ field_number('hosts.roll_cooldown_minutes', 'Host roll cooldown (minutes)',
            'When a capture fails because an account\'s active stream host stopped resolving, ChannelBin swaps the account to the next host on its list. This is the least time between two such swaps on one account, so a flaky resolver cannot walk the whole list in a minute. The list itself is on each account\'s page.', hosts_cfg.get('roll_cooldown_minutes', 10), tier='advanced') }}
         {{ field_number('hosts.check_interval_hours', 'Host check interval (hours)',
-           'How often every listed host is looked up in DNS so the account page can show which ones still resolve. A lookup only - nothing is opened on the provider, and a failed check never swaps hosts by itself.', hosts_cfg.get('check_interval_hours', 6), tier='advanced') }}
+           'How often every listed host is checked on its own, so the account page can show which ones still work. What that check does is the next setting. A check never swaps hosts by itself.', hosts_cfg.get('check_interval_hours', 6), tier='advanced') }}
+        {{ field_select('hosts.scheduled_check', 'Scheduled host check',
+           'Look up only asks DNS whether each name still exists, and nothing reaches the provider. Full check also connects to each host and asks it for an answer, with no login in it, one host at a time. Check now and Check all on an account always do the full check.', hosts_cfg.get('scheduled_check', 'lookup'), [('lookup', 'Look up only'), ('full', 'Full check')], tier='advanced') }}
+        {{ field_number('hosts.check_spacing_seconds', 'Time between host checks (seconds)',
+           'A full check waits about this long after one host before it starts the next, give or take a quarter, so a reseller never sees its hosts tested all at once. Every check waits in the same line, so starting several never shortens the wait. No host is checked twice in 10 minutes. At least 10.', hosts_cfg.get('check_spacing_seconds', 60), tier='advanced') }}
         {{ field_number('logins.refusal_cooldown_minutes', 'Login refusal cooldown (minutes)',
            'When a capture fails because the server refused one of an account\'s listed logins (401 or 403), that login is skipped for this long while another login on the account has a free seat. With no other login it is tried again at once. The list itself is on each account\'s page.', logins_cfg.get('refusal_cooldown_minutes', 30), tier='advanced') }}
       </div>

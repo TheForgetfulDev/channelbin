@@ -379,6 +379,34 @@ class WatchingTests(_PageCase):
         for code in (feed.REASON_FFMPEG_EXITED, feed.REASON_CONNECT_TIMEOUT):
             self.assertNotIn(code, watching)
 
+    def test_a_group_play_offers_the_move_and_a_single_channel_says_why_not(self):
+        """dev/changelog/1675: the move is offered where there is somewhere to go, and a single
+        channel's menu says there is nowhere rather than leaving the action out."""
+        group_play = self.session(feed.feed_id_for_group(self.group.id))
+        group_play.fails_over = True
+        watching = _region(self.page(), 'of-watching')
+        self.assertRegex(watching, rf'data-act="move-play" data-id="{group_play.id}"[^>]*'
+                                   r'data-channel="Alpha">Move to another channel</button>')
+        self.assertNotIn(feed.MOVE_NOWHERE_TEXT, watching)
+        self.assertIn('js/play-move.js', self.page())
+        feed._finish(group_play, feed.REASON_STOPPED)
+        self.session(feed.feed_id_for_channel(self.alpha.id))
+        watching = _region(self.page(), 'of-watching')
+        self.assertNotIn('data-act="move-play"', watching)
+        self.assertIn(f'<button class="menu-item" disabled>{feed.MOVE_NOWHERE_TEXT}</button>', watching)
+
+    def test_the_dashboard_offers_the_same_move(self):
+        group_play = self.session(feed.feed_id_for_group(self.group.id))
+        group_play.fails_over = True
+        html = self.client.get('/').get_data(as_text=True)
+        self.assertRegex(html, rf'data-act="move-play" data-id="{group_play.id}"[^>]*'
+                               r'>Move to another channel</button>')
+        self.assertIn('js/play-move.js', html)
+        group_play.fails_over = False
+        html = self.client.get('/').get_data(as_text=True)
+        self.assertNotIn('data-act="move-play"', html)
+        self.assertIn(feed.MOVE_NOWHERE_TEXT, html)
+
     def test_an_ended_play_keeps_why_it_moved_in_recent_plays(self):
         """A sports channel has no group timeline, so the play's own line is where a move's
         reason outlives the play (dev/changelog/1568)."""

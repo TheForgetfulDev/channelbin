@@ -95,6 +95,7 @@
       {{ m.account_type_badge(account_type) }}
       {{ m.account_extra_badges(account) }}
       {{ m.account_block_badge(blocks) }}
+      {{ m.account_playlist_badge(playlist_host_off, playlist_login_off) }}
     </div>
     <p class="gd-sub-lead">
       {% if st == ACCOUNT_STATUS.UNSYNCED %}
@@ -153,6 +154,25 @@
   <strong>{{ constructed_mode_label }}</strong> URL form{% endif %}. This is often normal and is not a
   problem while those channels play. If they do not, the declared origin and the URL Normalization
   mode are the first two things to check.
+  {% if not (stream_check and stream_check.check.status in (STREAM_CHECK.WAITING, STREAM_CHECK.RUNNING)) %}
+  <div class="acct-block-line"><button type="button" class="btn btn-sm" data-act="stream-check">Test a few channels</button></div>
+  {% endif %}
+</div>
+{% endif %}
+{# The latest stream check (app/stream_check.py, dev/changelog/1665). Every state is drawn
+   from stream_check.view(), which names them all; a passed one leaves after a day, and the
+   Content card's row keeps it. #}
+{% if stream_check and stream_check.notice %}
+<div class="notice notice-{{ stream_check.tone }}" id="acct-stream-check">
+  <strong>{{ stream_check.title }}</strong><br>
+  {{ stream_check.body }}
+  {% for r in stream_check.rows %}
+  <div class="small"><a href="{{ url_for('channels.channel_detail', channel_id=r.channel_id) }}">{{ r.name }}</a>{% if r.category %} <span class="text-faint">({{ r.category }})</span>{% endif %}: {{ r.words }}{% if r.show_detail %} <span class="text-faint">- {{ r.detail }}</span>{% endif %}</div>
+  {% endfor %}
+  {% if stream_check.check.finished_at %}<div class="text-faint small">Checked {{ stream_check.check.finished_at | local_time }}.</div>{% endif %}
+  {% if stream_check.rerun %}
+  <div class="acct-block-line"><button type="button" class="btn btn-sm" data-act="stream-check">Test other channels</button></div>
+  {% endif %}
 </div>
 {% endif %}
 {# Every block in force or still to come, each with its own way out. Info, not a warning:
@@ -189,6 +209,34 @@
   {% endfor %}
 </div>
 {% endfor %}
+{# The switches (app/account_links.py, dev/changelog/1671). Everything off is the one that
+   stops every stream, so it is said instead of the softer line below, never beside it. #}
+{% if unusable %}
+<div class="notice notice-bad" id="acct-switches">
+  <strong>{{ icon('warning') }} Nothing on this account can stream</strong><br>
+  {% if unusable == UNUSABLE.HOSTS %}Every host on it is turned off. Turn one on, or add one, on the Hosts card.
+  {% elif unusable == UNUSABLE.LOGINS %}Every login on it is turned off. Turn one on, or add one, on the Logins card.
+  {% else %}{{ unusable }}{% endif %}
+  Recordings, health checks and previews on it don't start until then.
+</div>
+{% elif playlist_host_off or playlist_login_off %}
+{% set both = playlist_host_off and playlist_login_off %}
+<div class="notice notice-info" id="acct-switches">
+  <strong>Streams skip the playlist's {{ 'host and login' if both else ('host' if playlist_host_off else 'login') }}</strong><br>
+  The playlist says to use {% if playlist_host_off %}host <code>{{ playlist_host_off.host }}</code>{% endif %}{% if both %} and {% endif %}{% if playlist_login_off %}login <code>{{ playlist_login_off.username }}</code>{% endif %}.
+  {{ 'Both are' if both else 'It is' }} turned off below, so ChannelBin uses the other {{ 'hosts and logins' if both else ('hosts' if playlist_host_off else 'logins') }} listed here instead.
+</div>
+{% endif %}
+{# The active host did not answer at its last full check (app/host_checks.py,
+   dev/changelog/1674). A warning, not a change: a host is swapped only when it stops
+   resolving, so the way out is Make active on the Hosts card. #}
+{% if host_not_answering %}
+<div class="notice notice-warn" id="acct-host-not-answering">
+  <strong>{{ icon('warning') }} The active host isn't answering</strong><br>
+  <code>{{ host_not_answering }}</code> didn't answer at its last check. Streams on this account still use it,
+  because a host is swapped only when it stops resolving. Make another host active on the Hosts card to move now.
+</div>
+{% endif %}
 {% if not account.sync_enabled and st != ACCOUNT_STATUS.UNSYNCED %}
 <div class="notice notice-info">
   <strong>Automatic sync is off for this account</strong><br>
@@ -229,7 +277,10 @@
     <span class="menu-wrap">
       <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
       <div class="menu" id="acct-kebab">
+        <button class="menu-item" data-act="stream-check"{% if st in (ACCOUNT_STATUS.UNSYNCED, ACCOUNT_STATUS.SYNCING) %} disabled{% endif %}
+                data-tip="Test a few channels.&#10;Test-plays up to 5 of this account's channels, one at a time, to show its stream URLs play at all. It stops as soon as one plays.">Test a few channels</button>
         <button class="menu-item" data-act="block">Block account use&hellip;</button>
+        {% if hosts %}<button class="menu-item" data-act="hosts-check">Check hosts</button>{% endif %}
         <button class="menu-item" data-act="settings">Edit settings&hellip;</button>
         <button class="menu-item" data-act="sections">Customize sections&hellip;</button>
         <div class="sep"></div>
@@ -279,7 +330,7 @@
         <div class="srow"><span class="sk">Sync interval</span>
           <span class="sv tip-plain" data-tip="Sync interval.&#10;How often this account is refreshed. (global) means it follows sync.sync_interval_hours in Settings rather than carrying its own value.">every {{ settings.interval_hours }}h{% if settings.interval_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
         <div class="srow"><span class="sk">Max connections</span>
-          <span class="sv tip-plain" data-tip="Max simultaneous connections.&#10;The cap on concurrent connections ChannelBin opens to this provider - recordings, channel tests and previews combined. Account sync does not count against it.{% if settings.max_connections_logins %}&#10;The sum of the seats on this account's listed logins; the Max connections setting is not read while any login is listed.{% endif %}">{{ settings.max_connections }}{% if settings.max_connections_logins %} <span class="text-faint sv-inherit">(logins: {{ settings.max_connections_logins }})</span>{% elif settings.max_connections_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
+          <span class="sv tip-plain" data-tip="Max simultaneous connections.&#10;The cap on concurrent connections ChannelBin opens to this provider - recordings, channel tests and previews combined. Account sync does not count against it.{% if settings.max_connections_logins %}&#10;The sum of the seats on this account's logins that are turned on. The login that comes with the playlist has as many seats as the Max connections setting says.{% endif %}">{{ settings.max_connections }}{% if settings.max_connections_logins %} <span class="text-faint sv-inherit">(logins: {{ settings.max_connections_logins }})</span>{% elif settings.max_connections_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
         {% if is_xtream %}
         {# What the provider itself reports in its auth response (dev/changelog/534) -
            separate from the sync-health Status row above and the configured Max
@@ -335,59 +386,90 @@
     </div>
   </div>
 
-  {# Hosts (DESIGN-account-providers.md §4, §6.3): the other names the reseller handed out
-     for this account's server, one active. Every state a host can be in is named - a
-     trailing else would become the home for the next one somebody adds. The list is the
-     user's; app/account_links.py is its one writer, and the page only shows it. The host
-     the streams are on is always a row: the stamped Account.stream_host, shown when it is
-     not one of the listed hosts, with no menu because it has no host id to act on
+  {# Hosts (DESIGN-account-providers.md §4, §6.3, §13): the other names the reseller handed
+     out for this account's server, one active, and the playlist's own host as a row the sync
+     lists (dev/changelog/1670). Every row has a Use switch, the user's; app/account_links.py
+     is its one writer, and the page only shows it. Every state a host can be in is named - a
+     trailing else would become the home for the next one somebody adds. Before an account's
+     first sync since the rows existed, the host the streams are on is a row of its own: the
+     stamped Account.stream_host, with no switch or menu because it has no host id to act on
      (dev/changelog/1176). #}
   {% set host_rows = (hosts | length) + (1 if unlisted_host else 0) %}
   <div class="card" data-section="hosts">
     <div class="card-head" id="acct-hosts-head"><h2>Hosts{% if host_rows %} <span class="cnt">{{ host_rows }}</span>{% endif %}</h2>
       <div class="card-head-actions">
+        {% if hosts %}
+        {% set hosts_busy = hosts | selectattr('queue') | list %}
+        <button class="btn btn-sm" data-act="hosts-check"{% if hosts_busy %} disabled{% endif %}
+                data-tip="Check all.&#10;Tests the {{ hosts | length }} host{{ 's' if hosts | length != 1 }} on this account, one at a time about {{ host_spacing }} seconds apart. No login is sent and no stream is opened.">{{ 'Checking...' if hosts_busy else 'Check all' }}</button>
+        {% endif %}
         <button class="btn btn-sm" data-act="host-add"
-                data-tip="Add another host name this account's streams can be reached on. When the active one stops resolving, ChannelBin swaps every stream URL on this account to the next one that does.">+ Add host</button>
+                data-tip="Add another host name this account's streams can be reached on. When the active one stops resolving, ChannelBin swaps every stream URL on this account to the next one that is turned on and resolves.">+ Add host</button>
       </div>
     </div>
     <div class="card-body" id="acct-hosts-body">
       {% if not host_rows %}
       <p class="card-note">No stream URLs yet. The host shows here after the first sync.</p>
       {% else %}
-      <p class="card-note">{% if hosts %}When the active host stops resolving, every stream URL moves to the next one that does, and an alert says so.{% else %}Add the other hosts your reseller gave you, and ChannelBin swaps to one that works when this one stops resolving.{% endif %}</p>
+      <p class="card-note">{% if hosts %}Streams use the active host. If it stops resolving, ChannelBin moves to the next host that's turned on, picks one that answered at its last check first, and an alert says so. A check looks each name up, connects, and asks the server for an answer, without logging in. Turn off any host you don't want used, including the one from the playlist.{% else %}Add the other hosts your reseller gave you, and ChannelBin swaps to one that works when this one stops resolving.{% endif %}</p>
+      {% if host_progress %}
+      <div class="notice notice-info" data-host-progress>
+        <strong>{{ host_progress.title }}</strong><br>
+        {{ host_progress.body }}
+        <div class="acct-block-line"><button type="button" class="btn btn-sm" data-act="hosts-check-stop">Stop checking</button></div>
+      </div>
+      {% endif %}
       <div class="table-scroll">
         <table class="tbl tbl-cards">
-          <thead><tr><th>Host</th><th>Role</th><th>Resolves</th><th></th></tr></thead>
+          <thead><tr><th>Host</th><th>Use</th><th>Role</th><th>Answers</th><th></th></tr></thead>
           <tbody>
           {% if unlisted_host %}
           <tr data-host-row="streams">
             <td data-label="Host"><code>{{ unlisted_host }}</code><div class="text-faint small">Where the streams are</div></td>
+            <td data-label="Use"><span class="text-faint tip-plain" data-tip="The next sync lists this host as a row with a switch, and so does adding a host. Until then it has no switch.">Not listed yet</span></td>
             <td data-label="Role">
               {% if hosts %}<span class="tip-plain" data-tip="Most of this account's stream URLs are on this host, and it is not on the list, so a host swap does not move them.">{{ m.status_badge('b-warn', 'Not listed') }}</span>
               {% else %}{{ m.status_badge('b-done', 'Active') }}{% endif %}</td>
-            <td data-label="Resolves"><span class="text-faint tip-plain" data-tip="Only listed hosts are checked. Add a host and this one goes on the list too.">Not checked</span></td>
+            <td data-label="Answers"><span class="text-faint tip-plain" data-tip="Only listed hosts are checked. Add a host and this one goes on the list too.">Not checked</span></td>
             <td class="num"></td>
           </tr>
           {% endif %}
           {% for h in hosts %}
-          <tr>
-            <td data-label="Host"><code>{{ h.host }}</code></td>
+          <tr data-host-row="{{ h.id }}">
+            <td data-label="Host"><code>{{ h.host }}</code>{% if h.from_playlist %}<div class="text-faint small">From the playlist</div>{% endif %}</td>
+            <td data-label="Use"><label class="switch" aria-label="Use host {{ h.host }}"><input type="checkbox" data-switch="host" data-host-id="{{ h.id }}"{% if h.enabled %} checked{% endif %}><span class="knob"></span></label></td>
             <td data-label="Role">
-              {% if h.is_active %}{{ m.status_badge('b-done', 'Active') }}{% if h.activated_at %}<div class="text-faint small">since {{ h.activated_at | local_time }}</div>{% endif %}
+              {% if not h.enabled %}<span class="text-faint">Off</span>{% if h.switched_at %}<div class="text-faint small">since {{ h.switched_at | local_time }}</div>{% endif %}
+              {% elif h.is_active %}{{ m.status_badge('b-done', 'Active') }}{% if h.activated_at %}<div class="text-faint small">since {{ h.activated_at | local_time }}</div>{% endif %}
               {% else %}<span class="text-faint">Standby</span>{% endif %}</td>
-            <td data-label="Resolves">
-              {% if h.state == 'resolving' %}{{ m.status_badge('b-done', 'Yes') }}<div class="text-faint small">checked {{ h.last_resolved_at | local_time }}</div>
-              {% elif h.state == 'failing' %}{{ m.status_badge('b-fail', 'No') }}<div class="small">{{ h.error }}</div>{% if h.last_resolved_at %}<div class="text-faint small">last resolved {{ h.last_resolved_at | local_time }}</div>{% endif %}
-              {% elif h.state == 'unchecked' %}<span class="text-faint">Not checked yet</span>
+            <td data-label="Answers">
+              {% if h.queue == 'checking' %}<div><span class="badge b-auto tip-plain" data-tip="Checking.&#10;Looking the name up, connecting, and asking the server for an answer.">Checking</span></div>
+              {% elif h.queue == 'waiting' %}<div><span class="badge b-auto tip-plain" data-tip="Waiting its turn.&#10;Hosts are checked one at a time, about {{ host_spacing }} seconds apart.">Waiting</span></div><div class="text-faint small">{% if h.ahead %}{{ h.ahead }} host{{ 's' if h.ahead != 1 }} ahead{% else %}next{% endif %}</div>
+              {% endif %}
+              {% if h.check %}
+              <div{% if h.queue %} class="text-faint"{% endif %}>{% if h.queue %}<span class="small">Last time: </span>{% endif %}<span class="badge {{ h.check.badge }} tip-plain" data-tip="{{ h.check.tip }}">{{ h.check.label }}</span>{% if h.fastest %} <span class="badge b-auto tip-plain" data-tip="Fastest.&#10;The quickest answer of the hosts on this account that answered at their last check.">Fastest</span>{% endif %}</div>
+              <div class="small">{{ h.check.line }}</div>
+              <div class="text-faint small">{{ 'looked up' if h.check.from_lookup else 'checked' }} {{ h.check.at | local_time }}{% if h.checks %} &middot; answered {{ h.answered }} of {{ h.checks }} check{{ 's' if h.checks != 1 }}{% endif %}{% if h.still_resolves_at %} &middot; still resolves at {{ h.still_resolves_at | local_time }}{% endif %}</div>
+              {% elif h.lookup %}
+              <span class="text-faint tip-plain" data-tip="Not tested yet.&#10;The scheduled check only looks the name up. Check now connects to it and asks for an answer.">Not tested yet</span>
+              <div class="text-faint small">{% if h.lookup.ok %}resolves{% else %}doesn't resolve: {{ h.lookup.error }}{% endif %}{% if h.lookup.at %}, looked up {{ h.lookup.at | local_time }}{% endif %}</div>
+              {% else %}
+              <span class="text-faint">Not checked yet</span>
               {% endif %}</td>
             <td class="num">
               <span class="menu-wrap">
                 <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ h.host }}">{{ icon('more') }}</button>
                 <div class="menu">
-                  <button class="menu-item" data-act="host-activate" data-host-id="{{ h.id }}" data-host="{{ h.host }}"{% if h.is_active %} disabled{% endif %}
-                          data-tip="Move every stream URL on this account to this host now.">Make active</button>
+                  {% if h.queue %}<button class="menu-item" disabled>Check now (already in line)</button>
+                  {% else %}<button class="menu-item" data-act="host-check" data-host-id="{{ h.id }}"{% if h.recent_until %} data-tip="Checked in the last 10 minutes. A host is checked at most once every 10 minutes; this one can be checked again at {{ h.recent_until | local_time }}."{% endif %}>Check now</button>{% endif %}
+                  <button class="menu-item" data-act="host-activate" data-host-id="{{ h.id }}" data-host="{{ h.host }}"{% if h.is_active or not h.enabled %} disabled{% endif %}
+                          data-tip="{% if not h.enabled %}Turned off. Turn it on to make it active.{% else %}Move every stream URL on this account to this host now.{% endif %}">Make active</button>
                   <div class="sep"></div>
+                  {% if h.from_playlist %}
+                  <button class="menu-item" disabled>From the playlist, so it can't be removed. Turn it off instead.</button>
+                  {% else %}
                   <button class="menu-item danger" data-act="host-remove" data-host-id="{{ h.id }}" data-host="{{ h.host }}" data-active="{{ '1' if h.is_active else '' }}" data-others="{{ hosts | length - 1 }}">Remove</button>
+                  {% endif %}
                 </div>
               </span>
             </td>
@@ -400,15 +482,17 @@
     </div>
   </div>
 
-  {# Logins (DESIGN-account-providers.md §5, §6.3): the username/passwords this account
-     accepts beyond its own, each with its seats. A capture takes a seat on one and is
-     launched with its credentials. Every row is one of two refusal states and both are
-     named; the password is never in the view. The list is the user's; app/account_links.py
-     is its one writer, and the page only shows it. The account's own login is always a
-     row too (own_login_view(), dev/changelog/1176) unless a listed login is the same one;
-     its menu edits the account, the only place its username and password live. #}
+  {# Logins (DESIGN-account-providers.md §5, §6.3, §13): the username/passwords this account
+     accepts, each with its seats, and the playlist's own login as a row the sync lists
+     (dev/changelog/1670). A capture takes a seat on one and is launched with its
+     credentials. Every row has a Use switch, for this account only; app/account_links.py is
+     its one writer, and the page only shows it. Every refusal state is named; the password
+     is never in the view. The account's own login - what syncs use - is a row of its own
+     while no listed login is the same one (own_login_view(), dev/changelog/1176); its menu
+     edits the account, the only place its username and password live. #}
   {% set own_row = own_login and not own_login.same_as %}
   {% set login_rows = (logins | length) + (1 if own_row else 0) %}
+  {% set logins_on = logins | selectattr('enabled') | list | length %}
   <div class="card" data-section="logins">
     <div class="card-head" id="acct-logins-head"><h2>Logins <span class="cnt">{{ login_rows }}</span></h2>
       <div class="card-head-actions">
@@ -417,17 +501,28 @@
       </div>
     </div>
     <div class="card-body" id="acct-logins-body">
-      <p class="card-note">{% if logins %}Recordings, health checks and previews take a seat on the first login with one free. {% if logins | length > 1 %}A login the server refuses is skipped for a while, and an alert says so.{% else %}If the server refuses it, an alert says so, and with no other login to take over, captures keep trying it.{% endif %}{% else %}Add another login to run more streams at once or keep a spare.{% endif %}</p>
+      <p class="card-note">{% if logins %}Each login is good for its seats, so two logins means two streams at once. Recordings, health checks and previews take a seat on the first login that's turned on, isn't blocked and has one free. {% if logins_on > 1 %}A login the server refuses is skipped for a while, and an alert says so.{% else %}If the server refuses it, an alert says so, and with no other login to take over, captures keep trying it.{% endif %} Turn off any login you don't want used, including the one from the playlist.{% else %}Add another login to run more streams at once or keep a spare.{% endif %}</p>
       <div class="table-scroll">
         <table class="tbl tbl-cards">
-          <thead><tr><th>Login</th><th>Seats</th><th>Refused</th><th></th></tr></thead>
+          <thead><tr><th>Login</th><th>Use</th><th>Seats</th><th>Refused</th><th></th></tr></thead>
           <tbody>
           {% for lg in logins %}
-          <tr>
-            <td data-label="Login"><strong>{{ lg.name }}</strong><div class="text-faint small"><code>{{ lg.username }}</code></div>{% if lg.shared_with %}<div class="small">Shared with {{ lg.shared_with | join(', ') }}</div>{% endif %}{% if own_login and own_login.same_as == lg.id %}<div class="text-faint small">The account's own login, also used by syncs</div>{% endif %}</td>
-            <td data-label="Seats">{{ lg.held }} of {{ lg.max_connections }} in use{% if lg.holders %}<div class="text-faint small">{{ lg.holders }}</div>{% endif %}</td>
+          <tr data-login-row="{{ lg.id }}">
+            <td data-label="Login">
+              {% if lg.from_playlist and lg.sync_listed %}<strong>From the playlist</strong><div class="text-faint small"><code>{{ lg.username }}</code></div>
+              {% else %}<strong>{{ lg.name }}</strong><div class="text-faint small"><code>{{ lg.username }}</code></div>{% if lg.from_playlist %}<div class="text-faint small">From the playlist</div>{% endif %}
+              {% endif %}
+              {% if lg.playlist_of %}<div class="text-faint small">From {{ lg.playlist_of }}'s playlist</div>{% endif %}
+              {% if lg.shared_with %}<div class="small">Shared with {{ lg.shared_with | join(', ') }}</div>{% endif %}
+              {% if own_login and own_login.same_as == lg.id %}<div class="text-faint small">The account's own login, {{ 'which syncs still use' if not lg.enabled else 'also used by syncs' }}</div>{% endif %}</td>
+            <td data-label="Use"><label class="switch" aria-label="Use login {{ lg.username }}"><input type="checkbox" data-switch="login" data-login-id="{{ lg.id }}"{% if lg.enabled %} checked{% endif %}><span class="knob"></span></label></td>
+            <td data-label="Seats">
+              {% if not lg.enabled %}<span class="text-faint">Off</span>{% if lg.switched_at %}<div class="text-faint small">since {{ lg.switched_at | local_time }}</div>{% endif %}{% if lg.held %}<div class="text-faint small">{{ lg.holders }} still on it</div>{% endif %}
+              {% elif lg.blocked %}<span class="text-warning">Blocked until {{ lg.blocked.stop_label }}</span>{% if lg.held %}<div class="text-faint small">{{ lg.holders }} still on it</div>{% endif %}
+              {% else %}{{ lg.held }} of {{ lg.max_connections }} in use{% if lg.holders %}<div class="text-faint small">{{ lg.holders }}</div>{% endif %}
+              {% endif %}</td>
             <td data-label="Refused">
-              {% if lg.refused %}{{ m.status_badge('b-fail', 'Yes') }}<div class="small">{{ lg.last_refused_at | local_time }}: {{ lg.last_refused_detail }}</div><div class="text-faint small">{% if logins | length > 1 %}Skipped while another login has a free seat.{% else %}Still used: it is this account's only login, so captures keep trying it.{% endif %}</div>
+              {% if lg.refused %}{{ m.status_badge('b-fail', 'Yes') }}<div class="small">{{ lg.last_refused_at | local_time }}: {{ lg.last_refused_detail }}</div><div class="text-faint small">{% if logins_on > 1 %}Skipped while another login has a free seat.{% else %}Still used: it is this account's only login turned on, so captures keep trying it.{% endif %}</div>
               {% elif lg.last_refused_at %}<span class="text-faint">Not lately</span><div class="text-faint small">last refused {{ lg.last_refused_at | local_time }}</div>
               {% else %}<span class="text-faint">Never</span>
               {% endif %}</td>
@@ -435,11 +530,24 @@
               <span class="menu-wrap">
                 <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for login {{ lg.name }}">{{ icon('more') }}</button>
                 <div class="menu">
+                  {% if lg.sync_listed %}
+                  <button class="menu-item" disabled>From {{ 'the' if lg.from_playlist else lg.playlist_of ~ "'s" }} playlist, so it follows the playlist and can't be edited.</button>
+                  {% else %}
                   <button class="menu-item" data-act="login-edit" data-login-id="{{ lg.id }}" data-shared-with="{{ lg.shared_with | join(', ') }}">Edit</button>
+                  {% endif %}
                   <button class="menu-item" data-act="login-move" data-login-id="{{ lg.id }}" data-direction="up"{% if lg.first %} disabled{% endif %}>Move up</button>
                   <button class="menu-item" data-act="login-move" data-login-id="{{ lg.id }}" data-direction="down"{% if lg.last %} disabled{% endif %}>Move down</button>
+                  {% if lg.blocked %}
+                  <button class="menu-item" data-act="login-unblock" data-login-id="{{ lg.id }}">Unblock</button>
+                  {% else %}
+                  <button class="menu-item" data-act="login-block" data-login-id="{{ lg.id }}" data-login="{{ lg.name }}" data-shared-with="{{ lg.shared_with | join(', ') }}">Block use&hellip;</button>
+                  {% endif %}
                   <div class="sep"></div>
+                  {% if lg.from_playlist and lg.sync_listed %}
+                  <button class="menu-item" disabled>From the playlist, so it can't be removed. Turn it off instead.</button>
+                  {% else %}
                   <button class="menu-item danger" data-act="login-remove" data-login-id="{{ lg.id }}" data-login="{{ lg.name }}" data-held="{{ lg.held }}" data-shared-with="{{ lg.shared_with | join(', ') }}">Remove</button>
+                  {% endif %}
                 </div>
               </span>
             </td>
@@ -448,6 +556,7 @@
           {% if own_row %}
           <tr data-login-row="own">
             <td data-label="Login"><strong>Account's own</strong><div class="text-faint small">{% if own_login.username %}<code>{{ own_login.username }}</code>{% else %}from the playlist{% endif %}</div></td>
+            <td data-label="Use">{% if own_login.syncs_only %}<span class="text-faint tip-plain" data-tip="Syncs always use the account's own login, and a sync takes no seat. Streams never use this row, so it has no switch.">Not for streams</span>{% else %}<span class="text-faint tip-plain" data-tip="When the playlist's stream URLs carry a username and password, the next sync lists them as a row with a switch, and so does adding a login. Until then this row has no switch.">Not listed yet</span>{% endif %}</td>
             <td data-label="Seats">
               {% if own_login.syncs_only %}<span class="text-faint tip-plain" data-tip="Recordings, health checks and previews use the logins above. Syncs use this one, and a sync takes no seat.">Syncs only</span>
               {% else %}{{ own_login.held }} of {{ settings.max_connections }} in use{% if settings.max_connections_inherited %} <span class="text-faint">(global)</span>{% endif %}{% if own_login.holders %}<div class="text-faint small">{{ own_login.holders }}</div>{% endif %}
@@ -466,6 +575,19 @@
           </tbody>
         </table>
       </div>
+      {# What the next stream would be launched with (account_links.next_stream(), the pick
+         try_acquire() makes), every state named. None for an account that lists nothing. #}
+      {% if next_stream %}
+      {% if next_stream.state == NEXT_STREAM.FREE %}
+      <p class="card-note" id="acct-next-stream">The next stream will use {% if next_stream.login %}login <strong>{{ next_stream.login.name }}</strong>{% else %}the playlist's login{% endif %}{% if next_stream.host %} on host <code>{{ next_stream.host }}</code>{% endif %}.</p>
+      {% elif next_stream.state == NEXT_STREAM.FULL %}
+      <p class="card-note" id="acct-next-stream">No seat is free right now, so the next stream waits for one. A recording stops a preview or a channel test for its seat.</p>
+      {% elif next_stream.state in (NEXT_STREAM.BLOCKED, NEXT_STREAM.UNUSABLE) %}
+      <p class="card-note text-warning" id="acct-next-stream">The next stream won't start: {{ next_stream.reason }}.</p>
+      {% else %}
+      <p class="card-note" id="acct-next-stream">{{ next_stream.state }}</p>
+      {% endif %}
+      {% endif %}
     </div>
   </div>
 
@@ -510,6 +632,10 @@
         <div class="srow"><span class="sk">Failing right now</span><span class="sv tip-plain" data-tip="{{ stats.failing_tip }}">
           {%- if cur.failing %}<span class="hb-poor hb-text">{{ '{:,}'.format(cur.failing) }}</span>{% else %}<span class="text-faint">0</span>{% endif -%}
         </span></div>
+        {{ m.stat_row('Stream check',
+                      stream_check.summary if stream_check else 'Never run',
+                      stream_check.summary_tone if stream_check else 'faint',
+                      tip='Stream check.&#10;A few of this account\'s channels test-played, to show its stream URLs play at all. More actions, Test a few channels runs one.') }}
         {{ m.stat_row('Constructed stream URLs',
                       '{:,}'.format(account.constructed_stream_url_count or 0),
                       'warn' if account.constructed_stream_url_count else 'faint',
@@ -540,7 +666,7 @@
      priority order that decides which one a channel's guide comes from. A url source's
      address is account-owned and masked in full, like every other account URL (§17.4). #}
   <div class="card" data-section="sources">
-    <div class="card-head"><h2>EPG sources{% if epg_sources %} <span class="cnt">{{ epg_sources | length }}</span>{% endif %}</h2>
+    <div class="card-head" id="acct-sources-head"><h2>EPG sources{% if epg_sources %} <span class="cnt">{{ epg_sources | length }}</span>{% endif %}</h2>
       <div class="card-head-actions">
         <button class="btn btn-sm" data-act="source-add"
                 data-tip="Add an XMLTV guide file, or another account's guide, as a source for this account's channels.">+ Add source</button>
@@ -664,7 +790,7 @@
      dev/changelog/1475). The Sync history table above stays the full sync ledger; this is
      the recent story of everything, cut down by the history-filter chips. #}
   <div class="card" data-section="activity" id="acct-activity">
-    <div class="card-head"><h2>Activity{% if act_total %} <span class="cnt">{{ act_total }}</span>{% endif %}</h2>
+    <div class="card-head" id="acct-activity-head"><h2>Activity{% if act_total %} <span class="cnt">{{ act_total }}</span>{% endif %}</h2>
       <div class="card-head-actions">
         <a class="btn btn-sm" href="{{ url_for('logs.logs_page') }}">Logs <span class="arw">{{ icon('forward') }}</span></a>
       </div>
@@ -685,7 +811,7 @@
          of what happened and it must survive with no JS. It reads the ORM rows directly -
          a different region from the history table, and Jinja's time filters want the
          datetimes rather than the ISO strings the JSON shape carries. #}
-      <p class="card-note">The last {{ act_days }} days on this account: its syncs, the alerts about it and the times it was blocked. Sync history above has every sync.</p>
+      <p class="card-note">The last {{ act_days }} days on this account: its syncs, the alerts about it, the times it or one of its logins was blocked and the last time each host and login was turned on or off. Sync history above has every sync.</p>
       {{ m.history_chips(act_chips) }}
       {% if not act_entries %}
       <p class="card-note">Nothing here for that filter.</p>
@@ -739,10 +865,45 @@
               {%- if e.recording %}Blocked for the recording <a href="{{ url_for('recordings.recording_detail', recording_id=e.recording.id) }}">{{ e.recording.name }}</a>
               {%- elif e.obj.recording_id %}Blocked for a recording that has since been deleted
               {%- else %}Blocked{% endif %}
-              {%- if e.start and e.stop %} from {{ e.start | local_time }} until {{ e.stop | local_time }}{% endif %}
+              {%- if e.start and e.no_end %} from {{ e.start | local_time }} until you unblock it
+              {%- elif e.start and e.stop %} from {{ e.start | local_time }} until {{ e.stop | local_time }}{% endif %}
               {%- if e.obj.slots %}, {{ e.obj.slots }} of its connections{% endif %}.
               {%- if e.active %} Still in force.{% endif %}
             </div>
+            <div class="acct-act-when">{{ e.ts | local_time }}</div>
+          </div>
+        </div>
+        {% elif e.kind == 'login_block' %}
+        {# A block on a login this account holds (app/account_blocks.py, dev/changelog/1672):
+           the user's own choice, a faint dot like an account block. #}
+        <div class="acct-act">
+          <span class="acct-act-dot faint"></span>
+          <div class="acct-act-body">
+            <div class="acct-act-line">Login "{{ e.login }}" blocked from {{ e.start | local_time }} {% if e.no_end %}until you unblock it{% else %}until {{ e.stop | local_time }}{% endif %}.{% if e.active %} Still in force.{% endif %}</div>
+            <div class="acct-act-when">{{ e.ts | local_time }}</div>
+          </div>
+        </div>
+        {% elif e.kind == 'stream_check' %}
+        {# A finished stream check (app/stream_check.py): its headline and count, and the
+           channel that played or the reasons none did. #}
+        <div class="acct-act">
+          <span class="acct-act-dot {{ e.dot }}"></span>
+          <div class="acct-act-body">
+            <div class="acct-act-line">{{ e.view.title }}: {{ e.view.summary | lower }}.</div>
+            {% if e.view.rows %}<div class="acct-act-sub">{% for r in e.view.rows %}{{ r.name }}: {{ r.words }}{{ '; ' if not loop.last }}{% endfor %}</div>{% endif %}
+            <div class="acct-act-when">{{ e.ts | local_time }}</div>
+          </div>
+        </div>
+        {% elif e.kind == 'switch' %}
+        {# A host or login the user turned on or off (account_links.set_host_enabled /
+           set_login_enabled): the user's own choice, a faint dot like a block. Named as the
+           row is now; a sync that makes the row name another host or login clears the time,
+           so the line never names one the user did not switch. Not "the playlist's": that
+           mark can move to another row after the flip. #}
+        <div class="acct-act">
+          <span class="acct-act-dot faint"></span>
+          <div class="acct-act-body">
+            <div class="acct-act-line">{% if e.what == 'host' %}Host <code>{{ e.name }}</code>{% else %}Login "{{ e.name }}"{% endif %} turned {{ 'on' if e.on else 'off' }}{% if e.what == 'login' %} for this account{% endif %}. {{ 'New streams can use it.' if e.on else "New streams don't use it." }}</div>
             <div class="acct-act-when">{{ e.ts | local_time }}</div>
           </div>
         </div>
@@ -811,9 +972,9 @@ window.ACCOUNT_DETAIL = {
   browseUrl: {{ url_for('channels.channel_browser', **{'f.acct': account.id}) | tojson }},
   accountsUrl: {{ url_for('accounts.accounts_list') | tojson }},
   isExample: {{ 'true' if account.is_example else 'false' }},
+  hostCount: {{ hosts | length }},
   sourceHours: {{ source_hours_choices | list | tojson }},
   maxConnections: {{ settings.max_connections }},
-  blockMaxHours: {{ block_max_hours }},
 };
 </script>
 <script src="{{ url_for('static', filename='js/account-modal.js') }}"></script>
