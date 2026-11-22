@@ -190,8 +190,7 @@ class AdjustStopKeepsTheInstantTests(_FormCase):
         with mock.patch('app.routes.recordings.datetime') as fake_dt:
             fake_dt.utcnow.return_value = datetime(2027, 11, 7, 4, 0)
             fake_dt.fromisoformat = datetime.fromisoformat
-            with mock.patch('app.routes.recordings.schedule_recording'), \
-                    mock.patch('app.routes.recordings.unschedule_recording'):
+            with mock.patch('app.scheduler.reschedule_recording_stop'):
                 resp = self.t.client.post(f'/recordings/{rec.id}/adjust-stop', json={
                     'stop_time': '2027-11-07T01:30', 'stop_time_utc': '2027-11-07T06:30:00Z'})
         self.assertEqual(resp.status_code, 200, resp.get_json())

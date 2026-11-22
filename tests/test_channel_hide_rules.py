@@ -18,7 +18,9 @@ rather than incidental:
   offered. The refusal has to reach a surface.
 """
 import os
+import sqlite3
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import admission, channel_hiding, db  # noqa: E402
+from app import migrations as M  # noqa: E402
 from app.database import (  # noqa: E402
     Account, Channel, ChannelHideRule, HIDE_TARGET_CATEGORY_EXACT,
     HIDE_TARGET_CATEGORY_GLOB, HIDE_TARGET_NAME_GLOB)
@@ -465,6 +468,65 @@ class RuleStatsTests(_RuleTestCase):
         self.assertEqual(rule.match_count, 2)
 
 
+class RuleStatsByAccountTests(_RuleTestCase):
+    """The same counts split by account, so the Hide Channels page can say what a rule hides
+    on the accounts a person picked (dev/changelog/1678). With every rule written for all
+    accounts, a single total per rule could never answer that."""
+
+    def setUp(self):
+        super().setUp()
+        self.beta = seed.make_account(name='Beta')
+        self.gamma = seed.make_account(name='Gamma')
+        for name, category in [('AR| One', 'AR| News'), ('AR| Two', 'AR| News'),
+                               ('BBC', 'UK| News')]:
+            self._channel(name, category=category)
+        self._channel('AR| Three', category='AR| News', account=self.beta, in_guide=True)
+        self._channel('CNN', category='US| News', account=self.gamma)
+
+    def _counts(self, rule):
+        channel_hiding.refresh_rule_stats()
+        db.session.commit()
+        return rule.account_count_map()
+
+    def test_a_global_name_rule_is_counted_on_each_account(self):
+        rule = self._rule(HIDE_TARGET_NAME_GLOB, 'AR|*')
+        self.assertEqual(self._counts(rule), {self.acct.id: (2, 0), self.beta.id: (1, 1)})
+        self.assertEqual((rule.match_count, rule.deferred_count), (3, 1))
+
+    def test_a_global_category_rule_is_counted_on_each_account(self):
+        rule = self._rule(HIDE_TARGET_CATEGORY_GLOB, 'AR| *')
+        self.assertEqual(self._counts(rule), {self.acct.id: (2, 0), self.beta.id: (1, 1)})
+        self.assertEqual((rule.match_count, rule.deferred_count), (3, 1))
+
+    def test_a_global_exact_pick_is_counted_on_each_account(self):
+        rule = self._rule(HIDE_TARGET_CATEGORY_EXACT, 'AR| News')
+        self.assertEqual(self._counts(rule), {self.acct.id: (2, 0), self.beta.id: (1, 1)})
+
+    def test_a_scoped_rule_is_counted_on_its_own_account_only(self):
+        name = self._rule(HIDE_TARGET_NAME_GLOB, 'AR|*', account_id=self.beta.id)
+        cat = self._rule(HIDE_TARGET_CATEGORY_GLOB, 'AR| *', account_id=self.beta.id)
+        channel_hiding.refresh_rule_stats()
+        db.session.commit()
+        self.assertEqual(name.account_count_map(), {self.beta.id: (1, 1)})
+        self.assertEqual(cat.account_count_map(), {self.beta.id: (1, 1)})
+
+    def test_a_rule_matching_nothing_is_counted_not_unknown(self):
+        """An empty split reads as zero on every account; None is reserved for a rule that
+        was never counted by account, which the page shows differently."""
+        rule = self._rule(HIDE_TARGET_NAME_GLOB, 'NOTHING*')
+        self.assertIsNone(rule.account_count_map())
+        self.assertEqual(self._counts(rule), {})
+        self.assertEqual(rule.match_count, 0)
+
+    def test_the_page_payload_carries_the_split(self):
+        rule = self._rule(HIDE_TARGET_NAME_GLOB, 'AR|*')
+        self._counts(rule)
+        data = self.t.app.test_client().get('/api/channel-hide-rules').get_json()
+        got = next(r for r in data['rules'] if r['id'] == rule.id)['account_counts']
+        self.assertEqual(got, {str(self.acct.id): {'matched': 2, 'deferred': 0},
+                               str(self.beta.id): {'matched': 1, 'deferred': 1}})
+
+
 class HiddenChannelCountTests(_RuleTestCase):
     """Account.hidden_channel_count - refreshed from inside recompute() itself, never
     separately, so it can never disagree with Channel.hidden (dev/docs/DESIGN-channel-hiding.md
@@ -800,6 +862,67 @@ class RefusedSaveIsVisibleTests(_RuleTestCase):
 
         self.assertNotIn('not applied to your channels yet',
                          self.t.client.get('/channels/hide-rules').get_data(as_text=True))
+
+
+
+class M143StepTests(unittest.TestCase):
+    """Migration 143 adds the per-account split and owes the count (dev/changelog/1678)."""
+
+    def _scratch(self, td):
+        conn = sqlite3.connect(os.path.join(td, 'scratch.db'))
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE channel_hide_rules (id INTEGER PRIMARY KEY, account_id INTEGER, '
+                    'target VARCHAR(32) NOT NULL, pattern VARCHAR(512) NOT NULL, '
+                    'enabled BOOLEAN NOT NULL DEFAULT 1, created_at DATETIME NOT NULL, '
+                    'updated_at DATETIME, match_count INTEGER, deferred_count INTEGER, '
+                    'counted_at DATETIME)')
+        conn.commit()
+        return conn, cur
+
+    def test_adds_the_column_and_owes_the_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._scratch(td)
+            M._m143_hide_rule_account_counts(conn, cur)
+            M._m143_hide_rule_account_counts(conn, cur)   # re-runnable from the top
+            cols = {r[1] for r in cur.execute('PRAGMA table_info(channel_hide_rules)')}
+            self.assertIn('account_counts', cols)
+            self.assertTrue(M._backfill_pending(cur, M._BF_HIDE_RULE_ACCOUNT_COUNTS))
+            conn.close()
+
+    def test_registered_as_migration_143(self):
+        self.assertIn((143, M._m143_hide_rule_account_counts),
+                      [(v, fn) for v, _d, fn in M.SCHEMA_MIGRATIONS])
+
+
+class M143DischargeTests(_RuleTestCase):
+    """channel_hiding.backfill_rule_account_counts() - the half of migration 143 that needs
+    the ORM: every rule gets its split at startup rather than at each account's next sync."""
+
+    def setUp(self):
+        super().setUp()
+        self._channel('AR| One', category='AR| News')
+        self.rule = self._rule(HIDE_TARGET_NAME_GLOB, 'AR|*')
+        db.session.commit()
+
+    def _register(self):
+        db.session.execute(db.text(M._BACKFILL_LEDGER_DDL))
+        db.session.execute(db.text(
+            "INSERT OR REPLACE INTO migration_backfills (name, registered_at) VALUES (:n, 'x')"),
+            {'n': M._BF_HIDE_RULE_ACCOUNT_COUNTS})
+        db.session.commit()
+
+    def test_discharging_counts_every_rule_by_account(self):
+        self._register()
+        channel_hiding.backfill_rule_account_counts()
+        db.session.expire_all()
+        rule = db.session.get(ChannelHideRule, self.rule.id)
+        self.assertEqual(rule.account_count_map(), {self.acct.id: (1, 0)})
+        self.assertFalse(M.obligation_pending(M._BF_HIDE_RULE_ACCOUNT_COUNTS))
+
+    def test_with_no_obligation_it_does_nothing(self):
+        channel_hiding.backfill_rule_account_counts()
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(ChannelHideRule, self.rule.id).account_counts)
 
 
 if __name__ == '__main__':

@@ -1369,3 +1369,31 @@ class AccountsListLabelTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LiveRegionCountTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-20: the account page's live refresh swapped a card's body but
+    not its head, so a count in the heading (Activity 97) went stale beside a list that had
+    grown (All 98). A card whose body is a live region and whose head carries a count must
+    have its head refreshed too."""
+
+    def test_every_counted_head_of_a_live_body_is_live(self):
+        with open(os.path.join(REPO, 'templates', 'account_detail.html'), encoding='utf-8') as f:
+            template = f.read()
+        with open(os.path.join(REPO, 'static', 'js', 'account-detail.js'), encoding='utf-8') as f:
+            script = f.read()
+        block = re.search(r'const LIVE_REGIONS = \[(.*?)\];', script, re.S).group(1)
+        live = set(re.findall(r"'#([\w-]+)'", block))
+        cards = re.findall(r'<div class="card-head"( id="[\w-]+")?><h2>(.*?)</h2>.*?'
+                           r'<div class="card-body" id="([\w-]+)"', template, re.S)
+        self.assertGreaterEqual(len(cards), 6, 'the card pattern no longer matches the page')
+        checked = 0
+        for head_id, heading, body_id in cards:
+            if body_id not in live or 'class="cnt"' not in heading:
+                continue
+            checked += 1
+            with self.subTest(body=body_id):
+                head = re.search(r'id="([\w-]+)"', head_id or '')
+                self.assertIsNotNone(head, f'the head over #{body_id} has no id')
+                self.assertIn(head.group(1), live)
+        self.assertGreaterEqual(checked, 4)

@@ -787,6 +787,27 @@ def _model_guide_spellings(view, f):
     view.guide = list(view.guide) + extra
 
 
+def _model_description_only_games(view, f):
+    """Event slots naming a game get a guide that names the league and no team in the title, no
+    sub-title, and the game only in the description's opening sentence, home team first, the way two
+    of prod's guide sources listed every local station's game (`Live: NFL Football`, `The Detroit
+    Lions host the Tampa Bay Buccaneers in NFL regular-season play at Ford Field.`)."""
+    share, seed = f.params['share'], view.world.seed
+    rows, extra = [], []
+    for row in view.rows:
+        m = _GAME_SLOT.search(row.name) if row.channel.kind == KIND_EVENT else None
+        if m and frac(seed, 'fault-described', view.name, row.channel.stream_id) < share:
+            sport, away, home = m.groups()
+            tvg = row.tvg_id or f'described{row.channel.stream_id}.slot'
+            row = _row(row, tvg_id=tvg)
+            extra.append(GuideChannel(tvg, row.name, None, True, None, filler=f'Live: {sport}',
+                                      desc=f'The {home} host the {away} in {sport} regular-season play at '
+                                           f'{home} Arena. {away} arrives on a two-game streak.'))
+        rows.append(row)
+    view.rows = rows
+    view.guide = list(view.guide) + extra
+
+
 def _model_shared_guide_id(view, f):
     target = next((g.guide_id for g in view.guide if g.has_programs), None)
     if target is None:
@@ -1145,6 +1166,13 @@ _KINDS = (
           'event slots naming a game get a guide that spells it the guide\'s way: a team with its state '
           'written out in parentheses, or a practice as `P2`', {'share': (1.0, _share)},
           apply=_model_guide_spellings),
+    _kind('description_only_games', SCOPE_PANEL, LAYER_MODEL, _ROWS + (EP_GUIDE,), MEASURED,
+          'dev/changelog/1679, 1680, BUGS.md 2026-11-21 10:13 PM; on two of prod\'s accounts all 170 of '
+          'Sunday 2026-11-22\'s local NFL listings were `Live: NFL Football` with no sub-title and the '
+          'game only in the description\'s first sentence',
+          'event slots naming a game get a guide titled with the league alone, no sub-title, and the game '
+          'named only in the description\'s opening sentence, home team first', {'share': (1.0, _share)},
+          apply=_model_description_only_games),
     _kind('guide_id_twins', SCOPE_PANEL, LAYER_MODEL, (EP_GUIDE,), MEASURED,
           'dev/changelog/1139 (2,297 channels), BUGS.md 2026-09-26 06:15 PM',
           'the guide lists a channel under a second id differing only in case, carrying '

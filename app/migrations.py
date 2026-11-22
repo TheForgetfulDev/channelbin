@@ -151,6 +151,9 @@ _BF_ACCOUNT_STREAM_HOST = 'm089.account_stream_host'
 #: Discharged by channel_hiding.apply_default_rules() from create_app(): the hidden answer is
 #: written by channel_hiding.recompute() alone, which is ORM code a step cannot call.
 _BF_DEFAULT_HIDE_RULES = 'm098.default_hide_rules'
+#: Discharged by channel_hiding.backfill_rule_account_counts() from create_app(): the counts
+#: are refresh_rule_stats(), which is ORM code a step cannot call.
+_BF_HIDE_RULE_ACCOUNT_COUNTS = 'm143.hide_rule_account_counts'
 
 
 def _register_backfill(conn, cur, name: str):
@@ -2884,7 +2887,7 @@ def _m085_logins(conn, cur):
             name                VARCHAR(100) NOT NULL,
             username            VARCHAR(255) NOT NULL,
             password            VARCHAR(255) NOT NULL,
-            max_connections     INTEGER NOT NULL,
+            max_connections     INTEGER,
             last_refused_at     DATETIME,
             last_refused_detail VARCHAR(255),
             created_at          DATETIME NOT NULL,
@@ -3794,6 +3797,168 @@ def _m136_recording_start_from(conn, cur):
     conn.commit()
 
 
+def _m137_account_stream_checks(conn, cur):
+    """account_stream_checks: a few of an account's channels test-played to show its stream URLs
+    play at all (app/stream_check.py, dev/changelog/1665). No backfill: no check exists before
+    this. Re-runnable from the top."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS account_stream_checks (
+            id INTEGER NOT NULL PRIMARY KEY,
+            account_id INTEGER NOT NULL REFERENCES accounts (id),
+            "trigger" VARCHAR(16) NOT NULL,
+            status VARCHAR(16) NOT NULL,
+            verdict VARCHAR(24),
+            created_at DATETIME NOT NULL,
+            started_at DATETIME,
+            finished_at DATETIME,
+            retry_at DATETIME,
+            wait_reason TEXT,
+            tested_count INTEGER NOT NULL DEFAULT 0,
+            played_count INTEGER NOT NULL DEFAULT 0,
+            constructed BOOLEAN NOT NULL DEFAULT 0,
+            results TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_account_stream_checks_account_id
+            ON account_stream_checks (account_id);
+    """)
+    conn.commit()
+
+
+_MAX_CONNECTIONS_NOT_NULL = re.compile(r'(\bmax_connections"?\s+INTEGER)\s+NOT NULL')
+
+
+def _m138_playlist_rows(conn, cur):
+    """The playlist's own host and login as rows with an on/off switch (dev/changelog/1670):
+    account_hosts.enabled + from_playlist, account_logins.enabled, logins.playlist_account_id
+    with its unique index, and logins.max_connections made nullable - NULL is a playlist
+    login's "the account's own Max connections", which SQLite cannot allow by ALTER, so the
+    table is rebuilt from its stored DDL with every other character kept (dev/changelog/937).
+
+    No backfill and no obligation to register (dev/changelog/686): every switch starts on,
+    which is what every row meant before the column existed, and the playlist's rows are
+    listed by each account's next sync, not here. Re-runnable from the top: every ADD COLUMN
+    asks PRAGMA table_info first, the index is IF NOT EXISTS, and a logins table whose
+    max_connections already allows NULL is left alone."""
+    hosts = {r[1] for r in cur.execute('PRAGMA table_info(account_hosts)').fetchall()}
+    if hosts and 'enabled' not in hosts:
+        cur.execute('ALTER TABLE account_hosts ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT 1')
+    if hosts and 'from_playlist' not in hosts:
+        cur.execute('ALTER TABLE account_hosts ADD COLUMN from_playlist BOOLEAN NOT NULL DEFAULT 0')
+    held = {r[1] for r in cur.execute('PRAGMA table_info(account_logins)').fetchall()}
+    if held and 'enabled' not in held:
+        cur.execute('ALTER TABLE account_logins ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT 1')
+    logins = {r[1] for r in cur.execute('PRAGMA table_info(logins)').fetchall()}
+    if logins and 'playlist_account_id' not in logins:
+        cur.execute('ALTER TABLE logins ADD COLUMN playlist_account_id INTEGER REFERENCES accounts (id)')
+    conn.commit()
+    row = cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='logins'").fetchone()
+    if row is not None and _MAX_CONNECTIONS_NOT_NULL.search(row[0]):
+        tmp_name = 'logins_nullable_new'
+        new_sql = re.sub(r'^CREATE TABLE "?logins"? \(', f'CREATE TABLE {tmp_name} (', row[0], count=1)
+        if new_sql == row[0]:
+            raise RuntimeError('Cannot rebuild logins: its stored CREATE TABLE does not carry the '
+                               f'expected header. Stored DDL:\n{row[0]}')
+        new_sql = _MAX_CONNECTIONS_NOT_NULL.sub(r'\1', new_sql, count=1)
+        copied, carried = _rebuild_table(conn, cur, 'logins', new_sql, tmp_name)
+        conn.commit()
+        log.warning('Migration 138: rebuilt logins so max_connections may be NULL, a playlist '
+                    'login\'s "the account\'s own Max connections" (%d row(s), %d index(es) '
+                    'carried over)', copied, carried)
+    if logins:
+        cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_logins_playlist_account '
+                    'ON logins (playlist_account_id)')
+    conn.commit()
+
+
+def _m139_switched_at(conn, cur):
+    """account_hosts.switched_at and account_logins.switched_at: when the user last moved the
+    row's on/off switch, for the row's "Off since" and the account's Activity card
+    (dev/changelog/1671). Nullable, no backfill: a switch nobody has moved has no time to show.
+    Re-runnable: each ADD COLUMN asks PRAGMA table_info first."""
+    for table in ('account_hosts', 'account_logins'):
+        cols = {r[1] for r in cur.execute(f'PRAGMA table_info({table})').fetchall()}
+        if cols and 'switched_at' not in cols:
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN switched_at DATETIME')
+    conn.commit()
+
+
+def _m140_login_blocks(conn, cur):
+    """login_blocks: the stretches of time the user has told ChannelBin to keep off one login
+    (app/account_blocks.py, dev/changelog/1672). No backfill and no obligation to register
+    (dev/changelog/686): an upgrading database has no login blocks, which is what it meant
+    before this table existed. Re-runnable from the top: IF NOT EXISTS throughout."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS login_blocks (
+            id INTEGER NOT NULL PRIMARY KEY,
+            login_id INTEGER NOT NULL REFERENCES logins (id),
+            start_time DATETIME NOT NULL,
+            stop_time DATETIME,
+            created_at DATETIME NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_login_blocks_login_id ON login_blocks (login_id);
+    """)
+    conn.commit()
+
+
+def _m141_host_checks(conn, cur):
+    """host_checks: one row per check of a listed host name - lookup, connect and answer times
+    and what each found (app/host_checks.py, dev/changelog/1674). No backfill and no
+    obligation to register: an upgrading database has no checks yet, which the account page
+    reads as "not tested yet". Re-runnable from the top: IF NOT EXISTS throughout."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS host_checks (
+            id INTEGER NOT NULL PRIMARY KEY,
+            host VARCHAR(255) NOT NULL,
+            checked_at DATETIME NOT NULL,
+            kind VARCHAR(16) NOT NULL,
+            status VARCHAR(16) NOT NULL,
+            lookup_ms INTEGER,
+            connect_ms INTEGER,
+            answer_ms INTEGER,
+            http_status INTEGER,
+            port INTEGER,
+            error VARCHAR(255),
+            in_use BOOLEAN NOT NULL DEFAULT 0,
+            trigger VARCHAR(16) NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_host_checks_host_checked_at ON host_checks (host, checked_at);
+    """)
+    conn.commit()
+
+
+def _m142_output_seconds(conn, cur):
+    """Time each account spent streaming to IPTV players (dev/changelog/1676):
+    output_feed_plays.account_seconds, a finished play's provider time split by account;
+    account_stat_days.output_seconds, its ledger column; account_stat_state.play_watermark,
+    how far the fold has read the plays. No backfill and no obligation to register: a play
+    written before this has no split, so it can be credited to no account, and the fold
+    passes it with nothing. A watermark of 0 is a fold that has read no play yet, which is
+    true. Re-runnable from the top: each ADD COLUMN asks PRAGMA table_info first."""
+    for table, column, kind in (
+            ('output_feed_plays', 'account_seconds', 'TEXT'),
+            ('account_stat_days', 'output_seconds', 'FLOAT NOT NULL DEFAULT 0'),
+            ('account_stat_state', 'play_watermark', 'INTEGER NOT NULL DEFAULT 0')):
+        cols = {r[1] for r in cur.execute(f'PRAGMA table_info({table})').fetchall()}
+        if cols and column not in cols:
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} {kind}')
+    conn.commit()
+
+
+def _m143_hide_rule_account_counts(conn, cur):
+    """channel_hide_rules.account_counts: what each hide rule matches on each account, so the
+    Hide Channels page can count a rule on the accounts a person picked (dev/changelog/1678).
+    The obligation is registered before the column exists and discharged by
+    channel_hiding.backfill_rule_account_counts() from create_app(), which recounts every
+    rule. Re-runnable from the top: the ADD COLUMN asks PRAGMA table_info first."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(channel_hide_rules)').fetchall()}
+    if not cols:
+        return
+    _register_backfill(conn, cur, _BF_HIDE_RULE_ACCOUNT_COUNTS)
+    if 'account_counts' not in cols:
+        cur.execute('ALTER TABLE channel_hide_rules ADD COLUMN account_counts TEXT')
+    conn.commit()
+
+
 def _m135_rule_sports_sessions(conn, cur):
     """auto_rules.sports_sessions: whether a rule about a league counts its practice, qualifying and
     shootouts among its games (app/auto_rules_sports.py, dev/changelog/1633). No backfill: before this a
@@ -4520,6 +4685,19 @@ SCHEMA_MIGRATIONS = [
      'and shootouts', _m135_rule_sports_sessions),
     (136, 'recordings.sports_start_from: where a Record-made event-channel recording\'s start came from',
      _m136_recording_start_from),
+    (137, 'account_stream_checks: a few of an account\'s channels test-played to show its stream '
+     'URLs play at all', _m137_account_stream_checks),
+    (138, 'account_hosts + account_logins + logins: the on/off switch on every host and login, '
+     'and the playlist\'s own host and login as rows', _m138_playlist_rows),
+    (139, 'account_hosts + account_logins: switched_at, when the user last moved the row\'s switch',
+     _m139_switched_at),
+    (140, 'login_blocks: time windows the user keeps ChannelBin off one login', _m140_login_blocks),
+    (141, 'host_checks: each listed host\'s lookup, connect and answer, timed', _m141_host_checks),
+    (142, 'output_feed_plays.account_seconds + account_stat_days.output_seconds + '
+          'account_stat_state.play_watermark: time each account streamed to IPTV players',
+     _m142_output_seconds),
+    (143, 'channel_hide_rules.account_counts: what each hide rule matches on each account',
+     _m143_hide_rule_account_counts),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

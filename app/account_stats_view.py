@@ -44,6 +44,17 @@ TIPS = {
                "failed. Cancelled checks are not counted either way - a cancelled check says "
                "nothing about the channel."),
     'rate': 'Pass rate.&#10;Passed as a share of passed plus failed. Blank when no check ran.',
+    # Says what cannot be counted, since a play a player watched for an hour that adds
+    # nothing here would otherwise be a number nobody could explain (dev/changelog/1676).
+    'output': ("Streamed to IPTV players.&#10;Time this account's connection spent playing "
+               "a channel for an IPTV player through the IPTV output, or for its preview in "
+               "ChannelBin. A play that moved between accounts credits each account only its "
+               "part. Not counted: a waiting screen or Up next picture, which use no "
+               "connection; a player sent straight to the provider (redirect mode), since "
+               "ChannelBin never sees that play end; a play still running when ChannelBin "
+               "stopped; and plays from before ChannelBin kept this number. Plays are kept 30 "
+               "days, so a change of display timezone, which recounts every number, recounts "
+               "this one from the last 30 days."),
     # Both say the automatic TV Guide health check is not counted, because a first-time
     # user read "In a group 0" for a channel that group held (dev/changelog/1271). It is a
     # health check over the guide, not a group anyone records from, and In the TV Guide
@@ -335,6 +346,7 @@ def section_context(window, cfg, app, account_ids=None):
         'window_note': WINDOW_NOTE,
         'rows_tip': rows_tip(rows_total),
         'failing_tip': failing_tip(cfg),
+        'show_output': _show_output(cfg, ids, window, windowed),
     }
     if not accounts:
         return ctx
@@ -354,8 +366,8 @@ def section_context(window, cfg, app, account_ids=None):
         return ctx
 
     totals = {c: sum(windowed[a.id][c] for a in accounts)
-              for c in ('capture_seconds', 'recordings', 'stalls', 'failovers_away',
-                        'checks_passed', 'checks_failed')}
+              for c in ('capture_seconds', 'output_seconds', 'recordings', 'stalls',
+                        'failovers_away', 'checks_passed', 'checks_failed')}
     checked = totals['checks_passed'] + totals['checks_failed']
     totals['pass_rate'] = totals['checks_passed'] / checked if checked else None
     ctx['totals'] = totals
@@ -395,6 +407,19 @@ def section_context(window, cfg, app, account_ids=None):
                           fmt_count, f'No health checks {phrase}.'),
     }
     return ctx
+
+
+def _show_output(cfg, ids, window, windowed):
+    """Whether the stats carry Streamed to IPTV players: while the output is on, and after
+    it is turned off for as long as any of the accounts shown has time on it - so an account
+    page reads its own account. An install that never used the output gets no column of
+    zeros, and the column does not come and go with the window."""
+    from .output_feed import feed_config, is_enabled
+    if is_enabled(feed_config(cfg)):
+        return True
+    if window == 'all':
+        return any(w['output_seconds'] for w in windowed.values())
+    return account_stats.ever_streamed(ids)
 
 
 def _checks_empty_single(account_id, window, current, today, phrase):

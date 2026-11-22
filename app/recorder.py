@@ -33,7 +33,7 @@ from .database import (
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_FAILED, REC_STATUS_ABORTED, WINDOW_OPEN_STATUSES, REC_ENDED_STATUSES,
     FAILURE_CONVERSION_COLLISION, FAILURE_CONNECTION_SLOT_TIMEOUT, FAILURE_DVR_DIR_UNUSABLE,
-    FAILURE_LAUNCH_FAILED, FAILURE_ACCOUNT_BLOCKED,
+    FAILURE_LAUNCH_FAILED, FAILURE_ACCOUNT_BLOCKED, FAILURE_SWITCHED_OFF,
     CANCEL_DURING_CAPTURE,
 )
 from .channel_groups import (effective_score, is_streaking, pick_best_member,
@@ -2284,17 +2284,17 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
         pace, pace_source = resolve_capture_pacing(
             cfg, channel.pace_realtime if channel is not None else None, segment_duration)
         # The recording's seat may be on one of the account's listed logins: if the server
-        # refused that login since the last segment, the seat moves to another login with
-        # a free one, and either way this segment is launched with the seated login's
-        # credentials rendered into the URL (app/account_links.py). Recording.url keeps
-        # the channel's URL; the substitution lives on the command only. An account with
-        # no login list pays nothing here: the holder is in its own pool and the URL
-        # passes through untouched.
+        # refused that login since the last segment, or the user turned it off, the seat
+        # moves to another login with a free one, and either way this segment is launched
+        # with the seated login's credentials rendered into the URL (app/account_links.py).
+        # Recording.url keeps the channel's URL; the substitution lives on the command
+        # only. An account with no login list pays nothing here: the holder is in its own
+        # pool and the URL passes through untouched.
         launch_url = rec.url
         if channel is not None:
             from . import connection_limits as connlim
             from .account_links import render_held_login
-            connlim.reseat_if_refused(channel.account_id, 'recording', recording_id)
+            connlim.reseat_before_relaunch(channel.account_id, 'recording', recording_id)
             launch_url, _login_id = render_held_login(rec.url, channel.account_id,
                                                       'recording', recording_id)
         hls_variant = _hls_variant_for(get_state(recording_id), launch_url, cfg, recording_id)
@@ -2679,6 +2679,8 @@ def switch_choices(recording_id: int) -> list:
     standing = connlim.seat_standing(account_ids, 'recording',
                                      exclude_holder=('recording', recording_id))
     full = {a for a, s in standing.items() if s == connlim.SEAT_NONE}
+    from .account_links import describe_unusable, unusable_reasons
+    switched_off = unusable_reasons(account_ids)
     latest = _latest_tests_by_channel([ch.id for ch in members])
     pin = recording_format_pin(recording_id)
     current = rec.channel
@@ -2693,6 +2695,10 @@ def switch_choices(recording_id: int) -> list:
                               'this run.')
         elif ch.account_id in blocked:
             ok, why = False, f'"{ch.account.name}" is blocked for the rest of this recording.'
+        elif ch.account_id in switched_off and (current is None
+                                                or ch.account_id != current.account_id):
+            ok, why = False, describe_unusable(ch.account.name, switched_off[ch.account_id],
+                                               capital=True) + '.'
         elif ch.account_id in full and (current is None or ch.account_id != current.account_id):
             ok, why = False, (f'"{ch.account.name}" is at its connection limit - every slot '
                               f'is held by another recording.')
@@ -3003,20 +3009,24 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
 
             if not _try_acquire_slot_with_preemption(app, recording_id, target_account_id,
                                                      acquire=_move_seat):
-                log.warning('Recording %d: cannot fail over to "%s" - account "%s" is at its '
-                            'connection limit and every slot is held by another recording; '
-                            'not exceeding it (%s)',
-                            recording_id, best.name, best.account.name, reason)
+                from .account_links import unusable_reason
+                off = unusable_reason(target_account_id, best.account.name)
+                held_why = (f'{off}, so nothing on it can stream' if off else
+                            f'account "{best.account.name}" is at its connection limit and '
+                            f'every slot is held by another recording')
+                log.warning('Recording %d: cannot fail over to "%s" - %s; not moving (%s)',
+                            recording_id, best.name, held_why, reason)
 
                 @retry_on_locked()
                 def _log_failover_blocked_and_commit():
                     add_recording_event(
                         recording_id, DIAGNOSTICS,
-                        detail=(f'Failover to "{best.name}" was held back: account '
-                                f'"{best.account.name}" is at its connection limit and every '
-                                f'slot is held by another recording. The recording was not '
-                                f'moved rather than opening a connection over the limit.'),
-                        extra={'kind': 'failover_blocked_by_connection_limit',
+                        detail=(f'Failover to "{best.name}" was held back: {held_why}. The '
+                                f'recording was not moved'
+                                + ('.' if off else ' rather than opening a connection over '
+                                   'the limit.')),
+                        extra={'kind': ('failover_blocked_by_switched_off' if off else
+                                        'failover_blocked_by_connection_limit'),
                                'group_id': rec.group_id, 'to_channel_id': best.id,
                                'to_account_id': best.account_id})
                     db.session.commit()
@@ -3240,6 +3250,12 @@ def _acquire_with_preemption(app, recording_id: int, account_id: int, acquire, m
             return connlim.try_acquire(account_id, 'recording', recording_id)
     if acquire():
         return True
+    # Every host or login on the account turned off: its usable limit is 0, so cutting off what
+    # it still has running would free nothing - and a stream already running keeps going when
+    # a switch goes off (dev/changelog/1670).
+    from .account_links import unusable_reasons
+    if account_id in unusable_reasons([account_id]):
+        return False
     # An IPTV player on the output feed yields first of all: it is entertainment that resumes
     # on its own, below the operator's own look and the measurement feeding the health
     # score (DESIGN-output-feed.md 4.4). The viewer is told why - the session ends by name
@@ -3553,6 +3569,11 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
         if block_until is not None:
             _defer_start_for_block(rec, account_id, block_until, now, move_note)
             return
+        from .account_links import unusable_reason
+        off = unusable_reason(account_id, _account_label(account_id))
+        if off is not None:
+            _defer_start_switched_off(rec, account_id, off, now, move_note)
+            return
     why = _slot_wait_reason(account_id, waiting_on)
 
     if rec.stop_time <= now:
@@ -3672,6 +3693,66 @@ def _defer_start_for_block(rec, account_id: int, block_until: datetime, now: dat
     reschedule_recording_start(recording_id, retry_at)
 
 
+def _note_switched_off_once(recording_id: int, account_id: int, why: str, move_note=None):
+    """The deferral event for a wait on a switch, written once per account. No alert, as for a
+    block: the user turned every host or login on the account off, so the recording waiting
+    is a state they chose, shown on the recording (dev/changelog/1670)."""
+    already = [e for e in RecordingEvent.query.filter_by(
+        recording_id=recording_id, event_type=RECORDING_START_DEFERRED).all()
+        if (e.extra_data or '') and json.loads(e.extra_data).get('kind') == 'switched_off'
+        and json.loads(e.extra_data).get('account_id') == account_id]
+    if already:
+        return
+
+    @retry_on_locked()
+    def _mark_switched_off_and_commit():
+        add_recording_event(
+            recording_id, RECORDING_START_DEFERRED,
+            detail=(f'Waiting: {why}, so nothing on it can stream. It starts as soon as one '
+                    f'is turned on and records what is left of its window.'
+                    + (f' {move_note}' if move_note else '')),
+            extra={'kind': 'switched_off', 'account_id': account_id, 'move_note': move_note})
+        db.session.commit()
+
+    _mark_switched_off_and_commit()
+
+
+def _defer_start_switched_off(rec, account_id: int, why: str, now: datetime, move_note=None):
+    """The switch-shaped half of _defer_start_for_slot: every host or every login on the account
+    is turned off. It waits, re-asking every poll, and records what is left once one is turned
+    on - or, when nothing is turned on before its window ends, it ends FAILED with its own
+    reason naming the switch, never the connection limit (dev/changelog/1670)."""
+    recording_id = rec.id
+    if rec.stop_time <= now:
+        log.warning('Recording "%s" (#%d): never started - %s for the rest of its window',
+                    rec.name, recording_id, why, extra={'recording_id': recording_id})
+
+        @retry_on_locked()
+        def _fail_switched_off_and_commit():
+            r = db.session.get(Recording, recording_id)
+            r.status = REC_STATUS_FAILED
+            r.completed_at = now
+            r.failure_reason = FAILURE_SWITCHED_OFF
+            add_recording_event(
+                recording_id, RECORDING_FAILED,
+                detail=(f'Never started: {why}, and none was turned on before its window '
+                        f'ended. Nothing was captured.'))
+            db.session.commit()
+
+        _fail_switched_off_and_commit()
+        from .health_score import dismiss_recording_failing_alerts
+        dismiss_recording_failing_alerts(recording_id)
+        end_capture_wait(recording_id)
+        return
+
+    _note_switched_off_once(recording_id, account_id, why, move_note)
+    _note_start_deferred(recording_id, f'a host or login on "{_account_label(account_id)}" '
+                                       f'to be turned on')
+    log.info('Recording %d: deferring start - %s', recording_id, why)
+    from .scheduler import reschedule_recording_start
+    reschedule_recording_start(recording_id, now + timedelta(seconds=SLOT_WAIT_POLL_SECONDS))
+
+
 def _defer_resume_for_slot(app, recording_id: int, account_id: int) -> None:
     """Hold a recording that is resuming (crash recovery, unpause, dead-stream retry) but
     cannot have a connection slot yet.
@@ -3705,6 +3786,22 @@ def _defer_resume_for_slot(app, recording_id: int, account_id: int) -> None:
                        now + timedelta(seconds=BLOCK_WAIT_MAX_POLL_SECONDS))
         reschedule_recording_resume(
             recording_id, max(retry_at, now + timedelta(seconds=SLOT_WAIT_POLL_SECONDS)))
+        return
+    from .account_links import unusable_reason
+    off = unusable_reason(account_id, _account_label(account_id))
+    if off is not None:
+        # Every host or login turned off: the same wait as a block's, noted without an alert;
+        # whatever was already captured is the stop job's to finalize (dev/changelog/1670).
+        _note_switched_off_once(recording_id, account_id, off)
+        if rec.stop_time <= now:
+            log.warning('Recording "%s" (#%d): %s and its window ended - not resuming; '
+                        'whatever was already captured is finalized by its stop job',
+                        rec.name, recording_id, off, extra={'recording_id': recording_id})
+            end_capture_wait(recording_id)
+            return
+        log.info('Recording %d: deferring resume - %s', recording_id, off)
+        from .scheduler import reschedule_recording_resume
+        reschedule_recording_resume(recording_id, now + timedelta(seconds=SLOT_WAIT_POLL_SECONDS))
         return
     why = _slot_wait_reason(account_id)
 

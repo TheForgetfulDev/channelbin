@@ -96,7 +96,8 @@ def _nothing_taken() -> dict:
     return {}
 
 
-def _pool_taken_plan(account_ids, seats: dict, cfg=None, holder_kind: Optional[str] = None):
+def _pool_taken_plan(account_ids, seats: dict, cfg=None, holder_kind: Optional[str] = None,
+                     login_blocks: bool = True):
     """A function of no arguments answering {pool: slots taken} for the pools of
     `account_ids` (`seats`, their login rows), to be called with _lock held. The queries run
     here, BEFORE the lock: a block and the login rows are database reads, and the lock guards
@@ -108,20 +109,26 @@ def _pool_taken_plan(account_ids, seats: dict, cfg=None, holder_kind: Optional[s
     'viewer' (a relayed play) is never kept off them, and for every other kind a relayed play
     already on the account fills one, so only the held seats no viewer holds are taken. That
     count is the holder list itself, so the function reads it under the lock, in the same
-    critical section as the decision it feeds."""
-    from .account_blocks import blocked_slots, blocks_at, pool_taken
+    critical section as the decision it feeds.
+
+    A block on one of their logins takes that login's whole pool (dev/changelog/1672);
+    `login_blocks=False` leaves those out, for must_yield_to_block(), since a login block
+    never moves a running recording. Asked only when one of them lists a login."""
+    from .account_blocks import blocked_slots, blocks_at, login_blocks_at, pool_taken
     from .account_links import login_seats_for_accounts, login_siblings
     ids = set(account_ids)
     wider = set(ids)
     if any(seats.get(a) for a in ids):
         wider |= {other for found in login_siblings(ids).values() for other in found}
     blocked = blocked_slots(blocks_at(account_ids=wider))
+    login_ids = {lid for a in ids for lid, _, _ in seats.get(a) or ()}
+    lblocks = login_blocks_at(login_ids=login_ids) if login_blocks and login_ids else []
     # Seats the output feed keeps free for an IPTV player are subtracted exactly where a block's
     # are: ChannelBin cannot see a redirected play's connection, so the recorder must never plan
     # on a seat the IPTV player may be using (DESIGN-output-feed.md 5.3, 5.5).
     from .output_feed import held_seats_now
     held_now = held_seats_now(wider, cfg) if holder_kind != 'viewer' else {}
-    if not blocked and not held_now:
+    if not blocked and not held_now and not lblocks:
         return _nothing_taken
     missing = (set(blocked) | set(held_now)) - set(seats)
     all_seats = dict(seats)
@@ -136,39 +143,52 @@ def _pool_taken_plan(account_ids, seats: dict, cfg=None, holder_kind: Optional[s
             if not held or merged.get(account_id, 0) is None:
                 continue
             merged[account_id] = merged.get(account_id, 0) + held
-        return pool_taken(merged, all_seats) if merged else {}
+        return pool_taken(merged, all_seats, lblocks) if merged or lblocks else {}
     return taken_locked
 
 
-def _pool_taken_now(account_ids, seats: dict, cfg=None, holder_kind: Optional[str] = None) -> dict:
+def _pool_taken_now(account_ids, seats: dict, cfg=None, holder_kind: Optional[str] = None,
+                    login_blocks: bool = True) -> dict:
     """_pool_taken_plan()'s answer now, for an advisory reader that decides nothing under the
     lock (at_limit(), accounts_without_free_recording_slot(), must_yield_to_block())."""
-    taken = _pool_taken_plan(account_ids, seats, cfg, holder_kind)
+    taken = _pool_taken_plan(account_ids, seats, cfg, holder_kind, login_blocks)
     with _lock:
         return taken()
 
 
 def _usable_limits(account, default_max_connections: int, taken: dict,
-                   seats: list) -> list:
+                   seats: list, hosts_off: frozenset = frozenset()) -> list:
     """[(pool, usable limit, last_refused_at), ...] for `account`, in the order seats are
     taken. `taken` is _pool_taken_now(): a block takes its slots from the blocked account's
     pools in order (None = every slot), so a fully blocked account answers 0 on every pool,
     which is what turns every acquire on it into the refusal its caller already handles
-    (dev/changelog/1151) - and a login it shares answers 0 for the sibling too."""
+    (dev/changelog/1151) - and a login it shares answers 0 for the sibling too.
+
+    A login turned off on the account answers 0 already (its seats are 0 in `seats`), and an
+    account in `hosts_off` - every host it lists turned off - answers 0 on every pool: no
+    stream may go out on a host the user turned off (dev/changelog/1670). A holder already
+    seated keeps its seat either way; only a new one is refused."""
     from .account_blocks import effective_limit
     if seats:
         pools = [(login_pool(lid), s, refused) for lid, s, refused in seats]
     else:
         pools = [(account.id, limit_for_account(account, default_max_connections), None)]
+    if account.id in hosts_off:
+        return [(pool, 0, refused) for pool, _limit, refused in pools]
     if not taken:
         return pools
     return [(pool, effective_limit(limit, taken[pool]) if pool in taken else limit, refused)
             for pool, limit, refused in pools]
 
 
-def _seats_now(account_ids) -> dict:
+def _seats_now(account_ids, cfg=None) -> dict:
     from .account_links import login_seats_for_accounts
-    return login_seats_for_accounts(account_ids)
+    return login_seats_for_accounts(account_ids, cfg)
+
+
+def _hosts_off(account_ids) -> frozenset:
+    from .account_links import hosts_all_off
+    return frozenset(hosts_all_off(account_ids))
 
 
 def _refused(refused_at, now, cooldown) -> bool:
@@ -204,14 +224,15 @@ def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
     cfg = load_config()
     default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
     cooldown = refusal_cooldown(cfg)
-    all_seats = _seats_now([account_id])
+    all_seats = _seats_now([account_id], cfg)
     seats = all_seats.get(account_id, [])
+    hosts_off = _hosts_off([account_id])
     taken = _pool_taken_plan([account_id], all_seats, cfg, holder_kind)
     with _lock:
         account = db.session.get(Account, account_id)
         if account is None:
             return False
-        pools = _usable_limits(account, default_max_connections, taken(), seats)
+        pools = _usable_limits(account, default_max_connections, taken(), seats, hosts_off)
         key = (holder_kind, holder_id)
         if any(key in _held_in(pool) for pool, _, _ in pools):
             return True
@@ -220,15 +241,52 @@ def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
             # Already counted on this account, in a pool its list no longer names (a login
             # removed while the seat was held). Still one seat, still this account's.
             return True
-        free = [(pool, refused) for pool, limit, refused in pools if len(_held_in(pool)) < limit]
-        if not free:
+        pool = _pick_free_locked(pools, datetime.utcnow(), cooldown)
+        if pool is None:
             return False
-        now = datetime.utcnow()
-        preferred = [pool for pool, refused in free if not _refused(refused, now, cooldown)]
-        pool = preferred[0] if preferred else free[0][0]
         _holders[pool].append(key)
         _seat_of[key] = (account_id, pool)
         return True
+
+
+def _pick_free_locked(pools, now, cooldown):
+    """The pool a new seat goes in: the first with a free seat, passing over a login refused
+    inside the cooldown while another has one. None when every pool is full. The caller holds
+    _lock. try_acquire() decides with it and next_seat() predicts with it, so the page's "the
+    next stream will use" cannot name a different login from the one the next seat takes."""
+    free = [(pool, refused) for pool, limit, refused in pools if len(_held_in(pool)) < limit]
+    if not free:
+        return None
+    preferred = [pool for pool, refused in free if not _refused(refused, now, cooldown)]
+    return preferred[0] if preferred else free[0][0]
+
+
+def next_seat(account_id: int, cfg=None) -> tuple:
+    """(whether a new stream could take a seat on the account right now, the login id it would
+    be seated on - None for an account with no logins). Advisory and racy exactly as at_limit()
+    is: for the account and channel pages' "the next stream will use" line, never a decision.
+    A recording that would have to stop a preview or a test for its seat reads as no free seat
+    here; the recorder still preempts them."""
+    from . import db
+    from .account_links import refusal_cooldown
+    from .config import load_config
+    from .database import Account
+    cfg = cfg if cfg is not None else load_config()
+    default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
+    cooldown = refusal_cooldown(cfg)
+    all_seats = _seats_now([account_id], cfg)
+    seats = all_seats.get(account_id, [])
+    hosts_off = _hosts_off([account_id])
+    taken = _pool_taken_now([account_id], all_seats, cfg)
+    account = db.session.get(Account, account_id)
+    if account is None:
+        return False, None
+    pools = _usable_limits(account, default_max_connections, taken, seats, hosts_off)
+    with _lock:
+        pool = _pick_free_locked(pools, datetime.utcnow(), cooldown)
+    if pool is None:
+        return False, None
+    return True, (pool[1] if isinstance(pool, tuple) else None)
 
 
 def move_seat(holder_kind: str, holder_id, from_account_id: int, to_account_id: int) -> bool:
@@ -255,15 +313,16 @@ def move_seat(holder_kind: str, holder_id, from_account_id: int, to_account_id: 
     cfg = load_config()
     default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
     cooldown = refusal_cooldown(cfg)
-    all_seats = _seats_now([to_account_id])
+    all_seats = _seats_now([to_account_id], cfg)
     seats = all_seats.get(to_account_id, [])
+    hosts_off = _hosts_off([to_account_id])
     taken = _pool_taken_plan([to_account_id], all_seats, cfg, holder_kind)
     key = (holder_kind, holder_id)
     with _lock:
         account = db.session.get(Account, to_account_id)
         if account is None:
             return False
-        pools = _usable_limits(account, default_max_connections, taken(), seats)
+        pools = _usable_limits(account, default_max_connections, taken(), seats, hosts_off)
         seated = _seat_of.get(key)
         current = seated[1] if seated is not None else from_account_id
         if key in _held_in(current) and any(pool == current for pool, _, _ in pools):
@@ -285,13 +344,20 @@ def move_seat(holder_kind: str, holder_id, from_account_id: int, to_account_id: 
         return True
 
 
-def reseat_if_refused(account_id: int, holder_kind: str, holder_id) -> Optional[int]:
-    """Before a relaunch: if the holder's seat is on a login the server refused inside the
-    cooldown and another login on the account has a free seat that was not, move the seat
-    there, so the next segment launches on a working login (design §5.4). Returns the login
-    id the holder is seated on afterward, or None when it holds no login seat."""
+def reseat_before_relaunch(account_id: int, holder_kind: str, holder_id) -> Optional[int]:
+    """Before a relaunch: move the holder's seat off a login it should not launch on again,
+    when another login on the account has a free seat that is fine - so the next segment
+    carries working credentials. Two reasons to move: the server refused the login inside the
+    cooldown (design §5.4), or the user turned the login off for this account since the seat
+    was taken (dev/changelog/1670). With nowhere to move, the seat stays where it is: a
+    refusal is sometimes a panel hiccup, and a stream already running keeps going rather than
+    being cut off by a switch. Returns the login id the holder is seated on afterward, or None
+    when it holds no login seat. A third reason, on the same terms: the user blocked the
+    login since (dev/changelog/1672) - the TV it was blocked for wants the seat, and a stream
+    already running keeps going when no other login has one."""
     from . import db
-    from .account_links import refusal_cooldown
+    from .account_blocks import login_blocks_at
+    from .account_links import login_enabled, refusal_cooldown
     from .config import load_config
     from .database import Account
     key = (holder_kind, holder_id)
@@ -302,8 +368,11 @@ def reseat_if_refused(account_id: int, holder_kind: str, holder_id) -> Optional[
     cfg = load_config()
     default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
     cooldown = refusal_cooldown(cfg)
-    all_seats = _seats_now([account_id])
+    all_seats = _seats_now([account_id], cfg)
     seats = all_seats.get(account_id, [])
+    hosts_off = _hosts_off([account_id])
+    current_off = not login_enabled(account_id, seated[1][1])
+    current_blocked = bool(login_blocks_at(login_ids=[seated[1][1]]))
     taken = _pool_taken_plan([account_id], all_seats, cfg, holder_kind)
     with _lock:
         seated = _seat_of.get(key)
@@ -313,10 +382,11 @@ def reseat_if_refused(account_id: int, holder_kind: str, holder_id) -> Optional[
         account = db.session.get(Account, account_id)
         if account is None:
             return current[1]
-        pools = _usable_limits(account, default_max_connections, taken(), seats)
+        pools = _usable_limits(account, default_max_connections, taken(), seats, hosts_off)
         now = datetime.utcnow()
         mine = next(((pool, refused) for pool, _, refused in pools if pool == current), None)
-        if mine is None or not _refused(mine[1], now, cooldown):
+        refused_now = mine is not None and _refused(mine[1], now, cooldown)
+        if not refused_now and not current_off and not current_blocked:
             return current[1]
         for pool, limit, refused in pools:
             if pool == current or _refused(refused, now, cooldown):
@@ -327,10 +397,39 @@ def reseat_if_refused(account_id: int, holder_kind: str, holder_id) -> Optional[
                     _holders.pop(current, None)
                 _holders[pool].append(key)
                 _seat_of[key] = (account_id, pool)
-                log.info('%s %s: moved from refused login %d to login %d on account %d',
-                         holder_kind, holder_id, current[1], pool[1], account_id)
+                why = ('refused' if refused_now else 'turned-off' if current_off
+                       else 'blocked')
+                log.info('%s %s: moved from %s login %d to login %d on account %d',
+                         holder_kind, holder_id, why,
+                         current[1], pool[1], account_id)
                 return pool[1]
         return current[1]
+
+
+def fold_account_pool(account_id: int) -> Optional[int]:
+    """Move every holder counted in the account's own pool onto its first login that is on,
+    once the account has started holding logins. Returns the login id they moved to, or None.
+
+    The first listing of a login - the playlist's own at a sync, or one the user adds - turns
+    an account that counted one pool keyed by its id into one counted per login. A recording
+    already seated in the old pool would otherwise count against nothing: every new holder
+    would see the login's seat as free and a second stream would open on a one-connection
+    login, and the recording itself would never be reseated, so it could not move off a login
+    the user later turns off (dev/changelog/1670)."""
+    from .account_links import login_seats_for_accounts
+    seats = login_seats_for_accounts([account_id]).get(account_id, [])
+    if not seats:
+        return None
+    target = login_pool(next((lid for lid, n, _ in seats if n), seats[0][0]))
+    with _lock:
+        held = _holders.pop(account_id, [])
+        for key in held:
+            _holders[target].append(key)
+            _seat_of[key] = (account_id, target)
+    if held:
+        log.info('Account %d now holds logins: %d seat(s) in its own pool counted on login %d',
+                 account_id, len(held), target[1])
+    return target[1]
 
 
 def held_login_id(holder_kind: str, holder_id) -> Optional[int]:
@@ -356,14 +455,15 @@ def at_limit(account_id: int) -> bool:
     from .database import Account
     cfg = load_config()
     default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
-    all_seats = _seats_now([account_id])
+    all_seats = _seats_now([account_id], cfg)
     seats = all_seats.get(account_id, [])
+    hosts_off = _hosts_off([account_id])
     taken = _pool_taken_now([account_id], all_seats, cfg)
     with _lock:
         account = db.session.get(Account, account_id)
         if account is None:
             return True
-        pools = _usable_limits(account, default_max_connections, taken, seats)
+        pools = _usable_limits(account, default_max_connections, taken, seats, hosts_off)
         return all(len(_held_in(pool)) >= limit for pool, limit, _ in pools)
 
 
@@ -410,9 +510,11 @@ def seat_standing(account_ids, holder_kind: str, exclude_holder=None) -> dict:
         return {}
     cfg = load_config()
     default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
-    seats = _seats_now(ids)
+    seats = _seats_now(ids, cfg)
+    hosts_off = _hosts_off(ids)
     taken = _pool_taken_now(ids, seats, cfg, holder_kind)
-    pools_by_account = {a.id: _usable_limits(a, default_max_connections, taken, seats.get(a.id, []))
+    pools_by_account = {a.id: _usable_limits(a, default_max_connections, taken, seats.get(a.id, []),
+                                             hosts_off)
                         for a in Account.query.filter(Account.id.in_(ids)).all()}
     # The viewers a recording's preemption leaves seated (preempt_viewers_for_slot keeps up to
     # an account's held seats, dev/changelog/1536) are in its way as surely as a recording.
@@ -472,17 +574,19 @@ def accounts_without_free_recording_slot(account_ids, exclude_holder=None) -> se
 
 
 def must_yield_to_block(account_id: int, recording_id: int) -> bool:
-    """True when a block now leaves the pool `recording_id`'s seat is in fewer usable slots
-    than the recordings holding one - so it should move to another member if it has one.
+    """True when an ACCOUNT block now leaves the pool `recording_id`'s seat is in fewer usable
+    slots than the recordings holding one - so it should move to another member if it has one.
     Advisory, like at_limit(): two recordings on one partly blocked account may both answer
-    True and both try to move, and a move that finds nowhere to go stays put."""
+    True and both try to move, and a move that finds nowhere to go stays put. A block on a
+    login is not counted: streams already running on a blocked login keep going
+    (dev/changelog/1672)."""
     from . import db
     from .config import load_config
     from .database import Account
     cfg = load_config()
     all_seats = _seats_now([account_id])
     seats = all_seats.get(account_id, [])
-    taken = _pool_taken_now([account_id], all_seats, cfg)
+    taken = _pool_taken_now([account_id], all_seats, cfg, login_blocks=False)
     if not taken:
         return False
     default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)

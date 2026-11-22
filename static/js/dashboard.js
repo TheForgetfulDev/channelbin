@@ -819,6 +819,8 @@ const REGIONS = {
   health: ['.dash-sec[data-sec="health"]'],
   recordings: ['#dash-sub', '.dash-pulse', '#dash-timeline',
                '.dash-sec[data-sec="live"]', '.dash-sec[data-sec="upcoming"]', '#dash-setup'],
+  // Redrawn after a play is moved from it (play-move.js), its only trigger.
+  viewers: ['.dash-sec[data-sec="viewers"]'],
 };
 const RERENDER_MS = 60 * 1000;
 
@@ -849,7 +851,13 @@ const AFTER_SWAP = {
     readTimeline();
     renderTimeline();
   },
+  viewers: () => {},
 };
+
+document.addEventListener('click', e => {
+  const el = e.target.closest('[data-act="move-play"]');
+  if (el) movePlay(el).then(asked => { if (asked) requestRefresh('viewers'); });
+});
 
 function refreshRegions(keys) {
   const todo = keys.filter(k => {

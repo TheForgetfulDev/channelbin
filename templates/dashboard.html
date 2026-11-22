@@ -342,7 +342,7 @@
              style="--pct: {{ ((health_check.completed_channels / health_check.total_channels * 100) | int) if health_check.total_channels else 0 }}%">
           <span class="d-title">
             <span class="d-name">{{ health_check.name }}</span>
-            <span class="d-meta">{{ 'On demand' if health_check.kind == 'on_demand' else ('Pre-check' if health_check.kind == 'pre_check' else 'Guide channels') }}</span>
+            <span class="d-meta">{% if health_check.kind == 'on_demand' %}On demand{% elif health_check.kind == 'pre_check' %}Pre-check{% elif health_check.kind == 'stream_check' %}Stream check{% elif health_check.kind == 'guide' %}Guide channels{% else %}{{ health_check.kind }}{% endif %}</span>
           </span>
           <span class="d-cell d-badge">{# b-running: a health check running is not an alarm (dev/changelog/816). #}{{ m.status_badge('b-running', 'RUNNING', pulse=true, id='hc-status-badge') }}</span>
           {#- The estimate rides in the Elapsed cell rather than taking a seventh column:
@@ -442,7 +442,11 @@
           <span class="d-cell"><span class="d-k">Elapsed</span>{{ s.elapsed_seconds | duration }}</span>
           <span class="d-cell"><span class="d-k">Relayed</span>{{ s.bytes_sent | filesize }}</span>
           <span class="d-cell"><span class="d-k">IPTV player</span>{{ s.client }}</span>
-          <span class="c-actions"></span>
+          <span class="c-actions">
+            {%- if s.move_offered or s.move_why %}<span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
+              <div class="menu pop-left">{% if s.move_offered %}<button class="menu-item" data-act="move-play" data-id="{{ s.session_id }}" data-client="{{ s.client }}" data-name="{{ s.label }}" data-channel="{{ s.channel_name }}">Move to another channel</button>{% else %}<button class="menu-item" disabled>{{ s.move_why }}</button>{% endif %}</div></span>
+            {%- endif -%}
+          </span>
         </div>
         {% endfor %}
         {#- Mixed mode: a plain channel's tune-in, sent straight to the provider (dev/changelog/1536). -#}
@@ -502,5 +506,6 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='js/play-move.js') }}"></script>
 <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
 {% endblock %}

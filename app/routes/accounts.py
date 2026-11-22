@@ -16,20 +16,23 @@ from ..accounts import (NORM_DISABLED, NORM_HLS, NORM_MODES, NORM_MPEGTS, NORM_M
                         start_source_refresh, sync_signature, update_source_stale_alert)
 from .. import account_stats_view
 from ..fmt_utils import iso_or_none, plural
-from ..account_links import (add_host, add_login, delete_hosts_for_account,
+from ..account_links import (add_host, add_login, configured_seats, delete_hosts_for_account,
                              delete_logins_for_account, host_list, hosts_for_accounts,
-                             is_refused_now, logins_for_accounts, move_login, refusal_cooldown,
-                             remove_host, remove_login, render_host, set_active_host,
-                             update_login)
+                             is_refused_now, logins_for_accounts, move_login, next_stream,
+                             playlist_rows_off, refusal_cooldown, remove_host, remove_login,
+                             render_host, set_active_host, set_host_enabled, set_login_enabled,
+                             unusable_reasons, update_login)
 from ..account_stats import WINDOWS, today_local, windowed_stats
 from ..channel_groups import clear_guide_listings_pins_on, report_orphaned_guide_groups
 from ..channel_search import GROUP_ANY, OTHER_NEW, OTHER_REMOVED
 from ..config import load_config, config_default
-from ..database import (Account, AccountBlock, AccountStatDay, Channel, AccountSyncLog,
-                        ChannelGroupMember, ChannelTest, EpgSource, EpgSourceSubscription, SportsMatch,
+from ..database import (Account, AccountBlock, AccountLogin, AccountStatDay, Channel, Login,
+                        AccountSyncLog, ChannelGroupMember, ChannelTest, EpgSource,
+                        EpgSourceSubscription, SportsMatch,
                         EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, ACCOUNT_STATUS_SYNCING,
                         ACCOUNT_STATUS_UNSYNCED, SYNC_LOG_SUCCESS, SYNC_LOG_CANCELLED,
-                        SYNC_LOG_IMPORTED, detach_channel_references)
+                        SYNC_LOG_IMPORTED, HOST_CHECK_ANSWERS, HOST_CHECK_RESOLVES,
+                        HOST_PROBE_LOOKUP, detach_channel_references)
 from ..db_utils import chunked, retry_on_locked
 from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, directory_row_summary,
                            case_sensitive_matching,
@@ -45,15 +48,17 @@ from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, dir
 from ..logo_cache import delete_cached_logos
 from ..storage_dirs import manual_screenshot_paths
 from ..tz_utils import format_local, get_display_tz, is_24h, parse_form_time
-from .. import account_activity, history_filter
-from ..account_blocks import (MAX_ACCOUNT_BLOCK_HOURS, account_limits, add_account_block,
+from .. import account_activity, history_filter, host_checks, stream_check
+from ..stream_check import delete_for_account as delete_stream_checks
+from ..account_blocks import (NO_END, account_limits, add_account_block, add_login_block,
                               block_views,
-                              describe, end_account_block, rearm_waiting_starts,
-                              recording_blocks, set_recording_blocks)
+                              describe, end_account_block, end_login_block,
+                              login_block_views, rearm_waiting_starts,
+                              recording_blocks, set_recording_blocks, until_label)
 from ..ui_constants import DEFAULT_COLOR, PRESET_COLORS
 from ..url_utils import mask_url_path
 from .channels import _DELETE_CHUNK_SIZE
-from .providers import account_provider, providers_section, sibling_blocks
+from .providers import account_provider, login_shares, providers_section, sibling_blocks
 
 accounts_bp = Blueprint('accounts', __name__)
 
@@ -220,8 +225,12 @@ def accounts_list():
         sync_queue=queue,
         stats=stats,
         blocks=block_views(account_ids),
+        playlist_off=playlist_rows_off(account_ids),
         conn_limits=account_limits(account_ids, cfg),
         providers=providers_section(accounts),
+        host_summaries=host_checks.account_summaries(account_ids),
+        host_progress=host_checks.progress_view(),
+        host_spacing=round(host_checks.spacing_seconds(cfg)),
     )
 
 
@@ -251,29 +260,64 @@ def _section_pref():
 
 
 def host_views(account_id):
-    """The Hosts card's rows (DESIGN-account-providers.md §4.5, §6.3), one query. Each host
-    is one of three states and the template names every one: resolving (the probe or a
-    roll last found it), failing (with the resolver's words and, when known, the last time
-    it did resolve), or not checked yet."""
+    """The Hosts card's rows (DESIGN-account-providers.md §4.5, §6.3; dev/changelog/1674),
+    a fixed number of queries. Each row carries `check`, the words for its newest verdict
+    (host_checks.describe(), which names every status), or None when no full check has run -
+    then `lookup` says what the last lookup found, if anything did. `queue` is 'checking',
+    'waiting' or None, from the one host-check line."""
+    rows = hosts_for_accounts([account_id]).get(account_id, [])
+    latest = host_checks.latest_for_hosts(r.host for r in rows)
+    line = host_checks.status()
+    floor = datetime.utcnow() - host_checks.REPEAT_FLOOR
     out = []
-    for row in hosts_for_accounts([account_id]).get(account_id, []):
-        if row.last_resolve_error:
-            state = 'failing'
+    for row in rows:
+        info = latest.get(row.host) or {}
+        verdict = host_checks.effective(info)
+        full, lookup = info.get('full'), info.get('lookup')
+        if lookup is not None:
+            lookup_view = {'ok': lookup.status == HOST_CHECK_RESOLVES, 'at': lookup.checked_at,
+                           'error': lookup.error}
+        elif row.last_resolve_error:
+            lookup_view = {'ok': False, 'at': None, 'error': row.last_resolve_error}
         elif row.last_resolved_at:
-            state = 'resolving'
+            lookup_view = {'ok': True, 'at': row.last_resolved_at, 'error': None}
         else:
-            state = 'unchecked'
+            lookup_view = None
+        if row.host == line['current']:
+            queue, ahead = 'checking', 0
+        elif row.host in line['line']:
+            queue, ahead = 'waiting', line['line'].index(row.host) + (1 if line['current'] else 0)
+        else:
+            queue, ahead = None, 0
         out.append({
             'id': row.id,
             'host': row.host,
             'is_active': row.is_active,
             'activated_at': row.activated_at,
-            'state': state,
-            'last_resolved_at': row.last_resolved_at,
-            'error': row.last_resolve_error,
+            'enabled': row.enabled,
+            'from_playlist': row.from_playlist,
+            'switched_at': row.switched_at,
+            'check': dict(host_checks.describe(verdict), at=verdict.checked_at,
+                          from_lookup=verdict.kind == HOST_PROBE_LOOKUP) if verdict else None,
+            'answer_ms': (verdict.answer_ms if verdict is not None and verdict.status == HOST_CHECK_ANSWERS
+                          and not verdict.in_use else None),
+            'still_resolves_at': (lookup.checked_at if verdict is not None and verdict is full
+                                  and lookup is not None and lookup.status == HOST_CHECK_RESOLVES
+                                  and lookup.checked_at > full.checked_at else None),
+            'lookup': lookup_view,
+            'answered': info.get('answered', 0),
+            'checks': info.get('checks', 0),
+            'queue': queue,
+            'ahead': ahead,
+            'recent_until': (full.checked_at + host_checks.REPEAT_FLOOR
+                             if full is not None and full.checked_at > floor else None),
+            'fastest': False,
         })
+    # The fastest answer among the hosts that are on, marked only when there are two to compare.
+    timed = [v for v in out if v['enabled'] and v['answer_ms'] is not None]
+    if len(timed) >= 2:
+        min(timed, key=lambda v: v['answer_ms'])['fastest'] = True
     return out
-
 
 def unlisted_stream_host(account, hosts):
     """The host the account's streams are on when it is not one of the listed `hosts` (the
@@ -296,10 +340,17 @@ def own_login_view(account, logins):
     row has nothing the login endpoints could act on."""
     from .. import connection_limits as connlim
     if account.username:
-        same = next((lg for lg in logins if lg['username'] == account.username), None)
+        # Username and password together: a username may repeat on an account since the
+        # playlist's expired login and a working one often share it (dev/changelog/1670).
+        same = next((lg for lg in logins if lg['is_account_login']), None)
         if same is not None:
             return {'same_as': same['id']}
     if logins:
+        if not account.username and any(lg['from_playlist'] for lg in logins):
+            # An M3U account has no login of its own for a sync to use; once the playlist's
+            # login is a row, a second "from the playlist" row would name it twice
+            # (dev/changelog/1671).
+            return None
         return {'same_as': None, 'username': account.username, 'syncs_only': True}
     held = connlim.holder_counts().get(account.id, 0)
     return {
@@ -317,7 +368,6 @@ def login_views(account_id, cfg):
     (`refused`) or ever (`last_refused_at`). The password is never in the view. One query
     for the rows, one registry read for the holders."""
     from .. import connection_limits as connlim
-    from .providers import login_shares
     rows = logins_for_accounts([account_id]).get(account_id, [])
     if not rows:
         return []
@@ -326,21 +376,42 @@ def login_views(account_id, cfg):
     held = connlim.login_pool_counts([row.id for row in rows])
     shares = login_shares(account_id, [row.id for row in rows])
     names = None
-    if shares:
+    if shares or any(row.playlist_account_id not in (None, account_id) for row in rows):
         names = dict(db.session.query(Account.id, Account.name).all())
     cooldown = refusal_cooldown(cfg)
     now = datetime.utcnow()
+    seats = configured_seats(rows, cfg)
+    switches = {lid: (on, at) for lid, on, at in db.session.query(
+        AccountLogin.login_id, AccountLogin.enabled, AccountLogin.switched_at)
+        .filter(AccountLogin.account_id == account_id).all()}
+    own_pair = db.session.query(Account.username, Account.password).filter(
+        Account.id == account_id).first()
+    blocks = login_block_views([row.id for row in rows])
     out = []
     for i, row in enumerate(rows):
         out.append({
             'id': row.id,
             'name': row.name,
             'username': row.username,
-            'max_connections': row.max_connections,
+            'max_connections': seats[row.id],
+            'enabled': bool(switches.get(row.id, (True, None))[0]),
+            'switched_at': switches.get(row.id, (True, None))[1],
+            'from_playlist': row.playlist_account_id == account_id,
+            # Another account's playlist login, shared here through a provider: named by
+            # whose playlist it is, never "the playlist" (this account's own).
+            'playlist_of': (names.get(row.playlist_account_id, f'account {row.playlist_account_id}')
+                            if row.playlist_account_id not in (None, account_id) else None),
+            # The sync rewrites it and its seats are its account's Max connections, so it
+            # has no Edit, and on its own account no Remove (account_links._is_sync_listed).
+            'sync_listed': row.playlist_account_id is not None and row.max_connections is None,
+            'is_account_login': own_pair is not None and bool(own_pair[0])
+                                and (row.username, row.password) == tuple(own_pair),
             'held': held.get(row.id, 0),
             'holders': (connlim.describe_pool_holders(row.id, account_id=account_id, names=names)
                         if held.get(row.id) else ''),
             'shared_with': shares.get(row.id, []),
+            # A block on the login itself (dev/changelog/1672): {'id', 'stop', 'stop_label'}.
+            'blocked': blocks.get(row.id),
             'refused': is_refused_now(row.last_refused_at, now, cooldown),
             'last_refused_at': row.last_refused_at,
             'last_refused_detail': row.last_refused_detail,
@@ -364,10 +435,10 @@ def _effective_settings(account, cfg, logins=()):
     return {
         'interval_hours': account.sync_interval_hours or global_hours,
         'interval_inherited': account.sync_interval_hours is None,
-        'max_connections': (sum(lg['max_connections'] for lg in logins) if logins
-                            else account.max_connections or global_conn),
+        'max_connections': (sum(lg['max_connections'] for lg in logins if lg['enabled'])
+                            if logins else account.max_connections or global_conn),
         'max_connections_inherited': account.max_connections is None and not logins,
-        'max_connections_logins': ', '.join(lg['name'] for lg in logins),
+        'max_connections_logins': ', '.join(lg['name'] for lg in logins if lg['enabled']),
         'norm_mode': mode,
         'norm_label': norm_mode_label(mode) or 'Disabled',
         'norm_example': norm_mode_example(mode),
@@ -495,6 +566,10 @@ def account_detail(account_id):
     payload = _account_detail_payload(account, cfg, stats)
     hosts = host_views(account.id)
     next_sync = next_sync_map([account])
+    # The playlist's own rows, read off the cards' views: the notice, the header badge and the
+    # rows themselves cannot disagree about which one is off (dev/changelog/1671).
+    playlist_host = next((h for h in hosts if h['from_playlist']), None)
+    playlist_login = next((lg for lg in payload['logins'] if lg['from_playlist']), None)
     return render_template(
         'account_detail.html',
         account=account,
@@ -512,12 +587,20 @@ def account_detail(account_id):
         xtream_debug=_xtream_debug_enabled(account),
         stats=stats,
         hosts=hosts,
+        host_progress=host_checks.progress_view([h['host'] for h in hosts]),
+        host_spacing=round(host_checks.spacing_seconds(cfg)),
+        host_not_answering=host_checks.not_answering_accounts([account.id]).get(account.id),
         unlisted_host=unlisted_stream_host(account, hosts),
+        playlist_host_off=playlist_host if playlist_host and not playlist_host['enabled'] else None,
+        playlist_login_off=(playlist_login if playlist_login and not playlist_login['enabled']
+                            else None),
+        unusable=unusable_reasons([account.id]).get(account.id),
+        next_stream=next_stream(account, cfg),
         blocks=block_views([account.id]).get(account.id, []),
         sibling_blocks=sibling_blocks(account.id),
         provider=account_provider(account),
-        block_max_hours=MAX_ACCOUNT_BLOCK_HOURS,
         sync_sig=sync_sig,
+        stream_check=stream_check.view(stream_check.latest(account.id)),
         **payload,
     )
 
@@ -575,6 +658,8 @@ def new_account():
             if account_type == 'xtream':
                 ensure_provider_source(account)
             source_id = add_url_source(account, xmltv).id if xmltv else None
+            if _checkbox(form.get('stream_check')):
+                stream_check.owe_after_first_sync(account.id)
             db.session.commit()
             return account.id, account.name, source_id
 
@@ -852,6 +937,8 @@ def _delete_account_and_jobs(account_id):
         AccountStatDay.query.filter_by(account_id=account_id).delete(synchronize_session=False)
         # Nor its blocks, for the same reason.
         AccountBlock.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+        # Nor its stream checks, whose retry jobs go with them.
+        delete_stream_checks(account_id)
         # Nor its host list (app/account_links.py is its one writer), nor its login list and
         # the logins no other account holds.
         delete_hosts_for_account(account_id)
@@ -1147,31 +1234,42 @@ def delete_account_api(account_id):
     return jsonify({'success': True, 'message': f'Account "{name}" deleted.'})
 
 
-@accounts_bp.route('/api/accounts/<int:account_id>/blocks', methods=['POST'])
-def block_account_api(account_id):
-    """Block the account from now for a while (app/account_blocks.py). Body: `minutes`, or
-    `until` as a datetime-local value in the display timezone beside `until_utc`, the instant
-    the field stands for (util.js::wallTimeField - a wall time a DST change repeats cannot
-    say which pass it means, dev/changelog/1477); optional `slots` (omitted or null = every
-    slot). Bounded at MAX_ACCOUNT_BLOCK_HOURS - a block is for a stretch of time, and one long
-    enough to forget about is the switch it exists to avoid."""
-    account, err = _json_account(account_id)
-    if err:
-        return err
-    data = request.get_json(silent=True) or {}
-    now = datetime.utcnow()
+def _block_stop(data, now, what):
+    """(the stop a block's body asks for - None for `until_unblocked` - , None) or (None, an
+    error response). The account block and the login block take one body shape, so their
+    dialogs offer the same choices: `minutes`; `until` beside `until_utc`; or
+    `until_unblocked: true`."""
+    if data.get('until_unblocked') is True:
+        return None, None
     try:
         if data.get('until'):
             stop = parse_form_time(str(data['until']), str(data.get('until_utc') or ''))
         else:
             stop = now + timedelta(minutes=int(data.get('minutes')))
-    except (TypeError, ValueError):
-        return jsonify({'error': 'Say how long to block the account for.'}), 400
+    except (TypeError, ValueError, OverflowError):
+        return None, (jsonify({'error': f'Say how long to block {what} for.'}), 400)
     if stop <= now:
-        return jsonify({'error': 'That time has already passed.'}), 400
-    if stop - now > timedelta(hours=MAX_ACCOUNT_BLOCK_HOURS):
-        return jsonify({'error': f'A block can run for at most {MAX_ACCOUNT_BLOCK_HOURS} '
-                                 f'hours.'}), 400
+        return None, (jsonify({'error': 'That time has already passed.'}), 400)
+    return stop, None
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/blocks', methods=['POST'])
+def block_account_api(account_id):
+    """Block the account from now (app/account_blocks.py). Body: `minutes`; or `until` as a
+    datetime-local value in the display timezone beside `until_utc`, the instant the field
+    stands for (util.js::wallTimeField - a wall time a DST change repeats cannot say which
+    pass it means, dev/changelog/1477); or `until_unblocked: true` for a block with no end,
+    which holds until the user unblocks it (dev/changelog/1667). Optional `slots` (omitted
+    or null = every slot). No upper bound on a timed block: one that may have no end at all
+    makes a cap on the timed ones meaningless."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    now = datetime.utcnow()
+    stop, err = _block_stop(data, now, 'the account')
+    if err:
+        return err
     slots = data.get('slots')
     if slots in ('', None):
         slots = None
@@ -1184,7 +1282,7 @@ def block_account_api(account_id):
             return jsonify({'error': 'Slots must be at least 1.'}), 400
     add_account_block(account_id, stop, start=now, slots=slots)
     return jsonify({'success': True,
-                    'message': f'{describe(account.name, stop, capital=True)}.'})
+                    'message': f'{describe(account.name, stop or NO_END, capital=True)}.'})
 
 
 @accounts_bp.route('/api/accounts/<int:account_id>/blocks/<int:block_id>', methods=['DELETE'])
@@ -1257,6 +1355,8 @@ def activate_host_api(account_id, host_id):
         summary = set_active_host(account_id, host_id)
     except LookupError as exc:
         return jsonify({'error': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 409
     n = summary['channels']
     message = (f'{account.name} now uses {summary["host"]}: {n:,} stream {plural(n, "URL")} '
                f'rewritten')
@@ -1264,6 +1364,88 @@ def activate_host_api(account_id, host_id):
         message += ', and the account\'s own URL'
     message += '.'
     return jsonify({'success': True, 'message': message, **summary})
+
+
+def _switch_value(data):
+    """The `enabled` field of a switch's body, which must be a real JSON boolean: a string
+    like "false" is truthy, and reading it as on would turn on a row the user turned off."""
+    value = data.get('enabled')
+    return value if isinstance(value, bool) else None
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/hosts/<int:host_id>/enabled', methods=['POST'])
+def host_enabled_api(account_id, host_id):
+    """The Use switch on one host (dev/changelog/1670). Body: `enabled`, true or false.
+    Turning the active host off hands the role to the next host that is on."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    enabled = _switch_value(request.get_json(silent=True) or {})
+    if enabled is None:
+        return jsonify({'error': 'Send "enabled" as true or false.'}), 400
+    try:
+        out = set_host_enabled(account_id, host_id, enabled)
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    if enabled:
+        message = f'{out["host"]} turned on.'
+    else:
+        message = (f'{out["host"]} turned off. Streams already running keep going; new ones '
+                   f'won\'t use it.')
+    if out['moved']:
+        message += f' {account.name} now uses {out["active"]}.'
+    elif not enabled and out['active'] == out['host']:
+        message += f' No other host on {account.name} is turned on, so nothing on it can stream.'
+    return jsonify({'success': True, 'message': message, **out})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/hosts/<int:host_id>/check', methods=['POST'])
+def check_host_api(account_id, host_id):
+    """Check now on one host: a full check, put in the one host-check line (app/host_checks.py).
+    A host given a full check in the last 10 minutes is left out, and the message says when
+    it can be checked again."""
+    from ..database import AccountHost
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    row = db.session.get(AccountHost, host_id)
+    if row is None or row.account_id != account_id:
+        return jsonify({'error': 'Host not found.'}), 404
+    result = host_checks.request(current_app._get_current_object(), [row.host])
+    return jsonify({'success': True, 'queued': len(result['added']),
+                    'message': host_checks.request_message(result, account.name)})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/hosts/check', methods=['POST'])
+def check_account_hosts_api(account_id):
+    """Check all on one account's Hosts card: every host on it, turned off or not."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    hosts = [r.host for r in hosts_for_accounts([account_id]).get(account_id, [])]
+    result = host_checks.request(current_app._get_current_object(), hosts)
+    return jsonify({'success': True, 'queued': len(result['added']),
+                    'message': host_checks.request_message(result, account.name)})
+
+
+@accounts_bp.route('/api/accounts/hosts/check', methods=['POST'])
+def check_all_hosts_api():
+    """Check all hosts on the Accounts list: every host name on every account, once each."""
+    from ..database import AccountHost
+    hosts = [h for (h,) in db.session.query(AccountHost.host).order_by(
+        AccountHost.account_id, AccountHost.position, AccountHost.id).all()]
+    result = host_checks.request(current_app._get_current_object(), hosts)
+    return jsonify({'success': True, 'queued': len(result['added']),
+                    'message': host_checks.request_message(result, 'any account')})
+
+
+@accounts_bp.route('/api/accounts/hosts/check/stop', methods=['POST'])
+def stop_host_checks_api():
+    """Stop checking: empty the line. A check already running finishes."""
+    n = host_checks.stop()
+    return jsonify({'success': True, 'stopped': n,
+                    'message': (f'Stopped. {n} host{"s" if n != 1 else ""} left unchecked.'
+                                if n else 'Nothing was waiting to be checked.')})
 
 
 def _login_seat_prefill(account):
@@ -1339,8 +1521,79 @@ def remove_login_api(account_id, login_id):
         name = remove_login(account_id, login_id)
     except LookupError as exc:
         return jsonify({'error': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 409
     return jsonify({'success': True,
                     'message': f'Login "{name}" removed from {account.name}\'s list.'})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/enabled', methods=['POST'])
+def login_enabled_api(account_id, login_id):
+    """The Use switch on one login, for this account only (dev/changelog/1670). Body:
+    `enabled`, true or false."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    enabled = _switch_value(request.get_json(silent=True) or {})
+    if enabled is None:
+        return jsonify({'error': 'Send "enabled" as true or false.'}), 400
+    try:
+        out = set_login_enabled(account_id, login_id, enabled)
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    if enabled:
+        message = f'Login "{out["login"]}" turned on for {account.name}.'
+    else:
+        message = (f'Login "{out["login"]}" turned off for {account.name}. Streams already '
+                   f'running keep going; new ones won\'t use it.')
+    return jsonify({'success': True, 'message': message, **out})
+
+
+def _held_login(account_id, login_id):
+    """(the Login row, None) when the account holds it, else (None, a 404 response)."""
+    held = db.session.query(Login).join(AccountLogin, AccountLogin.login_id == Login.id).filter(
+        AccountLogin.account_id == account_id, Login.id == login_id).first()
+    if held is None:
+        return None, (jsonify({'error': 'Login not found.'}), 404)
+    return held, None
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/block', methods=['POST'])
+def block_login_api(account_id, login_id):
+    """Block one login from now (dev/changelog/1672): no new stream takes a seat on it, on any
+    account holding it; streams already running on it keep going. The body is the account
+    block's (`minutes`, `until` + `until_utc`, or `until_unblocked: true`), with no `slots`:
+    the block takes the whole login."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    login, err = _held_login(account_id, login_id)
+    if err:
+        return err
+    stop, err = _block_stop(request.get_json(silent=True) or {}, datetime.utcnow(), 'the login')
+    if err:
+        return err
+    add_login_block(login_id, stop)
+    others = login_shares(account_id, [login_id]).get(login_id, [])
+    message = f'Login "{login.name}" blocked until {until_label(stop or NO_END)}.'
+    if others:
+        message += f' That covers {", ".join(others)} too.'
+    return jsonify({'success': True, 'message': message})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/block', methods=['DELETE'])
+def unblock_login_api(account_id, login_id):
+    """End the block on one login; any start that was waiting on it is re-armed at once."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    login, err = _held_login(account_id, login_id)
+    if err:
+        return err
+    if not end_login_block(login_id):
+        return jsonify({'success': True, 'message': f'Login "{login.name}" was not blocked.'})
+    rearm_waiting_starts()
+    return jsonify({'success': True, 'message': f'Login "{login.name}" unblocked.'})
 
 
 @accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/move', methods=['POST'])
@@ -1387,6 +1640,25 @@ def sync_account_api(account_id):
             return jsonify({'error': message, 'conflict': True, 'conflicts': conflicts}), 409
         return jsonify({'error': message, 'conflict': False, 'conflicts': []}), 400
     return jsonify({'success': True, 'message': message})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/stream-check', methods=['POST'])
+def stream_check_api(account_id):
+    """Test a few of the account's channels now (app/stream_check.py). A check already
+    running, or one owed after a first sync that has not happened, is reported rather than
+    doubled; a waiting one starts now."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    if account.status == ACCOUNT_STATUS_UNSYNCED:
+        return jsonify({'error': f'"{account.name}" has no channels yet. Sync it first.'}), 409
+    if account.status == ACCOUNT_STATUS_SYNCING:
+        return jsonify({'error': f'"{account.name}" is syncing. Test it once the sync has '
+                                 'finished.'}), 409
+    check_id, message = stream_check.request_check(current_app._get_current_object(), account_id)
+    if check_id is None:
+        return jsonify({'error': message}), 404
+    return jsonify({'success': True, 'message': message, 'check_id': check_id})
 
 
 @accounts_bp.route('/api/accounts/sync-queue', methods=['GET'])

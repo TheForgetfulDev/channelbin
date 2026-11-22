@@ -26,11 +26,12 @@ from typing import NamedTuple
 
 import requests
 from sqlalchemy import delete as sa_delete, func, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .config import load_config, config_default
 from . import admission, db, duplicate_streams
-from .account_links import (clear_rolled_alert_after_sync, current_host, host_list, render_host,
+from .account_links import (clear_rolled_alert_after_sync, host_list, list_playlist_rows,
+                            note_playlist_changes, playlist_facts, render_host,
                             rerender_stream_urls)
 from .channel_groups import touch_group
 from .database import (
@@ -155,12 +156,29 @@ def sync_signature() -> str:
 
     Both halves are needed. The syncing set moves when a sync starts or ends; the newest
     sync-log id moves when one starts, which is the only trace left by a sync that starts
-    and fails inside a single poll interval - the syncing set is the same at both polls."""
+    and fails inside a single poll interval - the syncing set is the same at both polls.
+
+    A third part follows the stream checks (app/stream_check.py): the newest one's id and
+    status, and the running one's id and tested count, so the account page shows a check
+    being asked for, moving channel by channel and ending without waiting for its minute
+    re-render (dev/changelog/1665).
+
+    A fourth part follows the host-check line (app/host_checks.py): it moves when a check
+    starts, finishes or the line changes length, so both pages show the checks going by
+    (dev/changelog/1674)."""
+    from .database import AccountStreamCheck, STREAM_CHECK_RUNNING
     syncing = (db.session.query(Account.id)
                .filter(Account.status == ACCOUNT_STATUS_SYNCING)
                .order_by(Account.id).all())
     latest_log_id = db.session.query(func.max(AccountSyncLog.id)).scalar() or 0
-    return f"{','.join(str(account_id) for (account_id,) in syncing)}|{latest_log_id}"
+    newest = (db.session.query(AccountStreamCheck.id, AccountStreamCheck.status)
+              .order_by(AccountStreamCheck.id.desc()).first())
+    running = (db.session.query(AccountStreamCheck.id, AccountStreamCheck.tested_count)
+               .filter(AccountStreamCheck.status == STREAM_CHECK_RUNNING).first())
+    check_part = ':'.join(str(v) for v in (*(newest or ()), *(running or ())))
+    from .host_checks import signature as host_check_signature
+    return (f"{','.join(str(account_id) for (account_id,) in syncing)}|{latest_log_id}"
+            f"|{check_part}|{host_check_signature()}")
 
 
 def _request_headers(cfg: dict | None = None) -> dict:
@@ -1059,11 +1077,13 @@ def sync_account(app, account_id: int, use_dump: bool = False, force_epg_resync:
         return None
 
     ticket = None
+    ran = False
     try:
         ticket = admission.try_start(admission.KIND_SYNC, f'account {account_id}',
                                      force=force_admission, ignoring=admission_ignoring)
         if not ticket.granted:
             return ticket
+        ran = True
 
         stop_event = threading.Event()
         with _sync_locks_mutex:
@@ -1085,6 +1105,11 @@ def sync_account(app, account_id: int, use_dump: bool = False, force_epg_resync:
     finally:
         admission.release(ticket)
         lock.release()
+        # After the sync has let go of everything: a stream check owed after the account's
+        # first good sync starts here, as a tester run of its own (app/stream_check.py).
+        if ran:
+            from .stream_check import after_sync
+            after_sync(app, account_id)
 
 
 def manual_sync_restarts_schedule(cfg: dict) -> bool:
@@ -1687,7 +1712,24 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         epg_entry_count_total = EPGEntry.query.join(Channel).filter(
             Channel.account_id == account_id
         ).count()
-        stream_host = current_host(account_id)
+        # The playlist's own host and login as rows on the account, re-rendering the URLs when
+        # the host list changed - its own commit, ahead of the success closure for the reason
+        # above. One pass over the channels answers both and the stamp (dev/changelog/1670).
+        facts = playlist_facts(account_id)
+        try:
+            playlist_changes = list_playlist_rows(account_id, facts['host'], facts['pair'])
+        except IntegrityError:
+            # A manual add listed the same account's playlist login in the moment between
+            # this sync's read and its write (uq_logins_playlist_account). The row is there;
+            # the next sync compares against it. The channels this sync wrote stand.
+            db.session.rollback()
+            log.warning('Account %d: the playlist\'s rows were listed by another writer during '
+                        'the sync; leaving them to the next sync', account_id)
+            playlist_changes = []
+        note_playlist_changes(account_id, account.name, playlist_changes)
+        listed_hosts, active_host = host_list(account_id)
+        stream_host = (active_host if active_host and facts['stream_host'] in listed_hosts
+                       else facts['stream_host'])
 
         duplicate_streams.recompute_and_commit()
 
@@ -3684,14 +3726,8 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
 
     # Delete scope = this source's rows in the window, both tables (§8.2). No channel join:
     # a channel hidden since the last refresh has its rows cleared by the same statement.
-    @retry_on_locked()
-    def _delete_old_epg_and_commit():
-        for model in (EPGEntry, EpgAlternateEntry):
-            model.query.filter(model.source_id == source_id,
-                               model.stop_time >= window_start).delete(synchronize_session=False)
-        db.session.commit()
-
-    _delete_old_epg_and_commit()
+    for model in (EPGEntry, EpgAlternateEntry):
+        _delete_source_window(model, source_id, window_start)
 
     @retry_on_locked()
     def _save_epg_batch_and_commit(active_rows, alternate_rows):
@@ -4026,6 +4062,44 @@ def _delete_ended_listings(model, cutoff: datetime) -> int:
         total += n
         if n < EPG_CLEANUP_CHUNK_ROWS:
             return total
+
+
+#: Ids an import's window delete covers per transaction. One transaction for a whole source
+#: held the write lock long enough on prod to outlast retry_on_locked's five 10 s waits and
+#: fail a scheduler pass (dev/docs/BUGS.md 2026-11-20 @ 06:44 PM). Measured on a copy of that
+#: database on the dev box, 917,034 rows of one source: 38.2 s held in one transaction;
+#: 5,000 ids per transaction held 1.24 s at worst and took 79 s in all. Walking the
+#: cleanup's way instead, LIMIT 2,500 in index order, held 2.84 s at worst and took 172 s,
+#: because index order scatters each chunk across table pages that the next chunk rewrites.
+#: A source's window is close to one contiguous id run, since each import writes it anew.
+EPG_IMPORT_DELETE_ID_SPAN = 5_000
+
+
+def _delete_source_window(model, source_id: int, window_start: datetime) -> int:
+    """Delete `model`'s rows of `source_id` that end at or after `window_start`, walking the
+    ids EPG_IMPORT_DELETE_ID_SPAN at a time, one transaction each, so no transaction can
+    delete more rows than the span however large the source grows. Returns how many went.
+    Re-runnable: each span deletes whatever still matches inside it."""
+    lo, hi = db.session.query(func.min(model.id), func.max(model.id)).filter(
+        model.source_id == source_id, model.stop_time >= window_start).one()
+    if lo is None:
+        return 0
+    total = 0
+    for start in range(lo, hi + 1, EPG_IMPORT_DELETE_ID_SPAN):
+        @retry_on_locked()
+        def _delete_span_and_commit():
+            # `source_id + 0` keeps SQLite on the id range. Given a plain source_id it picks
+            # the source's index and walks every row the source holds once per span.
+            n = db.session.execute(
+                sa_delete(model)
+                .where(model.id >= start, model.id < start + EPG_IMPORT_DELETE_ID_SPAN,
+                       (model.source_id + 0) == source_id, model.stop_time >= window_start)
+                .execution_options(synchronize_session=False)).rowcount
+            db.session.commit()
+            return n
+
+        total += _delete_span_and_commit()
+    return total
 
 
 def cleanup_old_epg_entries(app):

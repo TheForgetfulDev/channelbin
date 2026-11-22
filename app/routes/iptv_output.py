@@ -79,6 +79,40 @@ def stop_play(session_id):
     return jsonify({'success': True})
 
 
+@iptv_output_bp.route('/api/iptv-output/plays/<session_id>/move', methods=['POST'])
+def move_play(session_id):
+    """Watching now's "Move to another channel", on the dashboard and this page
+    (output_feed.move_by_hand, dev/changelog/1675). `message` is the sentence both pages show."""
+    try:
+        done = output_feed.move_by_hand(session_id)
+    except output_feed.FeedRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    left = f'"{done.from_name}"'
+    if done.outcome == output_feed.MOVE_ENDED:
+        session = output_feed.get_session(session_id)
+        why = ' '.join(x for x in (session.reason_text(), session.detail) if x) if session else ''
+        return jsonify({'error': f'Nothing else would start, so the play ended. {why}'.strip()}), 409
+    if done.outcome == output_feed.MOVE_ADJUSTED:
+        said = (f' {left} now has a score adjustment of {output_feed.HAND_MOVE_ADJUSTMENT}, so it '
+                f'is tried last, for a play or a recording, until you set it back on its channel page.')
+    elif done.outcome == output_feed.MOVE_ALREADY:
+        said = f' {left} already had a score adjustment of {output_feed.HAND_MOVE_ADJUSTMENT}.'
+    elif done.outcome == output_feed.MOVE_CHANNEL_GONE:
+        said = f' {left} is no longer in your channels.'
+    elif done.outcome == output_feed.MOVE_UNSAVED:
+        said = (f' The score adjustment on {left} could not be saved, so it may be picked again: '
+                f'{done.error}')
+    else:
+        raise ValueError(f'Unknown move outcome "{done.outcome}"')
+    log.info('IPTV output: play %s moved by hand from %s to "%s"', session_id, left,
+             done.to_name)
+    return jsonify({'success': True, 'moved_to': done.to_name, 'left': done.from_name,
+                    'left_channel_id': done.from_id,
+                    'adjusted': done.outcome == output_feed.MOVE_ADJUSTED,
+                    'warning': done.outcome == output_feed.MOVE_UNSAVED,
+                    'message': f'Moved to "{done.to_name}".{said}'})
+
+
 @iptv_output_bp.route('/api/iptv-output/accounts/<int:account_id>', methods=['POST'])
 def set_account(account_id):
     """Whether the output may play from one account (`allow`), or how many of its

@@ -325,7 +325,7 @@ class PageTests(_Case):
         rec = self.recording(seed.make_channel(self.account))
         html = self.page(rec)
         self.assertIn('The one Pretend Football League event around then did not match its listing', html)
-        self.assertIn('the description is never read', html)
+        self.assertIn('The description is read only for a game whose title names the league and no team', html)
 
     def test_a_listing_marked_wrong_says_so(self):
         self.follow()

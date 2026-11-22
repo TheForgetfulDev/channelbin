@@ -1735,20 +1735,25 @@ class AccountHostWriteBypassTests(unittest.TestCase):
     listed; a delete takes the whole list with the account). A second writer is how a list
     ends up non-empty with nothing active.
 
+    `enabled` is the user's on/off switch and `from_playlist` the sync's record of which row
+    the playlist's URLs are on (dev/changelog/1670): both are written only by the module's
+    set_host_enabled() and list_playlist_rows(), so both are in the pattern. So is
+    `switched_at`, the switch's own time (dev/changelog/1671), written with it.
+
     `is_active` / `activated_at` / `last_resolved_at` / `last_resolve_error` are deliberately
     NOT in the pattern: they are state the app writes - which of the user's own declared
     equivalents is dialed, and whether each one resolved - a selection among what the user
     listed, never a change to the list. They are written inside the same module anyway.
 
     app/ only - a test builds fixtures. The scan: a constructor call, a query-level delete,
-    or an assignment to the two list columns, in any file that names the model. Escape
+    or an assignment to the list columns, in any file that names the model. Escape
     hatch: `# account-host-write-ok: <reason>`.
     """
 
     _MARKER = 'account-host-write-ok'
     _CANONICAL_FILE = 'app/account_links.py'
     _PATTERN = re.compile(r'(?<!class )\bAccountHost\(|\bAccountHost\.query\b.*\.delete\(|'
-                          r'\.(?:host|position)\s*=(?!=)')
+                          r'\.(?:host|position|enabled|from_playlist|switched_at)\s*=(?!=)')
 
     def test_the_host_list_has_one_writer(self):
         offenders = []
@@ -1797,6 +1802,11 @@ class AccountLoginWriteBypassTests(unittest.TestCase):
     account; a password blank on edit means "keep"; a changed credential clears the refusal
     stamp; a login goes with the last account holding it).
 
+    `AccountLogin.enabled` is the user's per-account switch and `Login.playlist_account_id`
+    the sync's record of whose playlist a login came from (dev/changelog/1670); both are
+    written only by the module, so both are in the pattern, with `switched_at`, the switch's
+    own time (dev/changelog/1671).
+
     `last_refused_at` / `last_refused_detail` are deliberately NOT in the pattern: they are
     state the app writes - the capture path's last credential refusal, read to skip the
     login for a while - a fact about what the user listed, never a change to the list. They
@@ -1812,7 +1822,8 @@ class AccountLoginWriteBypassTests(unittest.TestCase):
     _MARKER = 'account-login-write-ok'
     _CANONICAL_FILE = 'app/account_links.py'
     _PATTERN = re.compile(r'(?<!class )\b(?:Account)?Login\(|\b(?:Account)?Login\.query\b.*\.delete\(|'
-                          r'\b(?:login|lg|row)\.(?:name|username|password|max_connections|position|login_id)\s*=(?!=)')
+                          r'\b(?:login|lg|row|held|own|match)\.(?:name|username|password|max_connections|'
+                          r'position|login_id|enabled|playlist_account_id|switched_at)\s*=(?!=)')
 
     def test_the_login_list_has_one_writer(self):
         offenders = []
@@ -1854,6 +1865,53 @@ class AccountLoginWriteBypassTests(unittest.TestCase):
                      'account.username = form.username',
                      'account.max_connections = int(raw)',
                      'Login.query.filter_by(id=lid).all()'):
+            self.assertIsNone(self._PATTERN.search(line), line)
+
+
+class LoginBlockWriteBypassTests(unittest.TestCase):
+    """A login's block is written by `app/account_blocks.py` and by nothing else
+    (dev/changelog/1672).
+
+    A `LoginBlock` row is the user's answer to "keep ChannelBin off this login for a while"
+    - the participation-switch rule applied to a block, as for an account's. The module's
+    writers are the user's Block use and Unblock, and drop_login_blocks(), which the login
+    list's writer calls when it deletes a login. app/ only - a test builds fixtures. Escape
+    hatch: `# login-block-write-ok: <reason>`."""
+
+    _MARKER = 'login-block-write-ok'
+    _CANONICAL_FILE = 'app/account_blocks.py'
+    _PATTERN = re.compile(r'(?<!class )\bLoginBlock\(|'
+                          r'(?:\bLoginBlock\.query\b|query\(LoginBlock\b).*\.(?:delete|update)\(|'
+                          r'\b\w+\.(?:login_id|start_time|stop_time)\s*=(?!=)')
+
+    def test_a_login_block_has_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            source = _read(path)
+            if 'LoginBlock' not in source or _rel(path) == self._CANONICAL_FILE:
+                continue
+            raw_lines = source.splitlines()
+            code_lines = _mask_comments_and_strings(source).splitlines()
+            for i, line in enumerate(code_lines):
+                if self._PATTERN.search(line) and not _marked_at(raw_lines, i, self._MARKER):
+                    offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(
+            offenders, [],
+            'login_blocks written outside app/account_blocks.py. Go through add_login_block()/'
+            'end_login_block()/drop_login_blocks(), or mark the line '
+            '`# login-block-write-ok: <reason>` if it is not a write:\n' + '\n'.join(offenders))
+
+    def test_the_scan_would_catch_a_second_writer(self):
+        for line in ('db.session.add(LoginBlock(login_id=1, start_time=now))',
+                     'LoginBlock.query.filter_by(login_id=1).delete()',
+                     'LoginBlock.query.filter(LoginBlock.id == 1).update({"stop_time": now})',
+                     'db.session.query(LoginBlock).filter_by(login_id=1).delete()',
+                     'row.stop_time = now',
+                     'blk.stop_time = now'):
+            self.assertIsNotNone(self._PATTERN.search(line), line)
+        for line in ('class LoginBlock(db.Model):',
+                     'LoginBlock.query.filter_by(login_id=1).all()',
+                     'if row.stop_time == now:'):
             self.assertIsNone(self._PATTERN.search(line), line)
 
 

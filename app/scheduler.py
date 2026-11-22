@@ -353,6 +353,8 @@ def init_scheduler(app):
         dismiss_open_alerts(SCHEDULER_STOPPED, 'scheduler')
 
     resume_in_progress_recordings(app)
+    from .stream_check import recover_at_startup as recover_stream_checks
+    recover_stream_checks(app)
     schedule_all_account_syncs(app)
     schedule_all_epg_source_refreshes(app)
     schedule_config_backup(app)
@@ -537,11 +539,11 @@ def _resume_job(recording_id):
 
 
 def reschedule_recording_stop(recording_id: int, run_date: datetime):
-    """Re-register stop_<id> alone at run_date - what a manual resume restores. It used to
-    call schedule_recording(), which also re-armed start_<id> at a start time already
-    passed, so every resume fired a start that refused itself as already IN_PROGRESS, and a
-    pre-check that skipped itself as not SCHEDULED (dev/changelog/1242). Same shape as
-    reschedule_recording_start above."""
+    """Re-register stop_<id> alone at run_date - what a manual resume restores, and what a
+    new end on a running recording moves. Both used to call schedule_recording(), which also
+    re-armed start_<id> at a start time already passed, so each fired a start that refused
+    itself as already IN_PROGRESS, and a pre-check that skipped itself as not SCHEDULED
+    (dev/changelog/1242, 1677). Same shape as reschedule_recording_start above."""
     _add_job(
         func=_stop_job,
         trigger='date',
@@ -1651,6 +1653,25 @@ def cancel_on_demand_job_schedule(job):
 def _on_demand_job_trigger(job_id):
     from .channel_tester import run_on_demand_test_job
     run_on_demand_test_job(_app, job_id)
+
+
+def stream_check_job_id(check_id: int) -> str:
+    return f'stream_check_{check_id}'
+
+
+def schedule_stream_check(check_id: int, run_date) -> bool:
+    """Queue a waiting stream check's retry (app/stream_check.py). False when there is no
+    scheduler to queue it on - a test app or an early-startup path."""
+    if _scheduler is None:
+        return False
+    _add_job(func=_stream_check_job, trigger='date', run_date=run_date, args=[check_id],
+             id=stream_check_job_id(check_id), replace_existing=True)
+    return True
+
+
+def _stream_check_job(check_id):
+    from .stream_check import run_check
+    run_check(_app, check_id)
 
 
 def account_sync_interval_hours(account, cfg) -> int:
@@ -3016,6 +3037,11 @@ def _db_maintenance_sweep():
     except Exception:
         log.exception('DB maintenance: EPG cleanup failed')
     try:
+        from .host_checks import cleanup_old_checks
+        cleanup_old_checks(_app)
+    except Exception:
+        log.exception('DB maintenance: host check cleanup failed')
+    try:
         _wal_maintenance(_app)
     except Exception:
         log.exception('DB maintenance: WAL check failed')
@@ -3253,14 +3279,16 @@ def schedule_host_resolve_check(app):
 
 
 def _host_resolve_job():
-    """Resolve every listed host and stamp the result (app/account_links.py::check_hosts).
-    DNS only - no stream is opened and no panel is called, so it takes no seat and no
-    admission ticket: a handful of lookups and a few row stamps, the same answer the
-    storage-directory sweep gives. Records no JobRun for the same reason."""
+    """The scheduled host check (app/account_links.py::check_hosts). By default DNS only: no
+    stream is opened and no panel is called. With `hosts.scheduled_check: full` it hands every
+    listed host to the one host-check line (app/host_checks.py), which paces the checks one
+    at a time on its own worker. Either way no seat and no admission ticket - a handful of
+    lookups or connections, not bulk database or CPU work - and no JobRun, the same answer
+    the storage-directory sweep gives."""
     with _app.app_context():
         from .account_links import check_hosts
         try:
-            check_hosts()
+            check_hosts(app=_app)
         except Exception:
             log.exception('Stream host check failed')
 

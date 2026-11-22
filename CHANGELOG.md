@@ -5,6 +5,48 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.48.0 - 2026-11-21
+
+Switch off or test an account's hosts and logins, and move a player off a bad channel.
+
+**Added**
+
+- An account can test-play a few of its channels, from its menu or right after its first
+  sync, and says whether a failure was the account's (a refused login, an unreachable server)
+  or just channels that were not on. (#67)
+- Every host and login an account uses, including the ones its playlist carries, has a Use
+  switch. ChannelBin streams only through the ones left on, and the account and channel pages
+  say which host and login the next stream will use. (#69)
+- A single login can be blocked on its own, on every account that holds it, while new streams
+  go through the account's other logins.
+- An account can be blocked until you unblock it, with no end time.
+- Every listed host can be checked properly: looked up, connected to and sent one plain
+  request, each step timed. Checks run one host at a time, a minute apart, and a host swap
+  picks one that answered last time first. (#70)
+- Watching now has Move to another channel on a channel group or sports channel play. It
+  switches to the next best channel and ranks the one it left last until you set it back.
+  (#71)
+- The Accounts pages show how long each account spent streaming to IPTV players, beside
+  Recorded time. (#76)
+- Picking an account on Hide Channels lists every rule that reaches it, with its matches
+  counted on that account alone. (#68)
+
+**Changed**
+
+- Timed account blocks are no longer capped at 24 hours.
+
+**Fixed**
+
+- Changing the end of a recording that is already running moves only its stop time. It no
+  longer schedules the start again, or deletes a retrying recording's pending retry or a
+  paused recording's resume. (#59)
+- A game named only in a listing's description, the way some providers list every local
+  station's game, is found on that channel, including teams with an initial in their name.
+  (#78)
+- Importing a very large guide no longer holds the database long enough to make a scheduled
+  job fail.
+- The channel page's stream URL matches the one Copy hands out.
+
 ## 0.47.0 - 2026-11-20
 
 Record games no guide lists, and the right word for each sport.

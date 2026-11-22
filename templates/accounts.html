@@ -99,6 +99,14 @@ Sync cancelled before it finished.
       </button>
       {% endif %}
     </span>
+    {# A live region too: the label follows the one host-check line (app/host_checks.py). #}
+    <span id="acct-host-check">
+      {% set host_total = host_summaries.values() | sum(attribute='hosts') %}
+      {% if host_total %}
+      <button type="button" class="btn" data-hosts-check-all{% if host_progress %} disabled{% endif %}
+              data-tip="Check all hosts.&#10;Tests every host on every account, one at a time about {{ host_spacing }} seconds apart. A host listed on two accounts is checked once. No login is sent and no stream is opened.">{{ 'Checking hosts...' if host_progress else 'Check all hosts' }}</button>
+      {% endif %}
+    </span>
     <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">+ Add Account</a>
   </div>
 </div>
@@ -121,6 +129,13 @@ Sync cancelled before it finished.
   <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">+ Add Account</a>
 </div>
 {% else %}
+{% if host_progress %}
+<div class="notice notice-info" data-host-progress>
+  <strong>{{ host_progress.title }}</strong><br>
+  {{ host_progress.body }}
+  <div class="acct-block-line"><button type="button" class="btn btn-sm" data-hosts-check-stop>Stop checking</button></div>
+</div>
+{% endif %}
 
 {# Sidebar-width overflow (dev/docs/BUGS.md): same fixed-track grid shape as the
    Recordings list, same .list-scroll fix - header and rows scroll together. #}
@@ -149,9 +164,9 @@ Sync cancelled before it finished.
        data-href="{{ url_for('accounts.account_detail', account_id=account.id) }}">
     <span class="a-title">
       <a class="a-name" href="{{ url_for('accounts.account_detail', account_id=account.id) }}">{{ account.name }}</a>
-      <span class="a-badges">{{ m.account_type_badge(acct_type, tip=false) }}{{ m.account_extra_badges(account, tip=false) }}{{ m.account_block_badge(blocks.get(account.id, []), tip=false) }}</span>
+      <span class="a-badges">{{ m.account_type_badge(acct_type, tip=false) }}{{ m.account_extra_badges(account, tip=false) }}{{ m.account_block_badge(blocks.get(account.id, []), tip=false) }}{% set po = playlist_off.get(account.id) %}{% if po %}{{ m.account_playlist_badge(po.host, po.login, tip=false) }}{% endif %}{% set hs = host_summaries.get(account.id) %}{% if hs and hs.active_not_answering %}<span class="badge b-warn">Active host not answering</span>{% endif %}</span>
       <span class="a-meta">
-        {% if account.last_sync_at %}Synced {{ account.last_sync_at | time_ago }}{% else %}Never synced{% endif %}
+        {% if account.last_sync_at %}Synced {{ account.last_sync_at | time_ago }}{% else %}Never synced{% endif %}{% if hs and hs.tested %} &middot; hosts: {{ hs.answering }} of {{ hs.tested }} answer{{ 's' if hs.answering == 1 }}{% endif %}
         {{ sparkline(logs_by_account.get(account.id, [])) }}
       </span>
     </span>
@@ -182,6 +197,7 @@ Sync cancelled before it finished.
           <button class="menu-item" data-act="force-epg"{% if syncing %} disabled{% endif %}>Force EPG resync</button>
           <div class="sep"></div>
           <button class="menu-item" data-act="block">Block account use&hellip;</button>
+          {% if hs and hs.hosts %}<button class="menu-item" data-act="hosts-check">Check hosts</button>{% endif %}
           <button class="menu-item" data-act="settings">Edit settings</button>
           <a class="menu-item" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">Browse channels</a>
           <div class="sep"></div>

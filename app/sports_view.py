@@ -2071,4 +2071,5 @@ def _unlinked_note(rec):
     lead = (f'The one {league.name} event around then did not match its listing.' if nearby == 1 else
             f'None of the {nearby} {league.name} events around then matched its listing.')
     return (f'{lead} A match needs the league and both teams, or for a race the series and the date, in the '
-            f'title or episode name, and the description is never read.{cut}')
+            f'title or episode name. The description is read only for a game whose title names the league '
+            f'and no team, and then only its first sentence.{cut}')

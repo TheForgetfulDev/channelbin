@@ -51,7 +51,7 @@ function boot(which, start, { serve = start } = {}) {
 
   const id = META[which];
   const pagePath = `/accounts/${id}`;
-  const server = { state: serve, pageStatus: 200 };
+  const server = { state: serve, pageStatus: 200, postStatus: 200 };
   const sent = [];
   const posts = [];
   const respond = (status, payload, text) => Promise.resolve({
@@ -67,6 +67,7 @@ function boot(which, start, { serve = start } = {}) {
     const st = STATES[server.state];
     if ((opts.method || 'GET').toUpperCase() !== 'GET') {
       posts.push({ path: url.pathname, body: opts.body });
+      if (server.postStatus !== 200) return respond(server.postStatus, { error: 'Refused.' });
       return respond(200, { success: true, message: 'Done.' });
     }
     if (url.pathname === pagePath) {
@@ -293,6 +294,32 @@ await record('action', async (start) => {
     pageFetches: c.pageFetches(),
     navigations: c.navigations.length,
     ...c.snap(),
+  };
+});
+
+/* ── A Use switch posts its value, refreshes in place, and goes back if refused ─── */
+await record('switch', async (start) => {
+  const c = start('busy', 'done');
+  await c.settle();
+  const flip = (on) => {
+    const input = c.$('input[data-switch="host"]');
+    input.checked = on;
+    input.dispatchEvent(new c.window.Event('change', { bubbles: true }));
+  };
+  flip(false);
+  await c.settle();
+  const after = { posts: c.posts.slice(), pageFetches: c.pageFetches() };
+  c.server.postStatus = 409;
+  flip(false);
+  await c.settle();
+  const input = c.$('input[data-switch="host"]');
+  return {
+    errors: c.errors.filter((e) => !/Refused/.test(e)),
+    hostId: META.host,
+    after,
+    refusedChecked: input.checked,
+    refusedDisabled: input.disabled,
+    refusedPageFetches: c.pageFetches(),
   };
 });
 

@@ -385,8 +385,10 @@ accounts:
 # host stopped resolving, the account swaps to the next listed host that does.
 hosts:
   roll_cooldown_minutes: 10             # at most one swap per account per this many minutes
-  check_interval_hours: 6               # how often every listed host is looked up in DNS (lookup
-                                        # only - never swaps by itself)
+  check_interval_hours: 6               # how often the scheduled host check runs (never swaps by itself)
+  scheduled_check: lookup               # lookup = DNS only, nothing reaches the provider; full = also
+                                        # connect and ask each host for an answer, one at a time
+  check_spacing_seconds: 60             # gap between two full host checks, give or take a quarter (min 10)
 
 # An account's login list (the account page's Logins card): the other username/passwords
 # the account accepts, each with its own seats.

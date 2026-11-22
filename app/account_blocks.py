@@ -26,7 +26,18 @@ streak or the account ledger - the user asked for the account to be left alone, 
 
 A block is the user's answer to a judgment call and only the explicit user action writes one
 (CLAUDE.md, participation-switch rule). Nothing clears one early on the user's behalf; it stops
-mattering once its window has passed.
+mattering once its window has passed. A block set on the account may have no end at all: it
+holds until the user unblocks it, and every surface that names a block says so in place of an
+end time (dev/changelog/1667).
+
+A block may also be set on one LOGIN (`LoginBlock`, dev/changelog/1672): the TV watches on that
+login and ChannelBin streams through the account's others. It is one more input to the same
+per-pool sum - pool_taken() takes every seat of the blocked login's pool - so it reaches every
+account holding the login, an account left with no usable login reads as fully blocked where a
+member is chosen, and every refusal names the login. Unlike an account block it never moves a
+running recording off the login: streams already running on it keep going, and a recording's
+next segment moves to another login only when one has a free seat
+(connection_limits.reseat_before_relaunch).
 """
 import logging
 from dataclasses import dataclass
@@ -38,9 +49,10 @@ from .db_utils import retry_on_locked
 
 log = logging.getLogger(__name__)
 
-#: The longest block the account page may set. A block exists so the user does not have to
-#: remember to turn something back on; one that could run for a week is that switch again.
-MAX_ACCOUNT_BLOCK_HOURS = 24
+#: The resolved stop of a block with no end time - an account block whose stop_time is NULL.
+#: Only BlockWindow.stop and free_at() carry it, so ordering, min() and ">= stop" read it as
+#: "later than anything"; never add to it or store it. Labels test it with no_end().
+NO_END = datetime.max
 
 _POINT = timedelta(microseconds=1)
 
@@ -60,8 +72,40 @@ class BlockWindow:
     account_id: int
     recording_id: Optional[int]
     start: datetime
-    stop: datetime
+    stop: datetime          # NO_END for an account block that holds until it is unblocked
     slots: Optional[int]   # None = every slot
+
+
+@dataclass(frozen=True)
+class LoginBlockWindow:
+    """One block on a login."""
+    id: int
+    login_id: int
+    start: datetime
+    stop: datetime          # NO_END for a block that holds until it is unblocked
+
+
+def login_blocks_overlapping(start: datetime, stop: datetime,
+                             login_ids: Optional[Iterable[int]] = None) -> List[LoginBlockWindow]:
+    """Every login block whose window overlaps [start, stop), in one query."""
+    from .database import LoginBlock
+    q = (db.session.query(LoginBlock.id, LoginBlock.login_id, LoginBlock.start_time,
+                          LoginBlock.stop_time)
+         .filter(LoginBlock.start_time < stop,
+                 db.or_(LoginBlock.stop_time.is_(None), LoginBlock.stop_time > start)))
+    if login_ids is not None:
+        ids = {i for i in login_ids if i is not None}
+        if not ids:
+            return []
+        q = q.filter(LoginBlock.login_id.in_(ids))
+    return [LoginBlockWindow(bid, login_id, own_start, own_stop or NO_END)
+            for bid, login_id, own_start, own_stop in q.all()]
+
+
+def login_blocks_at(at: Optional[datetime] = None,
+                    login_ids: Optional[Iterable[int]] = None) -> List[LoginBlockWindow]:
+    at = at or datetime.utcnow()
+    return login_blocks_overlapping(at, at + _POINT, login_ids)
 
 
 def blocks_overlapping(start: datetime, stop: datetime,
@@ -76,7 +120,8 @@ def blocks_overlapping(start: datetime, stop: datetime,
          .outerjoin(Recording, AccountBlock.recording_id == Recording.id)
          .filter(db.or_(
              db.and_(AccountBlock.recording_id.is_(None),
-                     AccountBlock.start_time < stop, AccountBlock.stop_time > start),
+                     AccountBlock.start_time < stop,
+                     db.or_(AccountBlock.stop_time.is_(None), AccountBlock.stop_time > start)),
              db.and_(AccountBlock.recording_id.isnot(None),
                      Recording.status.in_(_live_recording_statuses()),
                      Recording.start_time < stop, Recording.stop_time > start))))
@@ -94,7 +139,7 @@ def blocks_overlapping(start: datetime, stop: datetime,
         tied = recording_id is not None
         out.append(BlockWindow(bid, account_id, recording_id,
                                rec_start if tied else own_start,
-                               rec_stop if tied else own_stop, slots))
+                               rec_stop if tied else (own_stop or NO_END), slots))
     return out
 
 
@@ -154,20 +199,28 @@ def account_pools(account_id: int, seats: Optional[list], limit: Optional[int]) 
     return [(account_id, limit)]
 
 
-def pool_taken(slots_by_account: Dict[int, Optional[int]], seats_by_account: Dict[int, list]
-               ) -> dict:
+def pool_taken(slots_by_account: Dict[int, Optional[int]], seats_by_account: Dict[int, list],
+               login_blocks: Iterable[LoginBlockWindow] = ()) -> dict:
     """{pool: slots taken} - each blocked account's slots spread over its pools in list
-    order, summed per pool (None = every slot).
+    order, summed per pool (None = every slot), and every seat of each blocked login's pool
+    (`login_blocks`, dev/changelog/1672).
 
     A block is written against an account, because that is what the user is keeping a TV
     on; the seats it takes are the account's logins'. When one of them is a login another
     account on the same provider shares, that account loses those seats too - the provider
     sees one login (DESIGN-account-providers.md §5.3, dev/changelog/1170). An account with
-    no logins has one pool and takes its block whole, which is the rule before logins."""
-    out: dict = {}
+    no logins has one pool and takes its block whole, which is the rule before logins.
+
+    A blocked login's pool is taken first and an account block's slots pass over it: two TVs,
+    one on a blocked login and one counted by a partial account block, are two connections,
+    so the account block takes the next login rather than the one already kept free."""
+    kept_free = {('login', b.login_id) for b in login_blocks}
+    out: dict = {pool: None for pool in kept_free}
     for account_id, taken in slots_by_account.items():
         left = taken
         for pool, size in account_pools(account_id, seats_by_account.get(account_id), None):
+            if pool in kept_free:
+                continue
             if left is None:
                 share = None
             elif size is None:
@@ -202,17 +255,23 @@ def _with_siblings(ids) -> tuple[set, dict]:
     return wider, siblings
 
 
-def _pool_blocked(merged: Dict[int, Optional[int]], candidates: Optional[set]) -> set:
+def _pool_blocked(merged: Dict[int, Optional[int]], candidates: Optional[set],
+                  login_blocks: List[LoginBlockWindow] = ()) -> set:
     """The accounts among `candidates` (None = every account a block can reach) that
-    `merged` (blocked_slots() over the right block set) leaves with no seat at all.
+    `merged` (blocked_slots() over the right block set) and `login_blocks` leave with no
+    seat at all.
 
     The question is per pool: a block on one account reaches every account sharing one of
-    its logins. Seats and limits are read only for the accounts involved."""
-    from .account_links import login_seats_for_accounts, login_siblings
-    if not merged:
+    its logins, and a block on a login every account holding it. Seats and limits are read
+    only for the accounts involved."""
+    from .account_links import login_holders, login_seats_for_accounts, login_siblings
+    if not merged and not login_blocks:
         return set()
     reached = set(merged) | {other for found in login_siblings(merged).values()
                              for other in found}
+    if login_blocks:
+        reached |= {aid for held in login_holders({b.login_id for b in login_blocks}).values()
+                    for aid in held}
     if candidates is not None:
         reached &= candidates
     if not reached:
@@ -220,7 +279,7 @@ def _pool_blocked(merged: Dict[int, Optional[int]], candidates: Optional[set]) -
     seats = login_seats_for_accounts(reached | set(merged))
     plain = {aid for aid in reached if not seats.get(aid)}
     limits = account_limits(plain) if plain else {}
-    return _fully_blocked_pools(reached, pool_taken(merged, seats), seats, limits)
+    return _fully_blocked_pools(reached, pool_taken(merged, seats, login_blocks), seats, limits)
 
 
 def blocked_account_ids(account_ids: Optional[Iterable[int]], at: Optional[datetime] = None,
@@ -236,12 +295,16 @@ def blocked_account_ids(account_ids: Optional[Iterable[int]], at: Optional[datet
     # A block on an account sharing a login with one of `ids` takes that login's seats from
     # it too (dev/changelog/1170), so those accounts' blocks are read as well.
     wider = None if ids is None else _with_siblings(ids)[0]
+    # A login block is read whole: the table holds a handful of rows, and which accounts it
+    # reaches is _pool_blocked()'s question (dev/changelog/1672).
     if start is not None and stop is not None:
         blocks = blocks_overlapping(start, stop, wider, exclude_recording_id)
+        login_blocks = login_blocks_overlapping(start, stop)
     else:
         blocks = blocks_at(at, wider)
+        login_blocks = login_blocks_at(at)
     pending = {a: s for a, s in (pending or {}).items() if wider is None or a in wider}
-    return _pool_blocked(blocked_slots(blocks, pending), ids)
+    return _pool_blocked(blocked_slots(blocks, pending), ids, login_blocks)
 
 
 def split_blocked(members, blocked_ids):
@@ -265,20 +328,32 @@ def free_at(account_id: int, at: Optional[datetime] = None) -> Optional[datetime
     from .account_links import login_seats_for_accounts
     at = at or datetime.utcnow()
     wider, _ = _with_siblings([account_id])
-    blocks = sorted(blocks_at(at, wider), key=lambda b: b.stop)
+    seats = login_seats_for_accounts(wider)
+    mine = {login_id for login_id, _, _ in seats.get(account_id, [])}
+    blocks = sorted(list(blocks_at(at, wider)) + (login_blocks_at(at, mine) if mine else []),
+                    key=lambda b: b.stop)
     if not blocks:
         return None
-    seats = login_seats_for_accounts(wider)
     limits = account_limits([account_id]) if not seats.get(account_id) else {}
     for i in range(len(blocks)):
-        taken = pool_taken(blocked_slots(blocks[i:]), seats)
+        rest = blocks[i:]
+        taken = pool_taken(blocked_slots([b for b in rest if isinstance(b, BlockWindow)]), seats,
+                           [b for b in rest if isinstance(b, LoginBlockWindow)])
         if not _fully_blocked_pools([account_id], taken, seats, limits):
             return None if i == 0 else blocks[i - 1].stop
     return blocks[-1].stop
 
 
+def no_end(dt: Optional[datetime]) -> bool:
+    """True for the stop of a block that holds until the user unblocks it."""
+    return dt is not None and dt >= NO_END
+
+
 def until_label(dt: datetime, tz=None, h24=None) -> str:
-    """'10:00 PM' for a time later today, 'Sat 9/28 10:00 PM' for one on another day."""
+    """'10:00 PM' for a time later today, 'Sat 9/28 10:00 PM' for one on another day, and
+    'you unblock it' for a block with no end - read after "until" on every surface."""
+    if no_end(dt):
+        return 'you unblock it'
     from .tz_utils import format_local, get_display_tz, to_local
     tz = tz or get_display_tz()
     same_day = to_local(dt, tz).date() == to_local(datetime.utcnow(), tz).date()
@@ -311,11 +386,35 @@ def blocked_reason(account_id: int, account_name: str, capital: bool = False,
     own = blocks_at(at, [account_id])
     if own:
         return describe(account_name, until, capital)
-    sibling = _sibling_block_phrase(account_id, at, until)
-    if sibling is None:
-        return describe(account_name, until, capital) if until is not None else None
     head = 'Account' if capital else 'account'
-    return f'{head} "{account_name}" {sibling}'
+    sibling = _sibling_block_phrase(account_id, at, until)
+    if sibling is not None:
+        return f'{head} "{account_name}" {sibling}'
+    logins = _login_block_phrase(account_id, at, until)
+    if logins is not None:
+        return f'{head} "{account_name}" {logins}'
+    return describe(account_name, until, capital) if until is not None else None
+
+
+def _login_block_phrase(account_id: int, at: datetime, until: Optional[datetime]) -> Optional[str]:
+    """'has login "main" blocked until 10:00 PM' for an account whose seats are gone because
+    the user blocked one of its logins (dev/changelog/1672), naming every blocked login it
+    holds, and saying so when the rest are turned off. None when no login it holds is
+    blocked at `at`."""
+    from .database import AccountLogin, Login
+    held = db.session.query(Login.id, Login.name, AccountLogin.enabled).join(
+        AccountLogin, AccountLogin.login_id == Login.id).filter(
+        AccountLogin.account_id == account_id).order_by(AccountLogin.position, Login.id).all()
+    blocked = {b.login_id for b in login_blocks_at(at, [lid for lid, _, _ in held])}
+    if not blocked:
+        return None
+    names = [name for lid, name, _ in held if lid in blocked]
+    login_text = (f'login "{names[0]}"' if len(names) == 1
+                  else 'logins ' + ', '.join(f'"{n}"' for n in names))
+    tail = f' until {until_label(until)}' if until is not None else ''
+    rest_off = any(not on for lid, _, on in held if lid not in blocked)
+    return f'has {login_text} blocked{tail}' + (' and its other logins turned off' if rest_off
+                                                  else '')
 
 
 def _sibling_block_phrase(account_id: int, at: datetime, until: Optional[datetime]) -> Optional[str]:
@@ -383,12 +482,28 @@ def block_views(account_ids: Optional[Iterable[int]] = None) -> Dict[int, List[d
     return out
 
 
+def login_block_views(login_ids: Iterable[int]) -> Dict[int, dict]:
+    """{login_id: {'id', 'stop', 'stop_label'}} for each of `login_ids` blocked right now -
+    what the Logins card's Seats cell and its menu read. One query, and the display
+    settings once."""
+    from .tz_utils import get_display_tz, is_24h
+    found = login_blocks_at(None, login_ids)
+    if not found:
+        return {}
+    tz, h24 = get_display_tz(), is_24h()
+    out: Dict[int, dict] = {}
+    for b in sorted(found, key=lambda b: b.stop):
+        out[b.login_id] = {'id': b.id, 'stop': b.stop, 'stop_label': until_label(b.stop, tz, h24)}
+    return out
+
+
 # ── Writers. The explicit user action is the only caller of each. ──────────────
 
 
-def add_account_block(account_id: int, stop: datetime, start: Optional[datetime] = None,
+def add_account_block(account_id: int, stop: Optional[datetime], start: Optional[datetime] = None,
                       slots: Optional[int] = None) -> int:
-    """Block `account_id` from `start` (default now) to `stop`. Returns the new block's id."""
+    """Block `account_id` from `start` (default now) to `stop`, or until the user unblocks it
+    when `stop` is None. Returns the new block's id."""
     from .database import AccountBlock
     start = start or datetime.utcnow()
 
@@ -400,7 +515,8 @@ def add_account_block(account_id: int, stop: datetime, start: Optional[datetime]
         return row.id
 
     block_id = _add_and_commit()
-    log.info('Account %d blocked from %s to %s (%s)', account_id, start, stop,
+    log.info('Account %d blocked from %s %s (%s)', account_id, start,
+             'until it is unblocked' if stop is None else f'to {stop}',
              'every slot' if slots is None else f'{slots} slot(s)')
     return block_id
 
@@ -501,3 +617,61 @@ def rearm_waiting_starts():
         Recording.start_time <= now, Recording.stop_time > now)]
     for rid in waiting:
         reschedule_recording_start(rid, now)
+
+
+def add_login_block(login_id: int, stop: Optional[datetime]) -> int:
+    """Block one login from now to `stop`, or until the user unblocks it when `stop` is None
+    (dev/changelog/1672). A block already in force on the login ends now and this one takes
+    its place, so a login carries one block at a time and Unblock has one thing to end.
+    Returns the new block's id."""
+    from .database import LoginBlock
+    start = datetime.utcnow()
+
+    @retry_on_locked()
+    def _add_and_commit():
+        for row in LoginBlock.query.filter(
+                LoginBlock.login_id == login_id,
+                db.or_(LoginBlock.stop_time.is_(None), LoginBlock.stop_time > start)).all():
+            row.stop_time = start
+        row = LoginBlock(login_id=login_id, start_time=start, stop_time=stop)
+        db.session.add(row)
+        db.session.commit()
+        return row.id
+
+    block_id = _add_and_commit()
+    log.info('Login %d blocked %s', login_id,
+             'until it is unblocked' if stop is None else f'to {stop}')
+    return block_id
+
+
+def end_login_block(login_id: int) -> int:
+    """Unblock one login: every block in force on it ends now. The row is kept, with its stop
+    moved to now, so the Activity card still shows when the login was blocked and for how
+    long. Returns how many blocks ended."""
+    from .database import LoginBlock
+    now = datetime.utcnow()
+
+    @retry_on_locked()
+    def _end_and_commit():
+        rows = LoginBlock.query.filter(
+            LoginBlock.login_id == login_id, LoginBlock.start_time <= now,
+            db.or_(LoginBlock.stop_time.is_(None), LoginBlock.stop_time > now)).all()
+        for row in rows:
+            row.stop_time = now
+        if rows:
+            db.session.commit()
+        return len(rows)
+
+    ended = _end_and_commit()
+    if ended:
+        log.info('Login %d unblocked by the user', login_id)
+    return ended
+
+
+def drop_login_blocks(login_ids: Iterable[int]) -> None:
+    """Inside the caller's unit (no commit): delete every block on `login_ids`, for logins
+    being deleted - a block goes with its login (CLAUDE.md, teardown releases everything)."""
+    from .database import LoginBlock
+    ids = {i for i in login_ids if i is not None}
+    if ids:
+        LoginBlock.query.filter(LoginBlock.login_id.in_(ids)).delete(synchronize_session=False)

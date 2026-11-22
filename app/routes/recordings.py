@@ -2738,10 +2738,11 @@ def adjust_stop_time(recording_id):
         ))
     db.session.commit()
 
-    # Re-register the stop job with the new time
-    unschedule_recording(recording_id)
-    from flask import current_app
-    schedule_recording(current_app._get_current_object(), rec.id, rec.start_time, stop_utc)
+    # The stop job only. The start has already happened, and a full unschedule would also
+    # drop a RETRYING recording's pending retry_<id> and a deferred resume_<id>
+    # (dev/changelog/1677).
+    from ..scheduler import reschedule_recording_stop
+    reschedule_recording_stop(rec.id, stop_utc)
 
     return jsonify({'success': True, 'stop_time': stop_utc.strftime('%Y-%m-%dT%H:%M:%S')})
 

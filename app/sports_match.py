@@ -7,8 +7,11 @@ The rules, in short. A matchup row needs the league (a match term in its text, o
 tied to the league), both teams, and a start inside 13 hours of the event's listed start; the time
 then sets only strength and first-or-replay, never which game it is (6.3). A field event, such as a
 race, is matched on the league and its local date, and its name only tells a match strong from weak
-(6.4). Only the title and sub-title are read: the description is where every wide false match came
-from, and on 2026-11-07 every local station that named a game named it there (6.7).
+(6.4). The title and sub-title are what is read: the description is where every wide false match
+came from. The one exception is a game's listing whose title names the league and no team, where the
+description's opening clause (`The Detroit Lions host the Tampa Bay Buccaneers in ...`) is read for
+the two teams and nothing else: on two of prod's accounts every local station named its game only
+there (6.7, dev/changelog/1680).
 
 One run takes an admission ticket and works one league at a time: one query for the league's rows,
 then one event at a time, each in its own commit with a pause after it, so a big import is not
@@ -430,6 +433,8 @@ class Row:
     stop: datetime
     is_live: bool
     text: str = ''
+    #: The description's first OPENING_CHARS characters, read only through _opening_teams().
+    opening: str = ''
 
     @property
     def minutes(self) -> float:
@@ -475,15 +480,67 @@ def _candidate_rows(lt: LeagueText, lo: datetime, hi: datetime) -> list:
     if not conds:
         return []
     q = (db.session.query(EPGEntry.channel_id, Channel.category_name, EPGEntry.title, EPGEntry.sub_title,
-                          EPGEntry.start_time, EPGEntry.stop_time, EPGEntry.is_live)
+                          EPGEntry.start_time, EPGEntry.stop_time, EPGEntry.is_live,
+                          db.func.substr(EPGEntry.description, 1, OPENING_CHARS))
          .join(Channel, Channel.id == EPGEntry.channel_id)
          .filter(EPGEntry.start_time >= lo, EPGEntry.start_time < hi, or_(*conds), ~_filler(), _offered()))
     out = []
-    for channel_id, category, title, sub_title, start, stop, is_live in q.all():
+    for channel_id, category, title, sub_title, start, stop, is_live, opening in q.all():
         row = Row(channel_id, category, title, sub_title, start, stop, bool(is_live) or _marked_live(title))
         row.text = normalize(f'{title} {sub_title or ""}')
+        row.opening = opening or ''
         out.append(row)
     return out
+
+
+#: How much of a description is read: its opening sentence is all _opening_teams() looks at.
+OPENING_CHARS = 240
+#: `The Detroit Lions host the Tampa Bay Buccaneers in NFL regular-season play at Ford Field.` The
+#: first team is at most six words inside the first sentence, with no comma or semicolon, so `The
+#: NBA's biggest stars, jaw-dropping plays ...` is not a game; the second ends where the venue, city,
+#: week, date or sentence begins, so a city after it is never read as a team. Neither `St. Louis` nor
+#: an initial (`Stephen F. Austin`, `N.C. State`) ends a sentence (dev/changelog/1680, 1681).
+_OPENING = re.compile(
+    r"^The\s+(?P<a>(?:[^,;:!?.]|(?<=\bSt)\.|(?<=\bMt)\.|(?<=\bFt)\.|(?<=\b[A-Z])\.)+?)\s+"
+    r"(?:hosts?|visits?|faces?|meets?|takes?\s+on|plays?)\s+(?:the\s+)?"
+    r"(?P<b>[^,;:!?]+?)"
+    r"(?=\s+(?:in|at|during|for|on|from)\s|[,;:!?]|(?<!\bSt)(?<!\bMt)(?<!\bFt)(?<!\b[A-Z])\.(?:\s|$)|\s*$)", re.IGNORECASE)
+#: `No. 12` before a team, and `(8-2, 5-2 SEC)` after one, stand between the verb and the team. Only an
+#: aside holding a digit is a record: `Miami (Ohio)` is the school's name (dev/changelog/1662).
+_OPENING_RANKING = re.compile(r'\bNo\.?\s*\d+\s*', re.IGNORECASE)
+_OPENING_ASIDE = re.compile(r'\([^)]*\d[^)]*\)')
+_OPENING_MAX_WORDS = 6
+
+
+def _opening_teams(lt: LeagueText, row) -> tuple | None:
+    """(first team's text, second team's text), normalized, from the description's opening clause,
+    or None. Read only for a row whose title or sub-title names the league in its text and names no
+    team or city of it: on two of prod's accounts every local station's game was named only there
+    (DESIGN-sports-data.md 6.7). Every wide false match in the investigation came from reading the
+    whole description, so nothing past the opening clause is read, the league is never taken from
+    it, and a tied category alone is not enough (the same sentence opens a film's description)."""
+    if not row.opening or lt.evidence(row.text, None) != 'text':
+        return None
+    flat = ' '.join(_OPENING_ASIDE.sub(' ', _OPENING_RANKING.sub(' ', row.opening)).split())
+    m = _OPENING.match(flat)
+    if m is None or len(m['a'].split()) > _OPENING_MAX_WORDS:
+        return None
+    if any(_has(row.text, n) for n in lt.every_name) or any(
+            t.city and _has(row.text, t.city) for t in lt.teams.values()):
+        return None
+    a, b = normalize(m['a']), normalize(' '.join(m['b'].split()[:_OPENING_MAX_WORDS]))
+    return (a, b) if a and b else None
+
+
+def _teams_in_opening(opening: tuple, home: TeamText, away: TeamText, lt: LeagueText) -> tuple:
+    """(how home is named, how away is named) when the opening clause's two teams are these two,
+    in either order (it puts the home team first, but not always), else (None, None)."""
+    a, b = opening
+    for first, second in ((a, b), (b, a)):
+        got_home, got_away = _team_in(first, home, lt), _team_in(second, away, lt)
+        if got_home is not None and got_away is not None:
+            return got_home, got_away
+    return None, None
 
 
 def _marked_live(title: str | None) -> bool:
@@ -594,8 +651,10 @@ def _not_a_game(lt: LeagueText, row) -> bool:
 
 
 def _identify_matchups(lt: LeagueText, events: list, rows: list) -> dict:
-    """{event id: [(row, league evidence, home, away)]}: the rows that are each game, before strength.
-    A row with two candidate games of the same pair goes to the nearer (NHL home-and-home series)."""
+    """{event id: [(row, league evidence, home, away, from the description)]}: the rows that are each
+    game, before strength. A row with two candidate games of the same pair goes to the nearer (NHL
+    home-and-home series). A row whose title and sub-title name no game is read for the
+    description's opening clause (_opening_teams)."""
     pairs = defaultdict(list)
     for e in events:
         pairs[frozenset((e.home_team_id, e.away_team_id))].append(e)
@@ -606,21 +665,37 @@ def _identify_matchups(lt: LeagueText, events: list, rows: list) -> dict:
         league = lt.evidence(row.text, row.category)
         if league is None:
             continue
-        for pair, candidates in pairs.items():
-            home_id, away_id = tuple(pair) if len(pair) == 2 else (next(iter(pair)),) * 2
-            home, away = lt.teams.get(home_id), lt.teams.get(away_id)
-            if home is None or away is None:
-                continue
-            got_home, got_away = _team_in(row.text, home, lt), _team_in(row.text, away, lt)
-            if got_home is None or got_away is None:
-                continue
-            near = [e for e in candidates if abs(row.start - _anchor(e)) <= WINDOW]
-            if not near:
-                continue
-            event = min(near, key=lambda e: abs(row.start - _anchor(e)))
-            if event.home_team_id != home_id:
-                got_home, got_away = got_away, got_home
-            out[event.id].append((row, league, got_home, got_away))
+        found = _row_games(lt, pairs, row, lambda home, away: (_team_in(row.text, home, lt), _team_in(row.text, away, lt)))
+        described = False
+        if not found:
+            opening = _opening_teams(lt, row)
+            if opening is not None:
+                found = _row_games(lt, pairs, row, lambda home, away: _teams_in_opening(opening, home, away, lt))
+                described = True
+        for event_id, got_home, got_away in found:
+            out[event_id].append((row, league, got_home, got_away, described))
+    return out
+
+
+def _row_games(lt: LeagueText, pairs: dict, row, named) -> list:
+    """[(event id, how home is named, how away is named)] for the games whose two teams `named(home,
+    away)` finds in the row, each the nearest of its pair inside the window."""
+    out = []
+    for pair, candidates in pairs.items():
+        home_id, away_id = tuple(pair) if len(pair) == 2 else (next(iter(pair)),) * 2
+        home, away = lt.teams.get(home_id), lt.teams.get(away_id)
+        if home is None or away is None:
+            continue
+        got_home, got_away = named(home, away)
+        if got_home is None or got_away is None:
+            continue
+        near = [e for e in candidates if abs(row.start - _anchor(e)) <= WINDOW]
+        if not near:
+            continue
+        event = min(near, key=lambda e: abs(row.start - _anchor(e)))
+        if event.home_team_id != home_id:
+            got_home, got_away = got_away, got_home
+        out.append((event.id, got_home, got_away))
     return out
 
 
@@ -755,7 +830,7 @@ def _judge_matchup(event, lt: LeagueText, hits: list, trusted: bool, now: dateti
     checked = trusted and not held and behind is None and not disagrees and event.start_at is not None
     by_start, _live = _starts(counted_rows)
     found = []
-    for row, league, home, away in hits:
+    for row, league, home, away, described in hits:
         delta = row.start - ref
         # An early row is a placeholder unless more channels list its start than list the game's:
         # 397 FOX stations at 3:30 PM against 44 at TheSportsDB's 7:00 PM are not one channel's slate
@@ -769,6 +844,8 @@ def _judge_matchup(event, lt: LeagueText, hits: list, trusted: bool, now: dateti
         else:
             strength = SPORTS_MATCH_WEAK
             evidence = 'the teams by city' if home == away == 'city' else 'one team by name and one by city'
+        if described:
+            evidence += " in its description's first sentence"
         where = 'the league named in the listing' if league == 'text' else f'its category, {row.category}'
         if checked and AGREE < abs(delta) <= OFF_LIMIT:
             strength = SPORTS_MATCH_WEAK
@@ -1871,7 +1948,9 @@ def skipped_listings(event_id: int, tz, h24: bool, skip_rules=None, one: str = N
             continue
         if matchup:
             if _team_in(row.text, home, lt) is None or _team_in(row.text, away, lt) is None:
-                continue
+                opening = _opening_teams(lt, row)
+                if opening is None or _teams_in_opening(opening, home, away, lt)[0] is None:
+                    continue
             length = sports_skips.LENGTH_GAME
         else:
             said_kind = session_of(row.text).kind

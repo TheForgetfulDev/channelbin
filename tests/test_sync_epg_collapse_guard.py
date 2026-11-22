@@ -441,6 +441,12 @@ class DeleteScopeSubqueryTests(unittest.TestCase):
                 account_id=self.account.id, stream_id=100 + i, name=f'Extra{i}',
                 stream_url=f'http://example.test/live/extra{i}', epg_channel_id=f'extra{i}.test',
             ))
+        # A row in the window, so the delete has something to remove and runs at all: it
+        # issues no statement for a source holding nothing in the window.
+        now = datetime.utcnow()
+        db.session.add(EPGEntry(
+            channel_id=self.channel.id, title='Old', start_time=now,
+            stop_time=now + timedelta(minutes=30), source_id=make_epg_source(self.account).id))
         db.session.commit()
 
         captured = []
@@ -462,12 +468,13 @@ class DeleteScopeSubqueryTests(unittest.TestCase):
                 event.remove(eng, 'before_cursor_execute', _on_execute)
 
         self.assertIsNone(reason)
-        self.assertEqual(len(captured), 1, 'expected exactly one delete statement')
-        param_count = len(captured[0])
-        self.assertLessEqual(
-            param_count, 10,
-            f'delete bound {param_count} parameters for 21 EPG-mapped channels - the '
-            'parameter count must not scale with channel count (subquery, not an id list)')
+        # One or more statements: the delete runs in id spans (dev/changelog/1666).
+        self.assertTrue(captured, 'expected a delete statement')
+        for parameters in captured:
+            self.assertLessEqual(
+                len(parameters), 10,
+                f'delete bound {len(parameters)} parameters for 21 EPG-mapped channels - the '
+                'parameter count must not scale with channel count (subquery, not an id list)')
 
 
 def _fake_get_factory(xml_bytes):

@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
-from app.database import Account, AccountSyncLog  # noqa: E402
+from app.database import Account, AccountHost, AccountSyncLog  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HARNESS = os.path.join(REPO, 'tests', 'support', 'account_detail_page.mjs')
@@ -64,10 +64,13 @@ def _observe():
             db.session.add(AccountSyncLog(account_id=busy.id, started_at=started,
                                           completed_at=started + timedelta(seconds=30),
                                           status='SUCCESS', channels_synced=100))
+        # A host row, so the page carries a Use switch (dev/changelog/1671).
+        host = AccountHost(account_id=busy.id, host='tv1.example.test', is_active=True)
+        db.session.add(host)
         db.session.commit()
         ids = {'fresh': fresh.id, 'busy': busy.id}
         with open(os.path.join(tmp, 'meta.json'), 'w', encoding='utf-8') as f:
-            json.dump(ids, f)
+            json.dump({**ids, 'host': host.id}, f)
 
         def snapshot(state):
             urls = {'fresh.html': f'/accounts/{ids["fresh"]}',
@@ -314,6 +317,26 @@ class ActionRefreshTests(_Base, unittest.TestCase):
         self.assertEqual(self.obs['navigations'], 0, 'a reload is reported as a navigation')
         self.assertEqual(self.obs['pageFetches'], 1)
         self.assertIn('Synced', self.obs['barMsg'])
+
+
+
+class UseSwitchTests(_Base, unittest.TestCase):
+    """dev/changelog/1671: a host's Use switch posts a real boolean to its own route, then
+    refreshes the page in place; a refused flip puts the switch back."""
+    SCENARIO = 'switch'
+
+    def test_a_flip_posts_the_value_and_refreshes_in_place(self):
+        posts = self.obs['after']['posts']
+        self.assertEqual(len(posts), 1)
+        self.assertTrue(posts[0]['path'].endswith(f'/hosts/{self.obs["hostId"]}/enabled'),
+                        posts[0]['path'])
+        self.assertEqual(json.loads(posts[0]['body']), {'enabled': False})
+        self.assertEqual(self.obs['after']['pageFetches'], 1)
+
+    def test_a_refused_flip_goes_back_and_refetches_nothing(self):
+        self.assertTrue(self.obs['refusedChecked'])
+        self.assertFalse(self.obs['refusedDisabled'])
+        self.assertEqual(self.obs['refusedPageFetches'], 1)
 
 
 if __name__ == '__main__':

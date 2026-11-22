@@ -38,7 +38,7 @@
 
    Depends on util.js (escHtml, fmtDur, jsonFetch, showToast, buildModal, closeMenus),
    account-actions.js (confirmAccountSync, accountCancelSync, confirmForceEpgResync,
-   confirmDeleteAccount, confirmBlockAccount, accountUnblock - shared with the list page) and account-modal.js (openAccountModal).
+   confirmDeleteAccount, confirmBlockAccount, blockForFields, accountUnblock - shared with the list page) and account-modal.js (openAccountModal).
 */
 (function () {
   const A = window.ACCOUNT_DETAIL;
@@ -322,8 +322,7 @@
           : 'The eye only reveals what you type here - ChannelBin never shows a stored ' +
             'password back to you.',
         control: '<span class="secret-field">' +
-          '<input type="password" id="login-pass" autocomplete="new-password" ' +
-          `placeholder="${edit ? 'Leave blank to keep existing' : 'Password'}">` +
+          '<input type="password" id="login-pass" autocomplete="new-password">' +
           '<button type="button" class="secret-reveal-btn" ' +
           'aria-label="Show what I am typing" title="Show what I am typing">' +
           ACCOUNT_EYE_SVG + '</button></span>',
@@ -415,6 +414,66 @@
         .then(() => refresh()).catch(() => {});
     });
   }
+
+  // ── Block use on one login (dev/changelog/1672) ────────────────────────
+  // The account block's choices (account-actions.js::blockForFields) and no connection count:
+  // the block takes the whole login, on every account holding it.
+  function openBlockLogin(el) {
+    const name = el.dataset.login || '';
+    const sharedWith = el.dataset.sharedWith || '';
+    const fields = blockForFields('on the Logins card');
+    const body = document.createElement('div');
+    body.innerHTML =
+      `<p>Keep ChannelBin off login <strong>${escHtml(name)}</strong>, so a TV or another ` +
+      'app can use its seat.</p>' + fields.html + fields.unblockedNote +
+      '<p class="text-muted small" style="margin-top:8px">No new recording, health check or ' +
+      'preview takes a seat on it until then; they use the account\'s other logins, or wait ' +
+      'for a seat. Streams already running on it keep going.' +
+      (sharedWith ? ` This covers every account it's on: ${escHtml(sharedWith)} too.` : '') +
+      '</p>';
+    const payloadOf = fields.wire(body);
+    buildModal({
+      title: `Block use of login ${name}`,
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+        {
+          label: 'Block',
+          class: 'btn btn-primary',
+          onClick: (close) => {
+            post(`${loginUrl(el.dataset.loginId)}/block`,
+              { method: 'POST', body: JSON.stringify(payloadOf()) })
+              .then(() => { close(); return refresh(); }).catch(() => {});
+            return false;
+          },
+        },
+      ],
+    });
+  }
+
+  function unblockLogin(el) {
+    return post(`${loginUrl(el.dataset.loginId)}/block`, { method: 'DELETE' })
+      .then(() => refresh()).catch(() => {});
+  }
+
+  // ── The Use switches (dev/changelog/1671) ───────────────────────────────
+  // One per host and per login row. The server is the authority: the page refreshes in place
+  // after a flip so the Role/Seats cells, the notice and the next-stream line come from its
+  // render, and a refused flip puts the switch back where the server says it is.
+  document.addEventListener('change', (e) => {
+    const input = e.target.closest('input[data-switch]');
+    if (!input) return;
+    const url = input.dataset.switch === 'host'
+      ? `${hostUrl(input.dataset.hostId)}/enabled`
+      : `${loginUrl(input.dataset.loginId)}/enabled`;
+    const wanted = input.checked;
+    input.disabled = true;
+    // Reverted only when the POST itself fails: a refresh that fails after a saved flip must
+    // not put the switch back over what the server now holds.
+    post(url, { method: 'POST', body: JSON.stringify({ enabled: wanted }) })
+      .then(() => { input.disabled = false; return refresh(); },
+        () => { input.checked = !wanted; input.disabled = false; });
+  });
 
   // ── EPG sources (DESIGN-epg-sources.md §9.2) ────────────────────────────
   // Add and Edit share one dialog. A new or re-pointed source is fetched straight away by
@@ -634,19 +693,33 @@
     'host-add': openAddHost,
     'host-activate': confirmActivateHost,
     'host-remove': confirmRemoveHost,
+    // Checks run one host at a time on the server's own line (app/host_checks.py); each one
+    // moves the account signature, so the page's refresh shows them going by.
+    'host-check': (el) => post(`/api/accounts/${A.id}/hosts/${el.dataset.hostId}/check`, { method: 'POST' })
+      .then(() => refresh()),
+    'hosts-check': () => post(`/api/accounts/${A.id}/hosts/check`, { method: 'POST' })
+      .then(() => refresh()),
+    'hosts-check-stop': () => post('/api/accounts/hosts/check/stop', { method: 'POST' })
+      .then(() => refresh()),
     'login-add': openAddLogin,
     'login-edit': openEditLogin,
     'login-move': moveLogin,
     'login-remove': confirmRemoveLogin,
+    'login-block': openBlockLogin,
+    'login-unblock': unblockLogin,
     sync: () => confirmAccountSync(A.id, A.name, A.syncPrompt, hooks()),
     'cancel-sync': () => accountCancelSync(A.id, hooks()),
     'force-epg': () => confirmForceEpgResync(A.id, hooks()),
     settings: () => openAccountModal({ accountId: A.id, onDone: reload }),
     block: () => confirmBlockAccount(Object.assign(hooks(), {
-      id: A.id, name: A.name, limit: A.maxConnections, maxHours: A.blockMaxHours,
+      id: A.id, name: A.name, limit: A.maxConnections,
     })),
     unblock: (el) => accountUnblock(A.id, el.dataset.blockId, hooks()),
     sections: sectionLayout.open,
+    // The check runs in the background; the page's own refresh follows it from here, since
+    // each channel it tests moves the account signature (dev/changelog/1665).
+    'stream-check': () => post(`/api/accounts/${A.id}/stream-check`, { method: 'POST' })
+      .then(() => refresh()),
     dump: () => post(`/api/accounts/${A.id}/dump`, { method: 'POST' }),
     'sync-dump': () => post(`/api/accounts/${A.id}/sync-from-dump`, { method: 'POST' }).then(reload),
     // The account page knows its own sync count, so its confirm names all three totals;
@@ -665,8 +738,12 @@
   // The sticky bar's overflow is a SHEET, not a popover (§17.5 item 2) - util.js's
   // openMenuSheet, built from an item list because this bar has no menu to copy.
   function openPageActionSheet() {
+    const ACCT = statusVocab('ACCOUNT_STATUS');
     const items = [
+      { act: 'stream-check', label: 'Test a few channels',
+        disabled: A.status === ACCT.UNSYNCED || A.status === ACCT.SYNCING },
       { act: 'block', label: 'Block account use' },
+      { act: 'hosts-check', label: 'Check hosts', disabled: !A.hostCount },
       { act: 'settings', label: 'Edit settings' },
       { act: 'sections', label: 'Customize sections' },
       { sep: true },
@@ -742,10 +819,13 @@
   // and replacing it would drop that and animate it back in. The history body is swapped
   // only while it holds the "No syncs yet" state - once #acct-hist exists, renderHistory()
   // is its one writer. The Usage card is left out: a sync moves none of its numbers.
+  // A card whose body is here has its head here too when the head carries a count, or the
+  // count goes stale beside a fresh body (dev/docs/BUGS.md 2026-11-20).
   const LIVE_REGIONS = ['#acct-state', '#acct-head', '#acct-notices', '#acct-actionbar',
     '#acct-stickybar-in', '#acct-details-body', '#acct-hosts-head', '#acct-hosts-body',
     '#acct-logins-head', '#acct-logins-body', '#acct-content-body',
-    '#acct-sources-body', '#acct-hist-head', '#acct-activity-body'];
+    '#acct-sources-head', '#acct-sources-body', '#acct-hist-head',
+    '#acct-activity-head', '#acct-activity-body'];
   const RERENDER_MS = 60 * 1000;
   // The Activity card's filter chips and "Show more" (app/history_filter.py). The body is one
   // of LIVE_REGIONS, swapped from location.href, which the chip click updates - so the live

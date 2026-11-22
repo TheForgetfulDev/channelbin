@@ -318,8 +318,8 @@ being found, or are matched to the wrong thing, open an issue (see
 
 - the league, as Sports Schedules names it
 - one game it missed or got wrong
-- the exact title and sub-title of a guide listing for that game, and the channel and category
-  it is on. For an event channel, the channel's name
+- the exact title and sub-title of a guide listing for that game, the first sentence of its
+  description, and the channel and category it is on. For an event channel, the channel's name
 - what the league page's **Matching your guide** card shows, and what the game's row says
 
 Adding the name on the league's page fixes it for you in the meantime.

@@ -134,7 +134,7 @@
             <td data-label="For" class="num">{{ '-' if s.starting else s.elapsed }}</td>
             <td data-label="Sent" class="num">{{ s.sent }}</td>
             <td data-label="" class="sp-kebab"><span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
-              <div class="menu pop-left"><button class="menu-item danger" data-act="stop" data-id="{{ s.id }}" data-client="{{ s.client }}" data-name="{{ s.name }}">Stop this play</button></div></span></td>
+              <div class="menu pop-left">{% if s.move_offered %}<button class="menu-item" data-act="move-play" data-id="{{ s.id }}" data-client="{{ s.client }}" data-name="{{ s.name }}" data-channel="{{ s.channel_name }}">Move to another channel</button>{% elif s.move_why %}<button class="menu-item" disabled>{{ s.move_why }}</button>{% endif %}<button class="menu-item danger" data-act="stop" data-id="{{ s.id }}" data-client="{{ s.client }}" data-name="{{ s.name }}">Stop this play</button></div></span></td>
           </tr>
           {% endfor %}
         </tbody></table></div>
@@ -308,5 +308,6 @@
         data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.min.js') }}"></script>
 <script src="{{ url_for('static', filename='js/live-now.js') }}"></script>
 <script src="{{ url_for('static', filename='js/channel-now.js') }}"></script>
+<script src="{{ url_for('static', filename='js/play-move.js') }}"></script>
 <script src="{{ url_for('static', filename='js/iptv-output.js') }}"></script>
 {% endblock %}

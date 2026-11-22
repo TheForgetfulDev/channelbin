@@ -511,6 +511,7 @@
     {%- elif rec.failure_reason == 'MISSED_AT_STARTUP' %}it <b>never started</b>: the service was not running during its window, and its stop time had already passed when the service came back
     {%- elif rec.failure_reason == 'START_ERROR' %}it <b>never started</b>: every try to start it hit an error inside ChannelBin, and its window ended before one worked - the activity log below names the error
     {%- elif rec.failure_reason == 'ACCOUNT_BLOCKED' %}it <b>never started</b>: every account it could record from was <b>blocked</b> for the rest of its window, as you asked
+    {%- elif rec.failure_reason == 'SWITCHED_OFF' %}it <b>never started</b>: every host or every login on its account was <b>turned off</b> for the rest of its window, as you set it on the account page
     {%- elif rec.failure_reason == 'ALL_SEGMENTS_PLACEHOLDER' %}every captured segment was the <b>provider's placeholder clip</b> rather than the channel, so there was nothing to join - the channel was down for the whole window
     {%- elif rec.failure_reason == 'SEGMENT_FILES_MISSING' %}the capture recorded data, but its segment files <b>went missing</b> before they could be joined, which is not a stream fault
     {%- elif rec.failure_reason == 'NO_VALID_SEGMENTS' %}the capture ran but the stream <b>never delivered any data</b>
@@ -530,7 +531,7 @@
     {%- if recover_act == 'retry-convert' %}the joined <b>.ts</b> is still on disk - use <b>Retry conversion</b> to finish it
     {%- elif recover_act == 'retry-concat' %}segments kept on disk - use <b>Retry join</b> to finish it
     {%- elif rec.failure_reason == 'ALL_SEGMENTS_PLACEHOLDER' %}a join would refuse the same placeholder clips again - use <b>Record again</b> to reschedule
-    {%- elif rec.failure_reason in ('CONVERSION_COLLISION', 'CONNECTION_SLOT_TIMEOUT', 'DVR_DIR_UNUSABLE', 'MISSED_AT_STARTUP', 'START_ERROR', 'ACCOUNT_BLOCKED', 'NO_VALID_SEGMENTS', 'PAUSED_NOTHING_CAPTURED') %}nothing was captured - use <b>Record again</b> to reschedule
+    {%- elif rec.failure_reason in ('CONVERSION_COLLISION', 'CONNECTION_SLOT_TIMEOUT', 'DVR_DIR_UNUSABLE', 'MISSED_AT_STARTUP', 'START_ERROR', 'ACCOUNT_BLOCKED', 'SWITCHED_OFF', 'NO_VALID_SEGMENTS', 'PAUSED_NOTHING_CAPTURED') %}nothing was captured - use <b>Record again</b> to reschedule
     {%- else %}nothing recoverable is left on disk - use <b>Record again</b> to reschedule{% endif %}</span>
 </div>
 {% elif rec.status == REC_STATUS.ABORTED %}

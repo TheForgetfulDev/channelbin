@@ -10,9 +10,9 @@ say what happened.
 from flask import Blueprint, jsonify, request
 
 from .. import db
-from ..account_links import (create_provider, delete_provider, hosts_for_accounts,
-                             logins_for_accounts, rename_provider, set_account_provider,
-                             share_login, unshare_login)
+from ..account_links import (configured_seats, create_provider, delete_provider,
+                             hosts_for_accounts, logins_for_accounts, rename_provider,
+                             set_account_provider, share_login, unshare_login)
 from ..database import Account, Login, Provider
 from ..fmt_utils import join_labels, plural
 
@@ -84,10 +84,11 @@ def providers_section(accounts) -> dict | None:
                 'active_host': next((h.host for h in hosts if h.is_active), None),
             })
         pools = []
+        seats = configured_seats(shared.values())
         for lg in sorted(shared.values(), key=lambda lg: lg.name.lower()):
             held = counts.get(lg.id, 0)
             pools.append({
-                'name': lg.name, 'seats': lg.max_connections, 'held': held,
+                'name': lg.name, 'seats': seats[lg.id], 'held': held,
                 'accounts': [names.get(h, f'account {h}') for h in holders.get(lg.id, [])],
                 'holders': (connlim.describe_pool_holders(lg.id, account_id=0, names=names)
                             if held else ''),
@@ -273,10 +274,10 @@ def share_login_api(login_id):
         return jsonify({'error': str(exc)}), 404
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 409
+    seats = configured_seats([login])[login.id]
     return jsonify({'success': True,
                     'message': (f'Login "{login.name}" is shared with {_names([account_id])}. '
-                                f'Its {login.max_connections} '
-                                f'{plural(login.max_connections, "seat")} now count across '
+                                f'Its {seats} {plural(seats, "seat")} now count across '
                                 f'both accounts.')})
 
 

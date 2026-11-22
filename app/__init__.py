@@ -259,6 +259,9 @@ def create_app(config_overrides=None, start_scheduler=True):
         # Channel.hidden runs, which is ORM code (dev/changelog/1276).
         from . import channel_hiding
         channel_hiding.apply_default_rules()
+        # Migration 143's: the per-account rule counts are refresh_rule_stats(), ORM code
+        # (dev/changelog/1678).
+        channel_hiding.backfill_rule_account_counts()
         duplicate_streams.install_listener()
         _ensure_system_health_job()
         _retire_sports_file_names()
@@ -360,6 +363,14 @@ def create_app(config_overrides=None, start_scheduler=True):
     # labels already travel, so a script keys on `statusVocab('ACCOUNT_STATUS').SYNCING`
     # and never on a spelling of its own.
     app.jinja_env.globals['status_vocab'] = vocab
+    # account_links.next_stream()'s states and unusable_reasons()' answers, for the account
+    # and channel pages to compare against the declared spellings (dev/changelog/1671).
+    from . import account_links as _links
+    app.jinja_env.globals['NEXT_STREAM'] = SimpleNamespace(
+        FREE=_links.NEXT_FREE, FULL=_links.NEXT_FULL, BLOCKED=_links.NEXT_BLOCKED,
+        UNUSABLE=_links.NEXT_UNUSABLE)
+    app.jinja_env.globals['UNUSABLE'] = SimpleNamespace(
+        HOSTS=_links.UNUSABLE_HOSTS, LOGINS=_links.UNUSABLE_LOGINS)
     # The one way a template draws an icon (app/icons.py). Pure: a dict lookup and
     # url_for, so it is safe inside a `{% for %}`.
     from .icons import ICONS as _ICONS, SPRITE as _ICON_SPRITE, make_jinja_icon

@@ -49,7 +49,7 @@ JSDOM = os.path.join(REPO, 'node_modules', 'jsdom')
 TIMELINE_HARNESS = os.path.join(REPO, 'tests', 'support', 'dashboard_timeline.mjs')
 
 # (enclosing function, id expression) for every _add_job call in app/scheduler.py, mapped to
-# the ids it produces. `{rec}`, `{acc}`, `{src}`, `{od}` are filled with seeded row ids.
+# the ids it produces. `{rec}`, `{acc}`, `{src}`, `{od}`, `{chk}` are filled with seeded row ids.
 # `_defer_job_for_contention` is absent on purpose: its ids are derived from its callers.
 SAMPLE_IDS = {
     ('schedule_recording', "f'start_{recording_id}'"): ['start_{rec}'],
@@ -89,6 +89,7 @@ SAMPLE_IDS = {
     ('schedule_storage_dirs_check', "'storage_dirs_check'"): ['storage_dirs_check'],
     ('schedule_host_resolve_check', "'host_resolve_check'"): ['host_resolve_check'],
     ('schedule_account_stats_fold', "'account_stats_fold'"): ['account_stats_fold'],
+    ('schedule_stream_check', 'stream_check_job_id(check_id)'): ['stream_check_{chk}'],
 }
 
 
@@ -138,8 +139,12 @@ class EveryScheduledJobIsNamedTests(unittest.TestCase):
             live = seed.make_recording(status='IN_PROGRESS', name='Live', channel_id=ch.id)
             od = seed.make_test_job(name='Nightly', status='SCHEDULED', recurring=True,
                                     recur_day=0, recur_hour=2, recur_minute=0)
+            from app.database import AccountStreamCheck, STREAM_CHECK_WAITING
+            chk = AccountStreamCheck(account_id=acc.id, trigger='manual',
+                                     status=STREAM_CHECK_WAITING)
+            db.session.add(chk)
             db.session.commit()
-            fill = dict(rec=rec.id, live=live.id, acc=acc.id, src=src.id, od=od.id)
+            fill = dict(rec=rec.id, live=live.id, acc=acc.id, src=src.id, od=od.id, chk=chk.id)
             _sites, bases = _scheduler_add_job_sites()
             ids = {i.format(**fill) for samples in SAMPLE_IDS.values() for i in samples}
             ids |= {f'{b}_retry' for b in bases}

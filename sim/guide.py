@@ -165,12 +165,15 @@ def _block(seed, station, index: int, shape: GuideShape) -> list:
 FILLER_BLOCK = _dt.timedelta(hours=2)
 
 
-def filler_programs(title: str, start: _dt.datetime, end: _dt.datetime) -> list:
-    """`title` and nothing else, block after block from the even hour at or before `start`."""
+def filler_programs(title: str, start: _dt.datetime, end: _dt.datetime, desc: str = None) -> list:
+    """`title` and nothing else but `desc` when given, block after block from the even hour at or
+    before `start`."""
     at = start.replace(hour=start.hour - start.hour % 2, minute=0, second=0, microsecond=0)
     out = []
     while at < end:
-        out.append(Program(at, at + FILLER_BLOCK, title))
+        p = Program(at, at + FILLER_BLOCK, title)
+        p.desc = desc
+        out.append(p)
         at += FILLER_BLOCK
     return out
 

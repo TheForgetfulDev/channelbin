@@ -205,6 +205,23 @@
     </div>
 
     <div class="form-group">
+      <label style="display:flex;align-items:center;gap:0.6rem;cursor:pointer">
+        <span class="switch">
+          <input type="checkbox" name="stream_check"
+                 {% if form.get('stream_check') %}checked{% endif %}>
+          <span class="knob"></span>
+        </span>
+        Test a few channels after the first sync
+      </label>
+      <span class="form-hint">
+        When the first sync finishes, ChannelBin test-plays up to 5 of this account's channels,
+        one at a time, to show its stream URLs work. It opens real connections to your IPTV
+        provider, so it is off unless you turn it on. You can also run it any time from the
+        account's page.
+      </span>
+    </div>
+
+    <div class="form-group">
       <label>Color</label>
       <div class="color-picker">
         {% for hex, label in preset_colors %}

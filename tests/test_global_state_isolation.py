@@ -55,6 +55,8 @@ APP_DIR = os.path.join(REPO, 'app')
 # red test rather than a no-op.
 RESET = {
     'app/account_links.py': {'_last_roll_attempt'},
+    'app/host_checks.py': {'_triggers', '_current', '_next_at', '_next_at_utc',
+                           '_worker', '_finished', '_spacing_seen'},
     'app/account_stats.py': {'_catch_up'},
     'app/provider_stalls.py': {'_recent'},
     'app/accounts.py': {'_sync_progress'},

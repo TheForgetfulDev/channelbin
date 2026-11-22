@@ -1,10 +1,13 @@
 import json
+import logging
 from datetime import datetime
 
 from sqlalchemy.ext.hybrid import hybrid_property
 
 from . import db
 from .ui_constants import DEFAULT_COLOR
+
+log = logging.getLogger(__name__)
 
 # ── Event type constants ──────────────────────────────────────────────────────
 
@@ -776,6 +779,10 @@ FAILURE_START_ERROR              = 'START_ERROR'
 # Every account it could record from was blocked by the user (app/account_blocks.py) for the
 # rest of its window. A state the user chose, so it raises no alert (dev/changelog/1151).
 FAILURE_ACCOUNT_BLOCKED          = 'ACCOUNT_BLOCKED'
+# Every host or every login on its account was turned off by the user for the rest of its
+# window (app/account_links.py). A state the user chose, so it raises no alert, like a block
+# (dev/changelog/1670).
+FAILURE_SWITCHED_OFF             = 'SWITCHED_OFF'
 # The join. ALL_SEGMENTS_PLACEHOLDER leaves its files on disk, and a Retry join would refuse
 # them again for the same reason, so it offers no recovery.
 FAILURE_ALL_SEGMENTS_PLACEHOLDER = 'ALL_SEGMENTS_PLACEHOLDER'
@@ -808,7 +815,7 @@ FAILURE_REASONS = (
     FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED,
     FAILURE_FAST_DELIVERY_DETECTED, FAILURE_LAUNCH_FAILED,
     FAILURE_CONVERSION_COLLISION, FAILURE_CONNECTION_SLOT_TIMEOUT, FAILURE_DVR_DIR_UNUSABLE,
-    FAILURE_MISSED_AT_STARTUP, FAILURE_START_ERROR, FAILURE_ACCOUNT_BLOCKED,
+    FAILURE_MISSED_AT_STARTUP, FAILURE_START_ERROR, FAILURE_ACCOUNT_BLOCKED, FAILURE_SWITCHED_OFF,
     FAILURE_ALL_SEGMENTS_PLACEHOLDER, FAILURE_SEGMENT_FILES_MISSING, FAILURE_NO_VALID_SEGMENTS,
     FAILURE_PAUSED_NOTHING_CAPTURED, FAILURE_INSUFFICIENT_DISK_SPACE, FAILURE_CONCAT_ERROR,
     FAILURE_SOURCE_MISSING, FAILURE_CONVERSION_FAILED,
@@ -926,6 +933,38 @@ SYNC_LOG_STATUSES = (
 # The runs that imported something: what "last good sync" and the per-day ledger count.
 SYNC_LOG_IMPORTED = (SYNC_LOG_SUCCESS, SYNC_LOG_PARTIAL)
 
+# AccountStreamCheck.status vocabulary - where one stream check of an account is
+# (app/stream_check.py, dev/changelog/1665). PENDING_SYNC is a check owed after the account's
+# first sync; WAITING has a retry queued at retry_at for the reason in wait_reason.
+STREAM_CHECK_PENDING_SYNC = 'PENDING_SYNC'
+STREAM_CHECK_WAITING      = 'WAITING'
+STREAM_CHECK_RUNNING      = 'RUNNING'
+STREAM_CHECK_DONE         = 'DONE'
+STREAM_CHECK_STATUSES = (
+    STREAM_CHECK_PENDING_SYNC, STREAM_CHECK_WAITING, STREAM_CHECK_RUNNING, STREAM_CHECK_DONE,
+)
+# The ones still to finish: at most one per account (stream_check.request_check).
+STREAM_CHECK_OPEN = (STREAM_CHECK_PENDING_SYNC, STREAM_CHECK_WAITING, STREAM_CHECK_RUNNING)
+
+# What one check of a listed host found (app/host_checks.py, dev/changelog/1674). A full check
+# looks the name up, connects to the stream port and sends one plain request with no login in
+# it; a lookup-only check (the scheduled default) does the first step only. RESOLVES is a
+# lookup's success; every other value is a full check's verdict except UNRESOLVED, which both
+# can give. Only ANSWERS counts as up.
+HOST_CHECK_ANSWERS      = 'ANSWERS'
+HOST_CHECK_SERVER_ERROR = 'SERVER_ERROR'
+HOST_CHECK_REFUSED      = 'REFUSED'
+HOST_CHECK_NO_ANSWER    = 'NO_ANSWER'
+HOST_CHECK_UNRESOLVED   = 'UNRESOLVED'
+HOST_CHECK_RESOLVES     = 'RESOLVES'
+HOST_CHECK_STATUSES = (
+    HOST_CHECK_ANSWERS, HOST_CHECK_SERVER_ERROR, HOST_CHECK_REFUSED, HOST_CHECK_NO_ANSWER,
+    HOST_CHECK_UNRESOLVED, HOST_CHECK_RESOLVES,
+)
+# HostCheck.kind. Not HOST_CHECK_-prefixed, so the status family above stays statuses only.
+HOST_PROBE_LOOKUP = 'lookup'
+HOST_PROBE_FULL   = 'full'
+
 
 def status_vocabularies():
     """Every status family above, keyed by its prefix: {'REC_STATUS': {'FAILED': 'FAILED',
@@ -935,7 +974,7 @@ def status_vocabularies():
     spelling and never re-types it. Derived from the module's own constants, so a new member
     is on every surface the moment it is declared."""
     families = ('REC_STATUS', 'TEST_STATUS', 'OD_JOB_STATUS', 'ACCOUNT_STATUS', 'SYNC_LOG',
-                'EPG_STATUS', 'EPG_SCAN', 'JOB_RUN')
+                'EPG_STATUS', 'EPG_SCAN', 'JOB_RUN', 'STREAM_CHECK', 'HOST_CHECK')
     out = {family: {} for family in families}
     for name, value in globals().items():
         if not isinstance(value, str):
@@ -2108,7 +2147,8 @@ class AccountBlock(db.Model):
     `recording_id` and NO times of its own: its window is that recording's, read live, so
     moving, extending, stopping or cancelling the recording carries the block with it and
     there is no copy to drift. A block set on the account carries `start_time`/`stop_time`
-    and no recording.
+    and no recording; a NULL `stop_time` there means no end - the block holds until the
+    user unblocks it (dev/changelog/1667).
 
     A user's answer to a judgment call, written only by the explicit user action
     (CLAUDE.md, participation-switch rule): nothing derives it and nothing clears it early
@@ -2120,10 +2160,31 @@ class AccountBlock(db.Model):
     account_id   = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False, index=True)
     recording_id = db.Column(db.Integer, db.ForeignKey('recordings.id'), nullable=True, index=True)
     start_time   = db.Column(db.DateTime)   # naive UTC; set only when recording_id is NULL
-    stop_time    = db.Column(db.DateTime)   # naive UTC; set only when recording_id is NULL
+    stop_time    = db.Column(db.DateTime)   # naive UTC; NULL with no recording = no end
     #: How many of the account's connection slots the block takes. NULL = every slot.
     slots        = db.Column(db.Integer)
     created_at   = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class LoginBlock(db.Model):
+    """A stretch of time during which ChannelBin keeps off one login, so a TV can watch on it
+    while ChannelBin streams through the account's other logins (app/account_blocks.py,
+    dev/changelog/1672).
+
+    Keyed by the login, not by an account: a login shared by two accounts on a provider is
+    one seat pool, so a block on it reaches every account holding it. `stop_time` NULL means
+    no end - the block holds until the user unblocks it, as an account block's may
+    (dev/changelog/1667). A user's answer to a judgment call, written only by the explicit
+    user action (CLAUDE.md, participation-switch rule); it goes with its login when the
+    login is deleted.
+    """
+    __tablename__ = 'login_blocks'
+
+    id         = db.Column(db.Integer, primary_key=True)
+    login_id   = db.Column(db.Integer, db.ForeignKey('logins.id'), nullable=False, index=True)
+    start_time = db.Column(db.DateTime, nullable=False)   # naive UTC
+    stop_time  = db.Column(db.DateTime)                    # naive UTC; NULL = no end
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
 class Provider(db.Model):
@@ -2178,6 +2239,56 @@ class AccountHost(db.Model):
     last_resolved_at   = db.Column(db.DateTime)   # naive UTC
     last_resolve_error = db.Column(db.String(255))
     created_at         = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    #: The user's switch (dev/changelog/1670): a host that is off is never the active one and
+    #: no stream goes out on it. URLs on it are still rewritten onto the active host, which is
+    #: what turning the playlist's own host off is for. Written only by
+    #: account_links.set_host_enabled().
+    enabled            = db.Column(db.Boolean, nullable=False, default=True,
+                                   server_default=db.text('1'))
+    #: True on the one row a sync listed because the playlist's stream URLs are on it - a fact
+    #: the sync reads, never the user's judgment. The switch beside it stays the user's.
+    from_playlist      = db.Column(db.Boolean, nullable=False, default=False,
+                                   server_default=db.text('0'))
+    #: When the user last moved `enabled` (dev/changelog/1671); NULL for a switch nobody has
+    #: moved. Display only: the row's "Off since" and the account's Activity card.
+    switched_at        = db.Column(db.DateTime)   # naive UTC
+
+
+
+class HostCheck(db.Model):
+    """One check of one listed host name (app/host_checks.py, dev/changelog/1674): what the
+    lookup, the connect and the plain request found, and how long each took.
+
+    Keyed by the host NAME, not by an `account_hosts` row: a name listed on two accounts is one
+    server, checked once per run, and the two rows share its history. So there is no foreign
+    key and nothing to tear down when a host is removed - the daily maintenance drops rows past
+    `host_checks.KEEP_DAYS`. Written only by app/host_checks.py; the account pages read the
+    newest row per name, and "answered N of M" counts the full checks.
+    """
+    __tablename__ = 'host_checks'
+    __table_args__ = (db.Index('ix_host_checks_host_checked_at', 'host', 'checked_at'),)
+
+    id          = db.Column(db.Integer, primary_key=True)
+    #: `name[:port]`, exactly as AccountHost.host spells it.
+    host        = db.Column(db.String(255), nullable=False)
+    checked_at  = db.Column(db.DateTime, nullable=False)   # naive UTC, when the check finished
+    kind        = db.Column(db.String(16), nullable=False)  # HOST_PROBE_LOOKUP | HOST_PROBE_FULL
+    status      = db.Column(db.String(16), nullable=False)  # a HOST_CHECK_* value
+    #: Milliseconds for each step that ran; NULL for a step that did not (an unresolved name
+    #: has no connect, a refused port no answer).
+    lookup_ms   = db.Column(db.Integer)
+    connect_ms  = db.Column(db.Integer)
+    answer_ms   = db.Column(db.Integer)
+    http_status = db.Column(db.Integer)
+    port        = db.Column(db.Integer)
+    #: What went wrong, in the resolver's or the socket's words; NULL when it answered.
+    error       = db.Column(db.String(255))
+    #: A recording or other stream was using this host when its turn came, so it was counted
+    #: as answering and not touched (principle 2: a check never risks a working capture).
+    in_use      = db.Column(db.Boolean, nullable=False, default=False,
+                            server_default=db.text('0'))
+    #: Who asked: 'scheduled', or 'manual' for Check now / Check all / Check all hosts.
+    trigger     = db.Column(db.String(16), nullable=False)
 
 
 class Login(db.Model):
@@ -2196,19 +2307,29 @@ class Login(db.Model):
     for a while when another has a free seat.
     """
     __tablename__ = 'logins'
+    __table_args__ = (db.Index('uq_logins_playlist_account', 'playlist_account_id', unique=True),)
 
     id                  = db.Column(db.Integer, primary_key=True)
-    #: The user's label for the login ("main", "spare"); what alerts and the card call it.
+    #: The user's label for the login ("main", "spare"); what alerts and the card call it. A
+    #: login the sync listed from a playlist carries its username here.
     name                = db.Column(db.String(100), nullable=False)
     username            = db.Column(db.String(255), nullable=False)
     password            = db.Column(db.String(255), nullable=False)
-    #: Seats on this login. Required: a login with no number cannot size its pool.
-    max_connections     = db.Column(db.Integer, nullable=False)
+    #: Seats on this login. NULL only on a login listed from a playlist
+    #: (`playlist_account_id` set): its seats are that account's own Max connections, or the
+    #: global default, read at the time - so the account form's field keeps its meaning and an
+    #: account behaves exactly as it did before its playlist's login was listed
+    #: (dev/changelog/1670). Resolved by account_links.login_seats_for_accounts() only.
+    max_connections     = db.Column(db.Integer)
     last_refused_at     = db.Column(db.DateTime)   # naive UTC
     last_refused_detail = db.Column(db.String(255))
     created_at          = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at          = db.Column(db.DateTime, nullable=False, default=datetime.utcnow,
                                     onupdate=datetime.utcnow)
+    #: The account whose playlist's stream URLs carry this login's username and password,
+    #: written by that account's sync (dev/changelog/1670). At most one per account. A fact the
+    #: sync reads; the account's switch for it is `AccountLogin.enabled`.
+    playlist_account_id = db.Column(db.Integer, db.ForeignKey('accounts.id'))
 
 
 class AccountLogin(db.Model):
@@ -2220,6 +2341,14 @@ class AccountLogin(db.Model):
     login_id   = db.Column(db.Integer, db.ForeignKey('logins.id'), primary_key=True)
     # server_default for the same reason AccountHost.position carries one (migration 85).
     position   = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    #: The user's switch for this login ON THIS ACCOUNT (dev/changelog/1670), so a shared login
+    #: can be off on one holder only. A login that is off takes no new seat on the account.
+    #: Written only by account_links.set_login_enabled() and the sync's first listing of a
+    #: playlist's login (account_links.list_playlist_rows()).
+    enabled    = db.Column(db.Boolean, nullable=False, default=True, server_default=db.text('1'))
+    #: When the user last moved `enabled` on this account (dev/changelog/1671); NULL for a
+    #: switch nobody has moved. Display only, like AccountHost.switched_at.
+    switched_at = db.Column(db.DateTime)   # naive UTC
 
 
 # ── Channel group format strategy ─────────────────────────────────────────────
@@ -2915,6 +3044,12 @@ class ChannelHideRule(db.Model):
     `channel_hiding.refresh_rule_stats()`, never the authority for what is hidden - that is
     `Channel.hidden`, and only `channel_hiding.recompute()` writes it. A NULL `counted_at`
     means the rule has never been counted, which is different from a count of zero.
+
+    `account_counts` is the same cache split by account, as JSON text
+    `{"<account id>": [matched, deferred]}` with an account it matches nothing on left out,
+    so the Hide Channels page can say what a rule hides on the accounts a person picked
+    (dev/changelog/1678). Written in the same pass as `match_count`, which is its sum; read
+    it through `account_count_map()`. NULL means not counted by account yet.
     """
     __tablename__ = 'channel_hide_rules'
 
@@ -2934,6 +3069,20 @@ class ChannelHideRule(db.Model):
     match_count    = db.Column(db.Integer)
     deferred_count = db.Column(db.Integer)
     counted_at     = db.Column(db.DateTime)
+    account_counts = db.Column(db.Text)
+
+    def account_count_map(self):
+        """`account_counts` parsed: {account id: (matched, deferred)}, or None when the rule
+        has not been counted by account yet - which is not the same as matching nothing."""
+        if self.account_counts is None:
+            return None
+        try:
+            raw = json.loads(self.account_counts)
+            return {int(k): (int(v[0]), int(v[1])) for k, v in raw.items()}
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            log.warning('Hide rule %s has unreadable account_counts %r', self.id,
+                        self.account_counts)
+            return None
 
     __table_args__ = (
         # Two PARTIAL indexes rather than one plain UNIQUE, because SQLite treats NULLs as
@@ -3494,6 +3643,12 @@ class OutputFeedPlay(db.Model):
     bytes_sent   = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
     moves        = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
     count        = db.Column(db.Integer, nullable=False, default=1, server_default=db.text('1'))
+    # An ended play's provider time split by account, as JSON {"<account id>": seconds}: how long
+    # each account's ffmpeg ran for it, so a play that moved credits each account its own part
+    # and a waiting screen credits none. '{}' is a play that streamed nothing from a provider;
+    # NULL is a refused or redirected play, or one written before the split was kept
+    # (dev/changelog/1676). Read by account_stats._fold_plays().
+    account_seconds = db.Column(db.Text)
 
 
 class SportsTeam(db.Model):
@@ -3992,6 +4147,43 @@ class SearchIndexState(db.Model):
     source_watermark = db.Column(db.Text)
 
 
+class AccountStreamCheck(db.Model):
+    """One stream check of an account: a few of its channels test-played to show its stream
+    URLs play at all (app/stream_check.py, dev/changelog/1665).
+
+    The row is the obligation as well as the result. A check asked for at Add account is
+    written PENDING_SYNC in the same commit as the account, so "a check is owed" is a recorded
+    fact the first good sync reads, never something inferred from the account having no
+    syncs. `results` is the per-channel list the account page shows for this one check;
+    `tested_count`/`played_count` are what it shows for every check, so they are columns.
+
+    Not in the ORM cascade: the account delete removes these rows and their retry jobs itself.
+    """
+    __tablename__ = 'account_stream_checks'
+
+    id           = db.Column(db.Integer, primary_key=True)
+    account_id   = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False, index=True)
+    trigger      = db.Column(db.String(16), nullable=False)    # stream_check.TRIGGER_*
+    status       = db.Column(db.String(16), nullable=False)    # STREAM_CHECK_*
+    verdict      = db.Column(db.String(24))                    # stream_check.VERDICT_*, when DONE
+    created_at   = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    started_at   = db.Column(db.DateTime)    # naive UTC; the latest attempt's start
+    finished_at  = db.Column(db.DateTime)    # naive UTC; set with DONE
+    retry_at     = db.Column(db.DateTime)    # naive UTC; set with WAITING
+    wait_reason  = db.Column(db.Text)        # why it is WAITING, in words for the page
+    tested_count = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    played_count = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    # Whether the account's stream URLs were built by ChannelBin when the check ran.
+    constructed  = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
+    results      = db.Column(db.Text)        # JSON list, stream_check.result_entry()
+
+    def result_list(self) -> list:
+        try:
+            return json.loads(self.results) if self.results else []
+        except ValueError:
+            return []
+
+
 class AccountSyncLog(db.Model):
     __tablename__ = 'account_sync_logs'
 
@@ -4067,6 +4259,10 @@ class AccountStatDay(db.Model):
     checks_passed   = db.Column(db.Integer, nullable=False, default=0)
     checks_failed   = db.Column(db.Integer, nullable=False, default=0)
     failovers_away  = db.Column(db.Integer, nullable=False, default=0)
+    # Time this account's ffmpeg ran for plays of the IPTV output that STARTED on this day
+    # (OutputFeedPlay.account_seconds, dev/changelog/1676).
+    output_seconds  = db.Column(db.Float, nullable=False, default=0.0,
+                                server_default=db.text('0'))
 
     __table_args__ = (
         # Leads with account_id, so it also serves every "these accounts, since that day" read.
@@ -4088,6 +4284,8 @@ class AccountStatState(db.Model):
     segment_watermark  = db.Column(db.Integer, nullable=False, default=0)
     test_watermark     = db.Column(db.Integer, nullable=False, default=0)
     event_watermark    = db.Column(db.Integer, nullable=False, default=0)
+    play_watermark     = db.Column(db.Integer, nullable=False, default=0,
+                                   server_default=db.text('0'))
     # The display timezone the days were bucketed in. A different one now means every day
     # boundary moved, and the ledger is rebuilt.
     tz_name            = db.Column(db.String(64))

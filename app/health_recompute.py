@@ -60,7 +60,7 @@ from typing import List
 from sqlalchemy import or_
 
 from .fmt_utils import iso_or_none
-from .health_score import blend_health_score, observation_weight
+from .health_score import blend_health_score, observation_weight, set_manual_adjustment
 
 log = logging.getLogger(__name__)
 
@@ -407,8 +407,7 @@ def apply_rollback(channel, action, cfg):
     Returns a dict describing what happened, or None when there was nothing left to unwind.
     """
     from . import db
-    from .database import (ChannelEvent, ChannelHealthExclusion,
-                           CHANNEL_HEALTH_OVERRIDE_CHANGED, CHANNEL_HEALTH_ROLLBACK)
+    from .database import ChannelEvent, ChannelHealthExclusion, CHANNEL_HEALTH_ROLLBACK
 
     ledger = observation_ledger(channel.id, cfg)
     counting = [o for o in ledger if not o.excluded]
@@ -437,18 +436,8 @@ def apply_rollback(channel, action, cfg):
     cleared_adjustment = None
     if action == 'reset' and (channel.manual_health_adjustment or channel.manual_health_note):
         cleared_adjustment = channel.manual_health_adjustment or 0
-        db.session.add(ChannelEvent(
-            channel_id=channel.id, timestamp=now,
-            event_type=CHANNEL_HEALTH_OVERRIDE_CHANGED,
-            detail=f'Manual adjustment changed {cleared_adjustment:+d} → +0 '
-                   f'(cleared by a health score reset)',
-            extra_data=json.dumps({
-                'old_adjustment': cleared_adjustment, 'new_adjustment': 0,
-                'old_note': channel.manual_health_note, 'new_note': None,
-                'cleared_by': 'health_reset',
-            })))
-        channel.manual_health_adjustment = 0
-        channel.manual_health_note = None
+        set_manual_adjustment(channel, 0, None, why='cleared by a health score reset',
+                              extra={'cleared_by': 'health_reset'}, timestamp=now)
 
     if action == 'reset':
         detail = (f'Health score reset - {len(targets)} observation'
