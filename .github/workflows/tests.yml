@@ -1,11 +1,18 @@
 name: tests
 
-# Two tiers run from this one file, so the ffmpeg pins below stay in one place. A push or pull
-# request runs the default suite. The capture tier - real recordings against the simulator,
-# about 10 minutes, timing-sensitive - runs nightly and on demand, never per push
+# Two tiers run from this one file, so the ffmpeg pins below stay in one place. A pull request
+# runs the default suite. The capture tier - real recordings against the simulator, about 10
+# minutes, timing-sensitive - runs nightly and on demand, never per push
 # (DESIGN-simulator.md D9, dev/changelog/1228). A manual run picks either tier.
+#
+# The suite runs once per tree (dev/changelog/1701). Every change reaches main through a pull
+# request, so a push to any other branch would only run it a second time over what its pull
+# request is about to run, and a tag sits on a main commit that has already been checked. A push
+# to main runs it only when no pull request run already passed over the same tree: see the
+# already_tested job.
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     - cron: "23 7 * * *"
@@ -34,8 +41,45 @@ env:
   FFMPEG_URL: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-7.1.tar.xz"
   FFMPEG_SHA256: "c1e6caf48923dd8e6bc5e54d51ba70c321175b8162ae9c414c392990e72f0e79"
 
+# A new push to a pull request cancels the run still going over its last one, which nobody can
+# merge any more. Every other event is its own group and is never cancelled.
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
+  # Read-only, and only on a push. Prints nothing when it cannot tell, and then the suite runs.
+  already_tested:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      run: ${{ steps.look.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+      - name: Look for a pull request run that passed over this tree
+        id: look
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run="$(bash .github/scripts/already-tested.sh)"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          if [ -n "$run" ]; then
+            echo "::notice::The suite did not run again: this tree already passed in $run"
+            echo "The suite did not run again: this tree already passed in $run" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   run_tests:
+    # `!cancelled()` lets this run when already_tested was skipped (every event but a push) or
+    # failed; only a run address it printed stops it.
+    needs: already_tested
+    if: ${{ !cancelled() && needs.already_tested.outputs.run == '' }}
     # Pinned, never ubuntu-latest. ffmpeg no longer rides on this choice (it is pinned
     # above), but everything else under the suite still does - the apt packages, the glibc
     # the pinned build runs against, the preinstalled tooling. Letting ubuntu-latest roll to
