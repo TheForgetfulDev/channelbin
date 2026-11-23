@@ -33,7 +33,8 @@ the change needs explaining.
 a green run without them has tested far less than it looks. No test touches the network: sync
 and recording tests run against `sim/`, a simulated IPTV provider - see
 [sim/README.md](sim/README.md). `.github/workflows/tests.yml` runs the default suite on every
-push and pull request, and the capture tier nightly and on demand.
+pull request, and the capture tier nightly and on demand. A push to a branch other than `main`
+starts no run, so open the pull request (a draft is fine) to have your branch tested.
 
 If you fix a bug that a real provider's behavior caused, add that behavior to the simulator as a
 fault and add a test that reproduces the bug through it, so the next change cannot bring it back
@@ -44,8 +45,8 @@ unnoticed.
 [`flake8`](https://pypi.org/project/flake8/) catches unused imports, undefined names, and unused
 local variables. `.flake8` restricts it to `E9,F` - the [`pyflakes`](https://pypi.org/project/pyflakes/)
 checks plus syntax errors - so it has no style opinions and will never argue with you about line
-length or whitespace. It's a dev-only tool, and `.github/workflows/tests.yml` runs it on every push
-and pull request before the test suite, so a finding fails the check. There's no git hook, so run it
+length or whitespace. It's a dev-only tool, and `.github/workflows/tests.yml` runs it on every pull
+request before the test suite, so a finding fails the check. There's no git hook, so run it
 yourself before you push:
 
 ```
