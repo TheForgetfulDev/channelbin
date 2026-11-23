@@ -13,7 +13,9 @@ from typing import NamedTuple, Optional
 from urllib.parse import urlsplit
 
 from .config import resolve_ffmpeg_path
-from .normalize import DEINTERLACE_SOFTWARE, fit_filter
+from .normalize import (DEINTERLACE_SOFTWARE, GPU_BT709_PIN, GPU_DECODE_OUTPUT_ARGS, MATRIX_BT601,
+                        MATRIX_BT709, NormalizePlan, fit_filter, gpu_decode_filter,
+                        gpu_decode_input_args, gpu_meet_filter)
 from .toolchain import vaapi_device_args, vaapi_encode_args
 from .url_utils import mask_creds_in_text
 
@@ -146,7 +148,9 @@ def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: i
 
 def build_preview_cmd(cfg: dict, url: str, out_dir: str, *, segment_seconds: int = 2,
                       list_size: int = 6, transcode_audio: bool = False,
-                      pace_realtime: bool = False, reencode_device: Optional[str] = None) -> list:
+                      pace_realtime: bool = False, reencode_device: Optional[str] = None,
+                      gpu_decode: bool = False, deinterlace: bool = False,
+                      start_number: int = 0) -> list:
     """ffmpeg "connect + stream-copy to a rolling HLS window" command for the live channel
     preview (app/preview.py). The input half is input_args(), the SAME connect behavior
     every capture gets, so a provider sees a preview exactly as it sees a recording.
@@ -164,7 +168,9 @@ def build_preview_cmd(cfg: dict, url: str, out_dir: str, *, segment_seconds: int
     `reencode_device` (a VA-API render node) re-encodes instead, for a stream the browser could
     not decode as copied - REENCODE_HEIGHT H.264 encoded on the GPU (reencode_args()). Only
     app/preview.py decides it may be passed, after the device's trial encode has passed and
-    while no conversion holds the GPU.
+    while no conversion holds the GPU. `gpu_decode` and `deinterlace` shape that re-encode
+    (reencode_args()); `start_number` continues a window another ffmpeg began
+    (_hls_window_args()). All three mean nothing without a device.
 
     delete_segments keeps the window bounded on disk, omit_endlist keeps the playlist live,
     independent_segments lets the player start at any segment. hls_delete_threshold keeps
@@ -175,13 +181,15 @@ def build_preview_cmd(cfg: dict, url: str, out_dir: str, *, segment_seconds: int
     told. Segment length is bounded below by the source's keyframe interval under a copy,
     so a provider with a 5 s GOP produces 5 s segments whatever segment_seconds says; a
     re-encode places its own keyframes and cuts at segment_seconds."""
-    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
+    gpu_decode = bool(reencode_device and gpu_decode)
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])] + gpu_decode_log_args(gpu_decode)
     if reencode_device:
-        cmd += reencode_input_args(reencode_device)
+        cmd += reencode_input_args(reencode_device, gpu_decode=gpu_decode)
     cmd += input_args(cfg, url, pace_realtime=pace_realtime)
     cmd += _hls_window_args(out_dir, segment_seconds=segment_seconds, list_size=list_size,
                             transcode_audio=transcode_audio, live=True,
-                            reencode=bool(reencode_device))
+                            reencode=bool(reencode_device), gpu_decode=gpu_decode,
+                            deinterlace=deinterlace, start_number=start_number)
     return cmd
 
 
@@ -203,35 +211,63 @@ def reencode_keyframes(seconds: int) -> str:
     return f'expr:gte(t,n_forced*{max(int(seconds), 1)})'
 
 
-def reencode_input_args(device: str) -> list:
-    """Before -i: open the device for the upload filter and the encoder, and keep the video
-    filter graph built once - with the fixed-size fit before the upload, the shape measured to
-    survive a stream that changes size part-way (dev/changelog/1183)."""
+def gpu_decode_log_args(gpu_decode: bool) -> list:
+    """Right after the ffmpeg path: a command decoding on the GPU writes each stderr line's
+    level (STDERR_LEVEL_ARGS), because only its error lines can say a death was the GPU's -
+    the banner names the device on every run, successful ones included (dev/changelog/1196).
+    read_stderr_tail() takes the tags off again for what a person reads."""
+    return list(STDERR_LEVEL_ARGS) if gpu_decode else []
+
+
+def reencode_input_args(device: str, gpu_decode: bool = False) -> list:
+    """Before -i. Decoding on the GPU: normalize.gpu_decode_input_args(), and the graph is
+    left free to rebuild at a size change, which is what keeps the GPU fit right
+    (dev/changelog/1687). Decoding on the CPU: open the device for the upload filter and the
+    encoder, and keep the video filter graph built once - with the fixed-size fit before the
+    upload, the shape measured to survive a stream that changes size part-way
+    (dev/changelog/1183)."""
+    if gpu_decode:
+        return gpu_decode_input_args(device)
     return vaapi_device_args(device) + ['-reinit_filter:v', '0']
 
 
-def reencode_args(segment_seconds: int = 2) -> list:
-    """The video half of a re-encoded preview or playback (dev/changelog/1461): decoded on the
-    CPU, fitted to REENCODE_WIDTH x REENCODE_HEIGHT (field by field where a frame is
-    interlaced), deinterlaced where a frame is interlaced, uploaded, encoded with h264_vaapi.
+def reencode_args(segment_seconds: int = 2, gpu_decode: bool = False,
+                  deinterlace: bool = False) -> list:
+    """The video half of a re-encoded preview or playback (dev/changelog/1461), encoded with
+    h264_vaapi at REENCODE_WIDTH x REENCODE_HEIGHT.
 
-    Fitted BEFORE deinterlacing: bwdif cannot take a frame of a new size under
-    -reinit_filter:v 0 ("Failed to reallocate frame", ffmpeg exits 255 - measured on a 720p
-    stretch turning 1080p), while the per-frame fit hands it one fixed size throughout.
+    Decoded on the GPU first (`gpu_decode`): normalize.gpu_decode_filter(), the conversion's
+    own chain, fits on the device, with -noautoscale (normalize.GPU_DECODE_OUTPUT_ARGS) so a
+    size change rebuilds the graph instead of killing it. Measured in the GPU lab: 44107's
+    field-coded 1080i stream, the one GPU decoding once died 8 s into, played 40 s through five
+    loop seams at 2.7% of one core against 27% decoding on the CPU (dev/changelog/1687). It is
+    deinterlaced on the GPU only when the source is known to be interlaced (`deinterlace`):
+    deinterlace_vaapi at field rate doubles every frame of a progressive source, so an unknown
+    one is left as it is. app/preview.py restarts a session that dies decoding on the GPU once,
+    on the CPU chain below, and says so.
 
-    Decoding stays on the CPU on purpose. Measured in the GPU lab on an i5-14500: the GPU
-    decoder died 8 s into the field-coded 1080i stream this exists for (the stream whose
-    reference errors Chrome would not decode), while the CPU decoder played it at 27% of one
-    core; a 1080p60 H.264 source cost 24%, a 2160p50 10-bit HEVC source 160-172% and 1.1 GB.
-    A conversion encoding beside it on the same GPU kept its speed (244 fps alone, 271 beside).
-    No tone mapping: a live source's HDR is not known before it plays, so an HDR picture
-    plays as 8-bit with flat colors."""
-    fit = fit_filter(REENCODE_WIDTH, REENCODE_HEIGHT, interlaced_aware=True)
-    vf = f'{fit},{DEINTERLACE_SOFTWARE},format=nv12,hwupload'
+    Decoded on the CPU: fitted (field by field where a frame is interlaced), deinterlaced
+    where a frame is interlaced, uploaded. Fitted BEFORE deinterlacing: bwdif cannot take a
+    frame of a new size under -reinit_filter:v 0 ("Failed to reallocate frame", ffmpeg exits
+    255 - measured on a 720p stretch turning 1080p), while the per-frame fit hands it one
+    fixed size throughout. `deinterlace` does not apply: bwdif's deint=interlaced already
+    judges each frame.
+
+    A conversion encoding beside either on the same GPU kept its speed (244 fps alone, 271
+    beside, dev/changelog/1461). No tone mapping: a live source's HDR is not known before it
+    plays, so an HDR picture plays as 8-bit with flat colors."""
+    if gpu_decode:
+        vf = gpu_decode_filter(NormalizePlan(width=REENCODE_WIDTH, height=REENCODE_HEIGHT,
+                                             deinterlace=bool(deinterlace)), hevc=False)
+        extra = list(GPU_DECODE_OUTPUT_ARGS)
+    else:
+        fit = fit_filter(REENCODE_WIDTH, REENCODE_HEIGHT, interlaced_aware=True)
+        vf = f'{fit},{DEINTERLACE_SOFTWARE},format=nv12,hwupload'
+        extra = []
     # passthrough: the deinterlacer declares the field rate whether or not a frame was
     # interlaced, and the HLS muxer's default constant rate then duplicated every frame of a
     # progressive 59.94 source to make 120 (measured, dev/changelog/1461).
-    return (['-vf', vf] + vaapi_encode_args('h264', REENCODE_QP)
+    return (['-vf', vf] + vaapi_encode_args('h264', REENCODE_QP) + extra
             + ['-fps_mode:v', 'passthrough',
                '-force_key_frames', reencode_keyframes(segment_seconds)])
 
@@ -316,7 +352,8 @@ FILE_PLAYBACK_BURST_SECONDS = 10
 def build_file_playback_cmd(cfg: dict, path: str, out_dir: str, *, offset: float = 0.0,
                             segment_seconds: int = 2, list_size: int = 30,
                             transcode_audio: bool = False, follow: bool = False,
-                            reencode_device: Optional[str] = None) -> list:
+                            reencode_device: Optional[str] = None, gpu_decode: bool = False,
+                            deinterlace: bool = False, start_number: int = 0) -> list:
     """ffmpeg command that plays a finished recording's file from `offset` seconds through
     the preview's rolling HLS window (app/preview.py file sessions, dev/docs/DESIGN-playback.md).
 
@@ -355,10 +392,12 @@ def build_file_playback_cmd(cfg: dict, path: str, out_dir: str, *, offset: float
 
     `reencode_device` re-encodes the video on the GPU, as build_preview_cmd's does, for a file
     the browser could not decode as copied; the timestamps are kept the same way, so a seek
-    lands where it does under a copy."""
-    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
+    lands where it does under a copy. `gpu_decode`, `deinterlace` and `start_number` are
+    build_preview_cmd's."""
+    gpu_decode = bool(reencode_device and gpu_decode)
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])] + gpu_decode_log_args(gpu_decode)
     if reencode_device:
-        cmd += reencode_input_args(reencode_device)
+        cmd += reencode_input_args(reencode_device, gpu_decode=gpu_decode)
     if follow:
         cmd += ['-follow', '1']
     cmd += ['-readrate', '1', '-readrate_initial_burst', str(FILE_PLAYBACK_BURST_SECONDS)]
@@ -369,26 +408,39 @@ def build_file_playback_cmd(cfg: dict, path: str, out_dir: str, *, offset: float
             '-muxpreload', '0']
     cmd += _hls_window_args(out_dir, segment_seconds=segment_seconds, list_size=list_size,
                             transcode_audio=transcode_audio, live=follow,
-                            reencode=bool(reencode_device))
+                            reencode=bool(reencode_device), gpu_decode=gpu_decode,
+                            deinterlace=deinterlace, start_number=start_number)
     return cmd
 
 
 def _hls_window_args(out_dir: str, *, segment_seconds: int, list_size: int,
                      transcode_audio: bool, live: bool, reencode: bool = False,
+                     gpu_decode: bool = False, deinterlace: bool = False,
+                     start_number: int = 0,
                      segment_pattern: str = None, playlist: str = None) -> list:
     """The output half shared by build_preview_cmd and build_file_playback_cmd: one video and
     one audio stream copied (audio to stereo AAC only when the browser cannot decode it) into a
     rolling HLS window. `reencode` re-encodes the video on the GPU (reencode_args(), the device
     opened by reencode_input_args() before -i) and the audio to AAC whatever it was, so nothing
     in the window is left that a browser might not decode. `live` keeps the playlist open
-    forever (omit_endlist); a file's playlist is ended by ffmpeg when the file is."""
+    forever (omit_endlist); a file's playlist is ended by ffmpeg when the file is.
+
+    `start_number` carries on a window an earlier ffmpeg of the same session wrote (a re-encode
+    restarted on the CPU, app/preview.py): its segments and the playlist's media sequence go on
+    from there, and the first one is marked a discontinuity, so a player already on the window
+    keeps going instead of being handed numbers it has already played (measured on 7.1:
+    `-start_number 7` writes seg00007.ts first, MEDIA-SEQUENCE 7, with EXT-X-DISCONTINUITY)."""
     cmd = ['-map', '0:v:0?', '-map', '0:a:0?', '-sn', '-dn']
-    cmd += reencode_args(segment_seconds) if reencode else ['-c:v', 'copy']
+    cmd += (reencode_args(segment_seconds, gpu_decode=gpu_decode, deinterlace=deinterlace)
+            if reencode else ['-c:v', 'copy'])
     if transcode_audio or reencode:
         cmd += ['-c:a', 'aac', '-b:a', '128k', '-ac', '2']
     else:
         cmd += ['-c:a', 'copy']
     flags = 'delete_segments+independent_segments' + ('+omit_endlist' if live else '')
+    if start_number:
+        flags += '+discont_start'
+        cmd += ['-start_number', str(int(start_number))]
     cmd += ['-f', 'hls', '-hls_time', str(segment_seconds), '-hls_list_size', str(list_size),
             '-hls_delete_threshold', '3',
             '-hls_flags', flags,
@@ -398,7 +450,8 @@ def _hls_window_args(out_dir: str, *, segment_seconds: int, list_size: int,
 
 
 def build_feed_preview_cmd(cfg: dict, out_dir: str, round_no: int, *, segment_seconds: int = 2,
-                           list_size: int = 6, reencode_device: Optional[str] = None) -> list:
+                           list_size: int = 6, reencode_device: Optional[str] = None,
+                           gpu_decode: bool = False, deinterlace: bool = False) -> list:
     """ffmpeg command that turns one stretch of an IPTV output play - the MPEG-TS a player is
     sent, fed on stdin by app/preview.py's pump - into the preview's rolling HLS window, so the
     browser plays exactly what an IPTV player gets, waiting screen included (dev/changelog/1645).
@@ -410,15 +463,210 @@ def build_feed_preview_cmd(cfg: dict, out_dir: str, round_no: int, *, segment_se
     segments carry its number (feed_preview_names), so a player still on the last round can
     never be handed a segment of this one. Audio is always AAC, whatever the source sends: a
     round starts before anything says what its audio is, and stereo AAC is about 5% of one core
-    (build_preview_cmd). Video is a copy unless `reencode_device` asks for the GPU re-encode."""
+    (build_preview_cmd). Video is a copy unless `reencode_device` asks for the GPU re-encode,
+    shaped by `gpu_decode` and `deinterlace` (reencode_args()); a round decoding on the GPU tags
+    its error lines with their level, which is how app/preview.py tells a GPU death from any
+    other (STDERR_LEVEL_ARGS)."""
+    gpu_decode = bool(reencode_device and gpu_decode)
     playlist, pattern = feed_preview_names(round_no)
-    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path']), '-hide_banner', '-loglevel', 'error']
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path']), '-hide_banner', '-loglevel',
+           'level+error' if gpu_decode else 'error']
     if reencode_device:
-        cmd += reencode_input_args(reencode_device)
+        cmd += reencode_input_args(reencode_device, gpu_decode=gpu_decode)
     cmd += ['-f', 'mpegts', '-i', 'pipe:0']
     cmd += _hls_window_args(out_dir, segment_seconds=segment_seconds, list_size=list_size,
                             transcode_audio=True, live=True, reencode=bool(reencode_device),
+                            gpu_decode=gpu_decode, deinterlace=deinterlace,
                             segment_pattern=pattern, playlist=playlist)
+    return cmd
+
+
+# ── Picture in picture (dev/docs/DESIGN-pip-channels.md) ────────────────────────────────────
+
+PIP_LAYOUT_CORNER = 'corner'
+PIP_LAYOUT_SIDE = 'side'
+PIP_LAYOUTS = (PIP_LAYOUT_CORNER, PIP_LAYOUT_SIDE)
+PIP_CORNERS = ('tl', 'tr', 'bl', 'br')
+#: A corner picture's size by its stored letter: 25%, 33% and 40% of the output's width.
+PIP_CORNER_SIZES = {'s': (480, 270), 'm': (640, 360), 'l': (768, 432)}
+#: From the output's edge to a corner picture's border, and the border's thickness.
+PIP_MARGIN = 48
+PIP_BORDER = 4
+#: How many of the small picture's frames the combiner takes for each second of the big one.
+#: Side by side a 60 fps game in the right half visibly plays at 30, and 60 measured about a
+#: point of one core more (16.5 to 16.9% against 15.3 to 15.5%); a corner picture is too small
+#: to tell
+#: (dev/changelog/1689).
+PIP_SMALL_FPS = {PIP_LAYOUT_CORNER: 30, PIP_LAYOUT_SIDE: 60}
+#: The name the one VA-API device of a picture-in-picture command is opened under.
+_PIP_DEVICE = 'pip'
+
+
+class PipGeometry(NamedTuple):
+    """Where the two pictures sit in the REENCODE_WIDTH x REENCODE_HEIGHT output. The big
+    picture is fitted to big_w x big_h, whose top left is at (big_x, big_y). The small one
+    arrives as raw frames of small_w x small_h, small_fps of them for each second of the big
+    picture, gets `border` on every side, and that box's top left is at (small_x, small_y)."""
+    big_w: int
+    big_h: int
+    big_x: int
+    big_y: int
+    small_w: int
+    small_h: int
+    small_x: int
+    small_y: int
+    border: int
+    small_fps: int
+
+
+def pip_geometry(layout: str, corner: str = 'br', size: str = 'm') -> PipGeometry:
+    """The geometry of a stored layout (pip_channels.layout / corner / size). Every state is
+    named: an unknown layout, corner or size is an error, never a default."""
+    W, H = REENCODE_WIDTH, REENCODE_HEIGHT
+    if layout == PIP_LAYOUT_SIDE:
+        half_w, half_h = W // 2, H // 2
+        return PipGeometry(half_w, half_h, 0, (H - half_h) // 2,
+                           half_w, half_h, half_w, (H - half_h) // 2, 0,
+                           PIP_SMALL_FPS[PIP_LAYOUT_SIDE])
+    if layout != PIP_LAYOUT_CORNER:
+        raise ValueError(f'unknown picture-in-picture layout {layout!r}')
+    if corner not in PIP_CORNERS:
+        raise ValueError(f'unknown picture-in-picture corner {corner!r}')
+    if size not in PIP_CORNER_SIZES:
+        raise ValueError(f'unknown picture-in-picture size {size!r}')
+    w, h = PIP_CORNER_SIZES[size]
+    box_w, box_h = w + 2 * PIP_BORDER, h + 2 * PIP_BORDER
+    x = PIP_MARGIN if corner.endswith('l') else W - PIP_MARGIN - box_w
+    y = PIP_MARGIN if corner.startswith('t') else H - PIP_MARGIN - box_h
+    return PipGeometry(W, H, 0, 0, w, h, x, y, PIP_BORDER, PIP_SMALL_FPS[PIP_LAYOUT_CORNER])
+
+
+def pip_frame_bytes(geometry: PipGeometry) -> int:
+    """The size of one of the small picture's raw nv12 frames."""
+    return geometry.small_w * geometry.small_h * 3 // 2
+
+
+def _pip_device_args(device: str) -> list:
+    """One VA-API device for the whole command, by name: the decoder, the upload and the
+    overlay must share it, and -hwaccel_device given a path opens a second one."""
+    return ['-init_hw_device', f'vaapi={_PIP_DEVICE}:{device}', '-filter_hw_device', _PIP_DEVICE]
+
+
+_PIP_GPU_DECODE = ['-hwaccel', 'vaapi', '-hwaccel_device', _PIP_DEVICE,
+                   '-hwaccel_output_format', 'vaapi']
+
+
+def _pip_cpu_fit(width: int, height: int, matrix: str) -> str:
+    """A CPU-decoded picture fitted to width x height and converted to bt709: the re-encoded
+    preview's CPU chain (reencode_args), fitted before it is deinterlaced for the reason
+    given there."""
+    convert = ',scale=in_color_matrix=bt601:out_color_matrix=bt709' if matrix == MATRIX_BT601 else ''
+    return (f'{fit_filter(width, height, interlaced_aware=True)},{DEINTERLACE_SOFTWARE}'
+            f'{convert},format=nv12')
+
+
+def build_pip_small_decoder_cmd(cfg: dict, device: str, geometry: PipGeometry, *,
+                                gpu_decode: bool = True, deinterlace: bool = False,
+                                matrix: str = MATRIX_BT709) -> list:
+    """ffmpeg command that decodes a picture-in-picture play's small picture: MPEG-TS on stdin
+    (fed from its picture's buffer), raw bt709 nv12 frames of geometry.small_w x small_h on
+    stdout, each pip_frame_bytes() long, the picture fitted without stretching.
+
+    Its own process because of what was measured with one ffmpeg reading both pictures: the
+    overlay waits for the small picture's next frame, so a small picture that stalls froze the
+    big one for the whole stall (DESIGN-pip-channels.md section 2). Here a stall only stops
+    this command's output, and the caller goes on handing the combiner the last frame.
+
+    Frames come out at the source's own rate and the caller keeps the newest. No rate filter:
+    one would hold the picture still after a backward jump in a live stream's timestamps.
+    Decoded on the GPU first, the frames downloaded only once they are small; `gpu_decode`
+    False is the fallback for a picture whose GPU decode failed (app/preview.py's
+    gpu_decode_failure() is the judgment), all on the CPU. `deinterlace` and `matrix` are
+    reencode_args()'s and normalize.gpu_meet_filter()'s; on the CPU `deinterlace` does not
+    apply, since bwdif judges each frame. The caller's reader thread is the one
+    drain of stdout; stderr goes to a file."""
+    w, h = geometry.small_w, geometry.small_h
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path']), '-hide_banner', '-nostdin', '-loglevel',
+           'level+error' if gpu_decode else 'error']
+    if gpu_decode:
+        cmd += _pip_device_args(device) + _PIP_GPU_DECODE
+        vf = f'{gpu_meet_filter(w, h, matrix, deinterlace=deinterlace)},hwdownload,format=nv12'
+        extra = list(GPU_DECODE_OUTPUT_ARGS)
+    else:
+        cmd += ['-reinit_filter:v', '0']
+        vf = _pip_cpu_fit(w, h, matrix)
+        extra = []
+    cmd += ['-f', 'mpegts', '-i', 'pipe:0', '-map', '0:v:0', '-an', '-sn', '-dn', '-vf', vf]
+    cmd += extra + ['-fps_mode:v', 'passthrough', '-f', 'rawvideo', 'pipe:1']
+    return cmd
+
+
+def build_pip_combiner_cmd(cfg: dict, device: str, geometry: PipGeometry, *,
+                           small_input: str = 'pipe:3', gpu_decode: bool = True,
+                           deinterlace: bool = False, matrix: str = MATRIX_BT709,
+                           big_input: str = '') -> list:
+    """ffmpeg command that makes a picture-in-picture play's one picture: the big picture's
+    MPEG-TS on stdin, the small picture's raw frames on `small_input` (what
+    build_pip_small_decoder_cmd writes, or a card), overlaid on the GPU, encoded with
+    h264_vaapi at REENCODE_WIDTH x REENCODE_HEIGHT and written as MPEG-TS on stdout with the
+    big picture's sound copied (DESIGN-pip-channels.md section 6.1).
+
+    The big picture is decoded on the GPU through normalize.gpu_meet_filter(), which is what
+    makes two inputs agree on color where they meet; the small one is uploaded from raw
+    frames, never handed over as GPU-decoded frames (two GPU-decoded inputs, one deinterlaced
+    on the GPU, die in the driver with "invalid VABufferID", dev/changelog/1687). -noautoscale
+    and no -reinit_filter:v 0, as every GPU-decoding command (normalize.GPU_DECODE_OUTPUT_ARGS).
+    `gpu_decode` False decodes the big picture on the CPU, the fallback when its GPU decode
+    failed (`deinterlace` does not apply there: bwdif judges each frame); combining and
+    encoding stay on the GPU either way.
+
+    `big_input` is the big window's card, for a big picture with nothing to play
+    (section 6.4): a clip of ChannelBin's own (sports_screen's, h264 with a sound track, so
+    the TV always has sound to follow) looped forever in place of stdin, and read at real
+    time, as build_screen_play_cmd() plays one, since nothing else paces a file.
+
+    `small_input` is a pipe the caller keeps full: the newest frame, the last one again
+    through a hiccup, a card when there is none. The caller has no clock: geometry.small_fps
+    is how ffmpeg counts the frames, so it takes that many for each second of the big picture
+    however fast the big picture arrives, and a provider's opening burst goes through to the
+    player (measured: 22.5 s of picture out in 3 s, against 2.9 s with the frames written on a
+    clock, dev/changelog/1689). The caller's reader is the one drain of stdout; stderr goes to
+    a file."""
+    g = geometry
+    full = (g.big_w, g.big_h) == (REENCODE_WIDTH, REENCODE_HEIGHT)
+    place = '' if full else (f',pad_vaapi=w={REENCODE_WIDTH}:h={REENCODE_HEIGHT}'
+                             f':x={g.big_x}:y={g.big_y}')
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path']), '-hide_banner', '-nostdin', '-loglevel',
+           'level+error' if gpu_decode else 'error']
+    cmd += _pip_device_args(device)
+    if gpu_decode:
+        cmd += _PIP_GPU_DECODE
+        big = f'{gpu_meet_filter(g.big_w, g.big_h, matrix, deinterlace=deinterlace)}{place}'
+    else:
+        cmd += ['-reinit_filter:v', '0']
+        cpu_place = '' if full else (f',pad={REENCODE_WIDTH}:{REENCODE_HEIGHT}'
+                                     f':{g.big_x}:{g.big_y}')
+        big = (f'{_pip_cpu_fit(g.big_w, g.big_h, matrix)}{cpu_place},{GPU_BT709_PIN},'
+               f'format=nv12,hwupload')
+    if big_input:
+        cmd += ['-readrate', '1', '-readrate_initial_burst', str(SCREEN_PLAY_BURST_SECONDS),
+                '-stream_loop', '-1', '-i', f'file:{big_input}']
+    else:
+        cmd += ['-f', 'mpegts', '-i', 'pipe:0']
+    cmd += ['-f', 'rawvideo', '-pix_fmt', 'nv12', '-video_size', f'{g.small_w}x{g.small_h}',
+            '-framerate', str(int(g.small_fps)), '-i', small_input]
+    border = (f'pad={g.small_w + 2 * g.border}:{g.small_h + 2 * g.border}:{g.border}:{g.border}'
+              f':color=white,' if g.border else '')
+    graph = (f'[0:v:0]{big}[big];'
+             f'[1:v:0]{GPU_BT709_PIN},{border}format=nv12,hwupload[small];'
+             f'[big][small]overlay_vaapi=x={g.small_x}:y={g.small_y}[v]')
+    cmd += ['-filter_complex', graph, '-map', '[v]', '-map', '0:a:0?', '-sn', '-dn',
+            '-c:a', 'copy']
+    cmd += vaapi_encode_args('h264', REENCODE_QP)
+    if gpu_decode:
+        cmd += GPU_DECODE_OUTPUT_ARGS
+    cmd += ['-fps_mode:v', 'passthrough', '-force_key_frames', reencode_keyframes(2),
+            '-f', 'mpegts', 'pipe:1']
     return cmd
 
 
@@ -612,6 +860,14 @@ STDERR_TAIL_MAX_LINES = 20
 # 2026-10-18 02:49 PM, found by the full-stack runner's ban scenario, dev/changelog/1224).
 _BANNER_LINE = re.compile(r'^(?:(?:ffmpeg|ffprobe) version |built with |configuration: '
                           r'|lib[a-z]+\s+\d+\.\s*\d+\.\s*\d+ /)')
+# The severity `-loglevel level+...` writes into a line, after any `[component @ 0x..]` prefix
+# (STDERR_LEVEL_ARGS). Taken off for a person to read; iter_stderr_error_lines reads it.
+_LEVEL_TAG = re.compile(r'\[(?:quiet|panic|fatal|error|warning|info|verbose|debug|trace)\] ')
+
+
+def strip_level_tag(line: str) -> str:
+    """One stderr line without the severity tag STDERR_LEVEL_ARGS writes into it."""
+    return _LEVEL_TAG.sub('', line, count=1)
 
 
 def _read_spool_end(path, max_bytes: int):
@@ -643,11 +899,13 @@ def read_stderr_tail(path, max_bytes: int = STDERR_TAIL_MAX_BYTES,
 
     Returns '' - not a placeholder string - when there is nothing to say, so callers can
     distinguish "ffmpeg said nothing" from "ffmpeg said something" and stay quiet accordingly.
+    A spool written with level tags (gpu_decode_log_args) reads like one written without.
     """
     raw = _read_spool_end(path, max_bytes)
     if raw is None:
         return ''
-    lines = [ln.strip() for ln in raw.decode('utf-8', errors='replace').replace('\r', '\n').split('\n')]
+    lines = [strip_level_tag(ln.strip())
+             for ln in raw.decode('utf-8', errors='replace').replace('\r', '\n').split('\n')]
     lines = [ln for ln in lines if ln and not _BANNER_LINE.match(ln)]
     if max_lines and len(lines) > max_lines:
         lines = lines[-max_lines:]

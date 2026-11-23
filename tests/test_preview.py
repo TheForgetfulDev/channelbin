@@ -1171,3 +1171,257 @@ class ReencodeSessionTests(_Live):
         self.assertTrue(resp.get_json()['reencode'])
         self.assertEqual(self.built, [_DEVICE])
         self.client.post(resp.get_json()['stop_url'])
+
+
+# ── Decoding on the GPU, with one restart on the CPU when that dies (dev/changelog/1688) ────
+from app.normalize import NormalizePlan, gpu_decode_filter  # noqa: E402
+from app.proc_utils import build_feed_preview_cmd, read_stderr_tail  # noqa: E402
+
+# What ffmpeg 7.1 printed when a size change rebuilt a GPU-decoding graph (lab job
+# 20261122-150110-gpu-decode-causes), as `-loglevel level+info` writes it.
+GPU_DEATH = ('[vf#0:0 @ 0x55750326db80] [error] Error reinitializing filters!\n'
+             '[vf#0:0 @ 0x55750326db80] [error] Task finished with error code: -38 '
+             '(Function not implemented)\n[info] Conversion failed!\n')
+STREAM_DEATH = ('[info] Stream #0:0 -> #0:0 (h264 (native) -> h264 (h264_vaapi))\n'
+                '[http @ 0x1] [error] HTTP error 404 Not Found\n'
+                '[in#0 @ 0x2] [error] Error opening input: Server returned 404 Not Found\n')
+
+
+class BuildGpuDecodeReencodeCmdTests(unittest.TestCase):
+    """The GPU-decoding re-encode's command: decoded on the device with the conversion's own
+    chain, -noautoscale, no -reinit_filter:v 0, level-tagged stderr; deinterlaced on the GPU only
+    when asked; the CPU chain unchanged as the fallback."""
+
+    def _gpu(self, cmd, *, deinterlace=False):
+        i = cmd.index('-i')
+        self.assertEqual(cmd[1:3], ['-loglevel', 'level+info'])
+        self.assertEqual(cmd[cmd.index('-hwaccel'):cmd.index('-hwaccel') + 6],
+                         ['-hwaccel', 'vaapi', '-hwaccel_device', _DEVICE,
+                          '-hwaccel_output_format', 'vaapi'])
+        self.assertLess(cmd.index('-hwaccel'), i)
+        # The GPU fit follows a size change only because the graph is rebuilt there.
+        self.assertNotIn('-reinit_filter:v', cmd)
+        self.assertNotIn('-vaapi_device', cmd)
+        vf = cmd[cmd.index('-vf') + 1]
+        self.assertEqual(vf, gpu_decode_filter(NormalizePlan(width=1920, height=1080,
+                                                             deinterlace=deinterlace), hevc=False))
+        self.assertIn('pad_vaapi=w=1920:h=1080', vf)
+        self.assertNotIn('hwupload', vf)
+        self.assertEqual(vf.startswith('deinterlace_vaapi=rate=field,'), deinterlace)
+        self.assertLess(cmd.index('h264_vaapi'), cmd.index('-noautoscale'))
+        self.assertLess(cmd.index('-noautoscale'), len(cmd) - 1)
+        self.assertEqual(cmd[cmd.index('-fps_mode:v') + 1], 'passthrough')
+
+    def test_a_channel_preview_decodes_on_the_gpu(self):
+        self._gpu(build_preview_cmd(_CFG, 'http://h/live/u/p/1', '/x', reencode_device=_DEVICE,
+                                    gpu_decode=True))
+
+    def test_a_known_interlaced_source_is_deinterlaced_on_the_gpu(self):
+        self._gpu(build_preview_cmd(_CFG, 'http://h/live/u/p/1', '/x', reencode_device=_DEVICE,
+                                    gpu_decode=True, deinterlace=True), deinterlace=True)
+
+    def test_a_file_keeps_its_timestamps_decoding_on_the_gpu(self):
+        cmd = build_file_playback_cmd(_CFG, '/a.ts', '/x', offset=60, reencode_device=_DEVICE,
+                                      gpu_decode=True)
+        self._gpu(cmd)
+        self.assertIn('-copyts -start_at_zero -muxdelay 0 -muxpreload 0', ' '.join(cmd))
+
+    def test_a_feed_round_decodes_on_the_gpu_with_tagged_errors(self):
+        cmd = build_feed_preview_cmd(_CFG, '/x', 1, reencode_device=_DEVICE, gpu_decode=True)
+        self.assertEqual(cmd[cmd.index('-loglevel') + 1], 'level+error')
+        self.assertIn('-hwaccel', cmd)
+        self.assertIn('-noautoscale', cmd)
+        self.assertNotIn('-reinit_filter:v', cmd)
+        cpu = build_feed_preview_cmd(_CFG, '/x', 1, reencode_device=_DEVICE)
+        self.assertEqual(cpu[cpu.index('-loglevel') + 1], 'error')
+        self.assertNotIn('-hwaccel', cpu)
+
+    def test_the_cpu_chain_is_the_one_it_always_was(self):
+        """Deinterlace means nothing to the CPU chain, whose bwdif judges each frame."""
+        cpu = build_preview_cmd(_CFG, 'http://h/1', '/x', reencode_device=_DEVICE)
+        self.assertEqual(cpu, build_preview_cmd(_CFG, 'http://h/1', '/x', reencode_device=_DEVICE,
+                                                gpu_decode=False, deinterlace=True))
+        self.assertNotIn('-noautoscale', cpu)
+        self.assertNotIn('-loglevel', cpu)
+
+    def test_gpu_decode_without_a_device_is_a_copy(self):
+        self.assertEqual(build_preview_cmd(_CFG, 'http://h/1', '/x'),
+                         build_preview_cmd(_CFG, 'http://h/1', '/x', gpu_decode=True))
+        self.assertEqual(build_file_playback_cmd(_CFG, '/a.ts', '/x'),
+                         build_file_playback_cmd(_CFG, '/a.ts', '/x', gpu_decode=True))
+
+    def test_a_restart_carries_on_the_window(self):
+        cmd = build_preview_cmd(_CFG, 'http://h/1', '/x', reencode_device=_DEVICE, start_number=7)
+        self.assertEqual(cmd[cmd.index('-start_number') + 1], '7')
+        self.assertIn('+discont_start', cmd[cmd.index('-hls_flags') + 1])
+        fresh = build_preview_cmd(_CFG, 'http://h/1', '/x', reencode_device=_DEVICE)
+        self.assertNotIn('-start_number', fresh)
+        self.assertNotIn('discont_start', ' '.join(fresh))
+
+
+class GpuDecodeJudgmentTests(unittest.TestCase):
+    """Which deaths are the GPU's, which sources deinterlace, and what a person reads."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='cb-gpudec-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _spool(self, text):
+        path = os.path.join(self.tmp, 'ffmpeg.stderr')
+        with open(path, 'w') as fh:
+            fh.write(text)
+        return path
+
+    def test_a_graph_that_could_not_rebuild_is_the_gpus(self):
+        self.assertEqual(preview.gpu_decode_failure(self._spool(GPU_DEATH)),
+                         '[vf#0:0 @ 0x55750326db80] [error] Error reinitializing filters!')
+
+    def test_a_stream_that_refused_is_not_the_gpus_though_the_banner_names_it(self):
+        self.assertEqual(preview.gpu_decode_failure(self._spool(STREAM_DEATH)), '')
+
+    def test_the_tail_a_person_reads_has_no_level_tags(self):
+        tail = read_stderr_tail(self._spool(STREAM_DEATH))
+        self.assertNotIn('[error]', tail)
+        self.assertNotIn('[info]', tail)
+        self.assertIn('[http @ 0x1] HTTP error 404 Not Found', tail)
+
+    def test_only_a_source_known_interlaced_is_deinterlaced(self):
+        self.assertTrue(preview.deinterlace_for(True))
+        self.assertFalse(preview.deinterlace_for(False))
+        self.assertFalse(preview.deinterlace_for(None))
+
+
+
+def _dying_cmd(stderr_text, rc=218, window=None):
+    """A stand-in for a GPU-decoding ffmpeg (the suite has no GPU): writes `stderr_text` and
+    exits `rc`. `window` (out_dir, last segment number) first leaves a playlist that has reached
+    that segment, as a run that died part-way would."""
+    pre = ''
+    if window:
+        out_dir, last = window
+        pre = (f'open({os.path.join(out_dir, "index.m3u8")!r}, "w").write('
+               f'"#EXTM3U\\n#EXTINF:2.0,\\nseg{last:05d}.ts\\n"); ')
+    return [sys.executable, '-c',
+            f'import sys; {pre}sys.stderr.write({stderr_text!r}); sys.exit({rc})']
+
+
+@unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg not available')
+class GpuDecodeRestartTests(_Live):
+    """A re-encoding session decoding on the GPU whose ffmpeg dies of the GPU path restarts once,
+    decoding on the CPU, on the same seat, and says so. The GPU-decoding command is a stand-in
+    that dies the way ffmpeg did in the lab; the CPU one is the real stream copy (no GPU here)."""
+
+    def setUp(self):
+        super().setUp()
+        self.built = []      # (gpu_decode, deinterlace, start_number, offset) per build
+        self.gpu_stderr = GPU_DEATH
+        self.died_at = None      # the last segment the dying GPU run leaves listed, if any
+        real_live, real_file = preview.build_preview_cmd, preview.build_file_playback_cmd
+
+        def wrap(real):
+            def build(*a, **kw):
+                self.built.append((kw.get('gpu_decode'), kw.get('deinterlace'),
+                                   kw.get('start_number'), kw.get('offset')))
+                if kw.get('gpu_decode'):
+                    window = (a[2], self.died_at) if self.died_at is not None else None
+                    return _dying_cmd(self.gpu_stderr, window=window)
+                return real(*a, **{**kw, 'reencode_device': None})
+            return build
+        for name, real in (('build_preview_cmd', real_live), ('build_file_playback_cmd', real_file)):
+            p = mock.patch.object(preview, name, side_effect=wrap(real))
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(preview, 'reencode_device', return_value=(_DEVICE, ''))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _reencode(self):
+        resp = self.client.post(f'/api/channels/{self.channel.id}/preview', json={'reencode': True})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        return resp.get_json()
+
+    def test_a_gpu_death_restarts_once_on_the_cpu_and_says_so(self):
+        data = self._reencode()
+        self.assertTrue(data['gpu_decode'])
+        sid = data['session_id']
+        self._wait_state(sid, preview.STATE_READY)
+        st = self._status(sid)
+        self.assertFalse(st['gpu_decode'])
+        self.assertIn('could not decode this channel', st['decode_note'])
+        self.assertIn('Error reinitializing filters!', st['decode_note'])
+        self.assertNotIn('[error]', st['decode_note'])
+        self.assertEqual([b[0] for b in self.built], [True, False])
+        # The seat it held throughout, one only.
+        self.assertEqual(self._holders(), [('preview', sid)])
+        self.client.post(data['stop_url'])
+        self.assertEqual(self._holders(), [])
+
+    def test_a_death_that_is_not_the_gpus_ends_the_session_as_before(self):
+        self.gpu_stderr = STREAM_DEATH
+        sid = self._reencode()['session_id']
+        self._wait_state(sid, preview.STATE_STOPPED)
+        st = self._status(sid)
+        self.assertEqual(st['reason'], preview.REASON_FFMPEG_EXITED)
+        self.assertIn('HTTP error 404', st['detail'])
+        self.assertEqual(st['decode_note'], '')
+        self.assertEqual([b[0] for b in self.built], [True])
+        self.assertEqual(self._holders(), [])
+
+    def test_only_once(self):
+        """The CPU run dying with the same words is not restarted again."""
+        def every_run_dies(*a, **kw):
+            self.built.append((kw.get('gpu_decode'), None, None, None))
+            return _dying_cmd(GPU_DEATH)
+        with mock.patch.object(preview, 'build_preview_cmd', side_effect=every_run_dies):
+            sid = self._reencode()['session_id']
+            self._wait_state(sid, preview.STATE_STOPPED)
+        st = self._status(sid)
+        self.assertEqual(st['reason'], preview.REASON_FFMPEG_EXITED)
+        self.assertEqual([b[0] for b in self.built], [True, False])
+        self.assertEqual(self._holders(), [])
+
+    def test_the_channels_latest_test_decides_the_deinterlace(self):
+        make_channel_test(self.channel, all_null=False, status='COMPLETED', interlaced=True)
+        db.session.commit()
+        self._reencode()
+        self.assertEqual(self.built[0][:2], (True, True))
+        preview.stop_all()
+        self.built.clear()
+        make_channel_test(self.channel, all_null=False, status='COMPLETED', interlaced=None)
+        db.session.commit()
+        self._reencode()
+        self.assertEqual(self.built[0][:2], (True, False))
+
+    def test_a_recording_restarts_from_where_the_window_got_to(self):
+        """The GPU run died with seg00003 written: the CPU run carries the window on from segment
+        4, and from 4 segments of segment_seconds further into the file."""
+        self.died_at = 3
+        seg_s = int((load_config().get('preview') or {}).get('segment_seconds', 2))
+        dvr = os.path.join(self.t._tmpdir, 'dvr')
+        os.makedirs(dvr, exist_ok=True)
+        path = os.path.join(dvr, 'Race day.ts')
+        shutil.copyfile(self.clip, path)
+        rec = make_recording(status='COMPLETED', name='Race day', output_path=path,
+                             recorded_video_codec='h264', recorded_audio_codec='aac',
+                             recorded_interlaced=True,
+                             recorded_duration_seconds=self.CLIP_SECONDS)
+        db.session.commit()
+        resp = self.client.post(f'/api/recordings/{rec.id}/playback',
+                                json={'offset': 5, 'reencode': True})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        sid = resp.get_json()['session_id']
+        self._wait_state(sid, preview.STATE_READY)
+        self.assertIn('could not decode this recording', self._status(sid)['decode_note'])
+        # Deinterlaced (the recording measured interlaced), and on from where the window got to.
+        self.assertEqual(self.built, [(True, True, 0, 5.0), (False, True, 4, 5.0 + 4 * seg_s)])
+        self.client.post(resp.get_json()['stop_url'])
+
+    def test_the_next_segment_number_follows_the_playlist(self):
+        session = preview.PreviewSession(id='x', channel_id=1, channel_name='', account_id=1,
+                                         dir=tempfile.mkdtemp(dir=self.t._tmpdir),
+                                         stderr_path='', transcode_audio=False, idle_timeout=15,
+                                         max_seconds=600, connect_timeout=20)
+        self.assertEqual(preview._next_segment_number(session), 0)
+        with open(session.playlist_path, 'w') as fh:
+            fh.write('#EXTM3U\n#EXTINF:2.0,\nseg00011.ts\n#EXTINF:2.0,\nseg00012.ts\n')
+        self.assertEqual(preview._next_segment_number(session), 13)

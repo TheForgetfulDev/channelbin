@@ -30,10 +30,12 @@ Rules this module holds, each guarded in tests/test_sports_feed.py:
   dev/changelog/1644): a person said it is on early, so every sports channel carrying it plays it
   ahead of its window until the end that was fixed when the button was pressed. Written by
   set_live_now() and nothing else; the code keeps the feature's first name, live now.
-* A league's layout is stored. SportsEvent.feed_number is written where the schedule is written
-  and a game keeps it, with one exception: a game whose time has changed so that it lands on
-  another's on the same channel is placed again, since the guide an IPTV player cached for it was
-  already wrong about its time. The number of channels only grows.
+* A league's layout is stored, one game per numbered channel per day (dev/changelog/1684).
+  SportsEvent.feed_number is written where the schedule is written and a game keeps it, with two
+  exceptions: a game whose time has changed so that it lands on another's on the same channel is
+  placed again, since the guide an IPTV player cached for it was already wrong about its time; and
+  a game past the guide the output sends that does not fit its channel's day is placed again,
+  since no player has cached it. The number of channels only grows.
 """
 import logging
 from dataclasses import dataclass, field
@@ -62,6 +64,11 @@ MAX_LENGTH = timedelta(hours=12)
 #: placed again. Less than this is one game running long, which the guide shows by ending it
 #: where the next starts.
 COLLISION = timedelta(minutes=30)
+#: A game is placed on a numbered channel only when no other game there starts on the same day in
+#: the display timezone and this much clears its window from every other one's, end to start
+#: (dev/changelog/1684). A viewer tuning back to a game in overtime, or in early for the next one,
+#: gets the game they asked for; the gap is for a game just after midnight, after a late one.
+DAY_GAP = timedelta(hours=3)
 #: A listing that starts within this of the game's start is the game itself, so its end is the
 #: game's end; one further off is a pregame show or a later airing.
 START_AGREE = timedelta(minutes=90)
@@ -228,6 +235,26 @@ def placement_window(event, named=None) -> Optional[tuple]:
     return start, start + (MATCHUP_LENGTH if matchup else FIELD_LENGTH)
 
 
+def game_windows(events, now: datetime) -> dict:
+    """{event id: (start, stop) or None}: each game's time on a sports channel (event_window),
+    one only a channel's name gives at that name's times. At most one read of the names."""
+    return _timed(events, now)
+
+
+def followed_coming(now: datetime, after: timedelta, limit: int) -> list:
+    """The games of everything followed that are not long over, soonest first, at most `limit`:
+    a followed league's all, a followed team's own. Postponed games are left out, having no time.
+    Two queries, one with nothing followed."""
+    scope = _follow_scope()
+    if not scope:
+        return []
+    events = (SportsEvent.query.filter(SportsEvent.league_id.in_(list(scope)), SportsEvent.postponed.is_(False),
+                                       _since(now - MAX_LENGTH - after))
+              .order_by(event_start(), SportsEvent.id).limit(limit).all())
+    return [e for e in events
+            if scope[e.league_id][0] or {e.home_team_id, e.away_team_id} & scope[e.league_id][1]]
+
+
 def event_start():
     return func.coalesce(SportsEvent.guide_start, SportsEvent.start_at)
 
@@ -270,7 +297,17 @@ def _usable_names(named, blocked, allowed) -> list:
     return [n for n in named.names if n.account_id not in blocked and (allowed is None or n.account_id in allowed)]
 
 
-def _events_of(served: Served):
+@dataclass
+class OneGame:
+    """One game and nothing else, where playing_now() is asked about it rather than about a
+    sports channel: a picture-in-picture channel's picture (app/pip_channels.py)."""
+    league: SportsLeague = field(repr=False)
+    event_id: int
+
+
+def _events_of(served):
+    if isinstance(served, OneGame):
+        return SportsEvent.query.filter(SportsEvent.id == served.event_id)
     if served.is_team:
         team = served.row.team_tsdb_id
         return SportsEvent.query.filter(SportsEvent.league_id == served.league.id,
@@ -701,12 +738,17 @@ def _named_now(found: tuple, now: datetime) -> Optional[NowPlaying]:
 
 
 def playing_now(served: Served, now: datetime, event_id: int = None, before: timedelta = timedelta(0),
-                after: timedelta = timedelta(0)) -> NowPlaying:
+                after: timedelta = timedelta(0), held: bool = False) -> NowPlaying:
     """The game `served` has on at `now` and the channels whose guide lists it, from `before` ahead
     of a listing's start to `after` past its end (integrations.output_feed's sports window,
     dev/changelog/1529): a viewer tuning in for the pregame or to a game running long expects
     something on. Zero for both is the listings on at this moment. `event_id` holds the answer to
-    that one game, which is how a failover stays on the game it started on. A game broadcast early
+    that one game, which is how a failover stays on the game it started on. `held` says a play is
+    already on that game (a failover, a seat search, a move by hand) rather than asking whether a
+    tune-in would get it, and a held play is never ended by the clock: its game's listings count
+    up to MAX_LENGTH and `after` past their end, the reach a play already has back to a game's
+    start, so a long overtime plus a provider blip moves the play rather than cutting it
+    (dev/changelog/1685). A game broadcast early
     with Start broadcast plays from its listings that start with the game, whenever they start, until its
     stored end (set_live_now). A game no guide lists that an event channel's name gives plays from
     the channels naming it (_name_play, dev/changelog/1643), only when no listing has a game to
@@ -714,10 +756,16 @@ def playing_now(served: Served, now: datetime, event_id: int = None, before: tim
     With nothing to play, `why_none` says which of four things is true: no game is near, a game is
     near that nothing lists, the game this play was held to is over, or a game opened early has no
     listing any more."""
+    if held and event_id is None:
+        raise ValueError('A held play needs the game it is held to')
     start = event_start()
-    q = _events_of(served).filter(_since(now - MAX_LENGTH - after))
+    reach_back = MAX_LENGTH + after
+    q = _events_of(served).filter(_since(now - reach_back))
     if event_id is not None:
         q = q.filter(SportsEvent.id == event_id)
+    # The tail a listing's end is measured against: the configured one for a tune-in, the whole
+    # reach for a play already on its game.
+    tail = reach_back if held else after
     events = q.order_by(start, SportsEvent.id).limit(_PLAY_EVENTS).all()
     by_id = {e.id: e for e in events}
     opened = {i: e for i, e in by_id.items() if live_now_on(e, now)}
@@ -735,7 +783,7 @@ def playing_now(served: Served, now: datetime, event_id: int = None, before: tim
         # A game a person opened early wins: they said it is on. Its listings count up to the end
         # fixed when the button was pressed, and no further.
         reach = max(e.live_now_until for e in opened.values()) - now
-        rows = [row for row in sports_match.airing_now(list(opened), now, reach, after, listed=True)
+        rows = [row for row in sports_match.airing_now(list(opened), now, reach, tail, listed=True)
                 if _starts_with_game(opened[row[0]], row[2])]
         picked = _pick(opened, rows, now)
         if picked is not None and picked[2] == PHASE_BEFORE:
@@ -746,7 +794,7 @@ def playing_now(served: Served, now: datetime, event_id: int = None, before: tim
             if found is not None:
                 return found
     if picked is None:
-        picked = _pick(by_id, sports_match.airing_now(list(by_id), now, before, after, listed=True), now)
+        picked = _pick(by_id, sports_match.airing_now(list(by_id), now, before, tail, listed=True), now)
         if picked is None or picked[2] != PHASE_ON:
             from_name = _name_play(by_id, named(), now, before)
             found = (_named_now(from_name, now)
@@ -992,20 +1040,39 @@ def set_live_now(event_id: int, on: bool, after: timedelta, now: datetime = None
 # A league's layout
 # ---------------------------------------------------------------------------
 
-def place_league_events(league: SportsLeague, now: datetime) -> int:
+def _fits(window: tuple, day, others) -> bool:
+    """A game at `window` whose start falls on `day` (the display timezone's date) may join
+    `others` [(start, stop, day)] on one numbered channel: no other starts that day, and DAY_GAP
+    clears its window from each other's in both directions."""
+    return all(day != other_day and (window[0] >= stop + DAY_GAP or window[1] + DAY_GAP <= begin)
+               for begin, stop, other_day in others)
+
+
+def place_league_events(league: SportsLeague, now: datetime, horizon: timedelta, tz) -> int:
     """Give each game of `league` that has a time and no channel yet the lowest-numbered channel
-    that is free for its whole length, and make sure a row exists for every number in use. Returns
-    how many were placed. Mutates without committing: the caller's unit is the schedule write, or
-    the switch going on.
+    it fits (_fits: one game per channel per day, dev/changelog/1684), and make sure a row exists
+    for every number in use. Returns how many were placed. Mutates without committing: the
+    caller's unit is the schedule write, or the switch going on. `horizon` is how far past `now`
+    the guide the output sends reaches (output_feed.guide_horizon()) and `tz` the display
+    timezone, read once by the caller.
 
     What is left to place is read from feed_number being NULL, which is the placement's own record,
-    so this is re-runnable from the top. A game already placed keeps its number unless its time
-    has changed onto another game's on the same number by more than COLLISION: then the one whose
-    time changed last gives its number up and is placed again, a WARNING names both, and the move
-    is kept on the game (feed_moved_*) for the league page to say. Left alone, one of the two
-    would have no channel to be tuned on."""
+    so this is re-runnable from the top. A game already placed keeps its number, with two
+    exceptions:
+
+    * A game inside the guide whose time has changed onto another game's on the same number by
+      more than COLLISION: the one whose time changed last gives its number up and is placed
+      again, a WARNING names both, and the move is kept on the game (feed_moved_*) for the league
+      page to say. Left alone, one of the two would have no channel to be tuned on. Measured on
+      the bare windows: moving a game a player has cached costs more than a tight pair.
+    * A game past the guide that does not fit its number beside the games kept there (another
+      starts that day, or one the day before or after is within DAY_GAP), as a game laid out
+      before one game per channel per day can: it is placed again with no feed_moved_* record,
+      since no player's cached guide has listed it, and one INFO line counts them. A number's
+      first game past the guide is not one of these: the guide's last block names it."""
     if not league.feed_league_channels:
         return 0
+    from .tz_utils import to_local
     start = event_start()
     lo = now - MAX_LENGTH
     events = (SportsEvent.query.filter(SportsEvent.league_id == league.id, _since(lo))
@@ -1020,9 +1087,20 @@ def place_league_events(league: SportsLeague, now: datetime) -> int:
         names = name_sources([league.id], now)
         for e in untimed:
             windows[e.id] = placement_window(e, names.get(e.id))
+    # The guide's own test for a game in it (guide_programs), so a game it may have sent counts as
+    # cached; so does each number's first game past it, which the guide's last block names
+    # ("Next: ...", guide_fillers).
+    guide_end = now + horizon
+    cached = {e.id for e in events if (e.guide_start or e.start_at) < guide_end}
+    named_next = {}
+    for event in events:
+        if event.id not in cached and event.feed_number is not None and windows[event.id] is not None:
+            named_next.setdefault(event.feed_number, event.id)
+    cached |= set(named_next.values())
+    days = {e.id: to_local(w[0], tz).date() for e in events if (w := windows[e.id]) is not None}
     placed = {}
     for event in events:
-        if event.feed_number is not None and windows[event.id] is not None:
+        if event.feed_number is not None and windows[event.id] is not None and event.id in cached:
             placed.setdefault(event.feed_number, []).append(event)
     for number, sharing in placed.items():
         sharing.sort(key=lambda e: (windows[e.id][0], e.id))
@@ -1046,21 +1124,31 @@ def place_league_events(league: SportsLeague, now: datetime) -> int:
             mover.feed_moved_by = (event if mover is clash else clash).id
             if mover is clash:
                 kept[kept.index(clash)] = event
-    taken, todo = {}, []
+    taken = {}
     for event in events:
         window = windows[event.id]
-        if window is None:
+        if window is not None and event.feed_number is not None and event.id in cached:
+            taken.setdefault(event.feed_number, []).append((window[0], window[1], days[event.id]))
+    relaid = 0
+    for event in events:
+        window = windows[event.id]
+        if window is None or event.feed_number is None or event.id in cached:
             continue
-        if event.feed_number is None:
-            todo.append((event, window))
+        if _fits(window, days[event.id], taken.get(event.feed_number, ())):
+            taken.setdefault(event.feed_number, []).append((window[0], window[1], days[event.id]))
         else:
-            taken.setdefault(event.feed_number, []).append(window)
+            event.feed_number = None
+            relaid += 1
+    if relaid:
+        log.info('Sports channels: %s past the guide placed again to keep one game per %s channel per day',
+                 counted(relaid, 'game'), league.name)
+    todo = [(e, windows[e.id]) for e in events if windows[e.id] is not None and e.feed_number is None]
     for event, window in todo:
         number = 1
-        while any(window[0] < stop and begin < window[1] for begin, stop in taken.get(number, ())):
+        while not _fits(window, days[event.id], taken.get(number, ())):
             number += 1
         event.feed_number = number
-        taken.setdefault(number, []).append(window)
+        taken.setdefault(number, []).append((window[0], window[1], days[event.id]))
     have = {n for (n,) in db.session.query(SportsFeedChannel.number).filter(
         SportsFeedChannel.league_id == league.id, SportsFeedChannel.team_tsdb_id == 0).all()}
     for number in range(1, max(taken, default=0) + 1):
@@ -1071,13 +1159,16 @@ def place_league_events(league: SportsLeague, now: datetime) -> int:
 
 
 @retry_on_locked()
-def place_all(now: datetime = None) -> int:
+def place_all(now: Optional[datetime], horizon: timedelta) -> int:
     """place_league_events() for every league whose switch is on, in one commit. The matcher calls
-    it after a run, since a guide match is what gives a field event its time."""
+    it after a run, since a guide match is what gives a field event its time. `horizon` is
+    output_feed.guide_horizon(), the caller's to read."""
+    from .tz_utils import get_display_tz
     now = now or datetime.utcnow()
+    tz = get_display_tz()
     placed = 0
     for league in SportsLeague.query.filter(SportsLeague.feed_league_channels.is_(True)).all():
-        placed += place_league_events(league, now)
+        placed += place_league_events(league, now, horizon, tz)
     if placed:
         db.session.commit()
         log.info('Sports channels: placed %s on league channels', counted(placed, 'game'))
@@ -1086,12 +1177,12 @@ def place_all(now: datetime = None) -> int:
     return placed
 
 
-def place_all_guarded(now: datetime = None) -> int:
+def place_all_guarded(now: Optional[datetime], horizon: timedelta) -> int:
     """place_all() for a caller whose own work must not depend on it: the schedule worker and the
     matcher. A failure is logged with its traceback and the games stay unplaced, which the next
     run reads from feed_number and places."""
     try:
-        return place_all(now)
+        return place_all(now, horizon)
     except Exception:  # noqa: BLE001 - a watch-only layout must never stop a schedule update or a match run
         db.session.rollback()
         log.exception('Sports channels: placing games on league channels failed; the next run tries again')
@@ -1137,10 +1228,11 @@ def set_team_channel(league_id: int, team_tsdb_id: int, enabled: bool) -> Option
 
 
 @retry_on_locked()
-def set_league_channels(league_id: int, enabled: bool) -> Optional[bool]:
+def set_league_channels(league_id: int, enabled: bool, horizon: timedelta) -> Optional[bool]:
     """A person's switch for a league's numbered channels. Turning it on lays out every game the
-    schedule already holds, in the same commit. Turning it off stops them being served and keeps
-    both the rows and every game's channel, so turning it back on brings back the same layout."""
+    schedule already holds, in the same commit (`horizon` as place_league_events() takes it).
+    Turning it off stops them being served and keeps both the rows and every game's channel, so
+    turning it back on brings back the same layout."""
     league = db.session.get(SportsLeague, league_id)
     if league is None:
         return None
@@ -1150,7 +1242,8 @@ def set_league_channels(league_id: int, enabled: bool) -> Optional[bool]:
         raise NotFollowed(f'Follow the whole league first: league channels carry every {event_word(league)} in it.')
     league.feed_league_channels = enabled
     if enabled:
-        place_league_events(league, datetime.utcnow())
+        from .tz_utils import get_display_tz
+        place_league_events(league, datetime.utcnow(), horizon, get_display_tz())
     db.session.commit()
     return True
 

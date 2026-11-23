@@ -269,16 +269,20 @@ def share_login_api(login_id):
     except (TypeError, ValueError):
         return jsonify({'error': 'account_id is required.'}), 400
     try:
-        login = share_login(login_id, account_id)
+        login, replaced = share_login(login_id, account_id)
     except LookupError as exc:
         return jsonify({'error': str(exc)}), 404
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 409
     seats = configured_seats([login])[login.id]
-    return jsonify({'success': True,
-                    'message': (f'Login "{login.name}" is shared with {_names([account_id])}. '
-                                f'Its {seats} {plural(seats, "seat")} now count across '
-                                f'both accounts.')})
+    target = _names([account_id])
+    message = (f'Login "{login.name}" is shared with {target}. Its {seats} '
+               f'{plural(seats, "seat")} now {plural(seats, "counts", "count")} across '
+               f'both accounts.')
+    if replaced is not None:
+        message += (f' {target} listed the same username and password from its own '
+                    f'playlist; the shared login took that row\'s place.')
+    return jsonify({'success': True, 'message': message})
 
 
 @providers_bp.route('/api/logins/<int:login_id>/share/<int:account_id>', methods=['DELETE'])

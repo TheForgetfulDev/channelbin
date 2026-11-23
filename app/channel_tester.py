@@ -1217,6 +1217,11 @@ def run_pre_check(app, recording_id: int):
                         unblocked, _ = split_blocked(members, blocked_account_ids(
                             {ch.account_id for ch in members}, at=rec.start_time))
                         members = unblocked or members
+                        # A recording of one game, as record start narrows it
+                        # (recorder.game_members(), dev/changelog/1690).
+                        from .recorder import game_members
+                        by_game = game_members(rec, members)
+                        members = by_game.preferred(by_game.members) or members
                         latest_by_channel = _latest_tests_by_channel([ch.id for ch in members])
                         # The format lock filters here too, or this pre-checks a member
                         # record start would have skipped - the shape this block promises

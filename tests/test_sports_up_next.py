@@ -17,6 +17,7 @@ import sys
 import time
 import unittest
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,6 +33,10 @@ import app.sports_screen_draw as draw  # noqa: E402
 from app import db, sports_feed, sports_up_next as un  # noqa: E402
 from app.database import (OutputFeedPlay, SportsEvent, SportsFollow, SportsLeague, SportsMatch,  # noqa: E402
                           SportsTeam, SportsUpNextChannel)
+
+#: The guide the output sends with xmltv_days unset (output_feed.guide_horizon()).
+HORIZON = timedelta(days=3)
+NY = ZoneInfo('America/New_York')
 
 _HAVE_FFMPEG = shutil.which('ffmpeg') is not None
 USER, PASS = 'tv', 'tv-secret'
@@ -221,7 +226,7 @@ class PagesTests(_Leagues, unittest.TestCase):
         nowhere = self.game(self.nhl, 5, 3)
         self.nhl.feed_league_channels = True
         db.session.commit()
-        sports_feed.place_league_events(self.nhl, datetime.utcnow())
+        sports_feed.place_league_events(self.nhl, datetime.utcnow(), HORIZON, NY)
         db.session.commit()
         listed.feed_number = None
         nowhere.feed_number = None
@@ -311,9 +316,9 @@ class CatalogTests(_Leagues, unittest.TestCase):
     def test_up_next_sits_with_the_sports_channels_ahead_of_them(self):
         un.set_up_next(un.EVERYTHING, True)
         nhl = un.set_up_next(self.nhl.id, True)
-        sports_feed.set_league_channels(self.nhl.id, True)
+        sports_feed.set_league_channels(self.nhl.id, True, HORIZON)
         self.game(self.nhl, 3, 1)
-        sports_feed.place_league_events(self.nhl, datetime.utcnow())
+        sports_feed.place_league_events(self.nhl, datetime.utcnow(), HORIZON, NY)
         db.session.commit()
         rows = feed.catalog()
         own = [(r.kind, r.name, r.category) for r in rows]
@@ -328,9 +333,9 @@ class CatalogTests(_Leagues, unittest.TestCase):
         channels listed none. They list ChannelBin's own picture, a static file an IPTV player
         can fetch with no login."""
         un.set_up_next(un.EVERYTHING, True)
-        sports_feed.set_league_channels(self.nhl.id, True)
+        sports_feed.set_league_channels(self.nhl.id, True, HORIZON)
         self.game(self.nhl, 3, 1)
-        sports_feed.place_league_events(self.nhl, datetime.utcnow())
+        sports_feed.place_league_events(self.nhl, datetime.utcnow(), HORIZON, NY)
         db.session.commit()
         rows = feed.catalog()
         self.assertEqual({r.kind for r in rows}, {feed.KIND_UP_NEXT, feed.KIND_SPORTS})

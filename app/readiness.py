@@ -457,6 +457,40 @@ def _gpu_trial_result(device, trial):
                   f'recording.post_process.vaapi_device.')
 
 
+def _gpu_overlay_result(device, trial):
+    """The gpu_overlay answer for one trial, whoever ran it."""
+    tested = f'Laid one test picture over another through {device} with overlay_vaapi'
+    if trial.ok:
+        return Result(READY, tested, f'{device} combined the two test pictures'
+                      + (' (remembered from an earlier pass)' if trial.cached else ''))
+    return Result(ATTENTION, tested,
+                  'The test failed, so a picture-in-picture channel plays its big picture alone. '
+                  f'ffmpeg reported: {trial.error}. In Docker, pass /dev/dri as a device; if the '
+                  'node is named differently here, set recording.post_process.vaapi_device.')
+
+
+def _check_gpu_overlay(ctx):
+    """On-demand: can the GPU lay one picture over another, which a picture-in-picture channel
+    on the IPTV output needs? READY and no spawn while no such channel exists, for the reason
+    _check_gpu_encoder is READY on software. ATTENTION on a failure: the channel still plays,
+    its big picture alone (dev/docs/DESIGN-pip-channels.md 7.1, 7.3)."""
+    from .database import PipChannel
+    from .toolchain import check_gpu_overlay
+    if PipChannel.query.first() is None:
+        return Result(READY, 'Looked for a picture-in-picture channel on the IPTV output',
+                      'Not in use - there is no picture-in-picture channel')
+    device = str(ctx.cfg['recording'].get('post_process', {}).get('vaapi_device') or '').strip()
+    tested = f'Looked for the GPU device{f" at {device}" if device else ""}'
+    if not device or not os.path.exists(device):
+        return Result(ATTENTION, tested,
+                      'There is no GPU device, so a picture-in-picture channel plays its big picture '
+                      'alone. In Docker, pass /dev/dri as a device; if the node is named differently '
+                      'here, set recording.post_process.vaapi_device.')
+    if not ctx.tools['ffmpeg'].get('found'):
+        return Result(NOTHING, tested, 'There is no ffmpeg to test with')
+    return _gpu_overlay_result(device, check_gpu_overlay(ctx.tools['ffmpeg']['path'], device))
+
+
 def _check_storage_dvr(ctx):
     from .fs_utils import PATH_OK, describe_dir_problem
     tested = f'Probed the recording folder at {ctx.dvr_dir}'
@@ -888,6 +922,14 @@ CHECKS = (
           'Encodes a one-second test clip on the GPU. Runs when you ask, when you turn the '
           'GPU encoder on in Settings, when the app starts with it on, and before each '
           'conversion that uses it. With the encoder set to Software it answers at once.'),
+    Check('gpu_overlay', 'machine', 'The GPU can combine two pictures', 'combining two pictures on the GPU',
+          ON_DEMAND,
+          'A picture-in-picture channel on the IPTV output plays its big picture alone, with no '
+          'small picture.',
+          Link('IPTV Output', 'iptv_output.page'), True,
+          _check_gpu_overlay,
+          'Lays one one-second test picture over another on the GPU. Runs when you ask and when '
+          'a picture-in-picture channel is tuned in. With no such channel it answers at once.'),
     Check('storage_dvr', 'machine', 'The recording folder works', 'the recording folder', CHEAP,
           "Any recording that starts now fails immediately because it can't write.",
           Link('Settings', 'settings.settings', 'recording.dvr_output_dir'), False, _check_storage_dvr),
@@ -1048,7 +1090,8 @@ CAPABILITIES = (
     Capability('safe', 'Keep the database safe and the login working',
                _cap('db_local', 'db_write', 'secret_key', 'auth_gate')),
     Capability('clear', 'See every error', _cap('alerts_unread')),
-    Capability('tv', 'Watch your channels and groups from a third-party IPTV player', _cap('output_feed')),
+    Capability('tv', 'Watch your channels and groups from a third-party IPTV player',
+               _cap('output_feed', 'gpu_overlay')),
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1455,6 +1498,11 @@ def run_check(check_id: str) -> dict:
     ctx = Context()
     _run_and_store(check_id, ctx)
     return evaluate(ctx=ctx)
+
+
+def record_gpu_overlay(device, trial):
+    """Store an overlay trial's answer as the gpu_overlay line (toolchain.check_gpu_overlay)."""
+    _store_ondemand('gpu_overlay', _gpu_overlay_result(device, trial))
 
 
 def record_gpu_trial(device, trial):

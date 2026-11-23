@@ -142,6 +142,7 @@ class SourceFormats:
     header_rate: str = None    # the joined file's r_frame_rate rational
     channels: tuple = ()       # distinct audio channel counts, ascending
     interlaced: bool = False
+    progressive: bool = False  # some stretch was measured progressive (beside `interlaced`)
     hdr_transfer: str = None   # 'smpte2084' / 'arib-std-b67', or None
     surveyed: bool = False     # the whole-file survey ran and answered
 
@@ -162,10 +163,29 @@ class SourceFormats:
         return any(abs((sar or 1.0) - 1.0) > 0.001 for _w, _h, sar in self.stored_sizes)
 
     @property
-    def single_format(self):
-        """One picture size and one rate, as far as anything measured - what GPU decode
-        requires (the hardware decoder dies on a mid-file size change, dev/changelog/1183)."""
-        return self.surveyed and len(self.sizes) == 1 and len(self.rates) <= 1
+    def gpu_decode_blocker(self) -> str:
+        """Why decoding this recording on the GPU would come out wrong, or '' when it would not.
+
+        A change of size or rate is no reason: it died only because ffmpeg 7.1 adds its own
+        software output scaler when a size change rebuilds the filter graph, and -noautoscale
+        stops that (measured in the GPU lab, dev/changelog/1687). Two changes still are, both
+        measured there: the GPU fit is worked out once per graph build and ffmpeg does not
+        rebuild for a pixel-aspect change alone, so a picture whose aspect changes at one size
+        keeps the first one's shape; and deinterlace_vaapi at field rate doubles every
+        progressive frame, so one chain cannot serve a file with both kinds of stretch. A file
+        the survey did not read whole is unknown, and unknown is not proof."""
+        if not self.surveyed:
+            return 'the format survey did not read the whole file'
+        aspects = {}
+        for w, h, sar in self.stored_sizes:
+            aspects.setdefault((w, h), set()).add(round(sar or 1.0, 3))
+        if any(len(s) > 1 for s in aspects.values()):
+            return ('its pixel aspect changes at one picture size, which the GPU does not '
+                    'refit')
+        if self.interlaced and self.progressive:
+            return ('it mixes interlaced and progressive stretches, and the GPU deinterlacer '
+                    'would double every progressive frame')
+        return ''
 
 
 def gather_source_formats(segments, survey, header, hdr_transfers):
@@ -183,6 +203,7 @@ def gather_source_formats(segments, survey, header, hdr_transfers):
     rates = []
     channels = set()
     interlaced = bool(survey.get('interlaced'))
+    progressive = False
     for resolution, fps, audio_channels, seg_interlaced in segments or ():
         size = parse_resolution(resolution)
         if size:
@@ -193,6 +214,10 @@ def gather_source_formats(segments, survey, header, hdr_transfers):
             channels.add(int(audio_channels))
         if seg_interlaced:
             interlaced = True
+        elif seg_interlaced is False:
+            progressive = True
+    if survey.get('progressive'):
+        progressive = True
     for w, h, sar in survey.get('video_sizes') or ():
         # The survey knows the aspect ratio and the rows do not, so a surveyed size
         # replaces the row's square-pixel guess at the same coded size.
@@ -225,8 +250,8 @@ def gather_source_formats(segments, survey, header, hdr_transfers):
     return SourceFormats(
         sizes=tuple(sizes), stored_sizes=tuple(sorted(stored)),
         rates=tuple(_distinct_rates(rates)), header_rate=header_rate,
-        channels=tuple(sorted(channels)), interlaced=interlaced, hdr_transfer=hdr,
-        surveyed=bool(survey))
+        channels=tuple(sorted(channels)), interlaced=interlaced, progressive=progressive,
+        hdr_transfer=hdr, surveyed=bool(survey))
 
 
 @dataclass(frozen=True)
@@ -436,16 +461,111 @@ def gpu_upload_filter(plan: NormalizePlan, *, hevc: bool, end_pad=0.0):
     return ','.join(parts)
 
 
+def gpu_fit_filter(width, height, fmt='nv12', scale_options=''):
+    """The GPU's fit_filter: scale to fit width x height at the picture's display aspect, then
+    pad the rest, all on the device. Sized from `dar` because scale_vaapi's own
+    force_original_aspect_ratio reads the coded size and ignores the pixel aspect (a 4:3 SD
+    picture came out 1620 wide where 1440 is right, measured, dev/changelog/1687). Worked out
+    when the graph is built, so it follows a size change only because ffmpeg rebuilds the graph
+    there - which is what -noautoscale on the command keeps alive. `scale_options` is more
+    scale_vaapi options, each with its leading colon (gpu_meet_filter's color conversion)."""
+    W, H = int(width), int(height)
+    ratio = f'{W}/{H}'
+    w_expr = f"if(gt(dar,{ratio}),{W},trunc({H}*dar/2)*2)"
+    h_expr = f"if(gt(dar,{ratio}),trunc({W}/dar/2)*2,{H})"
+    return (f"scale_vaapi=w='{w_expr}':h='{h_expr}':format={fmt}{scale_options},"
+            f"pad_vaapi=w={W}:h={H}:x=(ow-iw)/2:y=(oh-ih)/2")
+
+
+# ── Color where two pictures meet on the GPU ─────────────────────────────────────────────
+#
+# overlay_vaapi takes two inputs, and ffmpeg 7.1 settles each link's color space when it builds
+# the graph. Two inputs that disagree (one bt709, one with no matrix at all) get a SOFTWARE
+# scaler put between GPU filters and the command dies: "Impossible to convert between the
+# formats ... 'auto_scale_0'" (dev/changelog/1686). So every picture reaches the overlay as
+# bt709, said on its link by GPU_BT709_PIN.
+
+MATRIX_BT709 = 'bt709'
+MATRIX_BT601 = 'smpte170m'
+#: What ffprobe calls the BT.601 family: NTSC's and PAL's matrices are the same numbers.
+_BT601_NAMES = ('smpte170m', 'bt470bg')
+
+#: Says "this picture is bt709, TV range" on a filter link. It changes no pixel.
+GPU_BT709_PIN = 'setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv'
+_GPU_BT601_TAG = ('setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m'
+                  ':range=tv')
+#: scale_vaapi options that make the GPU convert to bt709. The primaries are what switch the
+#: conversion on: with the matrix alone the driver converted nothing (measured on color bars,
+#: Intel iHD, dev/changelog/1689).
+_GPU_TO_BT709 = (':out_color_matrix=bt709:out_color_primaries=bt709:out_color_transfer=bt709'
+                 ':out_range=tv')
+
+
+def source_matrix(color_space, height):
+    """Which matrix a picture's colors are in: MATRIX_BT601 or MATRIX_BT709. Its own tag when
+    it has one of those two, else by frame size - HD is bt709 and SD is bt601, what every
+    player assumes of an untagged picture. Anything else (bt2020 included: an HDR picture
+    plays with flat colors, as the re-encoded preview's does) is treated as bt709."""
+    name = (color_space or '').strip().lower()
+    if name in _BT601_NAMES:
+        return MATRIX_BT601
+    if name == MATRIX_BT709:
+        return MATRIX_BT709
+    if name in ('', 'unknown', 'unspecified') and height and int(height) < 720:
+        return MATRIX_BT601
+    return MATRIX_BT709
+
+
+def gpu_meet_filter(width, height, matrix=MATRIX_BT709, *, deinterlace=False):
+    """gpu_fit_filter for a GPU-decoded picture on its way to an overlay: fitted to
+    width x height and handed on as bt709 (see the block comment above).
+
+    `matrix` is source_matrix()'s answer for the picture and must be right, because the driver
+    does not read it from the stream: asked to convert, it treated every GPU-decoded picture
+    as bt601 whatever its tag said, and shifted a bt709 picture's colors (green 186 became
+    219). So the picture is tagged here first, with what the caller knows, then converted,
+    then pinned. Measured on color bars in the GPU lab against a software reference: bt709
+    exact, bt601 within 6 of 255, tagged and not, SD and HD (dev/changelog/1689).
+    Never pass a matrix guessed from the frame size when the stream names one."""
+    tag = _GPU_BT601_TAG if matrix == MATRIX_BT601 else GPU_BT709_PIN
+    parts = [tag]
+    if deinterlace:
+        parts.append(DEINTERLACE_VAAPI)
+    parts += [gpu_fit_filter(width, height, scale_options=_GPU_TO_BT709), GPU_BT709_PIN]
+    return ','.join(parts)
+
+
+#: Output options every command that decodes on the GPU carries. ffmpeg 7.1 rebuilds the
+#: filter graph when a decoded picture changes size, and on a rebuild inserts its own SOFTWARE
+#: output scaler (pinned to the size the encoder opened at), which cannot take GPU frames:
+#: "Impossible to convert between the formats ... 'auto_scale_0'", the death dev/changelog/1183
+#: put down to the hardware decoder. Without that scaler every size change measured runs
+#: (720p30 to 1080p60, 4:3 SD to HD, 1080 to 720 to 1080; dev/changelog/1687). Safe because
+#: every GPU-decode chain fixes its own output size.
+GPU_DECODE_OUTPUT_ARGS = ['-noautoscale']
+
+
+def gpu_decode_input_args(device) -> list:
+    """Before -i: decode on the GPU through `device` and keep the frames on it; -hwaccel_device
+    opens the device for the filters and the encoder too. Never paired with -reinit_filter:v 0:
+    gpu_fit_filter follows a size change only because ffmpeg rebuilds the graph there
+    (dev/changelog/1687)."""
+    return ['-hwaccel', 'vaapi', '-hwaccel_device', device, '-hwaccel_output_format', 'vaapi']
+
+
 def gpu_decode_filter(plan: NormalizePlan, *, hevc: bool):
-    """The VAAPI path's -vf when the GPU decodes too (frames never leave the device).
-    Only for a clean, single-format recording - see SourceFormats.single_format."""
+    """The VAAPI path's -vf when the GPU decodes too (frames never leave the device). Only for
+    a recording SourceFormats.gpu_decode_blocker lets through, on a command carrying
+    GPU_DECODE_OUTPUT_ARGS."""
     parts = []
     if plan.deinterlace:
         parts.append(DEINTERLACE_VAAPI)
     if plan.hdr and not hevc:
         parts.append(TONEMAP_VAAPI)
-    size = f'w={plan.width}:h={plan.height}:' if plan.width and plan.height else ''
     fmt = 'p010' if (plan.hdr and hevc) else 'nv12'
-    parts.append(f'scale_vaapi={size}format={fmt}')
+    if plan.width and plan.height:
+        parts.append(gpu_fit_filter(plan.width, plan.height, fmt))
+    else:
+        parts.append(f'scale_vaapi=format={fmt}')
     parts.append('setsar=1')
     return ','.join(parts)

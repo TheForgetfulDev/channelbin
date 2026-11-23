@@ -5,6 +5,38 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.49.0 - 2026-11-23
+
+Picture-in-picture channels, and GPU decoding on by default.
+
+**Added**
+
+- Picture-in-picture channels on the IPTV output. Pick what the big and the small picture
+  show (a game, a channel, a group, or a search by name), and an IPTV player lists it as a
+  channel with its own number, guide and an optional swapped copy.
+- When a recording needs a connection a picture-in-picture channel is using, the small
+  picture gives way first and comes back on its own. The setup dialog says what each picture
+  would play from and how many connections it costs.
+
+**Changed**
+
+- Each numbered sports channel on the IPTV output carries one game per day, so tuning back
+  to a game in overtime, or in early for the next one, lands on the right game.
+- Converting a recording decodes on the GPU whenever the GPU encoder is set up, including
+  recordings whose picture size changes partway, and a recording says why when it could not.
+- Try re-encoded in Preview and Play decodes on the GPU too. If the GPU decode fails, it
+  restarts once on the CPU and says so.
+
+**Fixed**
+
+- A sports channel already playing a game moves to another channel carrying it when its
+  channel fails, even after the game's listed end, instead of stopping.
+- A sports channel or game recording on a group of local stations takes the game only from a
+  station whose guide shows it, not the group's best station showing another city's game.
+- A game listed on more than 1,000 channels can be played and recorded.
+- Sharing a login with an account whose playlist already lists it works again, and the two
+  accounts count it as one connection.
+
 ## 0.48.0 - 2026-11-21
 
 Switch off or test an account's hosts and logins, and move a player off a bad channel.

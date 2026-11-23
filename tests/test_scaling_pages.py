@@ -250,13 +250,38 @@ def _enable_output_feed(t):
         'enabled': True, 'username': 'tv', 'password': 'tv'}}})
 
 
+def _seed_pip_feed(n):
+    """_seed_sports_feed plus n picture-in-picture channels, every kind of picture among them and
+    each with its swapped copy (dev/docs/DESIGN-pip-channels.md 4)."""
+    from app.database import (PIP_SOURCE_CHANNEL, PIP_SOURCE_GAME, PIP_SOURCE_GROUP, PIP_SOURCE_SEARCH,
+                              ChannelGroup, PipChannel, SportsEvent)
+    _seed_sports_feed(n)
+    channels = Channel.query.filter(Channel.in_guide.is_(True)).order_by(Channel.id).all()  # guide-flag-read-ok: seeding the feed's own rows
+    groups = ChannelGroup.query.filter(ChannelGroup.in_guide.is_(True)).order_by(ChannelGroup.id).all()
+    events = SportsEvent.query.order_by(SportsEvent.id).all()
+    for i in range(n):
+        row = PipChannel(name=f'PiP {i}', swapped_copy=True, on_output=True)
+        if events and i % 2 == 0:
+            row.main_kind, row.main_ref = PIP_SOURCE_GAME, events[i % len(events)].tsdb_id
+        else:
+            row.main_kind, row.main_ref = PIP_SOURCE_CHANNEL, channels[i % len(channels)].id
+        if groups and i % 3 == 0:
+            row.inset_kind, row.inset_ref = PIP_SOURCE_GROUP, groups[i % len(groups)].id
+        elif i % 3 == 1:
+            row.inset_kind, row.inset_query = PIP_SOURCE_SEARCH, 'a'
+        else:
+            row.inset_kind, row.inset_ref = PIP_SOURCE_CHANNEL, channels[(i + 1) % len(channels)].id
+        db.session.add(row)
+    db.session.commit()
+
+
 def _seed_iptv_output(n):
-    """The IPTV Output page at its widest: the guide scope with its sports channels, n lines
-    of Recent plays, and n IPTV players watching n different channels (dev/changelog/1526)."""
+    """The IPTV Output page at its widest: the guide scope with its sports channels and n
+    picture-in-picture channels, n lines of Recent plays, and n IPTV players watching n different channels (dev/changelog/1526)."""
     import time
     import app.output_feed as feed
     from app.database import FEED_PLAY_ENDED, FEED_PLAY_REFUSED, OutputFeedPlay
-    _seed_sports_feed(n)
+    _seed_pip_feed(n)
     now = datetime.utcnow()
     watched = Channel.query.filter(Channel.in_guide.is_(True)).order_by(Channel.id).limit(n).all()  # guide-flag-read-ok: seeding the feed's own rows
     for i, ch in enumerate(watched):
@@ -1176,6 +1201,22 @@ class PageScalingTests(unittest.TestCase):
 
     def test_output_feed_xmltv_with_sports_channels(self):
         self._assert_row_independent(_seed_sports_feed, '/xmltv.php?username=tv&password=tv',
+                                     configure=_enable_output_feed)
+
+    def test_output_feed_guide_with_pip_channels(self):
+        """The guide a player downloads with picture-in-picture channels on it: their blocks are
+        titled from one describe() over every row (dev/docs/DESIGN-pip-channels.md 4.4)."""
+        self._assert_row_independent(_seed_pip_feed, '/xmltv.php?username=tv&password=tv',
+                                     configure=_enable_output_feed)
+
+    def test_output_feed_catalog_with_pip_channels(self):
+        self._assert_row_independent(_seed_pip_feed,
+                                     '/player_api.php?username=tv&password=tv&action=get_live_streams',
+                                     configure=_enable_output_feed)
+
+    def test_pip_pickers(self):
+        """The setup dialog's lists: the coming games and the guide's rows, however many."""
+        self._assert_row_independent(_seed_pip_feed, '/api/iptv-output/pip/pickers',
                                      configure=_enable_output_feed)
 
     def test_iptv_output_page(self):

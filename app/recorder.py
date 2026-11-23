@@ -346,6 +346,9 @@ POSTER_FRAME_RETRY_STEP_SECONDS = 60.0
 
 #: extra_data['kind'] of the DIAGNOSTICS event written when a poster frame was skipped.
 DIAGNOSTIC_KIND_POSTER_FRAME = 'poster_frame'
+#: extra_data['kind'] of the DIAGNOSTICS event written when a group recording of a game starts on
+#: a member whose guide shows something else, since none showed the game (game_members()).
+DIAGNOSTIC_KIND_OTHER_PROGRAM = 'other_program_override'
 
 #: What is known about the final-frame thumbnail when every poster try was black. Each is
 #: named because each changes what the recording's cover turns out to be.
@@ -895,14 +898,37 @@ def _busy_account_channel_ids(members, exclude_recording_id: int) -> tuple:
     standing = connlim.seat_standing({ch.account_id for ch in members}, 'recording',
                                      exclude_holder=('recording', exclude_recording_id))
     full = {ch.id for ch in members if standing.get(ch.account_id) == connlim.SEAT_NONE}
-    viewer = {ch.id for ch in members
-              if standing.get(ch.account_id) == connlim.SEAT_BY_CUTTING_VIEWER}
-    return full, viewer
+    watched = {ch.id for ch in members
+               if standing.get(ch.account_id) == connlim.SEAT_BY_CUTTING_VIEWER}
+    paused = {ch.id for ch in members
+              if standing.get(ch.account_id) == connlim.SEAT_BY_PAUSING_PICTURE}
+    return full, ViewerAccounts(watched | paused, watched)
 
 
-def _viewer_account_note(best, took: bool, skipped) -> str:
+class ViewerAccounts(frozenset):
+    """The channels a recording reaches only by taking a connection the IPTV output holds.
+    `watched` are the ones where that cuts off a play or a picture-in-picture channel's big
+    picture; on the rest it only pauses a picture no TV has as its big one, so those are
+    taken first (dev/docs/DESIGN-pip-channels.md 8.2). A plain set handed where one of these
+    is read counts as all watched."""
+
+    def __new__(cls, ids=(), watched=()):
+        self = super().__new__(cls, ids)
+        self.watched = frozenset(watched)
+        return self
+
+
+def _watched(viewer_account) -> frozenset:
+    return getattr(viewer_account, 'watched', frozenset(viewer_account))
+
+
+def _viewer_account_note(best, took: bool, skipped, viewer_account=frozenset()) -> str:
     """The member-selection event's clause about IPTV players on the output feed: the
     connection it takes from one, or the members it passed over so as not to, or ''."""
+    if took and best.id not in _watched(viewer_account):
+        return (f' - no member on an account with a connection nobody is using, so it takes '
+                f'one a picture-in-picture channel can spare on "{best.account.name}": a TV '
+                f'watching it keeps its big picture')
     if took:
         return (f' - no member on an account with a connection nobody is using, so it takes '
                 f'the one an IPTV player is watching on "{best.account.name}"')
@@ -1005,6 +1031,14 @@ def start_recording(app, recording_id: int):
             # recording is not a failover candidate
             # (app/channel_groups.py::recording_members).
             members = recording_members(rec.group.memberships)
+            # A recording of one game takes only members that may carry it (dev/changelog/1690).
+            # When none can, the start goes ahead on the whole list and says so, as the format
+            # lock's zero-survivors override does: a member's guide can be wrong, and a
+            # recording that never starts cannot be checked.
+            by_game = game_members(rec, members)
+            game_override = bool(members) and not by_game.members
+            if not game_override:
+                members = by_game.members
             # Members on an account the user has blocked are dropped first, before the
             # format lock, like a member that already failed - a blocked one must never be
             # the lone survivor that suppresses the lock's zero-survivors override. When
@@ -1017,6 +1051,8 @@ def start_recording(app, recording_id: int):
                 members = unblocked
             else:
                 skipped_blocked = []
+            if not game_override:
+                members = by_game.preferred(members)
             from .routes.channel_tests import _latest_tests_by_channel
             latest_by_channel = _latest_tests_by_channel([ch.id for ch in members])
             # Format lock filters, health score ranks (DESIGN-channel-groups-model.md 5).
@@ -1037,9 +1073,18 @@ def start_recording(app, recording_id: int):
                 # Sparing an IPTV player never sends a recording to a feed the health checks
                 # say is down: the recording always wins (DESIGN-output-feed.md 4.4).
                 best = None
+            if best is None and viewer_account:
+                # Nothing on an empty account. A picture-in-picture channel's small picture
+                # gives way before anything a TV would lose its picture without
+                # (DESIGN-pip-channels.md 8.2), and never for a feed on a failing streak.
+                best = pick_best_member(members, latest_by_channel,
+                                        exclude_ids=busy | busy_account | _watched(viewer_account),
+                                        streak_threshold=streak_threshold)
+                if best is not None and is_streaking(best, streak_threshold):
+                    best = None
             if best is None:
-                # Nothing on an empty account. Cut off an IPTV player before waiting: the
-                # recording is what the app is for (DESIGN-output-feed.md 4.4).
+                # Cut off an IPTV player before waiting: the recording is what the app is
+                # for (DESIGN-output-feed.md 4.4).
                 best = pick_best_member(members, latest_by_channel,
                                         exclude_ids=busy | busy_account,
                                         streak_threshold=streak_threshold)
@@ -1081,7 +1126,9 @@ def start_recording(app, recording_id: int):
                     busy_note += (' - rolled over to a free account, past: '
                                   + ', '.join(f'"{ch.name}"' for ch in skipped_busy_account))
                 busy_note += _viewer_account_note(best, took_viewer_account,
-                                                  skipped_viewer_account)
+                                                  skipped_viewer_account, viewer_account)
+                if not game_override:
+                    busy_note += _skipped_game_note(by_game.skipped, by_game.game)
                 if skipped_blocked:
                     busy_note += (' - skipped member(s) on a blocked account: '
                                   + ', '.join(f'"{ch.name}" ({ch.account.name})'
@@ -1100,6 +1147,14 @@ def start_recording(app, recording_id: int):
                     override_detail = (
                         f'Recorded from "{best.name}" at {got}. This group is locked to '
                         f'{format_label(selection.reference)} and no member matched.')
+
+                game_detail = None
+                if game_override:
+                    shows = dict((ch.id, what) for ch, what in by_game.skipped).get(best.id, 'something else')
+                    game_detail = (f'Recording from "{best.name}", whose guide shows {shows} at this time, not '
+                                   f'{by_game.game}. No channel in group "{rec.group.name}" with Recording on '
+                                   f'shows {by_game.game} then, so the recording starts on the best of them '
+                                   'rather than not at all.')
 
                 selected_detail = (f'Group "{rec.group.name}": recording from "{best.name}" '
                                    f'({best.account.name}, score {effective_score(best)})'
@@ -1141,8 +1196,16 @@ def start_recording(app, recording_id: int):
                                    'locked_format': list(selection.reference),
                                    'recorded_format': list(
                                        format_key(latest_by_channel.get(best.id)) or [])})
+                    if game_detail and not repeat_selection:
+                        add_recording_event(recording_id, DIAGNOSTICS, detail=game_detail,
+                            extra={'kind': DIAGNOSTIC_KIND_OTHER_PROGRAM, 'group_id': rec.group_id,
+                                   'channel_id': best.id,
+                                   'skipped_channel_ids': [ch.id for ch, _ in by_game.skipped]})
                     db.session.commit()
 
+                if game_detail and not repeat_selection:
+                    log.warning('Recording %d: %s', recording_id, game_detail,
+                                extra={'recording_id': recording_id})
                 _select_group_member_and_commit()
 
         # Case 2: if a recording on this same channel - or the same channel group
@@ -2576,6 +2639,58 @@ def _pin_eligible_members(members, pin, latest_by_channel):
     return keep, False
 
 
+@dataclass
+class GameMemberFilter:
+    """game_members()' answer: `members` to choose from, `skipped` the ones left out because
+    their own guide shows something else then, as [(channel, what it shows)], `carry` the ids of
+    those whose guide shows the game, and `game` the game's name, or '' when the recording is of
+    no game this can tell."""
+    members: list
+    skipped: list
+    carry: frozenset = frozenset()
+    game: str = ''
+
+    def preferred(self, members) -> list:
+        """`members` narrowed to those whose guide shows the game, when any is among them: a
+        station with no guide may be showing the other game, so it is used only when no
+        carrier can be (sports_match.members_for_game())."""
+        carriers = [ch for ch in members if ch.id in self.carry]
+        return carriers or list(members)
+
+
+def game_members(rec, members) -> GameMemberFilter:
+    """Narrow a group recording's candidate `members` to those that may carry the game its
+    listing is of (sports_match.recording_game(), members_for_game()). A group of local stations
+    shows each city's own game in a regional window, and a recording of one game must not be made
+    from a station showing another (dev/changelog/1690). Anything not tied to one game - no source
+    listing, no match there, a listing of two games - leaves `members` as they are. Applied where
+    a member is chosen, before both format filters, like a member that already failed, so neither
+    filter's zero-survivors override counts a member showing another game. Three queries at most,
+    none for a recording with no source listing."""
+    from .program_titles import title_key
+    from .sports_data import event_game_name
+    from .sports_match import members_for_game, recording_game
+    event = recording_game(rec)
+    if event is None or not members:
+        return GameMemberFilter(list(members), [])
+    found = members_for_game([ch.id for ch in members], event.id, rec.program_start_time,
+                             title_key(rec.program_title))
+    return GameMemberFilter([ch for ch in members if ch.id in found.keep],
+                            [(ch, found.other[ch.id]) for ch in members if ch.id in found.other],
+                            found.carry, event_game_name(event))
+
+
+def _skipped_game_note(skipped, game) -> str:
+    """The clause a member-selection event adds for members left out by game_members(): how many,
+    and the first few by name with what each shows instead."""
+    if not skipped:
+        return ''
+    shown = ', '.join(f'"{ch.name}" ({what})' for ch, what in skipped[:3])
+    more = f' and {len(skipped) - 3} more' if len(skipped) > 3 else ''
+    return (f' - skipped {counted(len(skipped), "member")} whose guide shows something other than '
+            f'{game} at that time: {shown}{more}')
+
+
 def _members_near(channel, members) -> tuple:
     """(avoid, same_login): the members that share a backend with `channel`. `avoid` is the
     id sets a feed-death failover keeps away from, widest first: everything on its account's
@@ -2609,11 +2724,13 @@ def _pick_by_tiers(members, latest_by_channel, stay_put, busy, busy_account, dem
                    streak_threshold, near=(), viewer_account=frozenset()):
     """The failover's preference tiers, best-first; the first that yields a member wins.
     The inner ones are the long-standing busy cascade - prefer a member whose account has
-    a slot nobody is using, then one whose slot an IPTV player on the output feed is using
-    (`viewer_account`, which the move cuts off - dev/changelog/1642), then any free member,
+    a slot nobody is using, then one whose slot a picture-in-picture channel's small picture
+    holds, then one whose slot an IPTV player on the output feed is watching through
+    (`viewer_account` and its `watched` part, which the move cuts off - dev/changelog/1642,
+    dev/docs/DESIGN-pip-channels.md 8.2), then any free member,
     then knowingly take the best busy one rather than abort (busy-member skip rule; no
     handoff fires mid-recording, so both recordings share the feed's provider connection). The
-    tier that spares a player never yields a member on a failing streak.
+    tiers that spare a player never yield a member on a failing streak.
 
     A demote pass wraps a second round outside them: every tier is tried against the
     not-yet-demoted members first, and only then re-tried with the demoted ones allowed
@@ -2630,12 +2747,17 @@ def _pick_by_tiers(members, latest_by_channel, stay_put, busy, busy_account, dem
     best = None
     for preferred in ([demoted, frozenset()] if demoted else [frozenset()]):
         base = set(stay_put) | set(preferred)
-        tiers = [base | busy | busy_account | viewer_account, base | busy | busy_account,
-                 base | busy, base]
-        for tier in [t for i, t in enumerate(tiers) if t not in tiers[:i]]:
-            # The tier that spares an IPTV player never prefers a feed on a failing streak, as
+        watched = _watched(viewer_account)
+        tiers = [(base | busy | busy_account | viewer_account, bool(viewer_account)),
+                 (base | busy | busy_account | watched, bool(watched)),
+                 (base | busy | busy_account, False), (base | busy, False), (base, False)]
+        seen = []
+        for tier, spares_viewer in tiers:
+            # A tier that spares an IPTV player never prefers a feed on a failing streak, as
             # the backend preference never does: the recording always wins.
-            spares_viewer = bool(viewer_account) and tier is tiers[0]
+            if tier in seen:
+                continue
+            seen.append(tier)
             for avoid in (*near, frozenset()):
                 best = pick_best_member(members, latest_by_channel, exclude_ids=tier | avoid,
                                         streak_threshold=streak_threshold)
@@ -2683,6 +2805,8 @@ def switch_choices(recording_id: int) -> list:
     switched_off = unusable_reasons(account_ids)
     latest = _latest_tests_by_channel([ch.id for ch in members])
     pin = recording_format_pin(recording_id)
+    by_game = game_members(rec, members)
+    shows_other = dict((ch.id, what) for ch, what in by_game.skipped)
     current = rec.channel
     out = []
     for ch in members:
@@ -2702,6 +2826,10 @@ def switch_choices(recording_id: int) -> list:
         elif ch.account_id in full and (current is None or ch.account_id != current.account_id):
             ok, why = False, (f'"{ch.account.name}" is at its connection limit - every slot '
                               f'is held by another recording.')
+        elif ch.id in shows_other:
+            # Offered, as a format that differs is: the pick is the user's (dev/changelog/1690).
+            ok, why, warn = True, (f'Its guide shows {shows_other[ch.id]} at this time, not '
+                                   f'{by_game.game}.'), True
         elif key is None:
             ok, why = True, ('Never tested - its format is unknown, so it is not filtered '
                              'on format.')
@@ -2715,10 +2843,14 @@ def switch_choices(recording_id: int) -> list:
             ok, why = True, f'Records at {format_label(key)}.'
         if ok and ch.id in state.demoted_member_ids:
             why += ' Moved off earlier in this recording for stalling.'
-        if (ok and standing.get(ch.account_id) == connlim.SEAT_BY_CUTTING_VIEWER
-                and (current is None or ch.account_id != current.account_id)):
+        seat = standing.get(ch.account_id)
+        other_account = current is None or ch.account_id != current.account_id
+        if ok and other_account and seat == connlim.SEAT_BY_CUTTING_VIEWER:
             why += (f' An IPTV player is watching on "{ch.account.name}"; switching cuts it off '
                     f'unless it can move to another channel.')
+        elif ok and other_account and seat == connlim.SEAT_BY_PAUSING_PICTURE:
+            why += (f' A picture-in-picture channel is using "{ch.account.name}"; switching pauses '
+                    f'one of its pictures, and a TV watching it keeps its big picture.')
         out.append(SwitchChoice(ch, ok, why, warn))
     return out
 
@@ -2746,6 +2878,8 @@ def block_move_preview(recording_id: int, pending: dict):
     if current.account_id not in blocked:
         return None
     members, _ = split_blocked(members, blocked)
+    by_game = game_members(rec, members)
+    members = by_game.preferred(by_game.members)
     latest = _latest_tests_by_channel([ch.id for ch in members])
     selection = format_eligible_members(rec.group, members, latest)
     members, _ = _pin_eligible_members(selection.members, recording_format_pin(recording_id),
@@ -2899,6 +3033,14 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
             # would have refused to start on. When the lock leaves nothing, it hands back the
             # unfiltered list rather than an empty one - a live capture is never abandoned to
             # a format rule (15.2, principle 2).
+            # Never onto a member showing another game: that would splice it into the file
+            # (dev/changelog/1690). Unlike record start, no override - the recording keeps
+            # what it has and ends as every other one with no member left does.
+            by_game = game_members(rec, members)
+            if by_game.skipped:
+                log.info('Recording %d: failover leaves out %s', recording_id,
+                         _skipped_game_note(by_game.skipped, by_game.game).lstrip(' -'))
+            members = by_game.preferred(by_game.members)
             selection = format_eligible_members(rec.group, members, latest_by_channel)
             members = selection.members
             # Then this run's own constraint: a recording does not change format mid-run
@@ -3050,7 +3192,8 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         elif skipped_busy_account:
             busy_note += (' - rolled over to a free account, past: '
                           + ', '.join(f'"{ch.name}"' for ch in skipped_busy_account))
-        busy_note += _viewer_account_note(best, took_viewer_account, skipped_viewer_account)
+        busy_note += _viewer_account_note(best, took_viewer_account, skipped_viewer_account,
+                                          viewer_account)
         override_note = ''
         if selection is not None and selection.override:
             override_note = (f' - no member matches the locked format '
@@ -3241,6 +3384,10 @@ def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int,
             output_feed.move_preempted(app, movers, recording_id)
 
 
+#: The most viewers one acquire takes a seat from before it moves on to previews and tests.
+_MAX_VIEWER_CUTS = 32
+
+
 def _acquire_with_preemption(app, recording_id: int, account_id: int, acquire, movers: list) -> bool:
     _preempt_sync_for_recording(recording_id, account_id)
 
@@ -3260,9 +3407,16 @@ def _acquire_with_preemption(app, recording_id: int, account_id: int, acquire, m
     # on its own, below the operator's own look and the measurement feeding the health
     # score (DESIGN-output-feed.md 4.4). The viewer is told why - the session ends by name
     # and an alert names this recording.
-    viewers = connlim.preempt_viewers_for_slot(account_id)
-    if viewers:
-        from . import output_feed
+    #
+    # One at a time, the readiest to give way first (a picture-in-picture channel's small
+    # picture before a play a TV would lose its picture without), and no more once the
+    # recording is seated: a recording that needs one connection cuts one viewer
+    # (DESIGN-pip-channels.md 8.2). The bound is for a player that keeps retaking a seat.
+    from . import output_feed
+    for _ in range(_MAX_VIEWER_CUTS):
+        viewers = connlim.preempt_viewers_for_slot(account_id, at_most=1)
+        if not viewers:
+            break
         for holder_account_id in dict.fromkeys(a for _, a in viewers):
             output_feed.preempt_for_account(app, holder_account_id, recording_id, movers=movers)
             log.warning('Recording %d: preempted an IPTV player on account %d%s',

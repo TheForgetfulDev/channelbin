@@ -1660,8 +1660,9 @@ def run(now: datetime = None, pause: float = PAUSE_SECONDS) -> str:
         _queue_rule_checks(league_ids)
         # A guide match is what gives a field event its time, so a league's numbered channels on
         # the output feed take their new games here as well as at a schedule update.
+        from .output_feed import guide_horizon
         from .sports_feed import place_all_guarded
-        place_all_guarded(now)
+        place_all_guarded(now, guide_horizon())
         seconds = time_mod.monotonic() - started
         note = (f'Found {counted(totals["matched"], "event")} of {totals["events"]} in the guide, on '
                 f'{counted(totals["rows"], "listing")}, in {seconds:.1f} seconds.')
@@ -1829,6 +1830,84 @@ def listing_windows(event_ids: list, now: datetime, rules=None) -> dict:
                                                                          now, rules):
         out.setdefault(event_id, []).append((channel_id, account_id, start, stop))
     return out
+
+
+#: How far past a listing's start a group member's own guide is read for what it shows then:
+#: two guides can list one game a few minutes apart (dev/changelog/1690).
+MEMBER_LOOK_AHEAD = timedelta(minutes=15)
+
+
+@dataclass
+class GameMembers:
+    """Which members of a channel group may carry one game at one listing (members_for_game()).
+    `keep` is the members whose own guide shows the game, or says nothing against it; `carry`
+    is those of them whose guide shows it, the ones to try first; `other` is {member id: what
+    its guide shows instead}, the members left out."""
+    keep: frozenset
+    carry: frozenset
+    other: dict
+
+
+def members_for_game(member_ids, event_id: int, start: datetime, key: str) -> GameMembers:
+    """The members of a group, `member_ids`, that may carry the game `event_id` for a listing of
+    it starting at `start` with title key `key`. A group holds copies of one channel, but a group
+    of local stations shows each city's own game in a regional window: of 210 CBS stations, 155
+    showed one NFL game and 26 another at the same hour (dev/changelog/1690). So a member is left
+    out only when its own guide, from `start` to MEMBER_LOOK_AHEAD past it, says something else
+    is on: a listing matched to another game and not this one, or an unmatched listing under
+    another title. A listing matched to this game keeps it; so does an unmatched listing under
+    the same title, which cannot be told apart, and no listing at all, as for a copy with no
+    guide. A member whose guide shows the game goes ahead of one that cannot be told apart
+    (`carry`): a station with no guide may be showing the other game. The one answer for a
+    sports channel's play (auto_rules.game_sources()) and a group recording of a game
+    (recorder.game_members()). Three queries at most."""
+    ids = sorted(set(member_ids))
+    if not ids:
+        return GameMembers(frozenset(), frozenset(), {})
+    entries = (db.session.query(EPGEntry.channel_id, EPGEntry.start_time, EPGEntry.title)
+               .filter(EPGEntry.channel_id.in_(ids), EPGEntry.start_time < start + MEMBER_LOOK_AHEAD,
+                       EPGEntry.stop_time > start).all())
+    if not entries:
+        return GameMembers(frozenset(ids), frozenset(), {})
+    matched = {}
+    for channel_id, at, matched_event in (_live_matches().with_entities(
+            SportsMatch.channel_id, SportsMatch.program_start_time, SportsMatch.event_id)
+            .filter(SportsMatch.channel_id.in_(sorted({e[0] for e in entries})),
+                    SportsMatch.program_start_time.in_(sorted({e[1] for e in entries})))):
+        matched.setdefault((channel_id, at), set()).add(matched_event)
+    by_channel = {}
+    for channel_id, at, title in sorted(entries, key=lambda e: e[1]):
+        by_channel.setdefault(channel_id, []).append((matched.get((channel_id, at), set()), title))
+    other_events, other, carry = set(), {}, set()
+    for channel_id, listings in by_channel.items():
+        if any(event_id in events for events, _title in listings):
+            carry.add(channel_id)
+            continue
+        events = next((events for events, _title in listings if events), None)
+        if events:
+            other[channel_id] = min(events)
+            other_events.add(min(events))
+        elif not any(title_key(title) == key for _events, title in listings):
+            other[channel_id] = listings[0][1] or 'another program'
+    if other_events:
+        from .sports_data import event_game_name
+        names = {e.id: event_game_name(e) for e in SportsEvent.query.filter(SportsEvent.id.in_(sorted(other_events)))}
+        other = {cid: names.get(what, 'another game') if isinstance(what, int) else what
+                 for cid, what in other.items()}
+    return GameMembers(frozenset(i for i in ids if i not in other), frozenset(carry), other)
+
+
+def recording_game(rec):
+    """The SportsEvent the listing a recording was made from is matched to - its
+    `source_channel_id` at its `program_start_time` - or None: no source (a recording made
+    without a listing, or before migration 144), no live guide match there, or a listing matched
+    to more than one game, which says nothing about which one this is. One query, two with a
+    game."""
+    if rec.source_channel_id is None or rec.program_start_time is None:
+        return None
+    events = {e for (e,) in _live_matches().with_entities(SportsMatch.event_id).filter(
+        SportsMatch.channel_id == rec.source_channel_id, SportsMatch.program_start_time == rec.program_start_time)}
+    return db.session.get(SportsEvent, events.pop()) if len(events) == 1 else None
 
 
 #: What the listings dialog calls each airing. Every value of the vocabulary is named here.

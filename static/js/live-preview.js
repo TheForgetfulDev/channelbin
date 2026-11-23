@@ -41,6 +41,7 @@
     let failed = false;     // this session's decode failure has been reported
     let attached = false;
     let attachedRound = null;   // a feed preview's round the player is on
+    let cpuRestart = false;     // a feed round died decoding on the GPU; the next is on the CPU
     let gen = 0;            // which begin() a response belongs to
 
     // pagehide cannot wait for a fetch and sendBeacon cannot set headers, so the token
@@ -115,7 +116,9 @@
       } else if (session.transcode_audio) {
         text = 'Playing. Audio is re-encoded to AAC so the browser can decode it; video is untouched.';
       }
-      setStatus(text, 'ok');
+      // A re-encode that restarted decoding on the CPU says so (dev/changelog/1688).
+      if (session.decode_note) setStatus(`${text}\n${session.decode_note}`, 'warn');
+      else setStatus(text, 'ok');
     });
     // The decoder refusing a packet puts the element in error at once, and hls.js may never
     // say so: on channel 44107's segments in Chrome 155 the element errored at 0.5 s and hls.js
@@ -177,6 +180,10 @@
           if (closed || !session || token !== gen) return;
           if (s.state === 'STOPPED') { ended(s); return; }
           session.now_playing = s.now_playing;
+          const newNote = s.decode_note && s.decode_note !== session.decode_note;
+          session.decode_note = s.decode_note;
+          // A feed round restarted on the CPU looks like a new round: say what it really is.
+          if (newNote && s.source === 'feed') cpuRestart = true;
           if (attached && s.source === 'feed' && (s.state === 'STARTING' || s.round !== attachedRound)) {
             // The output moved to another source: this round is over, and the next one starts
             // with a decoder of its own.
@@ -188,13 +195,18 @@
             attached = true;
             attachedRound = s.round;
             session.playlist_url = s.playlist_url;
-            setStatus(attachedRound > 1 ? `Switching to ${s.now_playing}…` : 'Connected - starting playback…');
+            if (cpuRestart) setStatus('Restarted decoding on the CPU - starting playback…', 'warn');
+            else setStatus(attachedRound > 1 ? `Switching to ${s.now_playing}…` : 'Connected - starting playback…');
+            cpuRestart = false;
             attach(token);
+          } else if (s.state === 'STARTING' && s.source === 'feed' && cpuRestart) {
+            setStatus(`${s.decode_note}\nRestarting it…`, 'warn');
           } else if (s.state === 'STARTING' && s.source === 'feed' && attachedRound !== null) {
             setStatus(`The IPTV output moved to another source. Switching to it…`);
           } else if (s.state === 'STARTING') {
             setStatus(`Connecting to the stream… (${Math.round(s.elapsed_seconds)}s)`);
           }
+          if (newNote && !cpuRestart) setStatus(s.decode_note, 'warn');
           pollTimer = setTimeout(() => poll(token), attached ? 3000 : 1000);
         })
         .catch((e) => {
@@ -211,6 +223,7 @@
       session = null;
       attached = false;
       attachedRound = null;
+      cpuRestart = false;
       recoveredOnce = false;
       failed = false;
       setStatus(reencode ? 'Starting the re-encode…' : 'Starting…');

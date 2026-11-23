@@ -64,6 +64,20 @@ tests/test_output_feed.py:
   shows changes. Its ids start at
   UP_NEXT_FEED_BASE; the one for everything followed is that number itself.
 
+* A fifth kind is a picture-in-picture channel (app/pip_channels.py,
+  dev/docs/DESIGN-pip-channels.md): two pictures a person chose, each a game, a channel, a
+  group or a search, resolved as the matching plain play would be. Its ids start at
+  PIP_FEED_BASE, two to a row: the channel and its swapped copy. It is streamed through
+  ChannelBin in every mode. A tune-in plays its two pictures combined into one
+  (app/pip_engine.py, _start_combined): the play's own ffmpeg is the combiner, and each
+  picture is a session of its own in `_internal`, seated, reaped, failed over and preempted
+  as a play is, listed and counted nowhere, belonging to the channel's row so two plays of
+  it share them. On a box whose GPU cannot combine two it plays its big picture alone
+  (section 7.3, `combine_off` says why), and with neither picture able to play, the
+  channel's card (STATE_CARD): ChannelBin's own clip saying why, no provider seat, not
+  counted, asked again every SCREEN_RECHECK_SECONDS and replaced by the pictures when one
+  comes on.
+
 * A channel or a group a person took off the output (`on_output`, written only by
   set_on_output with its event) is in the TV Guide and not in the feed: gone from every
   catalog answer, the numbers after it one lower, its feed id unchanged, and a play of it
@@ -114,7 +128,12 @@ STATE_WAITING = 'WAITING'
 #: On an Up next channel: ChannelBin's own looped picture of the coming games, which is all the
 #: channel ever plays. No provider seat, not counted against max_viewers (dev/changelog/1614).
 STATE_SHOWING = 'SHOWING'
-STATES = (STATE_STARTING, STATE_STREAMING, STATE_WAITING, STATE_SHOWING, STATE_STOPPED)
+#: A picture-in-picture channel's card: its big picture has nothing to play right now, and the
+#: card says why. Never a second meaning of STATE_WAITING or STATE_SHOWING.
+STATE_CARD = 'CARD'
+STATES = (STATE_STARTING, STATE_STREAMING, STATE_WAITING, STATE_SHOWING, STATE_CARD, STATE_STOPPED)
+#: The states in which a play is on ChannelBin's own clip and holds no provider connection.
+OWN_PICTURE_STATES = (STATE_WAITING, STATE_SHOWING, STATE_CARD)
 
 # Why a session ended. Every terminal path names one, and REASON_TEXT is what the dashboard
 # shows for it - a stream that stops says why, or it is a number nobody can explain
@@ -142,6 +161,7 @@ REASON_SCREEN_FAILED = 'screen_failed'
 REASON_SCREEN_GONE = 'screen_gone'
 REASON_WINDOW_OPENED = 'window_opened'
 REASON_PICTURE_FAILED = 'picture_failed'
+REASON_CARD_FAILED = 'card_failed'
 
 #: What two of the reasons read as on a sports channel, which has no group.
 SPORTS_REASON_TEXT = {
@@ -171,6 +191,7 @@ REASON_TEXT = {
     REASON_ACCOUNT_OFF: 'Cut - its account was switched off for the IPTV output.',
     REASON_SCREEN_FAILED: 'Cut - the waiting screen stopped playing.',
     REASON_PICTURE_FAILED: 'Cut - the Up next picture stopped playing.',
+    REASON_CARD_FAILED: 'Cut - the picture-in-picture card stopped playing.',
     REASON_SCREEN_GONE: 'Cut - the sports channel is no longer on the IPTV output.',
     REASON_WINDOW_OPENED: ('Ended - the game came on. In redirect mode ChannelBin cannot tune a player in, '
                            'so the waiting screen stops and the next tune-in gets the game.'),
@@ -227,6 +248,8 @@ SCREEN_RECHECK_SECONDS = 30.0
 SCREEN_NAME = 'the waiting screen'
 #: What a play's line in Recent plays names as what an Up next channel played.
 PICTURE_NAME = 'the Up next picture'
+#: And what a play on a picture-in-picture channel's card is on.
+CARD_NAME = 'the picture-in-picture card'
 
 #: The one-line body every refused credential gets, whatever the cause (section 6.1).
 AUTH_FAILED_MESSAGE = 'Invalid or missing credentials'
@@ -323,6 +346,13 @@ def guide_days(fcfg: dict) -> int:
     return min(high, max(low, days))
 
 
+def guide_horizon(cfg=None) -> timedelta:
+    """How far past now the guide the output sends reaches: a game starting past it is in no IPTV
+    player's cached guide, so a league's layout may still move it (sports_feed.place_league_events,
+    dev/changelog/1684)."""
+    return timedelta(days=guide_days(feed_config(cfg)))
+
+
 def sports_window(fcfg: dict) -> tuple:
     """(before, after): how far ahead of a game's listing and past its end a sports channel plays
     the channel that lists it (sports_feed.playing_now, dev/changelog/1529). A missing key is 0,
@@ -350,8 +380,9 @@ def relays(fcfg: dict, feed_id: int) -> bool:
     a group and a sports channel are relayed, because failover and a waiting screen handing
     over happen during a play, where a redirected TV is out of ChannelBin's reach."""
     mode = mode_of(fcfg)
-    if decode_feed_id(feed_id)[0] == KIND_UP_NEXT:
-        # ChannelBin's own picture is the only thing an Up next channel plays, in every mode.
+    if decode_feed_id(feed_id)[0] in (KIND_UP_NEXT, KIND_PIP):
+        # ChannelBin's own picture is the only thing an Up next channel plays, and a
+        # picture-in-picture channel has no one provider stream to send a player to.
         return True
     if mode == MODE_PROXY:
         return True
@@ -466,6 +497,7 @@ KIND_CHANNEL = 'channel'
 KIND_GROUP = 'group'
 KIND_SPORTS = 'sports'
 KIND_UP_NEXT = 'up_next'
+KIND_PIP = 'pip'
 
 #: Where sports channels' feed ids start. Channels and groups between them use every integer
 #: from 0 up and may never be renumbered (an IPTV player caches them), so the third kind takes a
@@ -476,6 +508,10 @@ SPORTS_FEED_BASE = 1_000_000_000
 #: is this number, a league's is this plus its row id. Leaves sports channels 500,000,000 ids,
 #: and stays below 2**31.
 UP_NEXT_FEED_BASE = 1_500_000_000
+#: Where picture-in-picture channels' feed ids start (dev/docs/DESIGN-pip-channels.md 4.2): a
+#: row's channel is this plus twice its id, its swapped copy one more. Leaves Up next channels
+#: 500,000,000 ids, and stays below 2**31 for 73 million rows.
+PIP_FEED_BASE = 2_000_000_000
 
 
 def feed_id_for_channel(channel_id: int) -> int:
@@ -495,9 +531,21 @@ def feed_id_for_up_next(number: int) -> int:
     return UP_NEXT_FEED_BASE + number
 
 
+def feed_id_for_pip(row_id: int, swapped: bool = False) -> int:
+    return PIP_FEED_BASE + 2 * row_id + (1 if swapped else 0)
+
+
+def pip_swapped(feed_id: int) -> bool:
+    """Whether a picture-in-picture feed id is the row's swapped copy."""
+    return feed_id >= PIP_FEED_BASE and bool((feed_id - PIP_FEED_BASE) % 2)
+
+
 def decode_feed_id(feed_id: int):
     """(kind, row id) for a feed id - no table needed, which is the point (section 3.3). An Up
-    next channel's "row id" is its number: 0 for everything followed."""
+    next channel's "row id" is its number: 0 for everything followed. A picture-in-picture
+    channel and its swapped copy decode to the same row; pip_swapped() says which it is."""
+    if feed_id >= PIP_FEED_BASE:
+        return KIND_PIP, (feed_id - PIP_FEED_BASE) // 2
     if feed_id >= UP_NEXT_FEED_BASE:
         return KIND_UP_NEXT, feed_id - UP_NEXT_FEED_BASE
     if feed_id >= SPORTS_FEED_BASE:
@@ -553,6 +601,7 @@ _DROP_BLOCKED = 'blocked'       # on an account blocked right now
 _DROP_ALLOWED = 'allowed'       # on an account the output may not serve from
 _DROP_FAILED = 'failed'         # already failed this play
 _DROP_GONE = 'gone'             # its channel or group was removed while the play was worked out
+_DROP_OTHER_GAME = 'other_game' # a group whose members with Recording on all show something else
 
 _GROUP_WHY = {
     _DROP_RECORDING: 'no channel in the group has Recording on',
@@ -561,15 +610,21 @@ _GROUP_WHY = {
 }
 
 
-def _members_for_feed(group, blocked, allowed):
+def _members_for_feed(group, blocked, allowed, game=None):
     """A group's members the feed may play, in the order a recording drops them: blocked
-    accounts first (account_blocks.split_blocked), then the allowlist. Returns (members,
-    why none) - `why` is a _DROP_* naming the reason when the list is empty, else ''."""
+    accounts first (account_blocks.split_blocked), then the allowlist. `game` is, for a
+    sports play, the members that may carry its game (auto_rules._Showing.members), and the
+    rest go before anything else is asked (dev/changelog/1690). Returns (members, why none) -
+    `why` is a _DROP_* naming the reason when the list is empty, else ''."""
     from .account_blocks import split_blocked
     from .channel_groups import recording_members
     members = recording_members(group.memberships)
     if not members:
         return [], _DROP_RECORDING
+    if game is not None:
+        members = [m for m in members if m.id in game]
+        if not members:
+            return [], _DROP_OTHER_GAME
     kept, _skipped = split_blocked(members, blocked)
     if not kept:
         return [], _DROP_BLOCKED
@@ -597,7 +652,7 @@ def logo_url(row: 'FeedRow', base_url: str, fcfg: dict) -> str:
     the provider's for it. Never the provider's URL itself, which may carry credentials, and
     never /api/channels/<id>/logo, which the password gate keeps from an IPTV player
     (dev/changelog/1618)."""
-    if row.kind in (KIND_UP_NEXT, KIND_SPORTS):
+    if row.kind in (KIND_UP_NEXT, KIND_SPORTS, KIND_PIP):
         return f'{base_url}{OWN_LOGO_PATH}'
     if row.kind in (KIND_CHANNEL, KIND_GROUP):
         if row.logo_channel_id is None:
@@ -657,14 +712,27 @@ def catalog(cfg=None, everything: bool = False) -> list:
 
     `everything` is the IPTV Output page's view: the rows that are not offered come back too,
     with `num` 0 and the reason on the row (`on_output`, `left_out`), from the same queries."""
+    fcfg = feed_config(cfg)
+    rows = guide_rows(fcfg, plays=everything) + _own_rows(everything, fcfg)
+    offered = [row for row in rows if row.offered]
+    for n, row in enumerate(offered, start=1):
+        row.num = n
+    return rows if everything else offered
+
+
+def guide_rows(fcfg: dict, plays: bool = False) -> list:
+    """The TV Guide's own feed rows, in its order, unnumbered and whether or not each is on the
+    output: catalog()'s first half, and what a picture-in-picture channel's search is matched
+    against (app/pip_channels.py), so the page and a tune-in cannot disagree about which
+    channel a search names. `plays` fills each group's `plays`. Four queries."""
     from .channel_groups import (blocked_account_ids_now, guide_listings_member,
                                  guide_row_sort_key, member_eager_options, serving_member)
     from .database import Channel, ChannelGroup
     from .routes.channel_tests import _latest_tests_by_channel
 
-    fcfg = feed_config(cfg)
     allowed = allowed_account_ids(fcfg)
     blocked = blocked_account_ids_now()
+    everything = plays
     channels = Channel.query.filter(Channel.in_guide.is_(True)).all()  # guide-flag-read-ok: the feed's own-row half; the grouped half is the groups below
     groups = (ChannelGroup.query.filter(ChannelGroup.in_guide.is_(True))
               .options(*member_eager_options(with_accounts=True)).all())
@@ -695,11 +763,7 @@ def catalog(cfg=None, everything: bool = False) -> list:
             listings_channel_id=listings.id if listings else None, members=members,
             on_output=bool(g.on_output), why_none=_GROUP_WHY[why] if why else '', plays=plays)))
     entries.sort(key=lambda e: e[0])
-    rows = [e[1] for e in entries] + _own_rows(everything, fcfg)
-    offered = [row for row in rows if row.offered]
-    for n, row in enumerate(offered, start=1):
-        row.num = n
-    return rows if everything else offered
+    return [e[1] for e in entries]
 
 
 #: The category an IPTV player files the Up next channel for everything followed under.
@@ -747,6 +811,15 @@ def _own_rows(everything: bool, fcfg: dict) -> list:
     for _key, (_league, league_rows) in sorted(by_league.items(),
                                                key=lambda kv: (kv[1][0].name.lower(), kv[0])):
         out += league_rows
+    # Picture-in-picture channels last, in the order they were made, each followed by its
+    # swapped copy (dev/docs/DESIGN-pip-channels.md 4.3). One with nothing set up is listed
+    # too: a player keeps the list it was given.
+    from . import pip_channels
+    for one in pip_channels.served():
+        out.append(FeedRow(
+            feed_id=feed_id_for_pip(one.row.id, one.swapped), kind=KIND_PIP, num=0, name=one.name,
+            category=UP_NEXT_CATEGORY, logo_channel_id=None, row=one, listings_channel_id=None,
+            on_output=bool(one.row.on_output)))
     return out
 
 
@@ -896,6 +969,16 @@ def xmltv_lines(rows, cfg=None, now: Optional[datetime] = None):
     for row in rows:
         if row.kind == KIND_UP_NEXT:
             yield from _up_next_programs(row, now, days)
+    pips = [row for row in rows if row.kind == KIND_PIP]
+    if pips:
+        from . import pip_channels
+        described = pip_channels.describe([row.row.row for row in pips], now)
+        for row in pips:
+            for start, stop, title, desc in pip_channels.guide_blocks(row.row, described, now, days,
+                                                                      UP_NEXT_BLOCK):
+                yield (f'  <programme start="{_xmltv_time(start)}" stop="{_xmltv_time(stop)}" '
+                       f'channel="{row.feed_id}"><title>{xml_escape(title)}</title>'
+                       f'<desc>{xml_escape(desc)}</desc></programme>\n')
     yield '</tv>\n'
 
 
@@ -964,6 +1047,9 @@ class Play:
     #: Resolved for a browser preview (resolve_play(preview=True)): a group plays whether or not
     #: the output offers it, and an Up next channel whether or not it is switched on.
     preview: bool = False
+    #: A picture-in-picture channel's play: its pip_channels.Tuned, the row and what its big
+    #: picture is right now. With `member` None the play is on the channel's card.
+    pip: object = field(default=None, repr=False)
 
 
 def _resolve_sports_play(feed_id: int, row_id: int, allowed, exclude_ids, event_id, now,
@@ -976,10 +1062,6 @@ def _resolve_sports_play(feed_id: int, row_id: int, allowed, exclude_ids, event_
     channel is passed over when its account is blocked, is one the output may not serve from, or
     it already failed this play."""
     from . import sports_feed
-    from .auto_rules import PICK_EVENT, game_sources
-    from .channel_groups import blocked_account_ids_now
-    from .fmt_utils import counted
-    from .sports_data import event_game_name
 
     served = sports_feed.served_channels(row_id)
     if not served:
@@ -987,8 +1069,22 @@ def _resolve_sports_play(feed_id: int, row_id: int, allowed, exclude_ids, event_
     play = Play(feed_id, f'sports channel {row_id} ({served[0].name})', sports=True)
     before, after = window
     now = now or datetime.utcnow()
-    found = sports_feed.playing_now(served[0], now, event_id=event_id, before=before, after=after)
+    # resolve_play()'s event_id is only ever a play already on that game (its docstring).
+    found = sports_feed.playing_now(served[0], now, event_id=event_id, before=before, after=after,
+                                    held=event_id is not None)
     play.served, play.found = served[0], found
+    return _play_found(play, found, allowed, exclude_ids, now, cfg, viewer_id)
+
+
+def _play_found(play: Play, found, allowed, exclude_ids, now, cfg, viewer_id) -> Play:
+    """Fill `play` from `found` (sports_feed.NowPlaying): the game, and the channel a recording
+    of it would be taken from. The one walk for a sports channel's play and for a
+    picture-in-picture channel's picture that is a game (resolve_game_play)."""
+    from .auto_rules import PICK_EVENT, game_sources
+    from .channel_groups import blocked_account_ids_now
+    from .fmt_utils import counted
+    from .sports_data import event_game_name
+    play.found = found
     if not found.channels:
         play.why_none = found.why_none
         play.fault = False
@@ -1025,6 +1121,23 @@ def _resolve_sports_play(feed_id: int, row_id: int, allowed, exclude_ids, event_
     return play
 
 
+def resolve_game_play(event, league, feed_id: int, label: str, cfg: dict, exclude_ids=frozenset(),
+                      held: bool = False, now: Optional[datetime] = None, viewer_id=None) -> Play:
+    """What one game plays right now as a picture-in-picture channel's picture: what a sports
+    channel carrying it would (dev/docs/DESIGN-pip-channels.md 5), over the same window, the
+    same order between channels and the same walk inside a group. `held` is a play already on
+    the game, which the clock never ends (dev/changelog/1685). `member` None with `found.channels`
+    empty is a game not on here now; the caller says which side of its window that is."""
+    from . import sports_feed
+    fcfg = feed_config(cfg)
+    before, after = sports_window(fcfg)
+    now = now or datetime.utcnow()
+    play = Play(feed_id, label, sports=True)
+    found = sports_feed.playing_now(sports_feed.OneGame(league, event.id), now, event_id=event.id,
+                                    before=before, after=after, held=held)
+    return _play_found(play, found, allowed_account_ids(fcfg), exclude_ids, now, cfg, viewer_id)
+
+
 def _viewer_standing(account_ids, viewer_id=None) -> dict:
     """connection_limits.seat_standing() for a play: which of `account_ids` it could take a seat
     on right now, its own seat (`viewer_id`, when it holds one) not counted against it."""
@@ -1043,6 +1156,8 @@ def sports_drop_words(why: str, game: str, named: bool = False) -> str:
                         f'output is not allowed to serve from'),
         _DROP_BLOCKED: f'every channel {which} is on a blocked account',
         _DROP_RECORDING: f'every channel group {which} has no channel with Recording on',
+        _DROP_OTHER_GAME: (f'every channel group {which} has its channels with Recording on showing '
+                           f'something else at that time'),
         _DROP_GONE: f'every channel or group {which} was removed while it was being worked out',
     }[why]
 
@@ -1092,12 +1207,20 @@ def _sports_member(sources, blocked, allowed, exclude_ids, live: bool = False,
             if group is None:
                 drops.add(_DROP_GONE)
                 continue
-            members, why = _members_for_feed(group, blocked, allowed)
+            game, carry = getattr(s, 'members', None), getattr(s, 'carriers', None)
+            members, why = _members_for_feed(group, blocked, allowed, game=game)
             if not members:
                 drops.add(why)
                 continue
-            member = serving_member(group, latest, blocked_account_ids=blocked, members=members,
-                                    exclude_ids=exclude_ids, seat_standing=standing).member
+            # The members whose guide shows the game go first, then those that cannot be told
+            # apart (sports_match.members_for_game(), dev/changelog/1690).
+            carriers = [m for m in members if carry is not None and m.id in carry]
+            member = None
+            for tier in ([carriers, members] if carriers and len(carriers) < len(members) else [members]):
+                member = serving_member(group, latest, blocked_account_ids=blocked, members=tier,
+                                        exclude_ids=exclude_ids, seat_standing=standing).member
+                if member is not None:
+                    break
             if member is not None:
                 return member, '', s
             drops.add(_DROP_FAILED)
@@ -1114,14 +1237,15 @@ def _sports_member(sources, blocked, allowed, exclude_ids, live: bool = False,
             drops.add(_DROP_FAILED)
         else:
             return ch, '', s
-    for why in (_DROP_FAILED, _DROP_ALLOWED, _DROP_BLOCKED, _DROP_RECORDING, _DROP_GONE):
+    for why in (_DROP_FAILED, _DROP_ALLOWED, _DROP_BLOCKED, _DROP_OTHER_GAME, _DROP_RECORDING, _DROP_GONE):
         if why in drops:
             return None, why, None
     raise ValueError('_sports_member was handed no sources')
 
 
 def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int = None,
-                 now: Optional[datetime] = None, viewer_id=None, preview: bool = False) -> Optional[Play]:
+                 now: Optional[datetime] = None, viewer_id=None, preview: bool = False,
+                 any_switch: bool = False) -> Optional[Play]:
     """The member `feed_id` plays right now, or None when the id names nothing served.
     A group is re-asked here on every tune-in and every failover (`exclude_ids` drops the
     members that already failed this play), so the IPTV player always gets the member a recording
@@ -1129,10 +1253,13 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int 
     start, one on an account with a connection free over one on a full account
     (connection_limits.seat_standing(), dev/changelog/1642). `viewer_id` is the play asking,
     whose own seat is not somebody else's. `event_id` holds a sports channel's failover to the
-    game its play started on. `preview` resolves for a browser preview (Play.preview): a group the
+    game its play started on, which the clock never ends (dev/changelog/1685). `preview` resolves for a browser preview (Play.preview): a group the
     output does not offer - not in the TV Guide, or taken off the output - plays as its row would,
     so a group can be watched before it is offered, and an Up next channel plays switched off. A
-    channel and a sports channel are asked exactly as for a player."""
+    channel and a sports channel are asked exactly as for a player. `any_switch` plays a channel
+    or a group in the TV Guide whether or not its On the output switch is on: a
+    picture-in-picture channel's picture may be a guide row kept off the player's list
+    (dev/docs/DESIGN-pip-channels.md 5). It never plays a row that left the guide."""
     from .channel_groups import blocked_account_ids_now, serving_member
     from .database import Channel, ChannelGroup
     from .routes.channel_tests import _latest_tests_by_channel
@@ -1144,6 +1271,10 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int 
     fcfg = feed_config(cfg)
     allowed = allowed_account_ids(fcfg)
     kind, row_id = decode_feed_id(feed_id)
+    if kind == KIND_PIP:
+        from . import pip_channels
+        return pip_channels.resolve_feed(feed_id, cfg, exclude_ids=exclude_ids, event_id=event_id,
+                                         now=now, viewer_id=viewer_id, preview=preview)
     if kind == KIND_UP_NEXT:
         from .sports_up_next import channels
         found = channels(everything=preview, number=row_id)
@@ -1162,7 +1293,7 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int 
         if ch is None or not ch.in_guide:  # guide-flag-read-ok: a feed id for a channel is its own guide row and nothing else
             return None
         play = Play(feed_id, f'channel {ch.id} ({ch.name})', preview=preview)
-        if not ch.on_output:
+        if not ch.on_output and not any_switch:
             play.why_none, play.fault = WHY_TAKEN_OFF, False
             return play
         if allowed is not None and ch.account_id not in allowed:
@@ -1177,7 +1308,7 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int 
     if group is None or (not group.in_guide and not preview):
         return None
     play = Play(feed_id, f'group {group.id} ({group.name})', group=group, preview=preview)
-    if not group.on_output and not preview:
+    if not group.on_output and not preview and not any_switch:
         play.why_none, play.fault = WHY_TAKEN_OFF, False
         return play
     blocked = blocked_account_ids_now()
@@ -1367,6 +1498,12 @@ class RelaySession:
     # An Up next channel's number (sports_up_next.UpNext.number) on a play of one: its clips'
     # owner. None for anything else.
     up_next_number: Optional[int] = None
+    # A picture-in-picture channel's row id on a play of one, whichever of its two feed ids it
+    # asked for; None for anything else. `card_state` is the pip_channels.PANE_* its card shows
+    # while it is on one (STATE_CARD) and `card_text` what Watching now says of it.
+    pip_row_id: Optional[int] = None
+    card_state: str = ''
+    card_text: str = ''
     # Counted against max_viewers while the play takes a slot to leave the screen for the game.
     slot_claimed: bool = False
     # Ask again now, not at the next SCREEN_RECHECK_SECONDS (recheck_waiting, Start broadcast).
@@ -1384,9 +1521,29 @@ class RelaySession:
     # seat anywhere until the move names its new account. Never a second meaning of _failing_over,
     # whose play still holds its seat.
     _moving: bool = False
+    # Leaving a picture for its card because its picture-in-picture channel was cleared
+    # (_to_card_now): no ffmpeg until the card's clip starts. Never a second meaning of
+    # _failing_over, whose play is on its way to another channel.
+    _carding: bool = False
+    # One of a picture-in-picture row's two pictures (app/pip_engine.py): a session kept in
+    # _internal and listed nowhere, never counted, whose `ring` is the picture's buffer and
+    # whose `picture` is the pip_engine.Picture it plays for. Its seat, launch, stall
+    # detection, failover and move for a recording are a plain play's.
+    internal: bool = False
+    picture: Optional[object] = field(default=None, repr=False)
+    # A play of a picture-in-picture channel on its two pictures combined: the
+    # pip_engine.Combined beside it. Its own ffmpeg is the combiner; it holds no seat and has
+    # no channel or account of its own, its pictures hold those.
+    combined: Optional[object] = field(default=None, repr=False)
+    # Why a play of a set-up picture-in-picture channel plays its big picture alone, a
+    # sentence; '' while it does not.
+    combine_off: str = ''
     # Held by whatever swaps what the play is playing: one swap at a time.
     _swap_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _rechecking: bool = False
+    # When a play that left a picture for its card went onto it (monotonic), 0.0 otherwise: a
+    # play that started on its card or a waiting screen counts from `started_mono`.
+    _screen_since: float = 0.0
 
     @property
     def live(self) -> bool:
@@ -1401,16 +1558,35 @@ class RelaySession:
         return self.state == STATE_SHOWING
 
     @property
+    def on_card(self) -> bool:
+        return self.state == STATE_CARD
+
+    @property
     def own_picture(self) -> bool:
-        """Playing ChannelBin's own clip, a waiting screen or an Up next channel: no provider
-        bytes, so a play ChannelBin streams in every mode."""
-        return self.state in (STATE_WAITING, STATE_SHOWING)
+        """Playing ChannelBin's own clip, a waiting screen, an Up next channel or a
+        picture-in-picture channel's card: no provider bytes, so a play ChannelBin streams in
+        every mode."""
+        return self.state in OWN_PICTURE_STATES
+
+    @property
+    def own_picture_name(self) -> str:
+        """What ChannelBin's own clip is called on this play: a sports channel's waiting screen,
+        an Up next picture or a picture-in-picture card. Read from what kind of play it is,
+        which never changes, and not from its state, which another thread may move between a
+        caller's check and its read. '' for a play that has no clip of ChannelBin's own."""
+        if self.up_next_number is not None:
+            return PICTURE_NAME
+        if self.pip_row_id is not None:
+            return CARD_NAME
+        if self.sports_row_id is not None:
+            return SCREEN_NAME
+        return ''
 
     @property
     def counted(self) -> bool:
         """Whether the play counts against max_viewers: every live one but a play of ChannelBin's
         own picture, unless it is taking a slot to leave a waiting screen for its game."""
-        return self.live and (not self.own_picture or self.slot_claimed)
+        return self.live and not self.internal and (not self.own_picture or self.slot_claimed)
 
     def reason_text(self) -> str:
         if not self.reason:
@@ -1431,15 +1607,20 @@ class RelaySession:
             'started_at': self.started_at, 'ended_at': self.ended_at,
             'failovers': list(self.failovers),
             'waiting': self.waiting, 'waiting_for': self.waiting_for, 'showing': self.showing,
+            'on_card': self.on_card, 'card_state': self.card_state, 'card_text': self.card_text,
             'screen_state': self.screen_state, 'screen_held': self.screen_held,
             'left_screen_at': self.left_screen_at,
             'screen_seconds': round(self._screen_seconds(now), 1),
             'move_offered': move_offer(self) == MOVE_OFFERED,
-            'move_why': MOVE_NOWHERE_TEXT if move_offer(self) == MOVE_NOWHERE else '',
+            'move_why': {MOVE_NOWHERE: MOVE_NOWHERE_TEXT,
+                         MOVE_TWO_PICTURES: MOVE_TWO_PICTURES_TEXT}.get(move_offer(self), ''),
         }
 
     def _screen_seconds(self, now: float) -> float:
-        """How long the play has been on the waiting screen, up to `now`."""
+        """How long the play has been on the waiting screen, or on its card over every time it
+        went onto it, up to `now`."""
+        if self.state == STATE_CARD and self._screen_since:
+            return self.screen_seconds + max(0.0, now - self._screen_since)
         if self.state == STATE_WAITING and self.started_mono:
             return max(0.0, now - self.started_mono)
         return self.screen_seconds
@@ -1449,7 +1630,9 @@ class RelaySession:
 MOVE_OFFERED = 'offered'          # a group or a sports channel playing a channel: there is somewhere to go
 MOVE_NOWHERE = 'nowhere'          # a single channel: nothing else plays it, and the menu says so
 MOVE_NO_CHANNEL = 'no_channel'    # ChannelBin's own picture, or ended: no channel to move off
+MOVE_TWO_PICTURES = 'two_pictures'    # two pictures combined: moving one by hand is not offered
 MOVE_NOWHERE_TEXT = 'A single channel, so there is nowhere to move it'
+MOVE_TWO_PICTURES_TEXT = 'It plays two pictures, and each moves to another channel by itself when it drops'
 
 
 def move_offer(session: 'RelaySession') -> str:
@@ -1457,6 +1640,10 @@ def move_offer(session: 'RelaySession') -> str:
     instant (another swap in flight) is move_by_hand()'s to say."""
     if not session.live or session.own_picture:
         return MOVE_NO_CHANNEL
+    if session.combined is not None:
+        # Its own ffmpeg is the combiner, not a channel's: a move would take that
+        # (dev/docs/DESIGN-pip-channels.md 15).
+        return MOVE_TWO_PICTURES
     if session.state not in (STATE_STARTING, STATE_STREAMING):
         raise ValueError(f'Unknown play state "{session.state}"')
     return MOVE_OFFERED if session.fails_over else MOVE_NOWHERE
@@ -1464,6 +1651,9 @@ def move_offer(session: 'RelaySession') -> str:
 
 _lock = threading.Lock()
 _sessions: dict = {}          # session id -> RelaySession, live ones and the last few ended
+#: The picture-in-picture pictures' sessions (RelaySession.internal), live ones only: seated,
+#: reaped, preempted and stopped as plays are, listed and counted nowhere.
+_internal: dict = {}
 _redirects: list = []         # the last _KEEP_ENDED redirect-mode plays, oldest first
 _refused: dict = {}           # (feed id, message) -> the last _KEEP_ENDED refused plays
 _reaper: Optional[threading.Thread] = None
@@ -1570,6 +1760,22 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False) ->
         raise FeedRefused('No such channel on the IPTV output', 404)
     if play.up_next is not None:
         return start_showing(play, client, cfg)
+    combine_off = ''
+    if play.pip is not None and play.pip.set_up:
+        device, combine_off = _pip_engine().gpu_state(cfg)
+        if device:
+            session = _start_combined(play, client, cfg, device)
+            if session is not None:
+                return session
+            # Neither picture can play right now, or no slot is free: the card says which.
+            held = None
+            if play.member is not None:
+                with _lock:
+                    full = sum(1 for s in _sessions.values() if s.counted) >= int(fcfg.get('max_viewers') or 1)
+                held = _screen_mod().HELD_NO_SLOT if full else _screen_mod().HELD_NO_CONNECTION
+            return start_card(play, client, cfg, held=held)
+    if play.pip is not None and play.member is None:
+        return start_card(play, client, cfg)
     if play.sports and play.member is None and not play.fault:
         return start_waiting(play, client, cfg)
     if play.member is None and not play.fault:
@@ -1588,8 +1794,13 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False) ->
                   float(fcfg.get('reserve_seconds') or 0)),
         **_session_limits(cfg, fcfg),
         started_mono=time.monotonic(),
-        event_id=play.event_id, fails_over=play.group is not None or play.sports,
+        event_id=play.event_id,
+        fails_over=play.group is not None or play.sports or play.pip is not None,
         app=current_app._get_current_object(), preview=preview,
+        pip_row_id=play.pip.row_id if play.pip is not None else None,
+        # A set-up picture-in-picture channel reaching here plays its big picture alone, a
+        # plain stream copy on one connection: nothing can combine the two (section 7.3).
+        combine_off=combine_off,
     )
     # The cap is counted and the session registered under the ONE lock, so two tune-ins in
     # the same instant cannot both pass the count (the check-then-act shape
@@ -1612,21 +1823,98 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False) ->
             # A game that is on and cannot start here yet waits on the screen, which says
             # why and starts the game by itself when a slot is free.
             return start_waiting(play, client, cfg, held=_screen_mod().HELD_NO_SLOT)
+        if play.pip is not None:
+            # As a sports channel does: the card says why, and the picture comes on when a
+            # slot frees.
+            return start_card(play, client, cfg, held=_screen_mod().HELD_NO_SLOT)
         _refuse(feed_id, play.label,
                 f'The IPTV output is already playing to as many IPTV players as it allows at once '
                 f'({cap}). Stop one, or raise "IPTV players at once" in the IPTV output\'s settings.',
                 503, 'cap', client, alert=not preview)
     try:
-        _launch(session, member, cfg, first=True, seat_deadline=deadline, hold=play.sports)
+        _launch(session, member, cfg, first=True, seat_deadline=deadline,
+                hold=play.sports or play.pip is not None)
     except _SeatHeld:
         with _lock:
             _sessions.pop(session.id, None)
+        if play.pip is not None:
+            # Every account its picture plays from is busy: the card says so, and the picture
+            # comes on by itself (dev/docs/DESIGN-pip-channels.md 8.2).
+            return start_card(play, client, cfg, held=_screen_mod().HELD_NO_CONNECTION)
         return start_waiting(play, client, cfg, held=_screen_mod().HELD_NO_CONNECTION)
     _ensure_reaper()
     log.info('Viewer %s from %s: %s playing channel %d (%s) on account %d%s%s', session.id,
              client, session.label, session.channel_id, session.channel_name, session.account_id,
              f' ({play.note})' if play.note else '', f' Why this channel: {play.picked}' if play.picked else '')
     return session
+
+
+def _start_combined(play: Play, client: str, cfg: dict, device: str) -> Optional[RelaySession]:
+    """Start `play`, a set-up picture-in-picture channel's, on its two pictures combined
+    (app/pip_engine.py). The session holds no seat and names no channel: its pictures do. None,
+    with nothing registered or held, when no slot is free or neither picture can play right
+    now; the caller starts the channel's card. Requires an app context."""
+    from flask import current_app
+    fcfg = feed_config(cfg)
+    tuned = play.pip
+    session = RelaySession(
+        id=secrets.token_urlsafe(12), feed_id=play.feed_id,
+        label=f'picture-in-picture channel {tuned.row_id} ({tuned.name})', client=client,
+        group_id=None, channel_id=None, channel_name='', account_id=None,
+        ring=Ring(int(fcfg.get('buffer_mb') or 64) * 1024 * 1024, float(fcfg.get('reserve_seconds') or 0)),
+        **_session_limits(cfg, fcfg), started_mono=time.monotonic(), fails_over=True,
+        app=current_app._get_current_object(), preview=play.preview, pip_row_id=tuned.row_id)
+    cap = int(fcfg.get('max_viewers') or 1)
+    # Counted and registered under the one lock, with the channel-change grace, as
+    # start_session() does for a plain play.
+    deadline = time.monotonic() + SWITCH_GRACE_SECONDS
+    while True:
+        with _lock:
+            live = sum(1 for s in _sessions.values() if s.counted)
+            if live < cap:
+                _sessions[session.id] = session
+                _prune_ended_locked()
+        if live < cap or time.monotonic() >= deadline:
+            break
+        time.sleep(_SWITCH_POLL)
+    if live >= cap:
+        return None
+    try:
+        began = _pip_engine().begin(session, tuned, cfg, device)
+    except Exception:
+        with _lock:
+            _sessions.pop(session.id, None)
+        raise
+    if not began:
+        with _lock:
+            _sessions.pop(session.id, None)
+        return None
+    log.info('Viewer %s from %s: %s playing its two pictures combined', session.id, client, session.label)
+    return session
+
+
+def play_alone(session: RelaySession) -> None:
+    """Put a picture-in-picture play whose two pictures cannot be combined on its big picture
+    alone, in place, as a plain stream copy on one connection, or on its card when that has no
+    connection either (dev/docs/DESIGN-pip-channels.md 7.3). The caller has stopped its ffmpeg
+    and let go of its pictures, and holds `_swap_lock`. Requires an app context."""
+    from .config import load_config
+    cfg = load_config()
+    play = resolve_play(session.feed_id, cfg, viewer_id=session.id, preview=session.preview)
+    if play is None or play.pip is None:
+        _finish(session, REASON_TAKEN_OFF)
+        return
+    member = _seat_for(session, play.member, play.event_id, cfg) if play.member is not None else None
+    if member is None or not _own_seat(session, member):
+        if session.live:
+            _put_on_card(session, play, cfg,
+                         held=_screen_mod().HELD_NO_CONNECTION if play.member is not None else None)
+        return
+    came_from = session.left_screen_at, session.screen_seconds
+    _put_on_game(session, play, member, cfg)
+    with _lock:
+        # It left no card: _put_on_game's "came from its card" does not apply.
+        session.left_screen_at, session.screen_seconds = came_from
 
 
 def _session_limits(cfg: dict, fcfg: dict) -> dict:
@@ -1650,13 +1938,20 @@ def _take_seat(session: RelaySession, member, first: bool, deadline: float = 0.0
     play of the output is live: that is the channel an IPTV player is changing from, about
     to let its seat go (SWITCH_GRACE_SECONDS). With no other play the refusal is at once."""
     if first:
+        # A picture's own plays are not a channel being left: they are who it plays for.
+        mine = session.picture.pair.plays if session.picture is not None else ()
         while True:
             if connlim.try_acquire(member.account_id, 'viewer', session.id):
+                return True
+            # A picture-in-picture picture no play is on any more gives its seat up the moment
+            # anything asks (dev/docs/DESIGN-pip-channels.md 9).
+            if _pip_engine().drop_lingering() and connlim.try_acquire(member.account_id, 'viewer', session.id):
                 return True
             # Any other play, not only one on this account: two accounts can be one login
             # and so one seat (app/account_links.py).
             with _lock:
-                leaving = any(s.counted and s is not session for s in _sessions.values())
+                leaving = any(s.counted and s is not session and s.id not in mine
+                              for s in _sessions.values())
             if not leaving or time.monotonic() >= deadline:
                 return False
             time.sleep(_SWITCH_POLL)
@@ -1891,7 +2186,9 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
             session._finishing = True
             session._teardown_lock.acquire()
         proc, reader = session.proc, session.reader
-        was_waiting = session.state == STATE_WAITING
+        # On a waiting screen or a card: no seat to free for anyone, and time on it to close.
+        on_screen = session.state in (STATE_WAITING, STATE_CARD)
+    pictures = ''
     if not claimed:
         with session._teardown_lock:
             return False
@@ -1911,10 +2208,19 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
             try:
                 connlim.release(session.account_id, 'viewer', session.id)
             finally:
-                _remove_stderr(session)
-                session.ring.clear()
+                try:
+                    if session.combined is not None:
+                        # The combiner is dead: its decoder, pacer and writers go, its pictures
+                        # are let go of, and the provider time they ran up is this play's.
+                        pictures = session.combined.title()
+                        for account_id, secs in _pip_engine().detach(session).items():
+                            session.account_seconds[account_id] = (
+                                session.account_seconds.get(account_id, 0.0) + secs)
+                finally:
+                    _remove_stderr(session)
+                    session.ring.clear()
         with _lock:
-            if was_waiting:
+            if on_screen:
                 session.screen_seconds = session._screen_seconds(time.monotonic())
             session.state = STATE_STOPPED
             session.slot_claimed = False
@@ -1925,23 +2231,26 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
             _close_phase_locked(session)
     finally:
         session._teardown_lock.release()
-    if not was_waiting and reason != REASON_SHUTDOWN:
+    if not on_screen and reason != REASON_SHUTDOWN:
         # A slot or a seat may have come free for a game waiting on the screen for one.
         recheck_waiting(held_only=True)
     level = logging.INFO if reason in (REASON_CLIENT_GONE, REASON_SHUTDOWN) else logging.WARNING
+    if session.internal:
+        level = logging.INFO   # the engine says what became of the picture (pip_engine.Picture.ended)
     log.log(level, 'Viewer %s: %s stopped after %s - %s%s', session.id, session.label,
             fmt_bytes(session.bytes_sent), reason, f' ({detail})' if detail else '')
     # Not on shutdown: this runs in the signal handler then, where starting a thread that
     # writes the database has no place. The log line above is that play's record.
-    if reason != REASON_SHUTDOWN:
+    if reason != REASON_SHUTDOWN and not session.internal:
         _queue_play(session.app, {
             'kind': FEED_PLAY_ENDED, 'at': session.ended_at, 'first_at': session.started_at,
             'feed_id': session.feed_id, 'label': session.label, 'client': session.client,
             # A play that only ever watched a sports channel's waiting screen played that, and
             # an Up next channel's play only ever plays its picture.
-            'channel_id': session.channel_id, 'channel_name': session.channel_name or (
+            'channel_id': session.channel_id, 'channel_name': pictures or session.channel_name or (
                 SCREEN_NAME if session.sports_row_id else PICTURE_NAME
-                if session.up_next_number is not None else ''),
+                if session.up_next_number is not None else CARD_NAME
+                if session.pip_row_id is not None else ''),
             'account_id': session.account_id, 'reason': reason,
             'message': ' '.join(x for x in (session.reason_text(), detail, _screen_note(session),
                                             _moves_note(session), play_notes(session),
@@ -1956,6 +2265,13 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
 def _screen_note(session: RelaySession) -> str:
     """What a play's line in Recent plays says about the waiting screen, or '' for a play
     that never saw it."""
+    if session.pip_row_id is not None:
+        if not session.screen_seconds:
+            return ''
+        waited = fmt_duration(session.screen_seconds)
+        # No account was ever timed: the play never left its card for a picture.
+        return (f'Showed only its card, for {waited}.' if not session.account_seconds
+                else f'Was on its card for {waited} of that.')
     if not session.sports_row_id:
         return ''
     waited = fmt_duration(session.screen_seconds)
@@ -1989,6 +2305,8 @@ def stop_all(reason: str = REASON_SHUTDOWN) -> int:
         live = [s for s in _sessions.values() if s.live]
     for s in live:
         _finish(s, reason)
+    # After the plays: a pair's pictures close with no play left on them to rebuild for.
+    _pip_engine().close_all(reason)
     _screen_mod().stop_makes()
     return len(live)
 
@@ -2001,10 +2319,67 @@ def stop_feed_id(feed_id: int, reason: str) -> int:
 
 
 def stop_account(account_id: int, reason: str = REASON_ACCOUNT_OFF) -> int:
-    """End every live play coming from `account_id`, by name. How many it ended."""
+    """End every live play coming from `account_id`, by name, and every picture-in-picture
+    picture on it, whose window then says why. How many it ended."""
     with _lock:
-        live = [s for s in _sessions.values() if s.live and s.account_id == account_id]
-    return sum(1 for s in live if _finish(s, reason))
+        live = [s for s in _all_live_locked() if s.account_id == account_id]
+    # A picture is not a play: it is ended here and counted nowhere.
+    return sum(1 for s in live if _finish(s, reason) and not s.internal)
+
+
+def _live_pip_plays(row_id: int) -> list:
+    with _lock:
+        return [s for s in _sessions.values() if s.live and s.pip_row_id == row_id]
+
+
+def stop_pip(row_id: int, reason: str = REASON_TAKEN_OFF, swapped_only: bool = False) -> int:
+    """End every live play of picture-in-picture channel `row_id`, by name: of both its feed
+    ids, or of its swapped copy alone when that is what stopped being offered. How many it
+    ended. Called after the commit that took it off, never inside it."""
+    ended = sum(1 for s in _live_pip_plays(row_id)
+                if (not swapped_only or pip_swapped(s.feed_id)) and _finish(s, reason))
+    if not swapped_only:
+        # Its pictures do not linger for a channel that is no longer offered.
+        _pip_engine().close_row(row_id, reason)
+    return ended
+
+
+def refresh_pip(row_id: int) -> tuple:
+    """A picture-in-picture channel's pictures or layout were changed. (plays on its card that
+    were asked again, plays left on a picture, plays that change in place). A play on its card
+    asks again within _REAP_INTERVAL. One on its two pictures combined changes in place: a
+    picture whose source changed is replaced, one that did not keeps its connection, and a new
+    layout is the next combiner's (pip_engine.row_changed). One on its big picture alone
+    keeps it until it tunes in again. Requires an app context; called after the commit."""
+    asked = kept = 0
+    changing = _pip_engine().row_changed(row_id)
+    for s in _live_pip_plays(row_id):
+        with _lock:
+            on_card = s.on_card
+            alone = not on_card and s.combined is None
+            if on_card:
+                s.recheck_due = True
+        asked, kept = asked + on_card, kept + alone
+    return asked, kept, changing
+
+
+def clear_pip(row_id: int) -> int:
+    """Move every live play of a picture-in-picture channel that was just cleared onto the card
+    saying it has nothing on it, giving its connection back. How many were on a picture.
+    Requires an app context; each move runs on a thread of its own, since it stops an ffmpeg and
+    makes a clip."""
+    moved = 0
+    for s in _live_pip_plays(row_id):
+        with _lock:
+            on_card = s.on_card
+            if on_card:
+                s.recheck_due = True
+        if on_card:
+            continue
+        moved += 1
+        threading.Thread(target=_to_card_now, args=(s,), daemon=True,
+                         name=f'relay-card-{s.id}').start()
+    return moved
 
 
 def _live_sports_plays() -> list:
@@ -2070,7 +2445,7 @@ def live_count_for(feed_id: int) -> int:
 # ── The switch ─────────────────────────────────────────────────────────────────────────────
 
 def set_on_output(kind: str, row_id: int, on: bool):
-    """Take a channel or a group off the IPTV output, or put it back: THE only writer of
+    """Take a channel, a group or a picture-in-picture channel off the IPTV output, or put it back: THE only writer of
     `on_output`, column and event together (the shape of channel_groups.set_participation).
     Mutates and adds the event without committing, so the caller owns the commit and keeps
     the read-modify-write in one retry_on_locked unit; ending the plays of a row that went
@@ -2079,10 +2454,22 @@ def set_on_output(kind: str, row_id: int, on: bool):
     Returns (row, moved), or (None, False) for an id that is not a guide row of that kind. A
     switch that did not move logs nothing. The feed id is the row's own and does not move,
     so an IPTV player that cached it finds the same channel when it comes back. A sports
-    channel has its own switch (app/sports_feed.py) and is not handled here."""
+    channel has its own switch (app/sports_feed.py) and is not handled here; a
+    picture-in-picture channel's is its row's, with no event (it has no timeline)."""
     from . import db
     from .database import (Channel, ChannelEvent, ChannelGroup, ChannelGroupEvent,
-                           OUTPUT_FEED_SWITCHED)
+                           OUTPUT_FEED_SWITCHED, PipChannel)
+    if kind == KIND_PIP:
+        # ChannelBin's own channel, in no TV Guide and with no timeline to carry an event: the
+        # route that asked logs the move. Its swapped copy follows it and has no switch.
+        row = db.session.get(PipChannel, row_id)
+        if row is None:
+            return None, False
+        on = bool(on)
+        if bool(row.on_output) == on:
+            return row, False
+        row.on_output = on
+        return row, True
     if kind == KIND_CHANNEL:
         row = db.session.get(Channel, row_id)
     elif kind == KIND_GROUP:
@@ -2264,9 +2651,8 @@ def preempt_for_account(app, account_id: int, recording_id: int, movers: Optiona
     seated = connlim.seated_holder_ids('viewer')
     moving, detached = [], []
     with _lock:
-        matched = [s for s in _sessions.values()
-                   if s.live and not s._moving and s.account_id == account_id
-                   and s.id not in seated]
+        matched = [s for s in _all_live_locked()
+                   if not s._moving and s.account_id == account_id and s.id not in seated]
         for s in matched:
             if movers is not None and _can_move(s):
                 s._moving = True
@@ -2288,7 +2674,9 @@ def preempt_for_account(app, account_id: int, recording_id: int, movers: Optiona
         _finish(s, REASON_PREEMPTED, detail=f'recording {recording_id} took the connection')
     cut = [s for s in matched if s not in moving]
     if cut:
-        _announce_quietly(app, [(s, s.channel_name, s.channel_id, None, True) for s in cut],
+        # A picture-in-picture picture a recording cut raises no alert: the TV kept its other
+        # picture, and the window says why (dev/docs/DESIGN-pip-channels.md 8.2).
+        _announce_quietly(app, [(s, s.channel_name, s.channel_id, None, not s.internal) for s in cut],
                           recording_id, account_id)
     return bool(matched)
 
@@ -2298,7 +2686,7 @@ def _can_move(session: RelaySession) -> bool:
     one that fails over (a group, a sports channel), relaying a channel now, and not already
     between channels or ending. The caller holds _lock."""
     return (session.fails_over and session.app is not None and session.proc is not None
-            and not session._failing_over and not session._finishing
+            and not session._failing_over and not session._carding and not session._finishing
             and session.state in (STATE_STARTING, STATE_STREAMING))
 
 
@@ -2345,7 +2733,8 @@ def _move_for_recording(app, session: RelaySession, recording_id: int, account_i
             # The recording's timeline says what it took whatever became of the play - a player
             # that gave up mid-move was still cut by it; only a play this cut raises the alert.
             _announce_quietly(app, [(session, from_name, from_id, moved,
-                                     moved is None and session.reason == REASON_PREEMPTED)],
+                                     moved is None and session.reason == REASON_PREEMPTED
+                                     and not session.internal)],
                               recording_id, account_id)
     except Exception:                                   # noqa: BLE001 - one play, never the reaper
         # A play left live with no ffmpeg and no seat would never be reaped (_check skips a
@@ -2371,8 +2760,7 @@ def _move_play(session: RelaySession, recording_id: int) -> tuple:
     while True:
         if not session.live or session._finishing:
             return None, why
-        play = resolve_play(session.feed_id, cfg, exclude_ids=frozenset(session.failed_ids),
-                            event_id=session.event_id, viewer_id=session.id, preview=session.preview)
+        play = _resolve_again(session, cfg, frozenset(session.failed_ids), session.event_id)
         if play is None or play.member is None:
             return None, why
         member = _seat_for(session, play.member, session.event_id, cfg, refused=tuple(refused))
@@ -2510,7 +2898,7 @@ def _check(session: RelaySession) -> None:
         proc = session.proc
         preempted = session.preempted
         state = session.state
-        failing_over = session._failing_over or session._moving
+        failing_over = session._failing_over or session._moving or session._carding
     if preempted and proc is not None:
         _finish(session, REASON_PREEMPTED,
                 detail=f'recording {session.preempted_by} took the connection')
@@ -2548,8 +2936,11 @@ def _check(session: RelaySession) -> None:
     if now - session.started_mono > session.max_seconds:
         _finish(session, REASON_MAX_DURATION)
         return
-    if state in (STATE_WAITING, STATE_SHOWING):
+    if state in OWN_PICTURE_STATES:
         _check_waiting(session, proc, now)
+        return
+    if session.combined is not None:
+        _pip_engine().check(session, proc, now, state)
         return
     rc = proc.poll() if proc is not None else None
     if rc is not None:
@@ -2575,7 +2966,10 @@ def _member_died(session: RelaySession, reason: str, detail: str) -> None:
         _finish(session, reason, detail=detail)
         return
     with _lock:
-        if session._failing_over or not session.live:
+        # The reaper judged an ffmpeg it read a moment ago. A play that has since gone to
+        # ChannelBin's own clip, or is on its way to its card, has no channel left to fail over
+        # from, and a failover beside that move would start a second clip nothing stops.
+        if session._failing_over or session._carding or session.own_picture or not session.live:
             return
         session._failing_over = True
     try:
@@ -2587,7 +2981,8 @@ def _member_died(session: RelaySession, reason: str, detail: str) -> None:
 
 def _failover(session: RelaySession, reason: str, detail: str):
     """Take `session` off the channel it is on and onto the best one left, in place. The channel
-    it lands on, or None when nothing would start and the play ended REASON_NO_MEMBER."""
+    it lands on, or None when nothing would start: the play then ended REASON_NO_MEMBER, or, for
+    a picture-in-picture channel, went to its card and is still live (`session.on_card`)."""
     from .config import load_config
 
     from .alerts import create_alert, has_open_alert
@@ -2601,8 +2996,16 @@ def _failover(session: RelaySession, reason: str, detail: str):
         cfg = load_config()
         _stop_detached(session, old_proc, old_reader)
         while True:
-            play = resolve_play(session.feed_id, cfg, exclude_ids=frozenset(session.failed_ids),
-                                event_id=session.event_id, viewer_id=session.id, preview=session.preview)
+            play = _resolve_again(session, cfg, frozenset(session.failed_ids), session.event_id)
+            if play is not None and play.pip is not None and play.member is None:
+                # Zero channels left is a card, never the end of the play
+                # (dev/docs/DESIGN-pip-channels.md 8.3): it tries again by itself.
+                log.warning('Viewer %s: "%s" %s and nothing else can play %s right now, so it shows '
+                            'its card', session.id, failed_name, _died_phrase(reason), session.label)
+                _note_once(session, f'"{failed_name}" {_died_phrase(reason)} and nothing else could '
+                                    f'play, so it showed its card.')
+                _put_on_card(session, play, cfg)
+                return None
             if play is None or play.member is None:
                 gone = 'the group' if session.group_id is not None else 'the channel'
                 why = play.why_none if play is not None else f'{gone} is no longer served'
@@ -2669,6 +3072,7 @@ def move_text(from_name: str, to_name: str, reason: str) -> str:
 
 # What a move by hand did with the channel it left (MoveResult.outcome).
 MOVE_ENDED = 'ended'              # nothing else would start, so the play ended; nothing written
+MOVE_TO_CARD = 'to_card'          # nothing else would start, so a picture-in-picture play shows its card
 MOVE_ADJUSTED = 'adjusted'        # moved, and the channel left now has HAND_MOVE_ADJUSTMENT
 MOVE_ALREADY = 'already'          # moved; the channel left already had it, so nothing was written
 MOVE_CHANNEL_GONE = 'channel_gone'    # moved; the channel left is no longer in the database
@@ -2711,6 +3115,9 @@ def move_by_hand(session_id: str) -> MoveResult:
         raise FeedRefused('That play is showing ChannelBin\'s own picture, not a channel.', 409)
     if offer == MOVE_NOWHERE:
         raise FeedRefused(f'{session.label} is a single channel, so there is nowhere to move it.', 409)
+    if offer == MOVE_TWO_PICTURES:
+        raise FeedRefused(f'{session.label} plays two pictures, and each moves to another channel by '
+                          f'itself when it drops.', 409)
     if offer != MOVE_OFFERED:
         raise ValueError(f'Unknown move offer "{offer}"')
     busy = FeedRefused('That play is changing channel right now. Try again in a moment.', 409)
@@ -2719,7 +3126,7 @@ def move_by_hand(session_id: str) -> MoveResult:
     try:
         with _lock:
             free = (session.live and not session._failing_over and not session._moving
-                    and not session._finishing and session.proc is not None
+                    and not session._carding and not session._finishing and session.proc is not None
                     and session.state in (STATE_STARTING, STATE_STREAMING))
             if free:
                 # The failover guard: the reaper and a dying member leave the play alone while
@@ -2751,7 +3158,7 @@ def move_by_hand(session_id: str) -> MoveResult:
     finally:
         session._swap_lock.release()
     if not moved:
-        return MoveResult(from_id, from_name, '', MOVE_ENDED)
+        return MoveResult(from_id, from_name, '', MOVE_TO_CARD if session.live and session.on_card else MOVE_ENDED)
     return _avoid_left_channel(from_id, from_name, session.channel_name)
 
 
@@ -2834,9 +3241,11 @@ def _reap_loop():
     global _reaper
     while True:
         time.sleep(_REAP_INTERVAL)
+        engine = _pip_engine()
         with _lock:
-            live = [s for s in _sessions.values() if s.live]
-            if not live:
+            live = _all_live_locked()
+            # A pair with no session left is still the engine's to close after its linger.
+            if not live and engine.idle_locked():
                 _reaper = None
                 return
         for s in live:
@@ -2844,6 +3253,10 @@ def _reap_loop():
                 _check(s)
             except Exception:                           # noqa: BLE001 - the loop must outlive one session's failure
                 log.exception('Viewer %s: reaper check failed', s.id)
+        try:
+            engine.tick()
+        except Exception:                               # noqa: BLE001 - the loop must outlive the engine's failure
+            log.exception('Picture in picture: the engine\'s turn failed')
 
 
 def _ensure_reaper():
@@ -2941,7 +3354,7 @@ def _note_badges(session: RelaySession, screen) -> None:
         log.warning('Viewer %s: could not ask whether the badges of %s can be read: %s', session.id,
                     session.label, exc)
         return
-    what = 'Up next picture' if session.showing else 'waiting screen'
+    what = (session.own_picture_name or 'the picture').removeprefix('the ')
     for name, code in unread:
         _note_once(session, f'The badge for {name} could not be read as a picture, so the {what} '
                             f'shows "{code}" in its place.')
@@ -3004,7 +3417,7 @@ def _launch_clip(session: RelaySession, path: str, cfg: dict) -> None:
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err)
     except OSError as exc:
         _remove_stderr(session)
-        what = 'the Up next picture' if session.showing else 'the waiting screen'
+        what = session.own_picture_name or 'the picture'
         log.error('Viewer %s: could not start %s: %s', session.id, what, exc)
         raise FeedRefused(f'Could not start {what}: {exc}', 500)
     if _adopt(session, proc) is None:
@@ -3046,8 +3459,7 @@ def _swap_clip(session: RelaySession, screen, path: str, still: bool, cfg: dict,
         _launch_clip(session, path, cfg)
     except FeedRefused as exc:
         if session.live:
-            _finish(session, REASON_PICTURE_FAILED if session.showing else REASON_SCREEN_FAILED,
-                    detail=exc.message)
+            _finish(session, _clip_failed_reason(session), detail=exc.message)
         return False
     if old != path:
         _discard_unplayed(old)
@@ -3055,7 +3467,10 @@ def _swap_clip(session: RelaySession, screen, path: str, still: bool, cfg: dict,
     if session.showing:
         log.info('Viewer %s: %s now shows its new picture%s', session.id, session.label,
                  ', the quick still' if still else '')
-    else:
+    elif session.on_card:
+        log.info('Viewer %s: the card for %s now says "%s"%s', session.id, session.label,
+                 screen.words.headline, ', the quick still' if still else '')
+    elif session.waiting:
         log.info('Viewer %s: the waiting screen for %s now shows %s%s%s', session.id, session.label,
                  screen.state, f' ({held})' if held else '', ', the quick still' if still else '')
     return True
@@ -3067,7 +3482,7 @@ def _make_moving_later(session: RelaySession, cfg: dict, screen, held: str = Non
     sports_screen's to stop (stop_makes(), from stop_all())."""
     def _make():
         ss = _screen_mod()
-        what = 'Up next picture' if session.showing else 'waiting screen'
+        what = (session.own_picture_name or 'the picture').removeprefix('the ')
         try:
             path = ss.make_clip(cfg, _clip_owner(session), screen, background=True)
         except ss.ClipFailed as exc:
@@ -3085,10 +3500,12 @@ def _make_moving_later(session: RelaySession, cfg: dict, screen, held: str = Non
 
 
 def _clip_owner(session: RelaySession):
-    """Whose clips a play of ChannelBin's own picture plays: its Up next channel's, or its sports
-    channel's row."""
+    """Whose clips a play of ChannelBin's own picture plays: its Up next channel's, its
+    picture-in-picture channel's, or its sports channel's row."""
     if session.up_next_number is not None:
         return _screen_mod().up_next_owner(session.up_next_number)
+    if session.pip_row_id is not None:
+        return _screen_mod().pip_owner(session.pip_row_id)
     return session.sports_row_id
 
 
@@ -3172,16 +3589,27 @@ def _recheck_showing(session: RelaySession) -> None:
 
 
 def recheck_waiting(held_only: bool = False) -> int:
-    """Ask every play on a waiting screen again now rather than at its next turn: Start broadcast
+    """Ask every play on a waiting screen or a picture-in-picture card again now rather than at its next turn: Start broadcast
     opened a game (app/routes/sports.py), or a play that held a slot ended (`held_only`, the
     plays whose game is on and waiting for one). No database; the reaper asks within
     _REAP_INTERVAL. How many plays were asked."""
     with _lock:
-        waiting = [s for s in _sessions.values() if s.live and s.waiting
+        waiting = [s for s in _sessions.values() if s.live and (s.waiting or s.on_card)
                    and (s.screen_held or not held_only)]
         for s in waiting:
             s.recheck_due = True
+    _pip_engine().ask_all()
     return len(waiting)
+
+
+def _clip_failed_reason(session: RelaySession) -> str:
+    """The end a play of ChannelBin's own clip gets when the clip stops playing, by the kind
+    of play it is (own_picture_name's reason: its state may move under the caller)."""
+    if session.up_next_number is not None:
+        return REASON_PICTURE_FAILED
+    if session.pip_row_id is not None:
+        return REASON_CARD_FAILED
+    return REASON_SCREEN_FAILED
 
 
 def _check_waiting(session: RelaySession, proc: subprocess.Popen, now: float) -> None:
@@ -3189,7 +3617,7 @@ def _check_waiting(session: RelaySession, proc: subprocess.Popen, now: float) ->
     channel: the clip's ffmpeg is alive and sending, and every SCREEN_RECHECK_SECONDS (or when
     asked) the play asks again on a thread of its own, so a clip made on the way never holds up
     the reaper."""
-    failed = REASON_PICTURE_FAILED if session.showing else REASON_SCREEN_FAILED
+    failed = _clip_failed_reason(session)
     rc = proc.poll()
     if rc is not None:
         tail = read_stderr_tail(session.stderr_path)
@@ -3223,9 +3651,11 @@ def _recheck(session: RelaySession) -> None:
                     _recheck_locked(session)
                 elif session.showing:
                     _recheck_showing(session)
+                elif session.on_card:
+                    _recheck_card(session)
     except Exception:                                   # noqa: BLE001 - one play's re-check, never the feed
         log.exception('Viewer %s: %s could not ask again what it shows', session.id,
-                      'the Up next channel' if session.showing else 'the waiting screen')
+                      session.own_picture_name or session.label)
     finally:
         with _lock:
             session._rechecking = False
@@ -3325,6 +3755,33 @@ def _own_seat(session: RelaySession, member) -> bool:
     return seated
 
 
+def _pip_engine():
+    from . import pip_engine
+    return pip_engine
+
+
+def viewer_give_way() -> dict:
+    """{a 'viewer' seat holder's id: connection_limits.VIEWER_*} for the holders that give a
+    recording their seat before a watched play does: a picture-in-picture channel's pictures
+    no TV has as its big one (pip_engine.give_way, dev/docs/DESIGN-pip-channels.md 8.2)."""
+    return _pip_engine().give_way()
+
+
+def _resolve_again(session: RelaySession, cfg: dict, exclude_ids, event_id=None) -> Optional[Play]:
+    """What `session` plays now with `exclude_ids` left out: the one re-ask of a seat walk, a
+    failover and a move. A plain play asks its feed id; a picture-in-picture picture asks its
+    own source (pip_engine.Picture.resolve), which a feed id does not name."""
+    if session.picture is not None:
+        return session.picture.resolve(cfg, exclude_ids, event_id, session.id)
+    return resolve_play(session.feed_id, cfg, exclude_ids=exclude_ids, event_id=event_id,
+                        viewer_id=session.id, preview=session.preview)
+
+
+def _all_live_locked() -> list:
+    """Every live session, the plays and the picture-in-picture pictures. Caller holds _lock."""
+    return [s for s in list(_sessions.values()) + list(_internal.values()) if s.live]
+
+
 def _seat_for(session: RelaySession, member, event_id, cfg: dict, refused=()):
     """The best channel that can play what the session asked for whose account has a seat free,
     with the seat taken, starting at `member` and going down the ranking; None when every one is
@@ -3334,8 +3791,7 @@ def _seat_for(session: RelaySession, member, event_id, cfg: dict, refused=()):
         if member.id not in tried and connlim.try_acquire(member.account_id, 'viewer', session.id):
             return member
         tried.add(member.id)
-        more = resolve_play(session.feed_id, cfg, exclude_ids=frozenset(tried | session.failed_ids),
-                            event_id=event_id, viewer_id=session.id, preview=session.preview)
+        more = _resolve_again(session, cfg, frozenset(tried | session.failed_ids), event_id)
         member = more.member if more is not None else None
     return None
 
@@ -3352,11 +3808,14 @@ def _put_on_game(session: RelaySession, play: Play, member, cfg: dict) -> None:
         else:
             alive = True
             session.screen_seconds = session._screen_seconds(now)
+            session._screen_since = 0.0
+            session.card_state = session.card_text = ''
             session.state = STATE_STARTING
             session.slot_claimed = False
             session.left_screen_at = datetime.utcnow()
             session.account_id = member.account_id   # the seat is held: _launch keeps it
             session.event_id = play.event_id
+            session.group_id = play.group.id if play.group is not None else None
             session.label = play.label
             session.screen_path = ''
     if not alive:
@@ -3370,9 +3829,261 @@ def _put_on_game(session: RelaySession, play: Play, member, cfg: dict) -> None:
             _finish(session, REASON_LAUNCH_FAILED, detail=exc.message)
         return
     _discard_unplayed(old)
-    log.info('Viewer %s: %s came on - moved from the waiting screen to channel %d (%s) on account '
-             '%d after %s%s', session.id, session.label, member.id, member.name, member.account_id,
+    log.info('Viewer %s: %s came on - moved from %s to channel %d (%s) on account '
+             '%d after %s%s', session.id, session.label,
+             CARD_NAME if session.pip_row_id is not None else SCREEN_NAME, member.id, member.name,
+             member.account_id,
              fmt_duration(session.screen_seconds), f' ({play.note})' if play.note else '')
+
+
+# ── A picture-in-picture channel's card ────────────────────────────────────────────────────
+#
+# What a play of a picture-in-picture channel is on while its big picture has nothing to play
+# (app/pip_channels.py, dev/docs/DESIGN-pip-channels.md 6.4, 8.1): nothing set up, a game not on
+# yet or over, a search with no match, every account busy. The waiting screen's machinery, in a
+# state of its own (STATE_CARD): a looped clip, no seat, not counted. Every
+# SCREEN_RECHECK_SECONDS, and the moment a seat or a slot frees, the play asks again and puts
+# the picture on in the card's place.
+
+def _pip_mod():
+    from . import pip_channels
+    return pip_channels
+
+
+def _card_of(play: Play, cfg: dict, held: str = None):
+    """The pip_channels.Card `play` shows now. `held` (a sports_screen.HELD_* reason) is a
+    picture that could play and cannot start here yet."""
+    return _pip_mod().card_for(play.pip, cfg, held=held,
+                               slots=int(feed_config(cfg).get('max_viewers') or 1))
+
+
+def _set_card(session: RelaySession, card, path: str, still: bool, held: str = None) -> None:
+    _set_screen(session, card.screen, path, still, held)
+    with _lock:
+        session.card_state, session.card_text = card.state, card.text
+
+
+def start_card(play: Play, client: str, cfg: dict, held: str = None) -> RelaySession:
+    """Start `play`, a picture-in-picture channel's, on its card. Requires an app context.
+    Raises FeedRefused, naming why, when the card cannot be made or played."""
+    from flask import current_app
+    ss = _screen_mod()
+    fcfg = feed_config(cfg)
+    card = _card_of(play, cfg, held)
+    try:
+        path, still = _clip_for(cfg, ss.pip_owner(play.pip.row_id), card.screen)
+    except ss.ClipFailed as exc:
+        message = f'Nothing to play for {play.label}: {card.text}. Its card could not be shown: {exc}.'
+        _note_refused(play.feed_id, play.label, client, message)
+        log.warning('Viewer from %s refused: %s', client, message)
+        raise FeedRefused(message, 409)
+    session = RelaySession(
+        id=secrets.token_urlsafe(12), feed_id=play.feed_id, label=play.label, client=client,
+        group_id=None, channel_id=None, channel_name='', account_id=None,
+        ring=Ring(int(fcfg.get('buffer_mb') or 64) * 1024 * 1024, 0.0),
+        **_session_limits(cfg, fcfg), started_mono=time.monotonic(), state=STATE_CARD,
+        fails_over=True, app=current_app._get_current_object(), pip_row_id=play.pip.row_id,
+        preview=play.preview)
+    session.last_recheck_mono = session._screen_since = session.started_mono
+    _set_card(session, card, path, still, held)
+    with _lock:
+        _sessions[session.id] = session
+        _prune_ended_locked()
+    try:
+        _launch_clip(session, path, cfg)
+    except FeedRefused as exc:
+        _finish(session, REASON_LAUNCH_FAILED, detail=exc.message)
+        raise
+    if still:
+        _make_moving_later(session, cfg, card.screen, held)
+    _ensure_reaper()
+    log.info('Viewer %s from %s: %s on its card (%s: %s)', session.id, client, session.label, card.state,
+             card.text)
+    return session
+
+
+def _recheck_card(session: RelaySession) -> None:
+    """A card play's turn to ask again: ended by name when its channel is no longer served, the
+    picture put on in the card's place when it can play now, else the card redrawn when what it
+    says has changed. The caller holds `_swap_lock`."""
+    from .config import load_config
+    ss = _screen_mod()
+    cfg = load_config()
+    fcfg = feed_config(cfg)
+    # A card that followed every channel failing tries them all again: the failures are at
+    # least a turn old, and nothing else would ever bring the picture back.
+    session.failed_ids.clear()
+    play = resolve_play(session.feed_id, cfg, viewer_id=session.id, preview=session.preview)
+    if play is None or play.pip is None:
+        _finish(session, REASON_TAKEN_OFF)
+        return
+    held = None
+    device = ''
+    if play.pip.set_up and not session.combine_off:
+        device, why = _pip_engine().gpu_state(cfg)
+        if not device:
+            with _lock:
+                session.combine_off = why
+    if device:
+        moved, held = _to_combined(session, play, cfg, fcfg, device)
+        if moved:
+            return
+    elif play.member is not None:
+        held = _to_game(session, play, cfg, fcfg)
+        if held is None:
+            return
+    card = _card_of(play, cfg, held)
+    if ss.clip_key(card.screen) == session.screen_key:
+        with _lock:
+            session.card_state, session.card_text = card.state, card.text
+        return
+    try:
+        path, still = _clip_for(cfg, ss.pip_owner(session.pip_row_id), card.screen)
+    except ss.ClipFailed as exc:
+        log.warning('Viewer %s: the card for %s stays as it is, its new one could not be made: %s',
+                    session.id, session.label, exc)
+        _note_once(session, f'Its card could not be redrawn, so it kept what it showed ({exc}).')
+        return
+    if _swap_clip(session, card.screen, path, still, cfg, held):
+        with _lock:
+            session.card_state, session.card_text = card.state, card.text
+        if still:
+            _make_moving_later(session, cfg, card.screen, held)
+
+
+def _to_combined(session: RelaySession, play: Play, cfg: dict, fcfg: dict, device: str) -> tuple:
+    """A play on its card asks to play its two pictures combined: a slot under the one lock
+    (start_session()'s count), then the pictures. (True, None) when it left the card, or ended
+    on the way; (False, the sports_screen.HELD_* reason it stays for, None when neither picture
+    has anything to play). The caller holds `_swap_lock`."""
+    ss = _screen_mod()
+    cap = int(fcfg.get('max_viewers') or 1)
+    with _lock:
+        if not session.live:
+            return True, None
+        if sum(1 for s in _sessions.values() if s.counted and s is not session) >= cap:
+            return False, ss.HELD_NO_SLOT if play.member is not None else None
+        session.slot_claimed = True
+    try:
+        if not _pip_engine().begin(session, play.pip, cfg, device, wait=False):
+            return False, ss.HELD_NO_CONNECTION if play.member is not None else None
+        old = session.screen_path
+        _stop_current(session)
+        now = time.monotonic()
+        with _lock:
+            alive = session.live and not session._finishing
+            if alive:
+                session.screen_seconds = session._screen_seconds(now)
+                session._screen_since = 0.0
+                session.card_state = session.card_text = ''
+                session.screen_held = None
+                session.state = STATE_STARTING
+                session.left_screen_at = datetime.utcnow()
+                session.label = f'picture-in-picture channel {play.pip.row_id} ({play.pip.name})'
+                session.screen_path = ''
+        if alive:
+            session.ring.set_reserve(session.reserve_seconds)
+            _discard_unplayed(old)
+            log.info('Viewer %s: %s left its card for its two pictures combined after %s', session.id,
+                     session.label, fmt_duration(session.screen_seconds))
+        return True, None
+    finally:
+        with _lock:
+            session.slot_claimed = False
+
+
+def _put_on_card(session: RelaySession, play: Play, cfg: dict, held: str = None) -> bool:
+    """Put `session`, a picture-in-picture play whose picture has nothing left to play, on its
+    card in place: the TV sees an MPEG-TS discontinuity, as at a failover. The caller has
+    stopped its ffmpeg; its seat is given back here. False when the play ended instead."""
+    ss = _screen_mod()
+    # A play that was on its two pictures combined leaves them: a card is one clip, and its
+    # pictures' connections go back (dev/docs/DESIGN-pip-channels.md 10).
+    _pip_engine().leave(session)
+    card = _card_of(play, cfg, held)
+    try:
+        path, still = _clip_for(cfg, ss.pip_owner(session.pip_row_id), card.screen)
+    except ss.ClipFailed as exc:
+        _finish(session, REASON_NO_MEMBER, detail=f'{card.text}, and its card could not be shown: {exc}')
+        return False
+    now = time.monotonic()
+    with _lock:
+        if not session.live or session._finishing:
+            return False
+        account_id = session.account_id
+        _close_phase_locked(session)
+        session.state = STATE_CARD
+        session.account_id = session.channel_id = session.group_id = session.event_id = None
+        session.channel_name = ''
+        session.label = play.label
+        session.preempted, session.preempted_by = False, None
+        session.last_data_mono = None
+        session._screen_since = session.last_recheck_mono = now
+    connlim.release(account_id, 'viewer', session.id)
+    # A card plays on no reserve, as a waiting screen does; the picture gets it back.
+    session.ring.set_reserve(0.0)
+    _set_card(session, card, path, still, held)
+    try:
+        _launch_clip(session, path, cfg)
+    except FeedRefused as exc:
+        if session.live:
+            _finish(session, REASON_CARD_FAILED, detail=exc.message)
+        return False
+    if still:
+        _make_moving_later(session, cfg, card.screen, held)
+    # The seat it held is free for a play waiting on one.
+    recheck_waiting(held_only=True)
+    log.info('Viewer %s: %s now shows its card (%s: %s)', session.id, session.label, card.state, card.text)
+    return True
+
+
+def _to_card_now(session: RelaySession) -> None:
+    """Take a play off the picture it is on and onto its channel's card: the channel was
+    cleared while it was watched (clear_pip). On a thread of its own."""
+    from .config import load_config
+    try:
+        # A play inside its launch window, or between channels, has no ffmpeg to take yet: it is
+        # asked again until it has one, so it never goes on playing a picture that was cleared.
+        deadline = time.monotonic() + CONNECT_TIMEOUT_SECONDS
+        while True:
+            with _lock:
+                over = not session.live or session._finishing or session.own_picture
+                free = (not over and not session._failing_over and not session._moving
+                        and session.proc is not None)
+            if over or free or time.monotonic() >= deadline:
+                break
+            time.sleep(_SWITCH_POLL)
+        if over:
+            # Ended, or already on its card: a card asks the channel again by itself.
+            with _lock:
+                session.recheck_due = True
+            return
+        with session.app.app_context(), session._swap_lock:
+            with _lock:
+                free = (session.live and not session.own_picture and not session._failing_over
+                        and not session._moving and not session._finishing and session.proc is not None)
+                if free:
+                    session._carding = True
+                    proc, reader = session.proc, session.reader
+                    session.proc = session.reader = None
+            if not free:
+                log.warning('Viewer %s: %s was cleared and could not be moved to its card: it is still '
+                            'changing what it plays', session.id, session.label)
+                return
+            try:
+                _stop_detached(session, proc, reader)
+                cfg = load_config()
+                play = resolve_play(session.feed_id, cfg, preview=session.preview)
+                if play is None or play.pip is None:
+                    _finish(session, REASON_TAKEN_OFF)
+                elif not _put_on_card(session, play, cfg) and session.live:
+                    _finish(session, REASON_CARD_FAILED)
+            finally:
+                with _lock:
+                    session._carding = False
+    except Exception as exc:                            # noqa: BLE001 - one play, never left with no ffmpeg
+        log.exception('Viewer %s: %s could not be moved to its card', session.id, session.label)
+        _finish(session, REASON_CARD_FAILED, detail=mask_creds_in_text(str(exc)))
 
 
 # ── Redirect mode ──────────────────────────────────────────────────────────────────────────
@@ -3467,9 +4178,11 @@ def reset_for_tests():
     """Stop everything and forget every session. tests/support/app.py only."""
     global _last_prune_mono
     stop_all(REASON_SHUTDOWN)
+    _pip_engine().reset_for_tests()
     wait_for_reaper()
     with _lock:
         _sessions.clear()
+        _internal.clear()
         _refused.clear()
         del _redirects[:]
     discard_play_log()

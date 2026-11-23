@@ -74,7 +74,8 @@ recording:
     vaapi_qp: 26                        # H.264 on the GPU: constant quantizer (0-51, lower =
                                          # better/larger). Comparable to video_crf 20 at 26
     vaapi_hevc_qp: 27                   # HEVC on the GPU: its own scale
-    vaapi_decode: false                 # decode on the GPU too, on clean single-format files
+    vaapi_decode: true                  # decode on the GPU too (only with video_encoder: vaapi;
+                                        # a damaged recording still decodes on the CPU)
     # A conversion can die or stall mid-flight (an ffmpeg crash, a service restart).
     # These decide whether the app restarts it and how it notices a stall.
     auto_restart: true

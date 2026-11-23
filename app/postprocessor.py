@@ -2617,14 +2617,33 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                          'video_end': round(pad_ends['video'], 3),
                          'audio_end': round(pad_ends['audio'], 3)}))
 
-            # GPU DECODE, on top of a GPU encode: only where the damage scan ran and found the
-            # file clean, and only on one single format. The hardware decoder logs no decode
-            # errors, so on a damaged file the concealed-damage count below would read zero;
-            # and it dies on a mid-file size change in every shape measured
-            # (dev/changelog/1183). Not with an end pad either: the pad holds software frames
-            # ahead of the upload, the shape measured on the GPU (dev/changelog/1199).
-            hw_decode = bool(use_gpu and pp.get('vaapi_decode') and timeline_damaged is False
-                             and src is not None and src.single_format and not end_pad)
+            # GPU DECODE, on top of a GPU encode, wherever it comes out right
+            # (dev/changelog/1687). Only where the damage scan ran and found the file clean:
+            # the hardware decoder logs fewer decode errors than the software one, so on a
+            # damaged file the damage count below would read low (dev/changelog/1183). Not
+            # with an end pad: the pad holds software frames ahead of the upload, the shape
+            # measured on the GPU (dev/changelog/1199). And not on a file whose formats one
+            # GPU chain cannot serve (SourceFormats.gpu_decode_blocker). When it is on and
+            # still not used, the recording says why.
+            hw_decode = False
+            if use_gpu and pp.get('vaapi_decode'):
+                if timeline_damaged is None:
+                    cpu_decode_why = 'the damage scan did not run, so nothing showed it clean'
+                elif timeline_damaged:
+                    cpu_decode_why = ('the damage scan found damage, and only the CPU decoder '
+                                      'counts all of it')
+                elif src is None:
+                    cpu_decode_why = 'nothing measured its formats'
+                elif end_pad:
+                    cpu_decode_why = ('its video ends before its sound, and the held last '
+                                      'picture is made on the CPU')
+                else:
+                    cpu_decode_why = src.gpu_decode_blocker
+                hw_decode = not cpu_decode_why
+                if cpu_decode_why:
+                    encoder_events.append((
+                        f'Decoded on the CPU, not the GPU: {cpu_decode_why}.',
+                        {'kind': 'conversion_cpu_decode', 'reason': cpu_decode_why}))
 
             gpu_plan = _plan(software=False)
             sw_plan = _plan(software=True)
@@ -2757,10 +2776,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 c += ['-dts_delta_threshold', dts_threshold]
                 gpu_reencode = use_gpu and fmt == 'mp4' and reencode
                 if gpu_reencode and hw_decode:
-                    # The decoded frames stay on the device; -hwaccel_device opens it for the
-                    # filters and the encoder as well.
-                    c += ['-hwaccel', 'vaapi', '-hwaccel_device', vaapi_device,
-                          '-hwaccel_output_format', 'vaapi']
+                    c += nz.gpu_decode_input_args(vaapi_device)
                 elif gpu_reencode:
                     # A global option, so it sits before -i. Decoding stays on the CPU: the
                     # decode-error count below is read from the software decoder's stderr
@@ -2787,8 +2803,10 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     # last frame, which is end_pad's job (measured, dev/changelog/1199).
                     if use_gpu:
                         hevc = gpu_codec == nz.VIDEO_CODEC_HEVC
+                        gpu_out = []
                         if hw_decode:
                             vf = nz.gpu_decode_filter(plan, hevc=hevc)
+                            gpu_out = nz.GPU_DECODE_OUTPUT_ARGS
                         elif plan.width:
                             vf = nz.gpu_upload_filter(plan, hevc=hevc, end_pad=end_pad)
                         else:
@@ -2804,7 +2822,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         # libx264 - measured, not assumed (dev/changelog/1124).
                         c += ['-vf', vf] + vaapi_encode_args(
                             gpu_codec, vaapi_hevc_qp if hevc else vaapi_qp,
-                            main10=hevc and plan.hdr)
+                            main10=hevc and plan.hdr) + gpu_out
                     else:
                         vf = nz.software_video_filter(plan, end_pad=end_pad)
                         if vf:

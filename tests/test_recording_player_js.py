@@ -170,6 +170,17 @@ class RecordingPlayerTests(unittest.TestCase):
         self.assertIn('re-encodes the video on the GPU', self.obs['re']['nativePlaying']['status'])
         self.assertEqual(self.obs['re']['nativePlaying']['kind'], 'ok')
 
+    def test_a_restart_on_the_cpu_is_said_when_it_happens_and_while_playing(self):
+        """The server restarted a re-encode whose GPU decode died, decoding on the CPU: the
+        player says so at the poll that carries the note and in its playing status after it
+        (dev/changelog/1688)."""
+        for key in ('restartNoted', 'restartPlaying'):
+            with self.subTest(key):
+                v = self.obs['re'][key]
+                self.assertEqual(v['kind'], 'warn')
+                self.assertIn('restarted it decoding on the CPU', v['status'])
+        self.assertIn('re-encodes the video on the GPU', self.obs['re']['restartPlaying']['status'])
+
     def test_a_failed_reencode_says_so_and_offers_nothing_more(self):
         f = self.obs['re']['reencodeFailed']
         self.assertEqual(f['recovered'], 1)

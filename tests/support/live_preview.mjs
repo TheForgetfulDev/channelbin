@@ -34,6 +34,7 @@ let reencodeAnswer = { success: true, available: true, reason: '' };
 let feedStatus = [];
 let nextSid = 1;
 const sessions = {};
+const decodeNotes = {};   // sid -> the decode_note its status carries (dev/changelog/1688)
 w.fetch = (url, opts = {}) => {
   if (opts.method && opts.method !== 'GET') {
     posted.push([url, typeof opts.body === 'string' ? JSON.parse(opts.body) : null]);
@@ -62,7 +63,8 @@ w.fetch = (url, opts = {}) => {
       playlist_url: `/api/preview/f1/index.m3u8?round=${st.round}`, ...st });
   }
   const m = url.match(/^\/api\/preview\/(s\d+)\/status$/);
-  if (m) return respond(200, { success: true, session_id: m[1], state: 'READY', elapsed_seconds: 2 });
+  if (m) return respond(200, { success: true, session_id: m[1], state: 'READY', elapsed_seconds: 2,
+    decode_note: decodeNotes[m[1]] || '' });
   if (url.endsWith('/stop')) return respond(200, { success: true, stopped: true });
   return respond(404, { error: `unexpected ${url}` });
 };
@@ -151,6 +153,15 @@ const second = hlsMade[hlsMade.length - 1];   // the first again when nothing wa
 v.dispatchEvent(new w.Event('playing'));
 out.reencodePlaying = view();
 
+// The re-encode's GPU decode died and the server restarted it on the CPU: the next poll says so,
+// and playing keeps saying so beside the re-encode's own words (dev/changelog/1688).
+const sid2 = `s${nextSid - 1}`;
+decodeNotes[sid2] = 'The GPU could not decode this channel, so ChannelBin restarted it decoding on the CPU. ffmpeg said: Error reinitializing filters!';
+tick(3000); await settle();
+out.restartNoted = view();
+v.dispatchEvent(new w.Event('playing'));
+out.restartPlaying = view();
+
 // The re-encode fails too: said as the re-encode, nothing more offered.
 second.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferAppendError', error: { message: 'append failed' } });
 second.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferAppendError', error: { message: 'append failed' } });
@@ -196,6 +207,17 @@ tick(1000); await settle();                // READY round 2 -> attach again
 const r2 = hlsMade[hlsMade.length - 1];
 d.querySelector('.modal video').dispatchEvent(new w.Event('playing'));
 out.feedRound2 = { ...view(), url: r2 && r2.url, made: hlsMade.length - madeBefore };
+// Round 2 dies decoding on the GPU: the server takes it off and round 3 decodes on the CPU. The
+// player says that, not that the output moved (dev/changelog/1688).
+const NOTE = 'The GPU could not decode this stream, so ChannelBin restarted it decoding on the CPU. ffmpeg said: Error reinitializing filters!';
+feedStatus = [
+  { state: 'STARTING', round: 2, now_playing: '"Local game"', decode_note: NOTE },
+  { state: 'READY', round: 3, now_playing: '"Local game"', decode_note: NOTE },
+];
+tick(3000); await settle();
+out.feedRestarting = view();
+tick(1000); await settle();
+out.feedRestarted = { ...view(), url: hlsMade[hlsMade.length - 1].url };
 d.querySelector('.modal .modal-close').click();
 
 process.stdout.write(JSON.stringify(out));

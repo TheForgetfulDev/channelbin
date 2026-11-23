@@ -27,6 +27,11 @@ Rules this module enforces, each of which a test in tests/test_preview.py guards
   encode; it is refused, with the reason, when no GPU encodes here or while a recording is
   being converted, and a re-encoding session is stopped by name the moment a conversion
   starts, because the conversion comes first. Every other rule above applies to it unchanged.
+  It decodes on the GPU too, deinterlacing there only a source known to be interlaced; when
+  ffmpeg dies of the GPU path, the session restarts once decoding on the CPU and says so
+  (decode_note), so the picture keeps playing and the viewer knows why (dev/changelog/1688).
+  recording.post_process.vaapi_decode is the conversions' switch and does not reach here: the
+  one-time restart is the guard.
 * "Capture screenshot" on the channel page is a preview too (capture_frame): it reads a
   frame out of the live preview of that channel when one is playing, and otherwise opens a
   short capture session through the same start path - same slot, same refusals, same
@@ -79,7 +84,8 @@ from .account_links import (is_credential_refusal, is_resolution_failure,
 from .config import resolve_ffmpeg_path
 from .proc_utils import (FEED_PREVIEW_SEGMENT_RE, PREVIEW_PLAYLIST, PREVIEW_SEGMENT_RE,
                          build_feed_preview_cmd, build_file_playback_cmd, build_preview_cmd,
-                         feed_preview_names, read_stderr_tail, stderr_cause, terminate_or_kill)
+                         feed_preview_names, iter_stderr_error_lines, read_stderr_tail,
+                         stderr_cause, strip_level_tag, terminate_or_kill)
 from .recording_story import http_answer, plain_cause
 from .url_utils import mask_creds_in_text
 
@@ -220,6 +226,44 @@ CONVERSION_FIRST = ('A recording is being converted right now, and a conversion 
                     're-encoded picture. Try again once it has finished.')
 
 
+def deinterlace_for(interlaced) -> bool:
+    """Whether a GPU-decoding re-encode deinterlaces, from a stored measurement
+    (ChannelTest.interlaced, Recording.recorded_interlaced, RecordingSegment.probe_interlaced).
+    Only a source known to be interlaced is: deinterlace_vaapi at field rate doubles every
+    frame of a progressive one (60 to 120, measured, dev/changelog/1687), so unknown plays as it
+    is, as progressive does."""
+    if interlaced is True:
+        return True
+    if interlaced is False:
+        return False
+    return False   # None: never measured, and not deinterlaced either
+
+
+def gpu_decode_failure(stderr_path: str) -> str:
+    """The first error line of a GPU-decoding ffmpeg's stderr that blames the GPU path, or ''.
+    The conversion's own judgment (postprocessor.names_gpu_failure) over error-level lines only,
+    so a stream that dropped or a provider that refused is never mistaken for one."""
+    from .postprocessor import names_gpu_failure
+    for line in iter_stderr_error_lines(stderr_path):
+        if names_gpu_failure(line):
+            return line
+    return ''
+
+
+def _latest_test(channel_id):
+    """The channel's latest ChannelTest row, or None."""
+    from .database import ChannelTest
+    return (ChannelTest.query.filter_by(channel_id=channel_id)
+            .order_by(ChannelTest.id.desc()).first())
+
+
+def _latest_interlaced(channel_id):
+    """The channel's latest test's interlaced answer: True, False or None (no test, or the
+    test could not tell)."""
+    latest = _latest_test(channel_id)
+    return latest.interlaced if latest else None
+
+
 def reencode_device(cfg: dict) -> tuple:
     """May a re-encode start right now: (device, '') when it may, ('', why not) when it may not.
 
@@ -310,6 +354,20 @@ class PreviewSession:
     # The video is re-encoded on the GPU (dev/changelog/1461); the session yields to a
     # conversion.
     reencode: bool = False
+    # The re-encode's decoding: on the GPU until it dies of it, then once on the CPU
+    # (dev/changelog/1688). `decode_note` is what the session says about that restart;
+    # `cpu_command` builds the CPU-decoding command from the segment number the window has
+    # reached. `restarted_mono` restarts the connect clock for the relaunched ffmpeg.
+    gpu_decode: bool = False
+    deinterlace: bool = False
+    decode_note: str = ''
+    cpu_command: Optional[object] = field(default=None, repr=False)
+    restarted_mono: Optional[float] = None
+    # Feed sessions: the round that died decoding on the GPU was taken off (`restarted_from`, so
+    # the pump and the reaper, which both notice a dead round, agree it was); the pump starts the
+    # next one, on the CPU, with the next bytes.
+    restart_round: bool = False
+    restarted_from: Optional[object] = field(default=None, repr=False)
     # Feed sessions: the feed id, the output's play (output_feed.RelaySession), the round its
     # segmenter is on and when that round began, what the play is playing as the round began,
     # the render node each round re-encodes on, and the config each round is built from.
@@ -378,6 +436,8 @@ class PreviewSession:
             'detail': self.detail,
             'transcode_audio': self.transcode_audio,
             'reencode': self.reencode,
+            'gpu_decode': self.gpu_decode,
+            'decode_note': self.decode_note,
             'feed_id': self.feed_id,
             'round': self.round_no,
             'now_playing': self.now_playing,
@@ -434,7 +494,7 @@ def _launch(channel_id: int, purpose: str, reencode: bool = False) -> PreviewSes
     acquire-to-Popen preemption window and the reaper are identical for a capture."""
     from . import db
     from .config import load_config
-    from .database import Channel, ChannelTest
+    from .database import Channel
     from .recorder import resolve_capture_pacing
 
     cfg = load_config()
@@ -449,10 +509,11 @@ def _launch(channel_id: int, purpose: str, reencode: bool = False) -> PreviewSes
         device, why = reencode_device(cfg)
         if not device:
             raise PreviewRefused(why, 409)
+    interlaced = None
     if purpose == PURPOSE_WATCH:
-        latest = (ChannelTest.query.filter_by(channel_id=channel_id)
-                  .order_by(ChannelTest.id.desc()).first())
+        latest = _latest_test(channel_id)
         transcode_audio = audio_needs_transcode(latest.audio_codec if latest else None)
+        interlaced = latest.interlaced if latest else None
     else:
         # Nobody hears a capture, so its audio is copied whatever the codec.
         transcode_audio = False
@@ -480,6 +541,8 @@ def _launch(channel_id: int, purpose: str, reencode: bool = False) -> PreviewSes
         purpose=purpose,
         app=current_app._get_current_object(),
         reencode=bool(device),
+        gpu_decode=bool(device),
+        deinterlace=deinterlace_for(interlaced),
     )
     # Registered BEFORE the slot is taken, so a recording preempting in the window between
     # acquire and Popen finds something to flag rather than nothing (see `preempted`).
@@ -518,10 +581,16 @@ def _launch(channel_id: int, purpose: str, reencode: bool = False) -> PreviewSes
     # credentials the provider sees are the same login (app/account_links.py).
     launch_url, session.login_id = render_held_login(channel.stream_url, channel.account_id,
                                                      'preview', session.id)
-    cmd = build_preview_cmd(cfg, launch_url, session.dir,
-                            segment_seconds=int(pcfg.get('segment_seconds', 2)),
-                            transcode_audio=transcode_audio, pace_realtime=pace,
-                            reencode_device=device or None)
+
+    def command(gpu_decode, start_number=0):
+        return build_preview_cmd(cfg, launch_url, session.dir,
+                                 segment_seconds=int(pcfg.get('segment_seconds', 2)),
+                                 transcode_audio=transcode_audio, pace_realtime=pace,
+                                 reencode_device=device or None, gpu_decode=gpu_decode,
+                                 deinterlace=session.deinterlace, start_number=start_number)
+    if session.gpu_decode:
+        session.cpu_command = lambda start_number: command(False, start_number)
+    cmd = command(session.gpu_decode)
     log.info('Preview %s (%s): channel %d (%s)%s - %s', session.id, purpose, channel.id,
              channel.name, _encoding_note(session), mask_creds_in_text(' '.join(cmd)))
     try:
@@ -549,14 +618,16 @@ def _launch(channel_id: int, purpose: str, reencode: bool = False) -> PreviewSes
 
 def _encoding_note(session: PreviewSession) -> str:
     if session.reencode:
-        return ' re-encoded on the GPU'
+        decoded = 'GPU' if session.gpu_decode else 'CPU'
+        deint = ', deinterlaced' if session.gpu_decode and session.deinterlace else ''
+        return f' re-encoded on the GPU (decoded on the {decoded}{deint})'
     return ' with audio re-encoded to AAC' if session.transcode_audio else ''
 
 
 def start_file_playback(recording_id: int, recording_name: str, path: str, offset: float,
                         transcode_audio: bool,
                         capture: Optional[CapturePlace] = None,
-                        reencode: bool = False) -> PreviewSession:
+                        reencode: bool = False, interlaced=None) -> PreviewSession:
     """Play a recording's finished file from `offset` seconds, replacing whatever session is
     being watched - a channel preview, or this recording's own session at its old offset,
     which is what a seek is. The caller has already decided the file may be played and
@@ -571,7 +642,9 @@ def start_file_playback(recording_id: int, recording_name: str, path: str, offse
     `capture` places a session over a recording that is still capturing; with a
     `follow_state` the file is the segment being written and ffmpeg follows it from `offset`.
     `reencode` re-encodes the video on the GPU (reencode_device()); a refusal is a
-    PreviewRefused (409) raised before the session being watched is touched."""
+    PreviewRefused (409) raised before the session being watched is touched. `interlaced` is
+    the file's stored answer (True, False or None), which decides whether a GPU-decoding
+    re-encode deinterlaces (deinterlace_for())."""
     from .config import load_config
 
     cfg = load_config()
@@ -606,6 +679,8 @@ def start_file_playback(recording_id: int, recording_name: str, path: str, offse
         capture=capture,
         following=bool(capture and capture.follow_state is not None),
         reencode=bool(device),
+        gpu_decode=bool(device),
+        deinterlace=deinterlace_for(interlaced),
     )
     if session.following:
         session.connect_timeout = max(session.connect_timeout, FOLLOW_START_SECONDS)
@@ -621,10 +696,20 @@ def start_file_playback(recording_id: int, recording_name: str, path: str, offse
     session.stderr_path = os.path.join(session.dir, 'ffmpeg.stderr')
 
     list_size = max(6, -(-FILE_WINDOW_SECONDS // max(segment_seconds, 1)))
-    cmd = build_file_playback_cmd(cfg, path, session.dir, offset=session.offset,
-                                  segment_seconds=segment_seconds, list_size=list_size,
-                                  transcode_audio=transcode_audio, follow=session.following,
-                                  reencode_device=device or None)
+
+    def command(gpu_decode, start_number=0):
+        # A restart picks up where the window got to: a re-encode cuts a segment every
+        # segment_seconds (reencode_keyframes), so that is within one segment of it.
+        return build_file_playback_cmd(cfg, path, session.dir,
+                                       offset=session.offset + start_number * segment_seconds,
+                                       segment_seconds=segment_seconds, list_size=list_size,
+                                       transcode_audio=transcode_audio, follow=session.following,
+                                       reencode_device=device or None, gpu_decode=gpu_decode,
+                                       deinterlace=session.deinterlace,
+                                       start_number=start_number)
+    if session.gpu_decode:
+        session.cpu_command = lambda start_number: command(False, start_number)
+    cmd = command(session.gpu_decode)
     log.info('Playback %s: %s%s - %s', session.id, session.label, _encoding_note(session),
              ' '.join(cmd))
     try:
@@ -684,6 +769,7 @@ def start_feed_preview(feed_id: int, reencode: bool = False) -> PreviewSession:
         feed_id=feed_id,
         reencode=bool(device),
         reencode_device=device,
+        gpu_decode=bool(device),
         cfg=cfg,
     )
     session.round_started_mono = session.started_mono
@@ -723,11 +809,8 @@ def start_feed_preview(feed_id: int, reencode: bool = False) -> PreviewSession:
 
 def _feed_now_playing(relay) -> str:
     """What the output's play is on right now, in the words the preview shows."""
-    from . import output_feed
-    if relay.showing:
-        return output_feed.PICTURE_NAME
-    if relay.waiting:
-        return output_feed.SCREEN_NAME
+    if relay.own_picture:
+        return relay.own_picture_name
     return f'"{relay.channel_name}"' if relay.channel_name else 'the stream'
 
 
@@ -745,7 +828,6 @@ def _pump(session: PreviewSession) -> None:
     relay = session.relay
     body = output_feed.stream(relay, marks=True)
     pending = True       # the next bytes start a round
-    died = None          # a round's ffmpeg that stopped taking input
     exhausted = False    # the play ended on its own
     try:
         for chunk in body:
@@ -756,26 +838,22 @@ def _pump(session: PreviewSession) -> None:
                     _end_round(session)
                     pending = True
                 continue
-            if pending:
-                if not _start_round(session):
-                    break
-                pending = False
-            with _lock:
-                proc = session.proc
+            proc = _round_for(session, pending)
+            pending = False
             if proc is None:
                 break
             try:
                 proc.stdin.write(chunk)
             except (OSError, ValueError):
-                # Killed by a stop (a closed pipe), or it exited on its own: _segment_died() tells
-                # the two apart and names the second.
-                died = proc
+                # Killed by a stop (a closed pipe), or it exited on its own: _segmenter_died()
+                # tells the two apart, restarts one that died decoding on the GPU and names any
+                # other. The chunk that found it dead is dropped; the next starts the new round.
+                if _segmenter_died(session, proc):
+                    continue
                 break
         else:
             exhausted = True
     finally:
-        if died is not None:
-            _segmenter_died(session, died)
         with _lock:
             finishing = session._finishing
         if finishing:
@@ -791,22 +869,53 @@ def _pump(session: PreviewSession) -> None:
         _finish(session, REASON_PLAY_ENDED, detail=' '.join(t for t in (said, relay.detail) if t))
 
 
-def _segmenter_died(session: PreviewSession, proc) -> None:
+def _round_for(session: PreviewSession, pending: bool):
+    """The round's ffmpeg the pump writes the next chunk into, starting one first when the pump is
+    `pending` (a source mark, or the play's first bytes) or a round that died decoding on the GPU
+    was taken off (_restart_round_on_cpu, which the reaper may do between any two lines here: the
+    flag and the process are read under one lock). None when the session is ending or a round
+    could not start, which ends the pump."""
+    for _ in range(2):   # a restart happens once, so a second pass is the most there can be
+        with _lock:
+            if session.restart_round:
+                session.restart_round = False
+                pending = True
+        if pending:
+            if not _start_round(session):
+                return None
+            pending = False
+        with _lock:
+            proc = session.proc
+            again = proc is None and session.restart_round
+        if not again:
+            return proc
+    return None
+
+
+def _segmenter_died(session: PreviewSession, proc) -> bool:
     """The pump could not write into `proc`. Unless a stop or a source mark took it off the session
-    (both clear session.proc first), it stopped taking input on its own: end the session by name with
-    its exit code and stderr, before the play is let go, so the play's record says the preview ended
-    and why. One that is still running but not reading is killed here."""
+    (both clear session.proc first), it stopped taking input on its own: a round that died decoding
+    on the GPU is restarted on the CPU (True: the pump carries on into the next round); any other
+    ends the session by name with its exit code and stderr, before the play is let go, so the
+    play's record says the preview ended and why. One that is still running but not reading is
+    killed here."""
     with _lock:
         ours = session.proc is proc and session.live and not session._finishing
+        restarted = session.restarted_from is proc   # the reaper took it off for a restart
+    if restarted:
+        return True
     if not ours:
-        return
+        return False
     try:
         rc = proc.wait(timeout=2.0)
     except subprocess.TimeoutExpired:
         rc = None
+    if rc and _restart_round_on_cpu(session, proc):
+        return True
     tail = read_stderr_tail(session.stderr_path) if session.stderr_path else ''
     said = f'ffmpeg exited with code {rc}' if rc is not None else 'ffmpeg stopped reading the IPTV output'
     _finish(session, REASON_FFMPEG_EXITED, detail=said + (f': {tail}' if tail else ''))
+    return False
 
 
 def _start_round(session: PreviewSession) -> bool:
@@ -823,9 +932,13 @@ def _start_round(session: PreviewSession) -> bool:
         session.now_playing = _feed_now_playing(session.relay)
     pcfg = session.cfg.get('preview', {}) or {}
     stderr_path = os.path.join(session.dir, f'ffmpeg-r{round_no:03d}.stderr')
+    with _lock:
+        gpu_decode = session.gpu_decode
+    deinterlace = _round_deinterlace(session) if gpu_decode else False
     cmd = build_feed_preview_cmd(session.cfg, session.dir, round_no,
                                  segment_seconds=int(pcfg.get('segment_seconds', 2)),
-                                 reencode_device=session.reencode_device or None)
+                                 reencode_device=session.reencode_device or None,
+                                 gpu_decode=gpu_decode, deinterlace=deinterlace)
     try:
         # stderr to a file, never a pipe (dev/changelog/430); stdin is the pump's to write.
         with open(stderr_path, 'wb') as err:
@@ -844,6 +957,23 @@ def _start_round(session: PreviewSession) -> bool:
         return False
     log.info('Preview %s: round %d, %s - %s', session.id, round_no, session.now_playing, ' '.join(cmd))
     return True
+
+
+def _round_deinterlace(session: PreviewSession) -> bool:
+    """Whether this round's GPU decode deinterlaces: from the latest test of the channel the
+    play is on as the round starts. ChannelBin's own pictures (a waiting screen, an Up next
+    picture, a picture-in-picture card) are progressive. A failed read is unknown, which is not deinterlaced, and is logged."""
+    relay = session.relay
+    if relay is None or relay.own_picture or relay.app is None:
+        return False
+    from sqlalchemy.exc import SQLAlchemyError
+    try:
+        with relay.app.app_context():
+            return deinterlace_for(_latest_interlaced(relay.channel_id))
+    except SQLAlchemyError as exc:
+        log.warning('Preview %s: could not read whether channel %s is interlaced, so this round is '
+                    'not deinterlaced: %s', session.id, relay.channel_id, exc)
+        return False
 
 
 def _kill_round(proc) -> None:
@@ -869,6 +999,12 @@ def _end_round(session: PreviewSession) -> None:
             session.state = STATE_STARTING
             session.round_started_mono = time.monotonic()
     _kill_round(proc)
+    _drop_round_files(session, round_no)
+    log.info('Preview %s: round %d ended - the IPTV output moved to another source', session.id, round_no)
+
+
+def _drop_round_files(session: PreviewSession, round_no: int) -> None:
+    """Delete one finished round's playlist and segments."""
     prefix = feed_preview_names(round_no)[0].rsplit('.', 1)[0]
     try:
         names = os.listdir(session.dir)
@@ -880,7 +1016,115 @@ def _end_round(session: PreviewSession) -> None:
                 os.unlink(os.path.join(session.dir, name))
             except OSError:
                 pass   # already gone
-    log.info('Preview %s: round %d ended - the IPTV output moved to another source', session.id, round_no)
+
+
+#: What a session restarted on the CPU says, then ffmpeg's own line.
+GPU_DECODE_RESTART_NOTE = ('The GPU could not decode this {what}, so ChannelBin restarted it '
+                           'decoding on the CPU. ffmpeg said: {line}')
+
+
+def _restart_note(session: PreviewSession, line: str) -> str:
+    what = {SOURCE_FILE: 'recording', SOURCE_FEED: 'stream'}.get(session.source, 'channel')
+    return GPU_DECODE_RESTART_NOTE.format(what=what, line=strip_level_tag(line))
+
+
+def _next_segment_number(session: PreviewSession) -> int:
+    """The number after the last segment the window's playlist lists; 0 when it lists none."""
+    names = _listed_segments(session.playlist_path)
+    if not names:
+        return 0
+    return int(re.search(r'(\d+)', names[-1]).group(1)) + 1
+
+
+def _restart_on_cpu(session: PreviewSession, proc) -> bool:
+    """A channel or file session's ffmpeg, decoding on the GPU, exited: when its error lines
+    blame the GPU path, relaunch it once decoding on the CPU into the same window and seat, and
+    put why on the session. True when this took the session over - relaunched it, or ended it
+    by name when the relaunch could not start; False leaves the exit to the caller's own rules.
+    The dead ffmpeg is already reaped (the caller's poll() returned its code); the new one is
+    on the session before anything can stop it, or killed here when a stop got there first."""
+    if not session.gpu_decode or session.cpu_command is None:
+        return False
+    line = gpu_decode_failure(session.stderr_path)
+    if not line:
+        return False
+    with _lock:
+        ours = (session.proc is proc and session.live and not session._finishing
+                and session.gpu_decode)
+        if ours:
+            session.gpu_decode = False
+    if not ours:
+        return False
+    line = mask_creds_in_text(line)
+    note = _restart_note(session, line)
+    start_number = _next_segment_number(session)
+    stderr_path = os.path.join(session.dir, 'ffmpeg-cpu.stderr')
+    cmd = session.cpu_command(start_number)
+    log.warning('Preview %s: %s - the GPU decode died (%s); restarting it decoding on the CPU '
+                'from segment %d - %s', session.id, session.label, line, start_number,
+                mask_creds_in_text(' '.join(cmd)))
+    try:
+        # stderr to a file, never a pipe (dev/changelog/430).
+        with open(stderr_path, 'wb') as err:
+            new = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=err)
+    except OSError as exc:
+        _finish(session, REASON_LAUNCH_FAILED,
+                detail=f'{note}\nThe restart could not start ffmpeg: {mask_creds_in_text(str(exc))}')
+        return True
+    with _lock:
+        adopt = session.live and not session._finishing
+        if adopt:
+            session.proc = new
+            session.stderr_path = stderr_path
+            session.decode_note = note
+            session.restarted_mono = time.monotonic()
+    if not adopt:
+        terminate_or_kill(new, hard=True)
+    return True
+
+
+def _restart_round_on_cpu(session: PreviewSession, proc) -> bool:
+    """A feed session's round, decoding on the GPU, died: when its error lines blame the GPU
+    path, take the round off and have the pump start the next one decoding on the CPU, with the
+    next bytes the play sends; the player re-attaches to it as to any new round. True when it
+    did, or when the other thread (the pump or the reaper, whichever saw it second) already
+    had: both notice a dead round, and the second must not end the session the first restarted.
+    One round only: every round after it decodes on the CPU."""
+    with _lock:
+        if session.restarted_from is proc:
+            return True
+    if not session.gpu_decode:
+        return False
+    line = gpu_decode_failure(session.stderr_path)
+    if not line:
+        return False
+    note = _restart_note(session, line)
+    with _lock:
+        ours = (session.proc is proc and session.live and not session._finishing
+                and session.gpu_decode)
+        if ours:
+            session.gpu_decode = False
+            session.decode_note = note
+            session.proc = None
+            session.restarted_from = proc
+            session.restart_round = True
+            session.state = STATE_STARTING
+            session.round_started_mono = time.monotonic()
+            round_no = session.round_no
+    if not ours:
+        return False
+    _kill_round(proc)
+    _drop_round_files(session, round_no)
+    log.warning('Preview %s: %s - round %d died decoding on the GPU (%s); the next round decodes '
+                'on the CPU', session.id, session.label, round_no, line)
+    return True
+
+
+# Ends that are no failure: logged at INFO, and a restart's decode_note stays off their detail.
+_ROUTINE_ENDS = (REASON_USER, REASON_REPLACED, REASON_CAPTURED, REASON_FILE_END,
+                 REASON_SEGMENT_CHANGED, REASON_CAPTURE_STOPPED, REASON_CONVERSION_STARTED,
+                 REASON_PLAY_ENDED)
 
 
 def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
@@ -903,6 +1147,7 @@ def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
     if not claimed:
         with session._teardown_lock:
             return False
+    quiet = reason in _ROUTINE_ENDS
     try:
         try:
             if session.source == SOURCE_FEED:
@@ -926,17 +1171,17 @@ def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
             finally:
                 if session.dir:
                     shutil.rmtree(session.dir, ignore_errors=True)
+        if session.decode_note and not quiet:
+            # A failure after a restart on the CPU: the GPU death that caused the restart (and the
+            # reconnect it took) is part of why, so it stays in what the viewer reads.
+            detail = '\n'.join(t for t in (session.decode_note, detail) if t)
         with _lock:
             session.state = STATE_STOPPED
             session.reason = reason
             session.detail = detail
     finally:
         session._teardown_lock.release()
-    level = (logging.INFO if reason in (REASON_USER, REASON_REPLACED, REASON_CAPTURED,
-                                        REASON_FILE_END, REASON_SEGMENT_CHANGED,
-                                        REASON_CAPTURE_STOPPED, REASON_CONVERSION_STARTED,
-                                        REASON_PLAY_ENDED)
-             else logging.WARNING)
+    level = logging.INFO if quiet else logging.WARNING
     log.log(level, 'Preview %s: %s stopped - %s%s', session.id, session.label, reason,
             f' ({detail})' if detail else '')
     return True
@@ -1197,6 +1442,8 @@ def _check(session: PreviewSession):
     proc = session.proc
     rc = proc.poll() if proc is not None else None
     if rc is not None:
+        if rc != 0 and _restart_on_cpu(session, proc):
+            return
         tail = mask_creds_in_text(read_stderr_tail(session.stderr_path))
         _finish(session, REASON_FFMPEG_EXITED,
                 detail=stream_stop_detail(tail, f'ffmpeg exited with code {rc}'))
@@ -1205,7 +1452,7 @@ def _check(session: PreviewSession):
     if session.state == STATE_STARTING:
         if _playlist_is_playable(session.playlist_path):
             _mark_ready(session, now)
-        elif now - session.started_mono > session.connect_timeout:
+        elif now - _connect_clock(session) > session.connect_timeout:
             tail = mask_creds_in_text(read_stderr_tail(session.stderr_path))
             _finish(session, REASON_CONNECT_TIMEOUT, detail=stream_stop_detail(tail))
             _roll_if_unresolved(session, tail)
@@ -1229,6 +1476,8 @@ def _check_feed(session: PreviewSession):
     if rc is not None:
         with _lock:
             still = session.proc is proc
+        if still and rc != 0 and _restart_round_on_cpu(session, proc):
+            return
         if still:
             # Not a round the pump ended at a mark: _end_round() takes proc off before the kill.
             tail = read_stderr_tail(session.stderr_path) if session.stderr_path else ''
@@ -1249,6 +1498,12 @@ def _check_feed(session: PreviewSession):
             return
     if now - session.started_mono > session.max_seconds:
         _finish(session, REASON_MAX_DURATION)
+
+
+def _connect_clock(session: PreviewSession) -> float:
+    """When the connect timeout started counting: the launch, or the CPU restart after a GPU
+    decode died, which gets a whole timeout of its own."""
+    return session.restarted_mono or session.started_mono
 
 
 def _mark_ready(session: PreviewSession, now: float) -> None:
@@ -1274,6 +1529,8 @@ def _check_file(session: PreviewSession):
     proc = session.proc
     rc = proc.poll() if proc is not None else None
     if rc is not None and not session.source_done:
+        if rc != 0 and _restart_on_cpu(session, proc):
+            return
         if rc != 0:
             _finish(session, REASON_READ_FAILED,
                     detail=f'ffmpeg exited with code {rc}: '
@@ -1291,7 +1548,7 @@ def _check_file(session: PreviewSession):
     if session.state == STATE_STARTING:
         if _playlist_is_playable(session.playlist_path):
             _mark_ready(session, now)
-        elif now - session.started_mono > session.connect_timeout:
+        elif now - _connect_clock(session) > session.connect_timeout:
             _finish(session, REASON_CONNECT_TIMEOUT,
                     detail=read_stderr_tail(session.stderr_path))
             return

@@ -208,8 +208,10 @@
     const playingText = () => {
       if (session && session.reencode) {
         const where = capture && atLive() ? 'Live, about ten seconds behind the capture. ' : '';
+        // A re-encode that restarted decoding on the CPU says so (dev/changelog/1688).
+        const restarted = session.decode_note ? `\n${session.decode_note}` : '';
         return `Playing. ${where}ChannelBin re-encodes the video on the GPU, and the audio to AAC, ` +
-          'so this browser can play it; skipping starts it again at the new spot.';
+          `so this browser can play it; skipping starts it again at the new spot.${restarted}`;
       }
       const audio = session && session.transcode_audio
         ? ' Audio is re-encoded to AAC so the browser can decode it.' : '';
@@ -390,6 +392,10 @@
         .then((s) => {
           if (isClosed() || token !== gen || !session) return;
           if (s.state === 'STOPPED') { ended(s); return; }
+          if (s.decode_note && s.decode_note !== session.decode_note) {
+            session.decode_note = s.decode_note;
+            setStatus(attached && !video.paused ? playingText() : s.decode_note, 'warn');
+          }
           if (s.state === 'READY' && !attached && !hls) {
             setStatus(`${reencode ? 'Starting the re-encode' : 'Starting'} ${atLive() ? 'live' : `at ${fmtDur(held)}`}…`);
             attach(token);
@@ -493,7 +499,7 @@
       pauseBtn.textContent = 'Pause';
       const woke = data.opened_seconds >= WOKE_NOTE_AFTER_S
         ? ` The storage took ${Math.round(data.opened_seconds)}s to answer.` : '';
-      setStatus(playingText() + woke, 'ok');
+      setStatus(playingText() + woke, session && session.decode_note ? 'warn' : 'ok');
     });
     video.addEventListener('pause', () => {
       if (switching || isClosed() || !attached || video.ended) return;

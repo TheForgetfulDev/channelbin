@@ -385,11 +385,13 @@
             <span class="d-name">{{ s.label }}</span>
             {%- if s.showing %}
             <span class="d-meta">ChannelBin's own picture of the coming games</span>
-            {%- else %}
+            {%- elif s.on_card %}
+            <span class="d-meta">on its card{% if s.card_text %}: {{ s.card_text }}{% endif %}</span>
+            {%- elif s.waiting %}
             <span class="d-meta">on the waiting screen{% if s.waiting_for %}, waiting for {{ s.waiting_for }}{% endif %} &middot; it stops when the game comes on</span>
             {%- endif %}
           </span>
-          <span class="d-cell d-badge">{{ m.status_badge('b-running', 'UP NEXT') if s.showing else m.status_badge('b-sched', 'WAITING SCREEN') }}</span>
+          <span class="d-cell d-badge">{% if s.showing %}{{ m.status_badge('b-running', 'UP NEXT') }}{% elif s.on_card %}{{ m.status_badge('b-sched', 'CARD') }}{% elif s.waiting %}{{ m.status_badge('b-sched', 'WAITING SCREEN') }}{% endif %}</span>
           <span class="d-cell"><span class="d-k">When</span>{{ s.started_at | local_time_only }}</span>
           <span class="d-cell"><span class="d-k">IPTV player</span>{{ s.client }}</span>
           <span class="d-cell"></span>
@@ -428,6 +430,7 @@
             <span class="d-meta">
               {%- if s.showing %}ChannelBin's own picture of the coming games &middot; not counted against the limit
               {%- elif s.waiting %}on the waiting screen{% if s.waiting_for %}, waiting for {{ s.waiting_for }}{% endif %} &middot; not counted against the limit
+              {%- elif s.on_card %}on its card{% if s.card_text %}: {{ s.card_text }}{% endif %} &middot; not counted against the limit
               {%- elif s.state != 'STOPPED' %}playing {{ s.channel_name }}
               {%- else %}{{ s.reason_text }}{% if s.detail %} {{ s.detail }}{% endif %}{% endif -%}
               {%- if s.failovers %} &middot; moved {{ s.failovers | length }}x{% endif -%}
@@ -436,6 +439,7 @@
           <span class="d-cell d-badge">
             {%- if s.showing %}{{ m.status_badge('b-running', 'UP NEXT') }}
             {%- elif s.waiting %}{{ m.status_badge('b-sched', 'WAITING SCREEN') }}
+            {%- elif s.on_card %}{{ m.status_badge('b-sched', 'CARD') }}
             {%- elif s.state != 'STOPPED' %}{{ m.status_badge('b-running', 'WATCHING', pulse=true) }}
             {%- else %}{{ m.status_badge('b-abort', 'ENDED') }}{% endif -%}
           </span>
