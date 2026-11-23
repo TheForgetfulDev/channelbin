@@ -5,7 +5,8 @@ app/connection_limits.py, app/routes/providers.py; DESIGN-account-providers.md Â
 The properties guarded here, each of which fails in its own way:
 
   * a login is shared only between accounts on one provider, never across two or with
-    none, and never onto an account already holding that username or name;
+    none, and never onto an account already holding a row the user typed with that
+    username and password, or that name;
   * an account leaving or moving off a provider stops sharing what it shared there, and
     keeps what only it holds; deleting a provider unlinks its accounts and leaves their
     hosts, logins and shares alone;
@@ -106,10 +107,13 @@ class ShareTests(_Case):
         with self.assertRaises(ValueError):
             links.share_login(main, self.dir_id)
 
-    def test_sharing_refuses_a_username_or_name_the_target_already_lists(self):
+    def test_sharing_refuses_a_credential_or_name_the_target_already_lists(self):
+        """A row the user typed with the same username and password is refused. The target's
+        own sync-listed playlist copy is replaced instead (tests/test_share_playlist_login.py,
+        dev/changelog/1692)."""
         self._provider(self.cur_id, self.dir_id)
-        main = links.add_login(self.cur_id, 'main', 'main', 'pw1', 1).id
-        links.add_login(self.dir_id, 'other', 'main', 'pw9', 1)
+        main = links.add_login(self.cur_id, 'main', 'backend', 'pwB', 1).id
+        links.add_login(self.dir_id, 'other', 'backend', 'pwB', 1)
         with self.assertRaises(ValueError):
             links.share_login(main, self.dir_id)
         spare = links.add_login(self.cur_id, 'spare', 'spare', 'pw2', 1).id

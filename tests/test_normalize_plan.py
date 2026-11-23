@@ -197,13 +197,43 @@ class GatherTests(unittest.TestCase):
         self.assertTrue(src.mixed_resolution)
         self.assertEqual(src.channels, (2, 6))
 
-    def test_single_format_needs_the_survey(self):
-        """GPU decode is refused unless the whole file was read and held one format."""
+    def test_gpu_decode_needs_the_survey(self):
+        """Unknown is not proof: a file the survey did not read whole decodes on the CPU."""
         rows_only = nz.gather_source_formats([('1920x1080', 59.94, 2, False)], {}, {},
                                              HDR_TRANSFERS)
-        self.assertFalse(rows_only.single_format)
-        self.assertTrue(_src(HD1080, rates=(59.94,)).single_format)
-        self.assertFalse(_src(HD720, HD1080).single_format)
+        self.assertIn('survey', rows_only.gpu_decode_blocker)
+        self.assertEqual(_src(HD1080, rates=(59.94,)).gpu_decode_blocker, '')
+
+    def test_a_change_of_size_or_rate_does_not_block_gpu_decode(self):
+        """The size change died only on ffmpeg's own output scaler, which -noautoscale turns
+        off (dev/docs/BUGS.md 2026-11-22 03:34 PM)."""
+        self.assertEqual(_src(HD720, HD1080, rates=(29.97, 59.94)).gpu_decode_blocker, '')
+
+    def test_a_pixel_aspect_change_at_one_size_blocks_gpu_decode(self):
+        """The GPU fit is worked out per graph build, and ffmpeg does not rebuild for SAR."""
+        src = _src((720, 480), (720, 480), sars=[8 / 9, 32 / 27])
+        self.assertIn('pixel aspect', src.gpu_decode_blocker)
+        self.assertEqual(_src((720, 480), HD1080, sars=[8 / 9, 1.0]).gpu_decode_blocker, '')
+
+    def test_interlaced_and_progressive_together_block_gpu_decode(self):
+        """deinterlace_vaapi at field rate doubles every progressive frame."""
+        both = nz.gather_source_formats(
+            [('1920x1080', 59.94, 2, False), ('1920x1080', 59.94, 2, True)],
+            {'video_sizes': [[1920, 1080, 1.0]], 'interlaced': True, 'keyframes': 4},
+            {}, HDR_TRANSFERS)
+        self.assertTrue(both.interlaced and both.progressive)
+        self.assertIn('interlaced and progressive', both.gpu_decode_blocker)
+        surveyed = _src(HD1080, interlaced=True)
+        self.assertEqual(surveyed.gpu_decode_blocker, '')
+        unknown_rows = nz.gather_source_formats(
+            [('1920x1080', 59.94, 2, None)],
+            {'video_sizes': [[1920, 1080, 1.0]], 'interlaced': True, 'keyframes': 4},
+            {}, HDR_TRANSFERS)
+        self.assertFalse(unknown_rows.progressive)
+        survey_both = nz.gather_source_formats(
+            [], {'video_sizes': [[1920, 1080, 1.0]], 'interlaced': True, 'progressive': True,
+                 'keyframes': 4}, {}, HDR_TRANSFERS)
+        self.assertIn('interlaced and progressive', survey_both.gpu_decode_blocker)
 
 
 class FilterChainTests(unittest.TestCase):
@@ -226,6 +256,17 @@ class FilterChainTests(unittest.TestCase):
         self.assertTrue(h264.endswith('format=p010,hwupload,' + nz.TONEMAP_VAAPI))
         self.assertIn(nz.TONEMAP_VAAPI, nz.gpu_decode_filter(plan, hevc=False))
         self.assertIn('format=p010', nz.gpu_decode_filter(plan, hevc=True))
+
+    def test_the_gpu_decode_chain_fits_by_display_aspect_and_pads_on_the_device(self):
+        """scale_vaapi's own aspect option reads the coded size: a 720x480 4:3 picture came out
+        1620 wide, not 1440 (dev/docs/BUGS.md 2026-11-22 03:34 PM)."""
+        plan = nz.plan_normalize(_src(HD720, HD1080))
+        chain = nz.gpu_decode_filter(plan, hevc=False)
+        self.assertIn("scale_vaapi=w='if(gt(dar,1920/1080),1920,trunc(1080*dar/2)*2)'", chain)
+        self.assertIn('pad_vaapi=w=1920:h=1080:x=(ow-iw)/2:y=(oh-ih)/2', chain)
+        self.assertNotIn('force_original_aspect_ratio', chain)
+        self.assertTrue(chain.endswith('setsar=1'))
+        self.assertEqual(nz.GPU_DECODE_OUTPUT_ARGS, ['-noautoscale'])
 
     def test_deinterlacing_comes_first(self):
         plan = nz.plan_normalize(_src(HD1080, rates=(29.97,), interlaced=True))

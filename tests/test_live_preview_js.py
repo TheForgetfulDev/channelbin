@@ -8,6 +8,7 @@ What the browser half promises:
   * the failure is the browser's own words, never a guess at the codec
   * the copy's session is let go at once, and a GPU re-encode is offered; pressing it starts a
     new session that asks for the re-encode, and playing says the video is re-encoded
+  * a re-encode restarted on the CPU after its GPU decode died says so (dev/changelog/1688)
   * a re-encode that fails too says so and offers nothing more
   * with no GPU, the server's reason stands where the button would be
 
@@ -75,6 +76,18 @@ class LivePreviewDecodeFailureTests(unittest.TestCase):
         self.assertEqual(p['kind'], 'ok')
         self.assertIn('re-encodes the video on the GPU', p['status'])
 
+    def test_a_restart_on_the_cpu_is_said_when_it_happens_and_while_playing(self):
+        """A re-encode whose GPU decode died is restarted on the CPU by the server, and the
+        dialog says so - at the poll that first carries the note, and in the playing status after
+        it (dev/changelog/1688)."""
+        n = self.obs['restartNoted']
+        self.assertEqual(n['kind'], 'warn')
+        self.assertTrue(n['status'].startswith('The GPU could not decode this channel'), n['status'])
+        p = self.obs['restartPlaying']
+        self.assertEqual(p['kind'], 'warn')
+        self.assertIn('re-encodes the video on the GPU', p['status'])
+        self.assertIn('restarted it decoding on the CPU', p['status'])
+
     def test_a_failed_reencode_says_so_and_offers_nothing_more(self):
         f = self.obs['reencodeFailed']
         self.assertTrue(f['status'].startswith('This browser could not play the re-encoded video: '
@@ -119,3 +132,14 @@ class FeedPreviewRoundTests(unittest.TestCase):
         self.assertEqual(r2['made'], 2)
         self.assertEqual(r2['url'], '/api/preview/f1/index.m3u8?round=2')
         self.assertTrue(r2['status'].startswith('Playing what an IPTV player gets: "Local game".'), r2['status'])
+
+    def test_a_round_restarted_on_the_cpu_is_named_as_that(self):
+        """A feed round that died decoding on the GPU comes back as a new round; the player says
+        it restarted on the CPU and why, never that the output moved (dev/changelog/1688)."""
+        r = self.obs['feedRestarting']
+        self.assertEqual(r['kind'], 'warn')
+        self.assertIn('restarted it decoding on the CPU', r['status'])
+        self.assertNotIn('moved to another source', r['status'])
+        done = self.obs['feedRestarted']
+        self.assertEqual(done['status'], 'Restarted decoding on the CPU - starting playback…')
+        self.assertEqual(done['url'], '/api/preview/f1/index.m3u8?round=3')

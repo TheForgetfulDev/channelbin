@@ -432,6 +432,25 @@ def fold_account_pool(account_id: int) -> Optional[int]:
     return target[1]
 
 
+def merge_login_pool(from_login_id: int, to_login_id: int) -> int:
+    """Move every holder counted on one login's pool onto another's, for a login row that was
+    deleted because another row carrying the same username and password took its place
+    (account_links.share_login). It is one credential at the provider, so a recording already
+    seated on the old row still holds one of its seats; left behind, it would count against
+    nothing and a second stream could open on a one-connection login. Returns how many moved."""
+    source, target = login_pool(from_login_id), login_pool(to_login_id)
+    with _lock:
+        held = _holders.pop(source, [])
+        for key in held:
+            _holders[target].append(key)
+            if key in _seat_of:
+                _seat_of[key] = (_seat_of[key][0], target)
+    if held:
+        log.info('Login %d replaced by login %d: %d seat(s) moved with it',
+                 from_login_id, to_login_id, len(held))
+    return len(held)
+
+
 def held_login_id(holder_kind: str, holder_id) -> Optional[int]:
     """The login the holder's seat is on, or None (no seat, or the account's own pool).
     What a launch site asks before rendering the capture URL."""
@@ -467,12 +486,23 @@ def at_limit(account_id: int) -> bool:
         return all(len(_held_in(pool)) >= limit for pool, limit, _ in pools)
 
 
-#: seat_standing()'s answers, best first: a seat nobody is in; a seat only by cutting off an
-#: IPTV player on the output feed (a recording's question only - a viewer cuts nobody); none.
+#: seat_standing()'s answers, best first: a seat nobody is in; a seat only by taking it from a
+#: picture-in-picture picture no TV has as its big picture, which leaves every TV a picture
+#: (dev/docs/DESIGN-pip-channels.md 8.2); a seat only by cutting off an IPTV player on the output
+#: feed; none. The middle two are a recording's question only - a viewer cuts nobody.
 SEAT_FREE = 'free'
+SEAT_BY_PAUSING_PICTURE = 'by_pausing_picture'
 SEAT_BY_CUTTING_VIEWER = 'by_cutting_viewer'
 SEAT_NONE = 'none'
-SEAT_STANDINGS = (SEAT_FREE, SEAT_BY_CUTTING_VIEWER, SEAT_NONE)
+SEAT_STANDINGS = (SEAT_FREE, SEAT_BY_PAUSING_PICTURE, SEAT_BY_CUTTING_VIEWER, SEAT_NONE)
+
+#: How readily a 'viewer' holder gives its seat to a recording, first to last
+#: (output_feed.viewer_give_way() says which each is; a holder it does not name is WATCHED): a
+#: picture-in-picture picture no TV is on any more; one that is the small picture for every TV
+#: on it; anything a TV would lose its picture without.
+VIEWER_UNWATCHED = 0
+VIEWER_SMALL_PICTURE = 1
+VIEWER_WATCHED = 2
 
 
 def seat_standing(account_ids, holder_kind: str, exclude_holder=None) -> dict:
@@ -485,7 +515,9 @@ def seat_standing(account_ids, holder_kind: str, exclude_holder=None) -> dict:
     (recorder._try_acquire_slot_with_preemption) and never makes an account less free. An IPTV
     player is preempted too, but cutting one off is a cost a viewer sees, so an account whose
     only free seats are a viewer's answers SEAT_BY_CUTTING_VIEWER and an empty one is preferred
-    over it. Only other recordings make an account SEAT_NONE - and a viewer the preemption would
+    over it. Between the two is SEAT_BY_PAUSING_PICTURE: the seats it would take are all held
+    by picture-in-picture pictures no TV has as its big one (viewer_give_way()), so every TV
+    keeps a picture. Only other recordings make an account SEAT_NONE - and a viewer the preemption would
     leave seated, one on its account's held seats (dev/changelog/1536), which counts as one.
 
     For a 'viewer': the question try_acquire() would answer - a viewer preempts nobody, so every
@@ -519,6 +551,7 @@ def seat_standing(account_ids, holder_kind: str, exclude_holder=None) -> dict:
     # The viewers a recording's preemption leaves seated (preempt_viewers_for_slot keeps up to
     # an account's held seats, dev/changelog/1536) are in its way as surely as a recording.
     held = {} if holder_kind == 'viewer' else held_seats_now(None, cfg)
+    give_way = {} if holder_kind == 'viewer' else viewer_give_way()
     out = {}
     with _lock:
         for account_id in ids:
@@ -533,35 +566,50 @@ def seat_standing(account_ids, holder_kind: str, exclude_holder=None) -> dict:
             # across all of them (_strip_kind's `keep`), not up to that many in each.
             kept: dict = defaultdict(int)
             for pool, limit, _ in pools:
-                hard, soft = _in_the_way(pool, holder_kind, exclude_holder, held, kept)
+                hard, soft, light = _in_the_way(pool, holder_kind, exclude_holder, held, kept, give_way)
                 if hard + soft < limit:
                     best = SEAT_FREE
                     break
-                if hard < limit:
-                    best = SEAT_BY_CUTTING_VIEWER
+                if hard >= limit:
+                    continue
+                # The preemption takes one viewer at a time, the readiest to give way first
+                # (preempt_viewers_for_slot), so this many go before a seat is free.
+                needed = hard + soft - limit + 1
+                here = SEAT_BY_PAUSING_PICTURE if light >= needed else SEAT_BY_CUTTING_VIEWER
+                best = min(best, here, key=SEAT_STANDINGS.index)
             out[account_id] = best
     return out
 
 
-def _in_the_way(pool, holder_kind: str, exclude_holder, held: dict, kept: dict) -> tuple:
+def viewer_give_way() -> dict:
+    """{a 'viewer' holder's id: VIEWER_*} for the holders that give way before a watched play
+    does: the picture-in-picture pictures only the output's own code can tell apart."""
+    from .output_feed import viewer_give_way as ask
+    return ask()
+
+
+def _in_the_way(pool, holder_kind: str, exclude_holder, held: dict, kept: dict,
+                give_way: dict) -> tuple:
     """(holders a `holder_kind` holder would have to wait on in `pool`, viewers it could cut off
-    instead). `kept` counts, per account, the viewers already found on its held seats in the
-    pools before this one. The caller holds _lock."""
+    instead, how many of those are not VIEWER_WATCHED). `kept` counts, per account, the viewers
+    already found on its held seats in the pools before this one; the held seats go to the
+    watched viewers first, as _strip_kind keeps them. The caller holds _lock."""
     others = [h for h in _held_in(pool) if h != exclude_holder]
     if holder_kind == 'viewer':
-        return len(others), 0
-    hard = soft = 0
-    for h in others:
-        if h[0] == 'recording':
+        return len(others), 0, 0
+    hard = soft = light = 0
+    hard += sum(1 for h in others if h[0] == 'recording')
+    viewers = sorted((h for h in others if h[0] == 'viewer'),
+                     key=lambda h: -give_way.get(h[1], VIEWER_WATCHED))
+    for h in viewers:
+        owner = _account_of(pool, h)
+        if kept[owner] < held.get(owner, 0):
+            kept[owner] += 1
             hard += 1
-        elif h[0] == 'viewer':
-            owner = _account_of(pool, h)
-            if kept[owner] < held.get(owner, 0):
-                kept[owner] += 1
-                hard += 1
-            else:
-                soft += 1
-    return hard, soft
+        else:
+            soft += 1
+            light += give_way.get(h[1], VIEWER_WATCHED) != VIEWER_WATCHED
+    return hard, soft, light
 
 
 def accounts_without_free_recording_slot(account_ids, exclude_holder=None) -> set:
@@ -698,7 +746,8 @@ def release(account_id: int, holder_kind: str, holder_id):
             _holders.pop(pool, None)
 
 
-def _strip_kind(account_id: int, holder_kind: str, keep: Optional[dict] = None) -> List[tuple]:
+def _strip_kind(account_id: int, holder_kind: str, keep: Optional[dict] = None,
+                give_way: Optional[dict] = None, at_most: Optional[int] = None) -> List[tuple]:
     """Release every holder of one kind that a recording on account_id would need the seat
     of, and return (holder_id, account the holder came through) pairs.
 
@@ -708,18 +757,23 @@ def _strip_kind(account_id: int, holder_kind: str, keep: Optional[dict] = None) 
     counted to this account in a pool its list no longer names (a login removed while the
     seat was held), which is still this account's connection on the provider.
 
-    `keep` ({account the holder came through: how many}) leaves that many of them seated,
-    the earliest first: the ones whose release would free nothing a recording may use."""
+    `keep` ({account the holder came through: how many}) leaves that many of them seated:
+    the ones whose release would free nothing a recording may use. `give_way` ({holder id:
+    VIEWER_*}) orders them: the holders readiest to give way are released first and kept
+    last, the earliest first among equals. `at_most` releases no more than that many."""
     seats = _seats_now([account_id]).get(account_id, [])
     pools = {login_pool(lid) for lid, _, _ in seats} if seats else {account_id}
     left = dict(keep or {})
-    stripped = []
+    ranks = give_way or {}
 
     def kept(owner) -> bool:
         if left.get(owner, 0) > 0:
             left[owner] -= 1
             return True
         return False
+
+    def rank(found) -> int:
+        return ranks.get(found[1][1], VIEWER_WATCHED)
 
     with _lock:
         # A kept holder that is not in the way (another pool of its own account) uses up its
@@ -729,18 +783,19 @@ def _strip_kind(account_id: int, holder_kind: str, keep: Optional[dict] = None) 
                 owner = _account_of(pool, h)
                 if h[0] == holder_kind and not (pool in pools or owner == account_id):
                     kept(owner)
-        for pool in list(_holders):
+        mine = [(pool, h, _account_of(pool, h)) for pool in list(_holders) for h in _holders[pool]
+                if h[0] == holder_kind and (pool in pools or _account_of(pool, h) == account_id)]
+        going = [found for found in sorted(mine, key=rank, reverse=True) if not kept(found[2])]
+        going.sort(key=rank)
+        if at_most is not None:
+            going = going[:at_most]
+        for pool, h, _ in going:
             holders = _holders[pool]
-            mine = [(h, _account_of(pool, h)) for h in holders if h[0] == holder_kind
-                    and (pool in pools or _account_of(pool, h) == account_id)]
-            mine = [(h, owner) for h, owner in mine if not kept(owner)]
-            for h, _ in mine:
-                holders.remove(h)
-                _seat_of.pop(h, None)
-            stripped.extend(mine)
+            holders.remove(h)
+            _seat_of.pop(h, None)
             if not holders:
                 _holders.pop(pool, None)
-    return [(h[1], owner if owner is not None else account_id) for h, owner in stripped]
+    return [(h[1], owner if owner is not None else account_id) for _, h, owner in going]
 
 
 def preempt_tests_for_slot(account_id: int) -> List[tuple]:
@@ -756,17 +811,21 @@ def preempt_tests_for_slot(account_id: int) -> List[tuple]:
     return _strip_kind(account_id, 'test')
 
 
-def preempt_viewers_for_slot(account_id: int) -> List[tuple]:
-    """Release every 'viewer'-kind holder a recording on account_id needs the seat of and
+def preempt_viewers_for_slot(account_id: int, at_most: Optional[int] = None) -> List[tuple]:
+    """Release the 'viewer'-kind holders a recording on account_id needs the seat of and
     return (relay session id, account the viewer came through) pairs, so recorder.py can
-    end the session through app/output_feed.py. An IPTV player is lowest in the order: the
+    end the session through app/output_feed.py. The recorder asks for one at a time
+    (`at_most`) and stops when it has its seat, so a recording that needs one connection
+    cuts one viewer; the readiest to give way goes first, a picture-in-picture channel's
+    small picture before anything a TV would lose its picture without
+    (dev/docs/DESIGN-pip-channels.md 8.2). An IPTV player is lowest in the order: the
     recorder asks this before the preview strip, since a viewer can resume on its own and
     a recording is what the app is for (DESIGN-output-feed.md 4.4).
 
     A viewer sitting on one of its account's held seats is left alone: recordings never get
     those seats, so ending the play would free nothing they may use (dev/changelog/1536)."""
     from .output_feed import held_seats_now
-    return _strip_kind(account_id, 'viewer', held_seats_now(None))
+    return _strip_kind(account_id, 'viewer', held_seats_now(None), viewer_give_way(), at_most)
 
 
 def preempt_previews_for_slot(account_id: int) -> List[tuple]:

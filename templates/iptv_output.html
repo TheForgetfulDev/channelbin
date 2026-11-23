@@ -128,9 +128,9 @@
           <tr>
             <td data-label="IPTV player" class="rl-when"><span class="day">{{ s.client }}</span></td>
             <td data-label="Channel" class="rl-prog">{% if s.row_url %}<a class="t name-link" href="{{ s.row_url }}">{{ s.name }}</a>{% else %}<span class="t">{{ s.name }}</span>{% endif %}<span class="s">{{ s.kind_text }}</span></td>
-            <td data-label="Program" class="rl-prog">{% if s.showing %}<span class="t">The coming games</span>{% elif s.waiting %}<span class="t">{{ s.waiting_text }}</span>{% elif s.program %}<span class="t">{{ s.program }}</span>{% if s.program_times %}<span class="s">{{ s.program_times }}</span>{% endif %}{% else %}<span class="sp-none">No listing in the guide right now</span>{% endif %}</td>
-            <td data-label="Playing from" class="rl-prog of-plays">{% if s.showing %}<span class="t">The Up next picture</span><span class="s tip-plain" data-tip="ChannelBin's own picture of the coming games. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;.">Not counted against the limit</span>{% elif s.waiting %}<span class="t">The waiting screen</span><span class="s tip-plain" data-tip="ChannelBin's own picture of what is on next. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;.{% if redirect %} In redirect mode it stops when the game comes on, and the player tunes in again to watch it.{% else %} The game starts here by itself when it comes on.{% endif %}">Not counted against the limit</span>{% else %}<a class="name-link" href="{{ s.channel_url }}">{{ s.channel_name }}</a>{{ acct(s.account) }}{% endif %}{% if s.from_screen %}<span class="s">{{ s.from_screen }}</span>{% endif %}{% if s.moves %}<span class="s tip-plain" data-tip="{{ s.moves_tip }}">Moved to another channel {{ s.moves_text }}</span>{% endif %}{% if s.notes %}<span class="s text-warning">{{ s.notes }}</span>{% endif %}{% if s.reserve_note %}<span class="s text-warning">{{ s.reserve_note }}</span>{% endif %}</td>
-            <td data-label="Status">{% if s.starting %}<span class="badge b-sched tip-plain" data-tip="The stream has been asked for and nothing has reached the IPTV player yet.">Connecting</span>{% elif s.showing %}<span class="badge b-running tip-plain" data-tip="An Up next channel: ChannelBin's own picture of the coming games.">Up next</span>{% elif s.waiting %}<span class="badge b-sched tip-plain" data-tip="The sports channel has no game to play right now, so the IPTV player is shown what is on next.">Waiting screen</span>{% else %}<span class="badge b-running"><span class="pulse"></span>Watching</span>{% endif %}</td>
+            <td data-label="Program" class="rl-prog">{% if s.showing %}<span class="t">The coming games</span>{% elif s.pip %}<span class="t">{{ s.pip.big }}</span><span class="s">and {{ s.pip.small }}</span>{% elif s.on_card %}<span class="t">Nothing set up</span>{% elif s.waiting %}<span class="t">{{ s.waiting_text }}</span>{% elif s.program %}<span class="t">{{ s.program }}</span>{% if s.program_times %}<span class="s">{{ s.program_times }}</span>{% endif %}{% else %}<span class="sp-none">No listing in the guide right now</span>{% endif %}</td>
+            <td data-label="Playing from" class="rl-prog of-plays">{% if s.showing %}<span class="t">The Up next picture</span><span class="s tip-plain" data-tip="ChannelBin's own picture of the coming games. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;.">Not counted against the limit</span>{% elif s.on_card %}<span class="t">Its card{% if s.card_text %}: {{ s.card_text }}{% endif %}</span><span class="s tip-plain" data-tip="ChannelBin's own picture saying why nothing is playing. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;. When its picture can play, it comes on here by itself.">Not counted against the limit</span>{% elif s.waiting %}<span class="t">The waiting screen</span><span class="s tip-plain" data-tip="ChannelBin's own picture of what is on next. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;.{% if redirect %} In redirect mode it stops when the game comes on, and the player tunes in again to watch it.{% else %} The game starts here by itself when it comes on.{% endif %}">Not counted against the limit</span>{% elif s.pip_live %}{% for w in s.pip_live %}<span class="s{{ ' text-warning' if w.warn else '' }}"><span class="pip-k">{{ w.label }}</span>{% if w.channel %}<a class="name-link" href="{{ w.channel.url }}">{{ w.channel.name }}</a>{{ acct(w.account) }}{% else %}{{ w.text }}{% endif %}</span>{% endfor %}{% else %}{% if s.pip %}<span class="pip-k">Big</span>{% endif %}<a class="name-link" href="{{ s.channel_url }}">{{ s.channel_name }}</a>{{ acct(s.account) }}{% if s.pip %}<span class="s text-warning"><span class="pip-k">Small</span>Off, so the big picture plays alone. {{ s.combine_off }}</span>{% endif %}{% endif %}{% if s.from_screen %}<span class="s">{{ s.from_screen }}</span>{% endif %}{% if s.moves %}<span class="s tip-plain" data-tip="{{ s.moves_tip }}">Moved to another channel {{ s.moves_text }}</span>{% endif %}{% if s.notes %}<span class="s text-warning">{{ s.notes }}</span>{% endif %}{% if s.reserve_note %}<span class="s text-warning">{{ s.reserve_note }}</span>{% endif %}</td>
+            <td data-label="Status">{% if s.starting %}<span class="badge b-sched tip-plain" data-tip="The stream has been asked for and nothing has reached the IPTV player yet.">Connecting</span>{% elif s.showing %}<span class="badge b-running tip-plain" data-tip="An Up next channel: ChannelBin's own picture of the coming games.">Up next</span>{% elif s.on_card %}<span class="badge b-sched tip-plain" data-tip="The picture-in-picture channel has nothing to play right now, so the IPTV player is shown a card saying why.">Card</span>{% elif s.waiting %}<span class="badge b-sched tip-plain" data-tip="The sports channel has no game to play right now, so the IPTV player is shown what is on next.">Waiting screen</span>{% else %}<span class="badge b-running"><span class="pulse"></span>Watching</span>{% endif %}</td>
             <td data-label="For" class="num">{{ '-' if s.starting else s.elapsed }}</td>
             <td data-label="Sent" class="num">{{ s.sent }}</td>
             <td data-label="" class="sp-kebab"><span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
@@ -145,11 +145,50 @@
   </div>
   {% endif %}
 
+  <div class="card{{ ' of-inert' if dormant else '' }}" id="of-pip"{{ ' inert' if dormant else '' }}>
+    <div class="card-head"><h2>Picture-in-picture channels{% if pips %} <span class="cnt">{{ pips | length }}</span>{% endif %}</h2>
+      <div class="card-head-actions"><button class="btn btn-sm" data-act="pip-add">{{ icon('add') }}Create a PiP channel</button></div></div>
+    <div class="card-body">
+      <p class="card-note">Each of these is a channel an IPTV player sees, showing two pictures at once: a big one and a small one. Choose what each shows here: a game, a channel or a channel group, or a search for channels by name. Your IPTV player keeps the list of channels it was given, so these channels stay on it whether or not anything is set up. One with nothing set up says so on the TV.</p>
+      {% if pip_gpu_why %}<div class="notice notice-warn"><div><strong>These channels play their big picture alone right now, with no small picture.</strong> Two pictures are combined only on a GPU, and that is not working here: {{ pip_gpu_why }} <a href="{{ url_for('system.readiness_page') }}">Readiness</a> has the check, under "The GPU can combine two pictures".</div></div>
+      {% endif %}
+      {% if pips %}
+      <div class="table-scroll"><table class="tbl tbl-cards rl-tbl">
+        <thead><tr><th class="tip-plain" data-tip="The channel number the IPTV player shows. A swapped copy is the number after it.">#</th><th>Channel</th><th>Big picture</th><th>Small picture</th><th class="tip-plain" data-tip="A second channel, right after this one, with the two pictures the other way around.">Swapped copy</th><th></th></tr></thead>
+        <tbody>
+          {% for p in pips %}
+          <tr{{ ' class="of-off"' | safe if not p.on else '' }} data-pip="{{ p.id }}" data-name="{{ p.name }}" data-twin="{{ p.twin_name }}" data-set="{{ 1 if p.set else 0 }}" data-watching="{{ p.watching }}" data-spec="{{ p.spec | tojson | forceescape }}">
+            <td data-label="#" class="of-num">{{ p.num }}{% if p.swapped_copy %}<br><span class="tip-plain" data-tip="{{ p.twin_name }}">{{ p.twin_num }}</span>{% endif %}</td>
+            <td data-label="Channel"><div class="pip-ch"><div class="pip-thumb">
+                <div class="pip-tv"><div class="pip-pane{{ ' pip-half' if p.side else '' }}"{% if p.main_box %} style="{{ p.main_box }}"{% endif %}><div class="pip-ph"><div class="pip-ph-t"{% if p.big %} title="{{ p.big.title }}"{% endif %}>{{ p.big.short if p.big else 'Not chosen yet' }}</div></div></div><div class="pip-pane pip-inset{{ ' pip-half' if p.side else '' }}" style="{{ p.inset_box }}"><div class="pip-ph pip-ph-small"><div class="pip-ph-t"{% if p.small %} title="{{ p.small.title }}"{% endif %}>{{ p.small.short if p.small else 'Not chosen yet' }}</div></div></div></div></div>
+              <div class="rl-prog"><span class="t">{{ p.name }}</span><span class="s">{{ p.sub }}</span>{% if p.watching %}<span class="s">{{ p.watching }} IPTV player{{ ' is' if p.watching == 1 else 's are' }} watching it</span>{% endif %}</div></div></td>
+            {% for d in (p.big, p.small) %}
+            <td data-label="{{ 'Big picture' if loop.first else 'Small picture' }}" class="rl-prog">{% if d %}<span class="t{{ ' text-warning' if d.gone else '' }}">{{ d.title }}</span><span class="s">{{ d.sub }}</span>{% else %}<span class="sp-none">Nothing set up</span>{% endif %}</td>
+            {% endfor %}
+            <td data-label="Swapped copy" class="of-sw">{{ switch('pip-twin', p.id, p.swapped_copy, 'Also offer ' ~ p.name ~ ' swapped', not p.set, ('Also offer ' ~ p.twin_name ~ ', right after it, with the small picture big.') if p.set else 'Set it up first.') }}</td>
+            <td data-label="" class="of-prev"><span class="pip-acts">
+              {% if p.set %}{{ preview_btn(p.name, feed=p.feed_id) }}{% else %}<button class="btn btn-sm btn-primary" data-act="pip-setup">Set up</button>{% endif %}
+              <span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
+              <div class="menu pop-left">
+                <button class="menu-item" data-act="pip-setup">{{ 'Change' if p.set else 'Set up' }}</button>
+                <button class="menu-item" data-act="pip-swap"{{ '' if p.set else ' disabled' }}>Swap the two pictures</button>
+                <button class="menu-item" data-act="pip-clear"{{ '' if p.set else ' disabled' }}>Clear</button>
+                <button class="menu-item danger" data-act="pip-remove">Remove from the output</button>
+              </div></span></span></td>
+          </tr>
+          {% endfor %}
+        </tbody></table></div>
+      {% else %}
+      <p class="card-note">None yet. Create a PiP channel to make the first one.</p>
+      {% endif %}
+    </div>
+  </div>
+
   <div class="card{{ ' of-inert' if dormant else '' }}" id="of-channels"{{ ' inert' if dormant else '' }}>
     <div class="card-head"><h2>{{ 'Channels it will offer' if dormant else 'Channels on the output' }} <span class="cnt">{{ counts.on }}</span></h2>
       <div class="card-head-actions"><a class="btn btn-sm" href="{{ url_for('guide.guide') }}">TV Guide {{ icon('forward') }}</a></div></div>
     <div class="card-body">
-      <p class="card-note">These are the channels an IPTV player gets from ChannelBin: everything in your TV Guide, in the same order. Turn one off here and players stop seeing it, while it stays in your TV Guide. A channel group shows up in the player as a single channel. After them come ChannelBin's own: Up next, a picture of the coming games in everything you follow (off until you turn it on here), then each league's Up next channel and sports channels. Those are turned on from the league's page in Sports Schedules; a league's Up next channel can be turned off and on here too once it has been turned on there.</p>
+      <p class="card-note">These are the channels an IPTV player gets from ChannelBin: everything in your TV Guide, in the same order. Turn one off here and players stop seeing it, while it stays in your TV Guide. A channel group shows up in the player as a single channel. After them come ChannelBin's own: Up next, a picture of the coming games in everything you follow (off until you turn it on here), then each league's Up next channel and sports channels. Those are turned on from the league's page in Sports Schedules; a league's Up next channel can be turned off and on here too once it has been turned on there. Last come the picture-in-picture channels, each followed by its swapped copy when it has one.</p>
       {% if rows %}
       <div class="toolbar of-tools">
         <input class="search" id="of-q" type="search" placeholder="Search channels" aria-label="Search channels on the output">
@@ -179,6 +218,7 @@
                 {%- endif %}{% endif %}
                 {%- if r.channel_now %}{% set cn = r.channel_now %}<button class="btn btn-sm{{ ' disabled' if cn.why else '' }}" data-act="channel-now" data-event="{{ cn.event }}"{% if cn.why %} aria-disabled="true" data-why="{{ cn.why }}"{% endif %}>Channel it would use</button>{% endif %}</span>{% endif %}
               {%- elif r.is_up_next %}<span class="t">ChannelBin's own picture</span><span class="s">{{ r.note }}</span>
+              {%- elif r.is_pip %}{% if r.pip %}{% for w in r.pip %}<span class="s{{ ' text-warning' if w.warn else '' }}"><span class="pip-k">{{ w.label }}</span>{% if w.channel %}<a class="name-link" href="{{ w.channel.url }}">{{ w.channel.name }}</a>{{ acct(w.account) }}{% else %}{{ w.text }}{% endif %}</span>{% endfor %}{% else %}<span class="t">ChannelBin's own picture</span><span class="s">{{ r.note }}</span>{% endif %}
               {%- elif r.plays %}{% if r.plays.name %}<a class="name-link" href="{{ r.plays.url }}">{{ r.plays.name }}</a>{% endif %}{{ acct(r.plays.account) }}{% if r.note %}<span class="s">{{ r.note }}</span>{% endif %}
               {%- endif %}{% if r.how and not r.problem %}<span class="s tip-plain" data-tip="{{ r.how_tip }}">{{ r.how }}</span>{% endif %}</td>
             <td data-label="On the output" class="of-sw">{{ switch('row', r.feed_id, r.on, r.name ~ ' on the IPTV output', not r.switchable, r.switch_tip) }}</td>
@@ -289,7 +329,7 @@
         {% endcall %}
         {{ number_setting('xmltv_days', 'Days of guide it sends', 'How far ahead the guide the IPTV player downloads reaches.') }}
         {{ number_setting('sports_before_minutes', 'Sports channels: start early by (minutes)', 'A sports channel plays the channel listing its game this long before the listing starts, so tuning in early gets the pregame show. A game no guide lists, played from a channel whose name mentions it, starts this long before the time that name gives. 0 starts at the listing.') }}
-        {{ number_setting('sports_after_minutes', 'Sports channels: keep playing after (minutes)', 'And this long after the listing ends, because games run long. A game played from a channel\'s name has no listing to run past, so it stops where a recording of it would. 0 stops at the listing\'s end. A play already running is never cut.') }}
+        {{ number_setting('sports_after_minutes', 'Sports channels: keep playing after (minutes)', 'And this long after the listing ends, because games run long. A game played from a channel\'s name has no listing to run past, so it stops where a recording of it would. 0 stops at the listing\'s end. A play already running is never cut, even when its channel fails and it moves to another one carrying the game.') }}
         {% if relays_some %}
         {{ number_setting('max_viewers', 'IPTV players at once', 'One more than this is refused, and the refusal says so. ' ~ ('In mixed mode only plays through ChannelBin count: a channel sent straight to your IPTV provider is never seen. ' if mixed else '') ~ 'A player on a sports channel\'s waiting screen is not counted until its game comes on, and one on an Up next channel is not counted at all.') }}
         {{ number_setting('reserve_seconds', 'Seconds behind live', 'How much of the stream ChannelBin holds before the IPTV player gets it. A short dropout plays through without the picture freezing.') }}
@@ -309,5 +349,7 @@
 <script src="{{ url_for('static', filename='js/live-now.js') }}"></script>
 <script src="{{ url_for('static', filename='js/channel-now.js') }}"></script>
 <script src="{{ url_for('static', filename='js/play-move.js') }}"></script>
+<script type="application/json" id="pip-boot">{{ pip_boot | tojson }}</script>
+<script src="{{ url_for('static', filename='js/pip-setup.js') }}"></script>
 <script src="{{ url_for('static', filename='js/iptv-output.js') }}"></script>
 {% endblock %}

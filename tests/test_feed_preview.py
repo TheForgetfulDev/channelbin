@@ -307,6 +307,45 @@ class GroupPreviewTests(_FeedPreview):
         self.assertIn('The preview in ChannelBin ended', play.detail)
         self.assertEqual(connlim._holders.get(self.account.id, []), [])
 
+    def test_a_round_that_dies_decoding_on_the_gpu_restarts_on_the_cpu(self):
+        """A re-encoding round whose GPU decode dies (a stand-in here: no GPU in the suite) is
+        taken off and the next round decodes on the CPU, on the same play, and the session says
+        why; the dead round's files go with it (dev/changelog/1688)."""
+        group, (a,) = self.group('a.ts')
+        real = preview.build_feed_preview_cmd
+        built = []
+
+        def build(*args, **kw):
+            built.append(kw.get('gpu_decode'))
+            if kw.get('gpu_decode'):
+                return [sys.executable, '-c',
+                        'import sys; sys.stdin.buffer.read(65536); '
+                        'sys.stderr.write("[vf#0:0 @ 0x1] [error] Error reinitializing filters!\\n"); '
+                        'sys.exit(218)']
+            return real(*args, **{**kw, 'reencode_device': None})
+        with mock.patch.object(preview, 'build_feed_preview_cmd', side_effect=build), \
+                mock.patch.object(preview, 'reencode_device', return_value=('/dev/dri/renderD128', '')):
+            resp = self.client.post(f'/api/feed/{feed.feed_id_for_group(group.id)}/preview',
+                                    json={'reencode': True})
+            self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True)[:400])
+            data = resp.get_json()
+            self.assertTrue(data['gpu_decode'])
+            sid = data['session_id']
+            st = self.wait_ready(sid, 2)
+            self.assertEqual(built, [True, False])
+            self.assertFalse(st['gpu_decode'])
+            self.assertIn('could not decode this stream', st['decode_note'])
+            self.assertIn('Error reinitializing filters!', st['decode_note'])
+            session = preview.get_session(sid)
+            first = feed_preview_names(1)[0].rsplit('.', 1)[0]
+            self.assertFalse([n for n in os.listdir(session.dir) if n.startswith(first)])
+            play = self.only_play()
+            self.assertTrue(play.live)
+            self.assertEqual(self.client.post(data['stop_url']).status_code, 200)
+        self.assertEqual(self.status(sid)['reason'], preview.REASON_USER)
+        self.assertFalse(play.live)
+        self.assertEqual(connlim._holders.get(self.account.id, []), [])
+
     def test_stop_ends_a_segmenter_that_stopped_reading(self):
         """A round's ffmpeg alive but reading nothing leaves the pump blocked in a write: Stop still
         returns at once, kills it and lets the play go."""

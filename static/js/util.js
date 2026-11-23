@@ -1196,7 +1196,7 @@ function overlayOpen() {
 // (dev/changelog/1608). Sets overlay.openModal() and overlay.closeModal(), and returns
 // close. Both are safe to call twice: a DOM listener added twice is added once. A removed
 // (non-persistent) overlay is never reopened, and a persistent one drops its escapeHandler
-// on close, since a step belongs to the opening that set it.
+// and backdropHandler on close, since a step belongs to the opening that set it.
 function wireModal(overlay, { dismissable = true, onClose = null, persistent = false } = {}) {
   // `overlay.escapeHandler`, when a host sets one, takes Escape instead of closing: a panel
   // showing a STEP (the filename designer inside a profile, its guide picker) steps back
@@ -1212,6 +1212,7 @@ function wireModal(overlay, { dismissable = true, onClose = null, persistent = f
     if (persistent) {
       overlay.style.display = 'none';
       overlay.escapeHandler = null;
+      overlay.backdropHandler = null;
     } else {
       overlay.remove();
     }
@@ -1228,7 +1229,9 @@ function wireModal(overlay, { dismissable = true, onClose = null, persistent = f
     const child = (el, cls) => el && Array.from(el.children).find((c) => c.classList.contains(cls));
     const backdrop = child(overlay, 'modal-backdrop');
     const x = child(child(child(overlay, 'modal-panel'), 'modal-head'), 'modal-close');
-    if (backdrop) backdrop.addEventListener('click', close);
+    // `overlay.backdropHandler`, like escapeHandler, takes a backdrop click instead of
+    // closing: a panel showing a step steps back (dev/docs/DESIGN-pip-channels.md 12).
+    if (backdrop) backdrop.addEventListener('click', () => (overlay.backdropHandler ? overlay.backdropHandler() : close()));
     if (x) x.addEventListener('click', close);
   }
   overlay.openModal = open;

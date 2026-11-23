@@ -22,6 +22,9 @@ from app.database import (  # noqa: E402
     SPORTS_FETCH_CAPPED_PAST, SPORTS_FETCH_OK, SPORTS_KIND_EVENT, SPORTS_KIND_ROUND, AutoRule, RecordingSports,
     SportsEvent, SportsFeedChannel, SportsFetch, SportsFollow, SportsLeague, SportsMatch, SportsState)
 
+#: The guide the output sends with xmltv_days unset (output_feed.guide_horizon()).
+HORIZON = timedelta(days=3)
+
 H, M = timedelta(hours=1), timedelta(minutes=1)
 ROUND = 'round:9001:2099:12'
 
@@ -195,7 +198,7 @@ class FeedTests(Case):
         self.league.feed_league_channels = True
         db.session.add(SportsFeedChannel(league_id=self.league.id, number=1))
         db.session.commit()
-        sports_feed.place_all(self.now)
+        sports_feed.place_all(self.now, HORIZON)
         self.assertEqual(self.arm(), 0, 'the output feed is off')
         self.t.sandbox_config({'integrations': {'output_feed': {'enabled': True}}})
         self.assertEqual(self.arm(), 1)

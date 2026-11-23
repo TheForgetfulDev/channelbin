@@ -2410,6 +2410,12 @@ body.actbar-on #app-toast { bottom: 78px; }
 .modal-head h2 { font-size: var(--fs-base); font-weight: 600; margin: 0; border-bottom: none; padding-bottom: 0; }
 .modal-close { background: none; border: none; color: var(--text-muted); font-size: var(--fs-xl); cursor: pointer; line-height: 1; padding: 2px 4px; }
 .modal-close:hover { color: var(--text); }
+/* A step's header control: back one step, where the X would close the whole dialog. */
+.modal-back { background: none; border: none; color: var(--text-muted); cursor: pointer; line-height: 1;
+  padding: 2px 6px 2px 0; display: inline-flex; align-items: center; }
+.modal-back:hover { color: var(--text); }
+.modal-back + h2 { flex: 1; }
+.modal-back .icon { width: 1.25rem; height: 1.25rem; }
 /* min-height: 0 is what makes overflow-y actually scroll. .modal-panel is a flex column
    with a max-height, and a flex item's default min-height: auto refuses to shrink below its
    content - so a body taller than the panel pushes .modal-foot out through the bottom
@@ -5087,6 +5093,95 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .of-held { width: auto; max-width: 100%; }
 .of-login label { display: block; margin-top: 12px; }
 .of-login .card-note { margin-top: 12px; }
+
+/* Picture-in-picture channels (mockup 63, dev/docs/DESIGN-pip-channels.md 12).
+   The stand-in picture: a channel's layout with the big picture dark and the small one light,
+   each naming what it will show. Never a live frame. Each pane is a size container, so its
+   text is sized to the pane and a thumbnail and the dialog's preview are one drawing at two
+   sizes. The small pane's box is the server's own geometry (output_feed_view.pip_boxes). */
+.pip-tv { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.pip-pane { position: absolute; inset: 0; overflow: hidden; container-type: inline-size; }
+.pip-pane.pip-inset, .pip-pane.pip-half { right: auto; bottom: auto; }
+.pip-ph { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center;
+  align-items: center; text-align: center; gap: 1cqw; padding: 5% 6%; background: var(--bg3); color: var(--text); }
+.pip-ph-small { background: var(--text); color: var(--bg0); border: 1px solid var(--bg0); }
+.pip-ph-k { font-size: 2.6cqw; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; opacity: .7; }
+.pip-ph-t { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+  max-width: 100%; font-size: 3.6cqw; font-weight: 600; line-height: 1.2; }
+.pip-inset .pip-ph-k, .pip-half .pip-ph-k { font-size: 7cqw; }
+.pip-inset .pip-ph-t, .pip-half .pip-ph-t { font-size: 8.5cqw; }
+/* The card's table: a thumbnail beside the name. The thumbnail drops the kicker, which the
+   dialog's bigger preview keeps. */
+.pip-thumb { width: 12.5rem; flex: none; }
+.pip-ch { display: flex; gap: 12px; align-items: flex-start; }
+.pip-ch .rl-prog { min-width: 0; }
+.pip-thumb .pip-ph-t { font-size: max(10px, 8cqw); overflow-wrap: anywhere; }
+.pip-thumb .pip-inset .pip-ph-t, .pip-thumb .pip-half .pip-ph-t { font-size: max(8px, 14cqw); line-height: 1.1; }
+.pip-thumb .pip-inset .pip-ph { padding: 4%; }
+.pip-acts { display: inline-flex; align-items: center; gap: 6px; }
+/* Which window a "plays from" line is about. */
+.pip-k { color: var(--text-muted); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .06em; margin-right: 4px; }
+/* The setup dialog: the main view, and a picture's picker in its place. */
+.pip-dlg { display: flex; flex-direction: column; gap: 18px; }
+.pip-top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.pip-opts { display: flex; flex-direction: column; gap: 12px; }
+.pip-row-l { display: block; font-size: var(--fs-xs); font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--text-muted); margin-bottom: 5px; }
+.pip-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.pip-chips .chip[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
+.pip-picks { display: flex; flex-direction: column; gap: 8px; }
+.pip-pickrow { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr) auto; gap: 4px 12px; align-items: center;
+  width: 100%; text-align: left; font: inherit; color: var(--text); cursor: pointer; padding: 10px 12px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.pip-pickrow:hover { border-color: var(--accent); }
+.pip-pr-k { font-size: var(--fs-xs); font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); }
+.pip-pr-v { min-width: 0; }
+.pip-pr-v .t, .pip-opt .t { display: block; font-weight: 600; }
+.pip-pr-v .s, .pip-opt .s { display: block; color: var(--text-muted); font-size: var(--fs-sm); }
+.pip-pr-a { display: inline-flex; align-items: center; gap: 2px; color: var(--accent-text); font-size: var(--fs-sm); }
+.pip-swap { align-self: flex-start; }
+.pip-dlg .tabs { margin: -6px 0 0; }
+.pip-list { display: flex; flex-direction: column; background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); }
+.pip-list > .card-note { padding: 10px 12px; margin: 0; }
+.pip-opt { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft); cursor: pointer; }
+.pip-opt:last-child { border-bottom: none; }
+.pip-opt:hover { background: var(--bg3); }
+.pip-opt input { margin-top: 3px; accent-color: var(--accent); flex: none; }
+.pip-opt.pip-dis { cursor: not-allowed; opacity: .55; }
+.pip-src { display: flex; flex-direction: column; gap: 10px; }
+.pip-src > .search { width: 100%; }
+.pip-gtools { margin: 0; flex-wrap: wrap; }
+.pip-gtools .search { flex: 1 1 200px; width: auto; }
+.pip-gtools select.form-control { flex: 1 1 200px; width: auto; height: var(--ctl-h); }
+/* Sticks to the top of the dialog body as the day's games scroll under it. */
+.pip-day { position: sticky; top: 0; z-index: 1; background: var(--bg2); padding: 10px 12px 6px;
+  font-size: var(--fs-xs); font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted);
+  border-bottom: 1px solid var(--border-soft); }
+.pip-use { display: flex; justify-content: flex-end; }
+.pip-twin { display: flex; gap: 12px; align-items: flex-start; }
+.pip-twin .switch { flex: none; margin-top: 2px; }
+.pip-twin-name { font-weight: 600; }
+.pip-twin .card-note { margin: 2px 0 0; }
+@media (max-width: 960px) {
+  .pip-top { grid-template-columns: minmax(0, 1fr); }
+  .pip-thumb { width: 10rem; }
+  /* A landscape phone: the preview never takes more than about half the screen's height. */
+  .pip-top > :first-child { width: 100%; max-width: calc(48vh * 16 / 9); }
+  .pip-pickrow { grid-template-columns: minmax(0, 1fr) auto; }
+  .pip-pr-k { grid-column: 1 / -1; }
+}
+/* A phone held sideways: the preview and its options side by side, so the first screen shows both. */
+@media (max-width: 960px) and (orientation: landscape) {
+  .pip-top { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .pip-top > :first-child { max-width: none; }
+}
+@media (max-width: 480px) {
+  .pip-ch { flex-direction: column; }
+  .pip-thumb { width: 100%; max-width: 16rem; }
+}
 
 @media (max-width: 960px) {
   .of-conn { flex-wrap: wrap; gap: 4px 10px; }

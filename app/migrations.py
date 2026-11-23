@@ -3959,6 +3959,44 @@ def _m143_hide_rule_account_counts(conn, cur):
     conn.commit()
 
 
+def _m144_recording_source_channel(conn, cur):
+    """recordings.source_channel_id: the channel whose guide listing a recording was made from, so
+    a group recording of a game records from the members showing that game (dev/changelog/1690).
+    No backfill: a recording scheduled before this has no source, and the recorder treats it as
+    it always did. Re-runnable from the top: the ADD COLUMN asks PRAGMA table_info first."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()}
+    if cols and 'source_channel_id' not in cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN source_channel_id INTEGER')
+    conn.commit()
+
+
+def _m145_pip_channels(conn, cur):
+    """Picture-in-picture channels on the output feed (app/pip_channels.py,
+    dev/docs/DESIGN-pip-channels.md 4.1). No backfill: none exists before this. AUTOINCREMENT
+    because a channel's id gives its feed id, which an IPTV player caches, so a removed row's id
+    must never be issued again. Re-runnable from the top."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS pip_channels (
+            id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            name VARCHAR(40) NOT NULL,
+            main_kind VARCHAR(16),
+            main_ref INTEGER,
+            main_query VARCHAR(80),
+            inset_kind VARCHAR(16),
+            inset_ref INTEGER,
+            inset_query VARCHAR(80),
+            layout VARCHAR(16) NOT NULL DEFAULT 'corner',
+            corner VARCHAR(2) NOT NULL DEFAULT 'br',
+            size VARCHAR(1) NOT NULL DEFAULT 'm',
+            swapped_copy BOOLEAN NOT NULL DEFAULT 0,
+            on_output BOOLEAN NOT NULL DEFAULT 1,
+            created_at DATETIME,
+            updated_at DATETIME
+        );
+    """)
+    conn.commit()
+
+
 def _m135_rule_sports_sessions(conn, cur):
     """auto_rules.sports_sessions: whether a rule about a league counts its practice, qualifying and
     shootouts among its games (app/auto_rules_sports.py, dev/changelog/1633). No backfill: before this a
@@ -4698,6 +4736,9 @@ SCHEMA_MIGRATIONS = [
      _m142_output_seconds),
     (143, 'channel_hide_rules.account_counts: what each hide rule matches on each account',
      _m143_hide_rule_account_counts),
+    (144, 'recordings.source_channel_id: the channel whose listing a recording was made from',
+     _m144_recording_source_channel),
+    (145, 'pip_channels: picture-in-picture channels on the output feed', _m145_pip_channels),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

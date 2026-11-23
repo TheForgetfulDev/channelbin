@@ -291,7 +291,8 @@ fails its test encode also raises an alert naming the reason.
 The same device lets Preview and Play re-encode a channel or a recording the browser cannot
 decode as it is: after a decode failure the player offers **Try re-encoded**. It works whenever
 the device passes its test encode, whether or not conversions use the GPU, waits for any
-conversion to finish first, and never falls back to the CPU.
+conversion to finish first, and never encodes on the CPU. It decodes on the GPU too; if the GPU
+cannot decode that stream, it restarts once decoding on the CPU and the player says so.
 
 Running without Docker, the same setting works if your ffmpeg has `h264_vaapi`, the VAAPI
 driver for your GPU is installed (`intel-media-va-driver` on Debian and Ubuntu), and the user

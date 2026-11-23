@@ -1243,8 +1243,6 @@ def pick_why(why, one, guide_end, now, tz, said='') -> str:
         return f'This {one} is not in your guide yet, so there is nothing to record.{reach} ChannelBin looks again after each guide update.'
     if why == ar.WHY_UNKNOWN:
         return f'This {one} is outside the days ChannelBin reads to record from.'
-    if why == ar.WHY_TOO_MANY:
-        return f'This {one} has more listings than ChannelBin picks among. Search programs shows them all.'
     raise ValueError(f'a Record reason with no words: {why!r}')
 
 
@@ -1554,8 +1552,13 @@ def channel_now(event_id, cfg=None) -> tuple:
         member, why, _from = output_feed.sports_member_now([showing], blocked, None)
         if member is None:
             where = f'the group "{showing.group_name}"' if showing.group_id is not None else f'"{showing.channel_name}"'
-            record['why'] = (f'Record would pick {where}, but it could not start now: '
-                             f'{_record_drop_words(why)}.')
+            if why == output_feed._DROP_OTHER_GAME:
+                # The recorder starts anyway and says so on the recording (recorder.game_members()).
+                record['why'] = (f'Record would pick {where}, but {_record_drop_words(why)}. A recording would '
+                                 'still start, on the best of them, and say so on the recording.')
+            else:
+                record['why'] = (f'Record would pick {where}, but it could not start now: '
+                                 f'{_record_drop_words(why)}.')
         else:
             record.update(chosen(member.id, showing.group_id, showing.group_name or ''))
         record['note'] = ' '.join(notes)
@@ -1667,6 +1670,7 @@ def _record_drop_words(why) -> str:
     return {
         of._DROP_BLOCKED: 'its account is blocked right now, or every channel of the group is on one that is',
         of._DROP_RECORDING: 'the group has no channel with Recording on',
+        of._DROP_OTHER_GAME: 'every channel in the group with Recording on shows something else at that time',
         of._DROP_GONE: 'it was removed as this was worked out',
     }[why]
 

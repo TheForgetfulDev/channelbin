@@ -12,19 +12,15 @@ synthesized TS file, so what is tested is the relay's handling of a clip, not th
   python3 -m unittest tests.test_sports_waiting
 """
 import os
-import shutil
 import subprocess
 import sys
 import threading
-import time
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests.support import clips  # noqa: E402
-from tests.support.app import make_test_app  # noqa: E402
 from tests.support.seed import make_account, make_channel, make_guide_match  # noqa: E402
 
 import app.connection_limits as connlim  # noqa: E402
@@ -34,59 +30,14 @@ from app import db, sports_feed  # noqa: E402
 from app.database import (Alert, OutputFeedPlay, SportsEvent, SportsFeedChannel,  # noqa: E402
                           SportsFollow, SportsLeague)
 
-_HAVE_FFMPEG = shutil.which('ffmpeg') is not None
-USER, PASS = 'tv', 'tv-secret'
+from tests.support.feed_plays import ClipPlayCase, PASS, USER, feed_cfg as _cfg, wait_for as _wait  # noqa: E402,F401
 
 
-def _cfg(**overrides):
-    block = {'enabled': True, 'username': USER, 'password': PASS, 'reserve_seconds': 0}
-    block.update(overrides)
-    return {'integrations': {'output_feed': block}}
-
-
-def _wait(predicate, timeout=15.0, interval=0.05):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-    return predicate()
-
-
-def _build(d):
-    for name, size in (('screen.ts', '192x108'), ('game.ts', '256x144')):
-        subprocess.run(
-            ['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', f'testsrc=size={size}:rate=30',
-             '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '20',
-             '-c:v', 'libx264', '-preset', 'ultrafast', '-g', '30', '-bf', '0', '-pix_fmt', 'yuv420p',
-             '-c:a', 'aac', '-f', 'mpegts', os.path.join(d, name)],
-            check=True, timeout=180)
-
-
-@unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg not available')
-class _Waiting(unittest.TestCase):
+class _Waiting(ClipPlayCase):
     FEED = _cfg()
 
-    @classmethod
-    def setUpClass(cls):
-        cls.media = clips.shared('sports-waiting', _build)
-
     def setUp(self):
-        self.t = make_test_app(csrf=False)
-        self.client = self.t.client
-        self.addCleanup(self.t.cleanup)
-        self.addCleanup(feed.stop_all)
-        self.t.sandbox_config(self.FEED)
-        self.account = make_account('Acct', max_connections=1)
-        db.session.commit()
-        self.renders = []
-        self.render_delay = 0.0
-        patcher = mock.patch.object(ss, 'render_clip', self._fake_render)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.open = []
-        self.addCleanup(self._close_all)
-        self.now = datetime.utcnow()
+        super().setUp()
         self.league = SportsLeague(tsdb_id=9001, name='Pretend League', match_terms='[]')
         db.session.add(self.league)
         db.session.flush()
@@ -100,37 +51,6 @@ class _Waiting(unittest.TestCase):
         db.session.commit()
         sports_feed.set_team_channel(self.league.id, 101, True)
         self.feed_id = feed.feed_id_for_sports(SportsFeedChannel.query.one().id)
-
-    def _fake_render(self, cfg, screen, path, *, still=False, background=False):
-        self.renders.append((path, still, screen))
-        if self.render_delay and not still:
-            time.sleep(self.render_delay)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        shutil.copyfile(os.path.join(self.media, 'screen.ts'), path)
-
-    def _close_all(self):
-        for resp in self.open:
-            try:
-                resp.close()
-            except Exception:  # noqa: BLE001 - a response the test already closed
-                pass
-
-    def play(self, feed_id=None, expect=200):
-        resp = self.client.get(f'/live/{USER}/{PASS}/{feed_id or self.feed_id}.ts')
-        self.assertEqual(resp.status_code, expect, resp.get_data(as_text=True)[:300] if expect != 200 else '')
-        if expect == 200:
-            self.open.append(resp)
-        return resp
-
-    @staticmethod
-    def read(resp, n=1):
-        it = iter(resp.response)
-        return [next(it) for _ in range(n)]
-
-    def only_session(self):
-        live = feed.live_sessions()
-        self.assertEqual(len(live), 1, live)
-        return live[0]
 
     def carrier(self, name='Local game', account=None, start=None):
         """A channel whose guide lists the game, from `start` (now by default)."""
@@ -149,13 +69,6 @@ class _Waiting(unittest.TestCase):
         self.event.local_date = start.date()
         db.session.commit()
         return self.carrier(start=start, **kw)
-
-    def plain_channel(self, name='Plain', account=None):
-        ch = make_channel(account or make_account(f'{name} acct', max_connections=1), name=name, pace_realtime=True)
-        ch.stream_url = os.path.join(self.media, 'game.ts')
-        ch.in_guide = True
-        db.session.commit()
-        return ch
 
 
 class WaitingScreenTests(_Waiting):

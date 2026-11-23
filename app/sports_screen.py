@@ -87,7 +87,8 @@ STATE_NEXT = 'next'          # no game near; the next one is known
 STATE_UNLISTED = 'unlisted'  # a game is near or on, but no channel's guide lists it
 STATE_NONE = 'none'          # nothing in the schedule
 STATE_HELD = 'held'          # the game is on and listed, but cannot start here yet (proxy only)
-STATES = (STATE_NEXT, STATE_UNLISTED, STATE_NONE, STATE_HELD)
+STATE_CARD = 'card'          # a picture-in-picture channel's card: the words are its caller's (app/pip_channels.py)
+STATES = (STATE_NEXT, STATE_UNLISTED, STATE_NONE, STATE_HELD, STATE_CARD)
 
 #: Why a game that is on cannot start on the screen yet (STATE_HELD).
 HELD_NO_SLOT = 'no_slot'              # every "IPTV players at once" slot is in use
@@ -421,9 +422,10 @@ MAKE_TIMEOUT_SECONDS = 180
 #: play while the moving clip is made (a whole number of draw.LOOP_UNITs).
 STILL_FRAMES = 64
 
-#: A clip's file: its owner (a sports channel's row id, or "u" and an Up next channel's number,
-#: up_next_owner()), its key, and "-still" for the quick still.
-_CLIP_RE = re.compile(r'^(u?)(\d+)-([0-9a-f]{20})(?:-still)?\.ts$')
+#: A clip's file: its owner (a sports channel's row id, "u" and an Up next channel's number,
+#: up_next_owner(), or "p" and a picture-in-picture channel's row id, pip_owner()), its key, and
+#: "-still" for the quick still.
+_CLIP_RE = re.compile(r'^([up]?)(\d+)-([0-9a-f]{20})(?:-still)?\.ts$')
 
 
 def unread_badges(screen) -> list:
@@ -481,10 +483,16 @@ def up_next_owner(number: int) -> str:
     return f'u{int(number)}'
 
 
+def pip_owner(row_id: int) -> str:
+    """The owner part of a picture-in-picture channel's card clips: "p" and its row id."""
+    return f'p{int(row_id)}'
+
+
 def _owner(owner) -> str:
-    """A clip's owner as its file name spells it: a sports channel's row id, or up_next_owner()."""
+    """A clip's owner as its file name spells it: a sports channel's row id, up_next_owner() or
+    pip_owner()."""
     if isinstance(owner, str):
-        if not re.fullmatch(r'u\d+', owner):
+        if not re.fullmatch(r'[up]\d+', owner):
             raise ValueError(f'Not a clip owner: "{owner}"')
         return owner
     return str(int(owner))
@@ -543,8 +551,11 @@ def make_clip(cfg: dict, row_id, screen, *, still: bool = False,
 
 def _what(screen) -> str:
     """What a clip is called in a log line or a ClipFailed."""
-    return (f'the Up next picture for {screen.channel}' if isinstance(screen, Rotation)
-            else f'the waiting screen for {screen.channel}')
+    if isinstance(screen, Rotation):
+        return f'the Up next picture for {screen.channel}'
+    if screen.state == STATE_CARD:
+        return f'the card for {screen.channel}'
+    return f'the waiting screen for {screen.channel}'
 
 
 def render_clip(cfg: dict, screen, path: str, *, still: bool = False, background: bool = False):
@@ -644,9 +655,9 @@ def discard_clip(path: str) -> bool:
 def prune_clips(cfg: dict, keep=(), now: datetime = None) -> int:
     """Delete the clips nothing has asked for in CLIP_KEEP, except `keep` (the paths live
     sessions play), every clip of a channel row that no longer exists, and a make's leftovers an
-    hour old. Returns how many files went. Two queries."""
+    hour old. Returns how many files went. Three queries."""
     import shutil
-    from .database import SportsFeedChannel, SportsUpNextChannel
+    from .database import PipChannel, SportsFeedChannel, SportsUpNextChannel
     folder = clip_dir(cfg)
     try:
         names = os.listdir(folder)
@@ -655,6 +666,8 @@ def prune_clips(cfg: dict, keep=(), now: datetime = None) -> int:
     rows = {i for (i,) in SportsFeedChannel.query.with_entities(SportsFeedChannel.id).all()}
     # An Up next clip's number is its feed number: 0 for everything followed, else its row id.
     up_next = {0} | {i for (i,) in SportsUpNextChannel.query.with_entities(SportsUpNextChannel.id).all()}
+    owners = {'': rows, 'u': up_next,
+              'p': {i for (i,) in PipChannel.query.with_entities(PipChannel.id).all()}}
     keep = set(keep)
     now_ts = time.time() if now is None else (now - datetime(1970, 1, 1)).total_seconds()
     gone = 0
@@ -671,7 +684,7 @@ def prune_clips(cfg: dict, keep=(), now: datetime = None) -> int:
         found = _CLIP_RE.match(name)
         if found is None or path in keep:
             continue
-        if int(found.group(2)) in (up_next if found.group(1) else rows) and age <= CLIP_KEEP.total_seconds():
+        if int(found.group(2)) in owners[found.group(1)] and age <= CLIP_KEEP.total_seconds():
             continue
         try:
             os.unlink(path)

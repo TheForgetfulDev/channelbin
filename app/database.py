@@ -1134,6 +1134,13 @@ class Recording(db.Model):
     # recording, so ChannelBin records the other start too, in case it is the right one. Written only
     # by app/sports_follow.py, which removes this recording when it is no longer needed.
     sports_cover_for_id = db.Column(db.Integer, index=True)
+    # The channel whose guide listing this recording was made from, beside program_start_time:
+    # for a group recording it is the member the listing came from, not the member it records
+    # from (channel_id), which is how the recorder knows which game a group of local stations is
+    # recording when the stations show different ones (recorder.game_members(),
+    # dev/changelog/1690). Written by the create path and moved by retrack with program_*; NULL
+    # for a recording made without a listing and for every one made before migration 144.
+    source_channel_id = db.Column(db.Integer)
 
     # ── Describing the recording to something outside this app ────────────────
     # The program's synopsis, genre and content rating, copied off its epg_entries row.
@@ -3587,6 +3594,45 @@ class SportsFeedChannel(db.Model):
     created_at   = db.Column(db.DateTime, default=datetime.utcnow)
 
 
+#: What a picture-in-picture channel's picture is (PipChannel.main_kind / inset_kind).
+PIP_SOURCE_GAME    = 'game'
+PIP_SOURCE_CHANNEL = 'channel'
+PIP_SOURCE_GROUP   = 'group'
+PIP_SOURCE_SEARCH  = 'search'
+PIP_SOURCE_KINDS = (PIP_SOURCE_GAME, PIP_SOURCE_CHANNEL, PIP_SOURCE_GROUP, PIP_SOURCE_SEARCH)
+
+
+class PipChannel(db.Model):
+    """A picture-in-picture channel on the output feed (app/pip_channels.py,
+    dev/docs/DESIGN-pip-channels.md 4.1): two pictures, the big one ("main") and the small one
+    ("inset"), as a person set them up. Its id gives its feed id and its swapped copy's
+    (output_feed.feed_id_for_pip), which an IPTV player caches, so AUTOINCREMENT keeps a removed
+    row's id from being issued again.
+
+    A picture is a kind (PIP_SOURCE_*) with a `ref` (a game's TheSportsDB event id, never a
+    sports_events row id, which goes with its league; a channel's id; a group's id) or a
+    search's words in `query`. Both kinds NULL is a channel with nothing set up, which is still
+    listed. Written only by app/pip_channels.py; `on_output` only by
+    output_feed.set_on_output()."""
+    __tablename__ = 'pip_channels'
+    __table_args__ = ({'sqlite_autoincrement': True},)
+    id           = db.Column(db.Integer, primary_key=True)
+    name         = db.Column(db.String(40), nullable=False)
+    main_kind    = db.Column(db.String(16))
+    main_ref     = db.Column(db.Integer)
+    main_query   = db.Column(db.String(80))
+    inset_kind   = db.Column(db.String(16))
+    inset_ref    = db.Column(db.Integer)
+    inset_query  = db.Column(db.String(80))
+    layout       = db.Column(db.String(16), nullable=False, default='corner', server_default=db.text("'corner'"))
+    corner       = db.Column(db.String(2), nullable=False, default='br', server_default=db.text("'br'"))
+    size         = db.Column(db.String(1), nullable=False, default='m', server_default=db.text("'m'"))
+    swapped_copy = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
+    on_output    = db.Column(db.Boolean, nullable=False, default=True, server_default=db.text('1'))
+    created_at   = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at   = db.Column(db.DateTime, default=datetime.utcnow)
+
+
 class SportsUpNextChannel(db.Model):
     """An Up next channel on the output feed: ChannelBin's own picture of the coming games, a page
     every 10 s (app/sports_up_next.py, dev/changelog/1614). `league_id` 0 is the one for everything
@@ -3610,7 +3656,12 @@ class SportsUpNextChannel(db.Model):
 FEED_PLAY_ENDED      = 'ended'        # a relayed play that ran and stopped; `reason` says why
 FEED_PLAY_REFUSED    = 'refused'      # a play that never started; `message` says why
 FEED_PLAY_REDIRECTED = 'redirected'   # redirect and mixed modes: the player was sent to the provider
-FEED_PLAY_KINDS = (FEED_PLAY_ENDED, FEED_PLAY_REFUSED, FEED_PLAY_REDIRECTED)
+FEED_PLAY_PICTURE    = 'picture'      # a picture-in-picture play's small picture stopped or came back
+FEED_PLAY_KINDS = (FEED_PLAY_ENDED, FEED_PLAY_REFUSED, FEED_PLAY_REDIRECTED, FEED_PLAY_PICTURE)
+# Which of the two a FEED_PLAY_PICTURE line is, in its `reason`.
+FEED_PICTURE_STOPPED = 'picture_stopped'
+FEED_PICTURE_BACK    = 'picture_back'
+FEED_PICTURE_REASONS = (FEED_PICTURE_STOPPED, FEED_PICTURE_BACK)
 
 
 class OutputFeedPlay(db.Model):
@@ -3759,11 +3810,13 @@ class SportsEvent(db.Model):
     # app/sports_match.py, in the same commit as guide_start.
     guide_behind_start = db.Column(db.DateTime)
     # Which of the league's numbered feed channels carries this event, NULL until it is placed.
-    # Written only by app/sports_feed.py::place_league_events(), which moves a placed game only off a
-    # collision: TheSportsDB moving it onto another game's time on the same number by more than
-    # sports_feed.COLLISION (dev/changelog/1529). An IPTV player caches the guide it was given.
+    # Written only by app/sports_feed.py::place_league_events(), one game per number per day
+    # (dev/changelog/1684). It moves a game inside the guide the output sends only off a collision:
+    # TheSportsDB moving it onto another game's time on the same number by more than
+    # sports_feed.COLLISION (dev/changelog/1529); one past the guide, which no IPTV player has
+    # cached, also when it does not fit its number's day.
     feed_number      = db.Column(db.Integer)
-    # The one move place_league_events() makes, kept so the league page can say it
+    # The collision move place_league_events() makes, kept so the league page can say it
     # (dev/changelog/1587): when the game was placed again, the number it left, and the id of the
     # game whose time it had come to share. All NULL for a game that never moved; a later move
     # keeps the first number left and overwrites the other two. Written only there.

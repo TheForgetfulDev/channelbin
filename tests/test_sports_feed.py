@@ -16,7 +16,7 @@ import os
 import re
 import sys
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,9 +26,13 @@ from tests.support.seed import make_account, make_channel, make_guide_match  # n
 
 import app.output_feed as feed  # noqa: E402
 from app import db, sports_data, sports_feed, sports_match  # noqa: E402
-from app.tz_utils import to_local  # noqa: E402
+from app.tz_utils import get_display_tz, to_local, to_naive_utc  # noqa: E402
 from app.database import (Alert, SportsEvent, SportsFeedChannel, SportsFollow,  # noqa: E402
                           SportsLeague, SportsMatch, SportsTeam)
+
+#: The guide the output sends with xmltv_days unset (output_feed.guide_horizon()).
+HORIZON = timedelta(days=3)
+NY = ZoneInfo('America/New_York')
 
 USER, PASS = 'tv', 'tv-secret'
 BEARS, GULLS, PANTHERS, COMETS = 101, 102, 103, 104
@@ -63,6 +67,13 @@ class _Case(unittest.TestCase):
         self.account = make_account('Acct', max_connections=1)
         self._tsdb = 7000
         db.session.commit()
+
+    def at(self, days, hour, minute=0):
+        """`hour`:`minute` in the display timezone `days` after today, as stored (naive UTC): a
+        layout by day must not depend on the hour the suite runs at."""
+        tz = get_display_tz()
+        day = to_local(self.now, tz).date() + timedelta(days=days)
+        return to_naive_utc(datetime.combine(day, time(hour, minute), tzinfo=tz))
 
     def event(self, home, away, start, **kw):
         self._tsdb += 1
@@ -519,9 +530,53 @@ class WindowTests(_Case):
         db.session.commit()
         moved = feed.resolve_play(fid, event_id=e.id, exclude_ids=frozenset({a.id}))
         self.assertEqual((moved.member.id, moved.event_id), (b.id, e.id))
-        over = feed.resolve_play(fid, event_id=e.id, now=self.now + timedelta(hours=2))
+        # Out of reach at last: its listings ended more than MAX_LENGTH and the tail ago.
+        over = feed.resolve_play(fid, event_id=e.id, now=self.now + timedelta(hours=13, minutes=1))
         self.assertIsNone(over.member)
         self.assertIn('any more', over.why_none)
+
+    def _ran_long(self):
+        """A game whose only listings ended 2 h 10 min ago, past the 2-hour tail, on two channels."""
+        e = self.event(BEARS, GULLS, self.now - timedelta(hours=5, minutes=10))
+        a, b = self.channel('Local a', score=90.0), self.channel('Local b', score=50.0)
+        self.listing(e, a, hours=3)
+        self.listing(e, b, hours=3)
+        db.session.commit()
+        return e, a, b
+
+    def test_a_failover_past_the_tail_stays_on_its_game(self):
+        """dev/changelog/1685: a play already on a game is never ended by the clock. A long overtime
+        plus a provider blip moves the play to the other channel carrying the game."""
+        fid = self.fid()
+        e, a, b = self._ran_long()
+        moved = feed.resolve_play(fid, event_id=e.id, exclude_ids=frozenset({a.id}))
+        self.assertEqual((moved.member.id, moved.event_id), (b.id, e.id))
+        self.assertRegex(moved.note, r'^its listing ended .+; it may be running long$')
+        later = feed.resolve_play(fid, event_id=e.id, exclude_ids=frozenset({a.id}),
+                                  now=self.now + timedelta(hours=6))
+        self.assertEqual((later.member.id, later.event_id), (b.id, e.id))
+
+    def test_a_fresh_tune_in_past_the_tail_still_has_nothing_to_play(self):
+        fid = self.fid()
+        e, _a, _b = self._ran_long()
+        play = feed.resolve_play(fid)
+        self.assertIsNone(play.member)
+        self.assertFalse(play.fault)
+        self.assertIn('no game is on right now', play.why_none)
+        # Naming the game is not holding it: a game page asking what a tune-in would get keeps the
+        # configured tail too (sports_view's "sports channel" answer).
+        served = sports_feed.served_channels(self.team_on(BEARS).id)[0]
+        before, after = feed.sports_window(feed.feed_config())
+        self.assertFalse(sports_feed.playing_now(served, self.now, event_id=e.id, before=before, after=after).channels)
+        self.assertTrue(sports_feed.playing_now(served, self.now, event_id=e.id, before=before, after=after,
+                                                held=True).channels)
+
+    def test_a_held_play_past_the_tail_with_no_channel_left_ends_by_name(self):
+        fid = self.fid()
+        e, a, b = self._ran_long()
+        done = feed.resolve_play(fid, event_id=e.id, exclude_ids=frozenset({a.id, b.id}))
+        self.assertIsNone(done.member)
+        self.assertIn('already failed this play', done.why_none)
 
     def test_a_game_near_that_no_guide_lists_says_so_with_its_time(self):
         fid = self.fid()
@@ -868,17 +923,17 @@ class LiveNowTests(_Case):
 
 class LeagueChannelTests(_Case):
     def on(self):
-        self.assertTrue(sports_feed.set_league_channels(self.league.id, True))
+        self.assertTrue(sports_feed.set_league_channels(self.league.id, True, HORIZON))
 
     def numbers(self):
         db.session.expire_all()
         return {e.tsdb_id: e.feed_number for e in SportsEvent.query.order_by(SportsEvent.tsdb_id).all()}
 
-    def test_games_at_once_get_a_channel_each_and_a_later_one_reuses_the_first(self):
-        t = self.now + timedelta(hours=2)
+    def test_games_at_once_get_a_channel_each_and_the_next_days_reuses_the_first(self):
+        t = self.at(1, 13)
         a = self.event(BEARS, GULLS, t)
         b = self.event(PANTHERS, COMETS, t + timedelta(minutes=30))
-        c = self.event(BEARS, COMETS, t + timedelta(hours=6))
+        c = self.event(BEARS, COMETS, self.at(2, 13))
         db.session.commit()
         self.on()
         self.assertEqual(self.numbers(), {a.tsdb_id: 1, b.tsdb_id: 2, c.tsdb_id: 1})
@@ -890,7 +945,7 @@ class LeagueChannelTests(_Case):
         self.assertIn(f'channel="{two}"><title>Saint-Remy Comets at Northgate Panthers</title>', xml)
 
     def test_a_placed_game_never_moves_and_the_channels_only_grow(self):
-        t = self.now + timedelta(hours=2)
+        t = self.at(1, 13)
         a = self.event(BEARS, GULLS, t)
         b = self.event(PANTHERS, COMETS, t)
         db.session.commit()
@@ -899,52 +954,52 @@ class LeagueChannelTests(_Case):
         # An earlier game arrives later and overlaps both, so it takes a new channel.
         early = self.event(GULLS, COMETS, t - timedelta(hours=1))
         db.session.commit()
-        self.assertEqual(sports_feed.place_all(self.now), 1)
-        # A placed game is rescheduled onto the time another is then given.
-        b.start_at = t + timedelta(hours=9)
-        late = self.event(GULLS, PANTHERS, t + timedelta(hours=9))
+        self.assertEqual(sports_feed.place_all(self.now, HORIZON), 1)
+        # A placed game is rescheduled onto the time another is then given, the next day.
+        b.start_at = self.at(2, 13)
+        late = self.event(GULLS, PANTHERS, self.at(2, 13))
         db.session.commit()
-        self.assertEqual(sports_feed.place_all(self.now), 1)
+        self.assertEqual(sports_feed.place_all(self.now, HORIZON), 1)
         numbers = self.numbers()
         self.assertEqual((numbers[a.tsdb_id], numbers[b.tsdb_id]), (1, 2), 'placed games keep their channel')
         self.assertEqual(numbers[early.tsdb_id], 3, 'no free channel for its whole length, so a new one')
         self.assertEqual(numbers[late.tsdb_id], 1)
         self.assertEqual({r.number: r.id for r in SportsFeedChannel.query.all() if r.number in ids}, ids)
-        self.assertEqual(sports_feed.place_all(self.now), 0, 're-runnable: nothing left to place')
+        self.assertEqual(sports_feed.place_all(self.now, HORIZON), 0, 're-runnable: nothing left to place')
 
     def test_a_game_moved_onto_anothers_time_is_placed_again_and_the_other_stays(self):
         """Left on its number, one of the two would have no channel: the guide can show only one
         game at a time and a play picks one. The game whose time changed is the one that goes,
         since the guide an IPTV player cached for it was already wrong about when it is."""
-        t = self.now + timedelta(hours=2)
+        t = self.at(1, 13)
         a = self.event(BEARS, GULLS, t)
         b = self.event(PANTHERS, COMETS, t)
-        c = self.event(GULLS, COMETS, t + timedelta(hours=6))
+        c = self.event(GULLS, COMETS, self.at(2, 13))
         db.session.commit()
         self.on()
         self.assertEqual(self.numbers(), {a.tsdb_id: 1, b.tsdb_id: 2, c.tsdb_id: 1})
         a.start_at, a.start_changed_at = c.start_at, self.now
         db.session.commit()
         with self.assertLogs('app.sports_feed', level='WARNING') as logs:
-            self.assertEqual(sports_feed.place_all(self.now), 1)
+            self.assertEqual(sports_feed.place_all(self.now, HORIZON), 1)
         self.assertIn('placed again', logs.output[0])
         self.assertEqual(self.numbers(), {a.tsdb_id: 2, b.tsdb_id: 2, c.tsdb_id: 1})
-        self.assertEqual(sports_feed.place_all(self.now), 0)
+        self.assertEqual(sports_feed.place_all(self.now, HORIZON), 0)
 
     def test_a_game_placed_again_is_said_on_the_league_page(self):
         """dev/docs/BUGS.md 2026-11-16 (said only in the log): the move was a WARNING and reached no
         page, while an IPTV player's cached guide still listed the game on the channel it left."""
-        t = self.now + timedelta(hours=2)
+        t = self.at(1, 13)
         a = self.event(BEARS, GULLS, t)
         b = self.event(PANTHERS, COMETS, t)
-        c = self.event(GULLS, COMETS, t + timedelta(hours=6))
+        c = self.event(GULLS, COMETS, self.at(2, 13))
         db.session.commit()
         self.on()
         html = self.client.get(f'/sports/{self.league.id}').get_data(as_text=True)
         self.assertNotIn('Changed channel', html)
         a.start_at, a.start_changed_at = c.start_at, self.now
         db.session.commit()
-        sports_feed.place_all(self.now)
+        sports_feed.place_all(self.now, HORIZON)
         db.session.expire_all()
         self.assertEqual((a.feed_moved_at, a.feed_moved_from, a.feed_moved_by), (self.now, 1, c.id))
         self.assertEqual([(e.feed_moved_at, e.feed_moved_from, e.feed_moved_by) for e in (b, c)],
@@ -961,24 +1016,116 @@ class LeagueChannelTests(_Case):
         self.assertIn(f'may still list it on {name} 1', html)
 
     def test_a_game_running_a_little_into_the_next_moves_nothing(self):
+        """Two games laid out back to back on one channel before one game per channel per day
+        (dev/changelog/1684) stay there while a player's cached guide lists them: only a move by
+        more than COLLISION places one again."""
         t = self.now + timedelta(hours=2)
-        a = self.event(BEARS, GULLS, t)
-        c = self.event(PANTHERS, COMETS, t + sports_feed.MATCHUP_LENGTH)
+        a = self.event(BEARS, GULLS, t, feed_number=1)
+        c = self.event(PANTHERS, COMETS, t + sports_feed.MATCHUP_LENGTH, feed_number=1)
         db.session.commit()
         self.on()
         self.assertEqual(self.numbers(), {a.tsdb_id: 1, c.tsdb_id: 1})
         c.start_at, c.start_changed_at = c.start_at - timedelta(minutes=20), self.now
         db.session.commit()
-        self.assertEqual(sports_feed.place_all(self.now), 0)
+        self.assertEqual(sports_feed.place_all(self.now, HORIZON), 0)
         self.assertEqual(self.numbers(), {a.tsdb_id: 1, c.tsdb_id: 1})
         xml = self.get('/xmltv.php').get_data(as_text=True)
         self.assertIn(f'start="{a.start_at:%Y%m%d%H%M%S} +0000" stop="{c.start_at:%Y%m%d%H%M%S} +0000"', xml)
+
+    def test_a_second_game_the_same_day_gets_a_channel_of_its_own(self):
+        """dev/changelog/1683: games 3 1/2 hours apart shared a channel, so tuning back to the first
+        in overtime, or in early for the second, could get the wrong game."""
+        noon = self.event(BEARS, GULLS, self.at(1, 12))
+        evening = self.event(PANTHERS, COMETS, self.at(1, 18))
+        db.session.commit()
+        self.on()
+        self.assertEqual(self.numbers(), {noon.tsdb_id: 1, evening.tsdb_id: 2})
+
+    def test_a_game_just_after_midnight_keeps_clear_of_the_late_game_before_it(self):
+        """A different day is not enough on its own: a 9 PM game is taken to run to 12:30 AM, so a
+        1:30 AM game is too close to share its channel and a 4 AM one is not."""
+        late = self.event(BEARS, GULLS, self.at(1, 21))
+        small_hours = self.event(PANTHERS, COMETS, self.at(2, 1, 30))
+        early = self.event(GULLS, COMETS, self.at(2, 4))
+        db.session.commit()
+        self.on()
+        self.assertEqual(self.numbers(), {late.tsdb_id: 1, small_hours.tsdb_id: 2, early.tsdb_id: 1})
+
+    def test_a_game_past_the_guide_is_laid_out_again_and_a_cached_one_keeps_its_channel(self):
+        """A layout from before one game per channel per day (dev/changelog/1684): a pair inside the
+        3 days of guide stays, since a player has cached it; a pair past it is split, with no
+        changed-channel record, since no guide has listed it. The log counts the split."""
+        cached = [self.event(BEARS, GULLS, self.at(1, 12), feed_number=1),
+                  self.event(PANTHERS, COMETS, self.at(1, 18), feed_number=1)]
+        later = [self.event(BEARS, COMETS, self.at(5, 12), feed_number=1),
+                 self.event(GULLS, PANTHERS, self.at(5, 18), feed_number=1)]
+        db.session.commit()
+        with self.assertLogs('app.sports_feed', level='INFO') as logs:
+            self.on()
+        self.assertEqual(self.numbers(), {cached[0].tsdb_id: 1, cached[1].tsdb_id: 1,
+                                          later[0].tsdb_id: 1, later[1].tsdb_id: 2})
+        self.assertIn('1 game past the guide placed again', '\n'.join(logs.output))
+        db.session.expire_all()
+        self.assertEqual({(e.feed_moved_at, e.feed_moved_from, e.feed_moved_by) for e in cached + later},
+                         {(None, None, None)})
+        self.assertEqual(sports_feed.place_all(self.now, HORIZON), 0, 're-runnable: nothing left to place')
+
+    def test_a_numbers_first_game_past_the_guide_keeps_its_channel(self):
+        """The guide's last block on a channel names its next game ("Next: ...", guide_fillers), so
+        a player has cached that game's channel even though its listing is past the guide."""
+        self.league.feed_league_channels = True
+        late = self.event(BEARS, GULLS, self.at(1, 22), feed_number=1)
+        named = self.event(PANTHERS, COMETS, self.at(2, 1), feed_number=1)
+        after = self.event(GULLS, COMETS, self.at(2, 13), feed_number=1)
+        db.session.commit()
+        horizon = self.at(2, 0) - self.now
+        sports_feed.place_league_events(self.league, self.now, horizon, get_display_tz())
+        db.session.commit()
+        self.assertEqual(self.numbers(), {late.tsdb_id: 1, named.tsdb_id: 1, after.tsdb_id: 2})
+
+    def test_the_layout_reads_the_days_of_guide_the_output_sends(self):
+        """output_feed.guide_horizon() follows xmltv_days, and the league switch, a schedule update
+        and a matcher run each lay a league out against it."""
+        from unittest import mock
+        from app.database import SportsState
+        self.t.sandbox_config(_feed_cfg(xmltv_days=7))
+        self.assertEqual(feed.guide_horizon(), timedelta(days=7))
+        pair = [self.event(BEARS, COMETS, self.at(5, 12), feed_number=1),
+                self.event(GULLS, PANTHERS, self.at(5, 18), feed_number=1)]
+        db.session.add(SportsState(id=1))
+        db.session.commit()
+        resp = self.client.put(f'/api/sports/leagues/{self.league.id}/feed-channels', json={'enabled': True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.numbers(), {pair[0].tsdb_id: 1, pair[1].tsdb_id: 1},
+                         'inside 7 days of guide, so cached and kept')
+        with mock.patch('app.sports_feed.place_all_guarded', return_value=0) as placed, \
+                mock.patch('app.sports_match.match_league', return_value={}), \
+                mock.patch('app.scheduler.queue_sports_match'):
+            sports_match.run(self.now, pause=0)
+        self.assertEqual(placed.call_args.args[1], timedelta(days=7))
+
+    def test_a_game_running_long_past_midnight_keeps_its_channel(self):
+        """The next day's game on the same channel is hours off, so a 10 PM game still on at 1:30 AM
+        is what the channel plays and the channel is still listed."""
+        late = self.event(BEARS, GULLS, self.at(1, 22))
+        tomorrow = self.event(PANTHERS, COMETS, self.at(2, 13))
+        ch1, ch2 = self.channel('Local 1'), self.channel('Local 2')
+        self.listing(late, ch1)
+        self.listing(tomorrow, ch2)
+        db.session.commit()
+        self.on()
+        self.assertEqual(self.numbers(), {late.tsdb_id: 1, tomorrow.tsdb_id: 1})
+        served = [s for s in sports_feed.served_channels() if s.row.number == 1]
+        moment, after = self.at(2, 1, 30), timedelta(hours=2)
+        now = sports_feed.playing_now(served[0], moment, after=after)
+        self.assertEqual(now.event.id, late.id)
+        self.assertEqual(sports_feed.numbered_with_games(served, moment, 3, after), {served[0].row.id})
 
     def test_a_failed_placement_never_stops_its_caller(self):
         from unittest import mock
         with mock.patch('app.sports_feed.place_all', side_effect=RuntimeError('boom')), \
                 self.assertLogs('app.sports_feed', level='ERROR') as logs:
-            self.assertEqual(sports_feed.place_all_guarded(self.now), 0)
+            self.assertEqual(sports_feed.place_all_guarded(self.now, HORIZON), 0)
         self.assertIn('the next run tries again', logs.output[0])
 
     def test_off_keeps_the_layout_and_on_again_brings_back_the_same_ids(self):
@@ -986,7 +1133,7 @@ class LeagueChannelTests(_Case):
         db.session.commit()
         self.on()
         before = [s['stream_id'] for s in self.streams()]
-        sports_feed.set_league_channels(self.league.id, False)
+        sports_feed.set_league_channels(self.league.id, False, HORIZON)
         self.assertEqual(self.streams(), [])
         self.assertEqual(self.numbers()[a.tsdb_id], 1)
         self.on()
@@ -1036,7 +1183,7 @@ class LeagueChannelTests(_Case):
                            local_date=midnight.date())
         db.session.add(race)
         db.session.commit()
-        self.assertEqual(sports_feed.place_all(self.now), 0, 'no time yet, so nothing to place')
+        self.assertEqual(sports_feed.place_all(self.now, HORIZON), 0, 'no time yet, so nothing to place')
 
         def found(*_a, **_k):
             db.session.get(SportsEvent, race.id).guide_start = midnight + timedelta(hours=14)
@@ -1065,7 +1212,7 @@ class GuideWindowTests(_Case):
     guide between games names the next one (dev/changelog/1621)."""
 
     def on(self):
-        self.assertTrue(sports_feed.set_league_channels(self.league.id, True))
+        self.assertTrue(sports_feed.set_league_channels(self.league.id, True, HORIZON))
 
     def busy_day(self):
         """Three games at once five days out, one tonight: channels 1-3, only 1 inside 3 days of guide."""
@@ -1094,6 +1241,16 @@ class GuideWindowTests(_Case):
         rows = {r.number: r.id for r in SportsFeedChannel.query.all()}
         self.assertEqual([(s['name'], s['stream_id']) for s in self.streams()],
                          [(f'Pretend League {n}', feed.SPORTS_FEED_BASE + rows[n]) for n in (1, 2, 3)])
+
+    def test_a_channel_whose_only_game_is_two_days_out_is_listed(self):
+        """The channel list keeps its 3-day outlook under one game per channel per day
+        (dev/changelog/1684): on a Thursday the channels Saturday needs are listed, a player
+        caching the list."""
+        self.event(BEARS, GULLS, self.at(2, 13))
+        self.event(PANTHERS, COMETS, self.at(2, 19))
+        db.session.commit()
+        self.on()
+        self.assertEqual([s['name'] for s in self.streams()], ['Pretend League 1', 'Pretend League 2'])
 
     def test_a_team_channel_is_listed_with_no_game_at_all(self):
         self.team_on(PANTHERS)
@@ -1297,7 +1454,7 @@ class NameTests(_Case):
         db.session.flush()
         start = max(self.now - timedelta(minutes=30), midnight + timedelta(minutes=1))
         ch = self.named(race, 'PFL GP: Grand Prix 3:00 PM ET', start)
-        self.assertEqual(sports_feed.place_league_events(self.league, self.now), 1)
+        self.assertEqual(sports_feed.place_league_events(self.league, self.now, HORIZON, NY), 1)
         db.session.commit()
         self.assertEqual(db.session.get(SportsEvent, race.id).feed_number, 1)
         row = SportsFeedChannel.query.filter_by(league_id=self.league.id, number=1).one()

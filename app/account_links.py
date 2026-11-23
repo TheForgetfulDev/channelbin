@@ -68,7 +68,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 
 from . import db
 from .db_utils import chunked, retry_on_locked
@@ -2017,8 +2017,18 @@ def share_login(login_id: int, account_id: int):
     """Add a login another account holds to `account_id`'s list too, so the two count its
     seats once (design §3.1 case 3). Only within one provider: every account holding it and
     the target must be on the same one. Appended at the end of the target's list; nothing
-    is copied. Returns the Login. Raises LookupError / ValueError."""
-    from .database import Account, AccountLogin, Login
+    is copied. Returns (Login, replaced) - `replaced` the id of the target's own playlist row
+    the share took the place of, or None. Raises LookupError / ValueError.
+
+    One login sold through two services is the case sharing exists for, and there the sync
+    has already listed the same username and password on both accounts as each one's
+    playlist login. The target's row is then replaced by the shared one, in its place on the
+    list with its switch, rather than refused: it cannot be removed (the next sync would list
+    it again), so a refusal would leave the two accounts no way to count the seat once. The
+    target's sync then adopts the shared row as its playlist login instead of adding another
+    (dev/changelog/1692). A row the user typed is never replaced: that is the user's to
+    remove."""
+    from .database import Account, AccountLogin, Login, LoginBlock
 
     @retry_on_locked()
     def _share_and_commit():
@@ -2037,23 +2047,55 @@ def share_login(login_id: int, account_id: int):
             raise ValueError(f'A login can be shared only between accounts on the same '
                              f'provider. Put {target.name} on the same provider first.')
         existing = logins_for_account(account_id)
-        if any((lg.username, lg.password) == (login.username, login.password) for lg in existing):
-            raise ValueError(f'{target.name} already has a login with the username '
-                             f'{login.username} and that password.')
+        twin = next((lg for lg in existing
+                     if (lg.username, lg.password) == (login.username, login.password)), None)
+        if twin is not None:
+            if not (twin.playlist_account_id == account_id and _is_sync_listed(twin)):
+                raise ValueError(f'{target.name} already has a login with the username '
+                                 f'{login.username} and that password. Remove it from '
+                                 f'{target.name} first, then share this one.')
+            if login_holders([twin.id]).get(twin.id, []) != [account_id]:
+                raise ValueError(f'{target.name}\'s own login {twin.username} is shared with '
+                                 f'another account. Stop sharing it first.')
+            now = datetime.utcnow()
+            if LoginBlock.query.filter(
+                    LoginBlock.login_id == twin.id,
+                    or_(LoginBlock.stop_time.is_(None), LoginBlock.stop_time > now)).first():
+                raise ValueError(f'{target.name}\'s own login {twin.username} is blocked. '
+                                 f'Unblock it first, then share this one.')
         if login.playlist_account_id is None and any(
                 lg.name.lower() == login.name.lower() and lg.playlist_account_id is None
                 for lg in existing):
             raise ValueError(f'{target.name} already has a login named {login.name}.')
-        positions = [p for (p,) in db.session.query(AccountLogin.position)
-                     .filter(AccountLogin.account_id == account_id).all()]
-        db.session.add(AccountLogin(account_id=account_id, login_id=login_id,
-                                    position=max(positions, default=-1) + 1))
+        replaced = None
+        if twin is not None:
+            held = db.session.get(AccountLogin, (account_id, twin.id))
+            row = AccountLogin(account_id=account_id, login_id=login_id, position=held.position,
+                               enabled=held.enabled, switched_at=held.switched_at)
+            replaced = twin.id
+            db.session.delete(held)
+            db.session.flush()
+            from .account_blocks import drop_login_blocks
+            drop_login_blocks([twin.id])
+            db.session.delete(twin)
+            db.session.add(row)
+        else:
+            positions = [p for (p,) in db.session.query(AccountLogin.position)
+                         .filter(AccountLogin.account_id == account_id).all()]
+            db.session.add(AccountLogin(account_id=account_id, login_id=login_id,
+                                        position=max(positions, default=-1) + 1))
         db.session.commit()
-        return login
+        return login, replaced
 
-    login = _share_and_commit()
-    log.info('Login "%s" shared with account %d', login.name, account_id)
-    return login
+    login, replaced = _share_and_commit()
+    if replaced is not None:
+        from . import connection_limits as connlim
+        connlim.merge_login_pool(replaced, login.id)
+        log.info('Login "%s" shared with account %d, in place of its own playlist login %d '
+                 '(the same username and password)', login.name, account_id, replaced)
+    else:
+        log.info('Login "%s" shared with account %d', login.name, account_id)
+    return login, replaced
 
 
 def unshare_login(login_id: int, account_id: int) -> str:

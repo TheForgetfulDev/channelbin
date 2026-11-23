@@ -197,7 +197,7 @@
             {% if feed.show_league %}
             <tr>
               <td data-label="Channel" class="rl-prog"><span class="t">{{ league.name }} 1{% if feed.numbered > 1 %} to {{ league.name }} {{ feed.numbered }}{% endif %}</span></td>
-              <td data-label="What it carries" class="rl-prog">Every {{ one }} in the league, spread over as many channels as it takes for none to overlap.<span class="s">A {{ one }} keeps the channel it is given.</span></td>
+              <td data-label="What it carries" class="rl-prog">Every {{ one }} in the league, one per channel per day, so tuning in late or early never gets the {{ one }} before or after it.<span class="s">A {{ one }} keeps its channel once your IPTV player's guide lists it.</span></td>
               <td data-label="On the output"><label class="switch"><input type="checkbox" data-act="feed-channel" data-team="0" aria-label="{{ league.name }} league channels on the IPTV output"{{ ' checked' if feed.league_on else '' }}><span class="knob"></span></label></td>
               <td data-label="" class="sp-kebab">
                 {%- if feed.numbered_feeds | length > 1 %}<span class="menu-wrap"><button class="btn btn-sm" data-menu>{{ icon('preview') }}Preview {{ icon('dropdown') }}</button>

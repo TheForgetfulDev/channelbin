@@ -241,7 +241,7 @@ def stop_following(league_id):
 def set_feed_channel(league_id):
     """Turn one of this league's sports channels on the output feed on or off: a team's channel
     (`team_id`), or the league's numbered channels with none (app/sports_feed.py)."""
-    from .. import sports_feed
+    from .. import output_feed, sports_feed
     data = request.get_json(silent=True) or {}
     if not isinstance(data.get('enabled'), bool):
         return jsonify({'error': 'enabled must be true or false.'}), 400
@@ -256,7 +256,7 @@ def set_feed_channel(league_id):
         if team_id:
             done = sports_feed.set_team_channel(league_id, team_id, data['enabled'])
         else:
-            done = sports_feed.set_league_channels(league_id, data['enabled'])
+            done = sports_feed.set_league_channels(league_id, data['enabled'], output_feed.guide_horizon())
     except sports_feed.NotFollowed as exc:
         return jsonify({'error': str(exc)}), 409
     if done is None:

@@ -10,7 +10,7 @@ import logging
 
 from flask import Blueprint, current_app, jsonify, render_template, request
 
-from .. import db, output_feed, output_feed_view
+from .. import db, output_feed, output_feed_view, pip_channels
 from ..config import config_write_lock, load_config, load_for_edit, save_config, set_nested
 from ..database import Account
 from ..db_utils import retry_on_locked
@@ -52,6 +52,9 @@ def set_row(feed_id):
     if kind == output_feed.KIND_SPORTS:
         return jsonify({'error': 'A sports channel is turned on and off on its league\'s page '
                                  'in Sports Schedules'}), 400
+    if kind == output_feed.KIND_PIP and output_feed.pip_swapped(feed_id):
+        return jsonify({'error': 'A swapped copy follows its channel. Turn it off with Swapped copy, under '
+                                 'Picture-in-picture channels'}), 400
 
     @retry_on_locked()
     def _switch_and_commit():
@@ -63,13 +66,129 @@ def set_row(feed_id):
 
     name, moved = _switch_and_commit()
     if name is None:
-        return jsonify({'error': 'That channel is not in the TV Guide any more'}), 404
-    cut = 0 if on else output_feed.stop_feed_id(feed_id, output_feed.REASON_TAKEN_OFF)
+        return jsonify({'error': 'That channel no longer exists' if kind == output_feed.KIND_PIP
+                        else 'That channel is not in the TV Guide any more'}), 404
+    if on:
+        cut = 0
+    elif kind == output_feed.KIND_PIP:
+        cut = output_feed.stop_pip(row_id)      # its swapped copy goes with it
+    else:
+        cut = output_feed.stop_feed_id(feed_id, output_feed.REASON_TAKEN_OFF)
     if moved:
         log.info('IPTV output: %s %s (feed id %d)%s', name,
                  'put back on' if on else 'taken off', feed_id,
                  f', {counted(cut, "play")} cut' if cut else '')
     return jsonify({'success': True, 'name': name, 'on': on, 'cut': cut})
+
+
+def _pip_numbers(row_id: int) -> dict:
+    """The channel numbers a picture-in-picture channel and its swapped copy have right now, 0
+    for one that is not on the output."""
+    nums = {r.feed_id: r.num for r in output_feed.catalog(load_config())}
+    return {'num': nums.get(output_feed.feed_id_for_pip(row_id), 0),
+            'swapped_num': nums.get(output_feed.feed_id_for_pip(row_id, True), 0)}
+
+
+def _pip_gone():
+    return jsonify({'error': 'That picture-in-picture channel no longer exists'}), 404
+
+
+@iptv_output_bp.route('/api/iptv-output/pip/pickers')
+def pip_pickers():
+    """What the setup dialog's pickers list: the coming games and the TV Guide's rows."""
+    return jsonify({'success': True, **pip_channels.picker_data(load_config())})
+
+
+@iptv_output_bp.route('/api/iptv-output/pip/would-play', methods=['POST'])
+def pip_would_play():
+    """What the two pictures of the draft in the setup dialog would start from right now, and
+    the connections that takes. A read: nothing is saved and no connection is taken."""
+    data = request.get_json(silent=True) or {}
+    main, inset = (pip_channels.clean_draft_source(data.get(k)) for k in ('main', 'inset'))
+    return jsonify({'success': True, **pip_channels.would_play(main, inset, load_config())})
+
+
+@iptv_output_bp.route('/api/iptv-output/pip', methods=['POST'])
+def pip_create():
+    """Create a picture-in-picture channel. Nothing is on the output until this."""
+    cfg = load_config()
+    try:
+        spec = pip_channels.clean(request.get_json(silent=True) or {})
+        pip_channels.check_sources(spec, cfg)
+    except pip_channels.PipRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    row = pip_channels.create(spec)
+    return jsonify({'success': True, 'id': row.id, 'name': row.name, **_pip_numbers(row.id)})
+
+
+@iptv_output_bp.route('/api/iptv-output/pip/<int:row_id>', methods=['POST'])
+def pip_change(row_id):
+    """Save a picture-in-picture channel's name, pictures and layout. A play on its card asks
+    again at once; one on its two pictures changes in place (`changing`); one on its big
+    picture alone keeps it until it tunes in again (`kept`)."""
+    cfg = load_config()
+    try:
+        spec = pip_channels.clean(request.get_json(silent=True) or {})
+        pip_channels.check_sources(spec, cfg)
+    except pip_channels.PipRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    row = pip_channels.change(row_id, spec)
+    if row is None:
+        return _pip_gone()
+    cut = 0 if row.swapped_copy else output_feed.stop_pip(row_id, swapped_only=True)
+    _asked, kept, changing = output_feed.refresh_pip(row_id)
+    return jsonify({'success': True, 'id': row.id, 'name': row.name, 'kept': kept, 'changing': changing,
+                    'cut': cut, **_pip_numbers(row.id)})
+
+
+@iptv_output_bp.route('/api/iptv-output/pip/<int:row_id>/swap', methods=['POST'])
+def pip_swap(row_id):
+    try:
+        row = pip_channels.swap(row_id)
+    except pip_channels.PipRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    if row is None:
+        return _pip_gone()
+    _asked, kept, changing = output_feed.refresh_pip(row_id)
+    return jsonify({'success': True, 'name': row.name, 'kept': kept, 'changing': changing})
+
+
+@iptv_output_bp.route('/api/iptv-output/pip/<int:row_id>/clear', methods=['POST'])
+def pip_clear(row_id):
+    """Take both pictures off. Its swapped copy leaves the output, so a play of that ends by
+    name; a play of the channel itself goes to the card saying nothing is set up."""
+    row = pip_channels.clear(row_id)
+    if row is None:
+        return _pip_gone()
+    cut = output_feed.stop_pip(row_id, swapped_only=True)
+    moved = output_feed.clear_pip(row_id)
+    return jsonify({'success': True, 'name': row.name, 'cut': cut, 'moved': moved})
+
+
+@iptv_output_bp.route('/api/iptv-output/pip/<int:row_id>/swapped-copy', methods=['POST'])
+def pip_swapped_copy(row_id):
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get('on'), bool):
+        return jsonify({'error': 'Say whether the swapped copy is offered'}), 400
+    try:
+        row = pip_channels.set_swapped_copy(row_id, data['on'])
+    except pip_channels.PipRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    if row is None:
+        return _pip_gone()
+    cut = 0 if data['on'] else output_feed.stop_pip(row_id, swapped_only=True)
+    return jsonify({'success': True, 'name': row.name, 'on': data['on'], 'cut': cut, **_pip_numbers(row.id)})
+
+
+@iptv_output_bp.route('/api/iptv-output/pip/<int:row_id>', methods=['DELETE'])
+def pip_remove(row_id):
+    """Remove a picture-in-picture channel from the output: the row is deleted and its plays
+    end by name, after the write and never inside it."""
+    name = pip_channels.remove(row_id)
+    if name is None:
+        return _pip_gone()
+    cut = output_feed.stop_pip(row_id)
+    return jsonify({'success': True, 'name': name, 'cut': cut})
 
 
 @iptv_output_bp.route('/api/iptv-output/plays/<session_id>/stop', methods=['POST'])
@@ -92,6 +211,8 @@ def move_play(session_id):
         session = output_feed.get_session(session_id)
         why = ' '.join(x for x in (session.reason_text(), session.detail) if x) if session else ''
         return jsonify({'error': f'Nothing else would start, so the play ended. {why}'.strip()}), 409
+    if done.outcome == output_feed.MOVE_TO_CARD:
+        return jsonify({'error': 'Nothing else would start, so it is showing its card. It tries again by itself.'}), 409
     if done.outcome == output_feed.MOVE_ADJUSTED:
         said = (f' {left} now has a score adjustment of {output_feed.HAND_MOVE_ADJUSTMENT}, so it '
                 f'is tried last, for a play or a recording, until you set it back on its channel page.')

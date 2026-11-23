@@ -229,7 +229,7 @@ _DEFAULTS = {
             # the GPU through the render node below (Intel Quick Sync, AMD), which the
             # container reaches only when /dev/dri is passed as a device. A re-encode is
             # the only thing that ever touches the GPU - a stream copy never decodes or
-            # encodes, and decoding stays on the CPU unless vaapi_decode is on. If the GPU
+            # encodes, and decoding moves to it too while vaapi_decode is on. If the GPU
             # is missing or fails, the conversion completes with libx264 and the recording
             # says so (dev/changelog/1125).
             'video_encoder': 'software',
@@ -243,11 +243,12 @@ _DEFAULTS = {
             # own. 27 measured at 60-67% of the source with VMAF within about a point of
             # h264_vaapi at 26 (dev/changelog/1183).
             'vaapi_hevc_qp': 27,
-            # Decode on the GPU too, on recordings the damage scan found clean and that hold
-            # one single format: ~9x less CPU for the same output. Never on a damaged file -
-            # the hardware decoder reports no decode errors, so concealed damage would read
-            # zero - and never on a mixed one, where the hardware decoder dies.
-            'vaapi_decode': False,
+            # Decode on the GPU too: ~9x less CPU for the same output. On by default since
+            # dev/changelog/1687, and it does nothing unless video_encoder is 'vaapi' and the
+            # GPU passed its test encode. Never on a damaged file (the hardware decoder logs
+            # fewer decode errors, so the damage count would read low) or on one whose formats
+            # one GPU chain cannot serve; the recording says which.
+            'vaapi_decode': True,
             # Conversion resilience (app/postprocessor.py supervised runner). A conversion
             # can be killed mid-flight (ffmpeg crash, a service restart, a stall); these
             # control whether the app restarts it and how it detects a stall.

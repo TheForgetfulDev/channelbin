@@ -190,9 +190,11 @@ class StartRouteTests(_Rig):
         super().setUp()
         self.calls = []
 
-        def fake_start(rid, name, path, offset, transcode_audio, capture=None, reencode=False):
+        def fake_start(rid, name, path, offset, transcode_audio, capture=None, reencode=False,
+                       interlaced=None):
             self.calls.append(dict(path=path, offset=offset, capture=capture,
-                                   transcode_audio=transcode_audio, reencode=reencode))
+                                   transcode_audio=transcode_audio, reencode=reencode,
+                                   interlaced=interlaced))
             return preview.PreviewSession(
                 id='sid', channel_id=None, channel_name='', account_id=None, dir='',
                 stderr_path='', transcode_audio=transcode_audio, idle_timeout=15,
@@ -247,6 +249,20 @@ class StartRouteTests(_Rig):
         self.assertIsNone(call['capture'].follow_state)
         self.assertAlmostEqual(data['capture']['span_end'], 100.0, delta=1)
         self.assertFalse(data['following'])
+
+    def test_the_segments_own_interlace_answer_goes_to_the_re_encode(self):
+        """A GPU-decoding re-encode deinterlaces only a source known to be interlaced; for a
+        capture that is the segment's probe (dev/changelog/1688)."""
+        rec, state = self._capturing()
+        seg = sorted(rec.segments, key=lambda s: s.segment_number)[0]
+        seg.probe_interlaced = True
+        db.session.commit()
+        code, data = self._play(rec, {'offset': 30, 'reencode': True}, state)
+        self.assertEqual(code, 200, data)
+        self.assertIs(self.calls[-1]['interlaced'], True)
+        code, data = self._play(rec, {'offset': 110}, state)
+        self.assertEqual(code, 200, data)
+        self.assertIsNone(self.calls[-1]['interlaced'])
 
     def test_behind_live_in_the_growing_segment_follows_from_the_offset(self):
         rec, state = self._capturing()

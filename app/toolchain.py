@@ -408,6 +408,65 @@ def check_gpu_encoder(ffmpeg_path, device, codec='h264', report=True):
     return trial
 
 
+#: What the overlay trial is filed under in _gpu_trial, beside the codecs an encode trial is.
+GPU_OVERLAY_TRIAL = 'overlay'
+
+
+def gpu_overlay_trial_cmd(ffmpeg_path, device):
+    """The one-second overlay trial: two generated pictures uploaded to the device, one laid
+    over the other with overlay_vaapi and encoded to a null muxer, the shape a
+    picture-in-picture play's combiner has (proc_utils.build_pip_combiner_cmd)."""
+    graph = (f'[0:v]{VAAPI_UPLOAD}[big];[1:v]{VAAPI_UPLOAD}[small];'
+             f'[big][small]overlay_vaapi=x=16:y=16[v]')
+    return ([ffmpeg_path, '-nostdin', '-hide_banner', '-loglevel', 'error']
+            + vaapi_device_args(device)
+            + ['-f', 'lavfi', '-i', 'testsrc2=s=320x240:d=1', '-f', 'lavfi', '-i', 'testsrc2=s=160x120:d=1',
+               '-filter_complex', graph, '-map', '[v]']
+            + vaapi_encode_args('h264') + ['-f', 'null', '-'])
+
+
+def _run_gpu_overlay_trial(ffmpeg_path, device):
+    """(returncode, stderr tail) of one overlay trial. The seam tests patch."""
+    try:
+        proc = subprocess.run(gpu_overlay_trial_cmd(ffmpeg_path, device), capture_output=True,
+                              text=True, timeout=_GPU_TRIAL_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return None, f'The overlay trial produced nothing in {_GPU_TRIAL_TIMEOUT_SECONDS}s'
+    except OSError as exc:
+        return None, f'Could not run {ffmpeg_path}: {exc}'
+    lines = [ln.strip() for ln in (proc.stderr or '').splitlines() if ln.strip()]
+    return proc.returncode, '\n'.join(lines[-6:])
+
+
+def check_gpu_overlay(ffmpeg_path, device):
+    """Prove the device lays one picture over another (overlay_vaapi), which a
+    picture-in-picture play needs and not every VA-API driver offers
+    (dev/docs/DESIGN-pip-channels.md 7.1). A pass is cached for the life of the process, keyed
+    as check_gpu_encoder() keys its own; a failure is run again on every call. Every answer
+    becomes Readiness's "The GPU can combine two pictures" line. It raises no alert: nothing
+    is broken for a box that has no picture-in-picture channel, and a play that cannot combine
+    says so itself."""
+    key = (_absolute(ffmpeg_path), device, GPU_OVERLAY_TRIAL)
+    with _lock:
+        cached = bool(_gpu_trial.get(key))
+    if cached:
+        trial = GpuTrial(True, cached=True, codec=GPU_OVERLAY_TRIAL)
+    else:
+        rc, tail = _run_gpu_overlay_trial(ffmpeg_path, device)
+        ok = rc == 0
+        if ok:
+            with _lock:
+                _gpu_trial[key] = True
+            log.info('GPU overlay trial passed on %s (%s)', device, key[0])
+        else:
+            log.warning('GPU overlay trial FAILED on %s (%s): %s', device, key[0],
+                        tail or f'ffmpeg exited {rc}')
+        trial = GpuTrial(ok, '' if ok else (tail or f'ffmpeg exited {rc}'), codec=GPU_OVERLAY_TRIAL)
+    from .readiness import record_gpu_overlay
+    record_gpu_overlay(device, trial)
+    return trial
+
+
 def record_gpu_failure(ffmpeg_path, device, codec, error):
     """A conversion's GPU encode died part-way on real content: forget the cached pass and
     say so where the trial would have.

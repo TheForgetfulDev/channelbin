@@ -79,8 +79,43 @@ class IptvOutputPageConformanceTests(FeedCase):
         self.session(feed.feed_id_for_channel(self.alpha.id))
         html = self.render()
         cards = re.findall(r'<div class="card[^"]*" id="(of-[a-z]+)"', html)
-        self.assertEqual(cards, ['of-connect', 'of-watching', 'of-channels', 'of-recent',
+        self.assertEqual(cards, ['of-connect', 'of-watching', 'of-pip', 'of-channels', 'of-recent',
                                  'of-accounts', 'of-settings'])
+
+    def test_the_picture_in_picture_card_is_a_shared_table_with_its_phone_form(self):
+        """Mockup 63, dev/docs/DESIGN-pip-channels.md 12: a table like every other on the page,
+        its one primary action in the card's head, and a stand-in picture, never a live frame."""
+        import app.pip_channels as pip
+        from app.database import PIP_SOURCE_CHANNEL, PIP_SOURCE_GROUP
+        pip.create(pip.clean({'name': 'PiP 1', 'swapped_copy': True,
+                              'main': {'kind': PIP_SOURCE_CHANNEL, 'ref': self.alpha.id},
+                              'inset': {'kind': PIP_SOURCE_GROUP, 'ref': self.group.id}}))
+        html = self.render()
+        card = html[html.index('id="of-pip"'):html.index('id="of-channels"')]
+        parser = _Tables()
+        parser.feed(card)
+        self.assertEqual(len(parser.tables), 1)
+        table = parser.tables[0]
+        self.assertEqual(table['class'].split()[:2], ['tbl', 'tbl-cards'])
+        self.assertTrue(table['scroll'])
+        self.assertEqual(table['cells'], ['#', 'Channel', 'Big picture', 'Small picture', 'Swapped copy', ''])
+        self.assertRegex(card, r'<div class="card-head-actions"><button class="btn btn-sm" data-act="pip-add">')
+        self.assertIn('class="pip-tv"', card)
+        self.assertNotIn('<img', card, 'a thumbnail is a stand-in: a live frame would open a connection')
+        self.assertNotIn('<video', card)
+        self.assertEqual(card.count('menu-item danger'), 1, 'Remove is the one destructive item')
+        for label in ('Change', 'Swap the two pictures', 'Clear', 'Remove from the output'):
+            self.assertIn(f'>{label}</button>', card)
+
+    def test_the_setup_dialog_is_the_shared_modal_and_steps_back_through_its_hooks(self):
+        with open(os.path.join(REPO, 'static', 'js', 'pip-setup.js'), encoding='utf-8') as fh:
+            js = fh.read()
+        self.assertIn('buildModal(', js)
+        self.assertIn('el.escapeHandler = picking ? closePicker : null', js)
+        self.assertIn('el.backdropHandler = picking ? closePicker : null', js)
+        self.assertNotIn('addEventListener(\'keydown\'', js, 'one Escape listener per overlay: wireModal\'s')
+        self.assertNotRegex(js, r'(?<![A-Za-z])confirm\(')
+        self.assertNotIn('location.href =', js)
 
     def test_every_table_is_the_shared_table_with_its_phone_form(self):
         self.session(feed.feed_id_for_channel(self.alpha.id))

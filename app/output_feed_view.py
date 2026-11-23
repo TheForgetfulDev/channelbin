@@ -17,10 +17,10 @@ from urllib.parse import quote, urlsplit
 from flask import url_for
 
 from . import connection_limits as connlim
-from . import output_feed
+from . import output_feed, pip_channels, pip_engine
 from . import db
 from .config import MASK_SENTINEL, PROXY_FIX_ARGS, public_url
-from .database import (FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED, Account,
+from .database import (FEED_PICTURE_BACK, FEED_PICTURE_STOPPED, FEED_PLAY_ENDED, FEED_PLAY_PICTURE, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED, Account,
                        EPGEntry, OutputFeedPlay, UserPref)
 from .fmt_utils import counted, fmt_bytes, fmt_duration
 from .tz_utils import day_label, format_local, get_display_tz, is_24h
@@ -84,9 +84,10 @@ MODE_LABELS = [(output_feed.MODE_PROXY, 'Proxy, everything through ChannelBin'),
                (output_feed.MODE_REDIRECT, 'Redirect, everything straight from the provider')]
 
 KIND_TEXT = {output_feed.KIND_CHANNEL: 'Channel', output_feed.KIND_GROUP: 'Channel group',
-             output_feed.KIND_SPORTS: 'Sports channel', output_feed.KIND_UP_NEXT: 'Up next channel'}
+             output_feed.KIND_SPORTS: 'Sports channel', output_feed.KIND_UP_NEXT: 'Up next channel',
+             output_feed.KIND_PIP: 'Picture-in-picture channel'}
 _PLAY_CHIPS = {FEED_PLAY_ENDED: 'Ended', FEED_PLAY_REFUSED: 'Refused',
-               FEED_PLAY_REDIRECTED: 'Tuned in'}
+               FEED_PLAY_REDIRECTED: 'Tuned in', FEED_PLAY_PICTURE: 'Small picture'}
 _LOCAL_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
 
 
@@ -251,7 +252,7 @@ def _sports_tuned(entry: tuple, now: datetime, window: tuple) -> tuple:
 
 
 def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dict, watching: dict, now, tz,
-              h24, window: tuple, fcfg: dict) -> dict:
+              h24, window: tuple, fcfg: dict, described: dict) -> dict:
     """One feed row as the Channels card shows it. `state` is exactly one of on / hidden /
     left_out; `problem` says why a play would not start, and is set on a left-out row too.
     `how` is how a play of it is delivered, said only in mixed mode, where rows differ."""
@@ -259,6 +260,7 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
             'name': row.name, 'category': row.category, 'num': row.num or '-',
             'is_sports': row.kind == output_feed.KIND_SPORTS,
             'is_up_next': row.kind == output_feed.KIND_UP_NEXT,
+            'is_pip': row.kind == output_feed.KIND_PIP, 'pip': None,
             'on': row.offered, 'switchable': True, 'switch_tip': '', 'problem': '',
             'plays': None, 'note': '', 'sub': KIND_TEXT[row.kind], 'live': None, 'channel_now': None,
             'watching': watching.get(row.feed_id, 0), 'how': '', 'how_tip': ''}
@@ -267,6 +269,9 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
             view['how'] = 'Through ChannelBin'
             view['how_tip'] = ('ChannelBin\'s own picture, so it always plays through ChannelBin and uses no '
                                'connection to your IPTV provider.')
+        elif row.kind == output_feed.KIND_PIP:
+            view['how'] = 'Through ChannelBin'
+            view['how_tip'] = ('ChannelBin makes its picture, so it plays through ChannelBin in every mode.')
         elif output_feed.relays(fcfg, row.feed_id):
             view['how'] = 'Through ChannelBin'
             view['how_tip'] = ('ChannelBin plays it through itself, so it can move to another channel '
@@ -385,6 +390,21 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
         if row.left_out:
             view['problem'] = f'Not on the output: {row.left_out}.'
             view['switch_tip'] = 'Follow something in its league again in Sports Schedules to bring it back.'
+    elif row.kind == output_feed.KIND_PIP:
+        one = row.row
+        view['url'] = '#of-pip'
+        view['sub'] = 'Picture in picture, swapped' if one.swapped else 'Picture in picture'
+        roles = (pip_channels.ROLE_INSET, pip_channels.ROLE_MAIN) if one.swapped else pip_channels.ROLES
+        if pip_channels.is_set(one.row):
+            view['pip'] = [_pip_plays(described[(one.row.id, role)], label, accounts)
+                           for role, label in zip(roles, ('Big', 'Small'))]
+        else:
+            view['note'] = 'Nothing set up: a card saying so'
+        if one.swapped:
+            # It follows its channel's switch and has none of its own (DESIGN-pip-channels.md 4.3).
+            view['switchable'] = False
+            view['switch_tip'] = ('A swapped copy follows its channel. Turn it off with Swapped copy, under '
+                                  'Picture-in-picture channels.')
     else:
         raise ValueError(f'Unknown feed row kind "{row.kind}"')
     # Preview (dev/changelog/1645): a provider's channel previews as itself; ChannelBin's own channels
@@ -400,7 +420,113 @@ def _row_view(row, accounts: dict, blocked, allowed, sports: dict, carrying: dic
     return view
 
 
-def _watching(sessions, by_feed: dict, accounts: dict, sports: dict, now, tz, h24, window: tuple) -> list:
+def _pip_plays(d, label: str, accounts: dict) -> dict:
+    """One picture of a picture-in-picture channel for a "plays from" cell: which window it is
+    (`label`), and either the channel a play would start from now with its account, or what the
+    picture is and when it is on. A game never names a channel here: which one carries it is
+    worked out at the tune-in."""
+    view = {'label': label, 'text': '', 'warn': d.gone, 'channel': None, 'account': None}
+    if d.member is not None:
+        view['channel'] = {'name': d.member.name,
+                           'url': url_for('channels.channel_detail', channel_id=d.member.id)}
+        view['account'] = accounts.get(d.member.account_id)
+    elif d.kind == pip_channels.PIP_SOURCE_GAME or d.gone:
+        view['text'] = f'{d.short}: {d.sub[:1].lower()}{d.sub[1:]}' if d.sub else d.title
+    elif d.kind == pip_channels.PIP_SOURCE_SEARCH:
+        view['text'] = f'no channel is named {d.short} right now' if not d.matches else f'{d.short}: nothing it matches can play right now'
+        view['warn'] = True
+    elif d.kind in (pip_channels.PIP_SOURCE_CHANNEL, pip_channels.PIP_SOURCE_GROUP):
+        view['text'] = f'{d.short} cannot play right now'
+        view['warn'] = True
+    else:
+        raise ValueError(f'Unknown kind of picture "{d.kind}"')
+    return view
+
+
+def pip_boxes() -> dict:
+    """Where the small picture sits in the stand-in picture, as a CSS box in percent of the
+    frame, for every layout a channel can store: 'side', and each corner with each size
+    ('brm'). From proc_utils.pip_geometry(), so the stand-in is the real arrangement."""
+    from .proc_utils import (PIP_CORNER_SIZES, PIP_CORNERS, PIP_LAYOUT_CORNER, PIP_LAYOUT_SIDE,
+                             REENCODE_HEIGHT, REENCODE_WIDTH, pip_geometry)
+
+    def box(g):
+        w, h = g.small_w + 2 * g.border, g.small_h + 2 * g.border
+        return (f'left:{100 * g.small_x / REENCODE_WIDTH:.2f}%;top:{100 * g.small_y / REENCODE_HEIGHT:.2f}%;'
+                f'width:{100 * w / REENCODE_WIDTH:.2f}%;height:{100 * h / REENCODE_HEIGHT:.2f}%')
+    side = pip_geometry(PIP_LAYOUT_SIDE)
+    out = {'side': box(side),
+           'side_main': (f'left:0;top:{100 * side.big_y / REENCODE_HEIGHT:.2f}%;'
+                         f'width:{100 * side.big_w / REENCODE_WIDTH:.2f}%;height:{100 * side.big_h / REENCODE_HEIGHT:.2f}%')}
+    for corner in PIP_CORNERS:
+        for size in PIP_CORNER_SIZES:
+            out[corner + size] = box(pip_geometry(PIP_LAYOUT_CORNER, corner, size))
+    return out
+
+
+def _pip_card(rows, described: dict, watching: dict) -> list:
+    """The Picture-in-picture card's rows, one per channel a person made, from the catalog's
+    rows and describe()'s answers: no query."""
+    by_row = {}
+    for row in rows:
+        if row.kind == output_feed.KIND_PIP:
+            by_row.setdefault(row.row.row.id, []).append(row)
+    out = []
+    boxes = pip_boxes()
+    for row_id, feed_rows in by_row.items():
+        main = next(r for r in feed_rows if not r.row.swapped)
+        twin = next((r for r in feed_rows if r.row.swapped), None)
+        row = main.row.row
+        is_set = pip_channels.is_set(row)
+        pics = {role: described.get((row.id, role)) for role in pip_channels.ROLES}
+        games = [d for d in pics.values() if d is not None and d.kind == pip_channels.PIP_SOURCE_GAME]
+        sub = f'{pip_channels.layout_words(row)}.' if is_set else pip_channels.NOTHING_SET_UP
+        if is_set and len(games) == 2 and all(d.over for d in games):
+            sub += ' Its games are over, and it shows that until you change it.'
+        if not row.on_output:
+            sub += ' Hidden from the IPTV output.'
+        spec = {'id': row.id, 'name': row.name, 'layout': row.layout, 'corner': row.corner,
+                'size': row.size, 'swapped_copy': bool(row.swapped_copy),
+                'main': None, 'inset': None}
+        for role in pip_channels.ROLES:
+            source, d = pip_channels.source_of(row, role), pics[role]
+            if source is not None:
+                spec[role] = dict(source.to_dict(), title=d.title, short=d.short, sub=d.sub)
+        out.append({
+            'id': row.id, 'name': row.name, 'feed_id': main.feed_id, 'num': main.num or '-',
+            'twin_num': (twin.num or '-') if twin is not None else '', 'twin_name': pip_channels.swapped_name(row.name),
+            'set': is_set, 'on': bool(row.on_output), 'swapped_copy': bool(row.swapped_copy), 'sub': sub,
+            'big': pics[pip_channels.ROLE_MAIN], 'small': pics[pip_channels.ROLE_INSET],
+            'side': row.layout == pip_channels.PIP_LAYOUT_SIDE,
+            'inset_box': boxes['side'] if row.layout == pip_channels.PIP_LAYOUT_SIDE else boxes[row.corner + row.size],
+            'main_box': boxes['side_main'] if row.layout == pip_channels.PIP_LAYOUT_SIDE else '',
+            'watching': watching.get(main.feed_id, 0) + (watching.get(twin.feed_id, 0) if twin else 0),
+            'spec': spec,
+        })
+    return out
+
+
+def _pip_live(session, accounts: dict):
+    """A combined play's two pictures for Watching now: each the channel and account it plays
+    from, or why it is not playing. None for a play that is not on its two pictures."""
+    from . import pip_engine
+    both = pip_engine.views(session)
+    if both is None:
+        return None
+    out = []
+    for label, one in (('Big', both['big']), ('Small', both['small'])):
+        text = one['text']
+        out.append({'label': label, 'warn': not one['live'],
+                    'channel': ({'name': one['channel_name'],
+                                 'url': url_for('channels.channel_detail', channel_id=one['channel_id'])}
+                                if one['live'] else None),
+                    'account': accounts.get(one['account_id']),
+                    'text': f'{text[:1].upper()}{text[1:]}' if text else 'Not playing'})
+    return out
+
+
+def _watching(sessions, by_feed: dict, accounts: dict, sports: dict, now, tz, h24, window: tuple,
+              described: dict) -> list:
     """The live plays, each with the program its row's guide lists now: ONE listings query
     for every watched channel together."""
     from . import db
@@ -428,9 +554,14 @@ def _watching(sessions, by_feed: dict, accounts: dict, sports: dict, now, tz, h2
                 'starting': s.state == output_feed.STATE_STARTING,
                 'waiting': s.state == output_feed.STATE_WAITING,
                 'showing': s.state == output_feed.STATE_SHOWING,
+                'on_card': s.state == output_feed.STATE_CARD,
+                'card_text': f'{s.card_text[:1].upper()}{s.card_text[1:]}' if s.card_text else '',
+                'pip': None, 'pip_live': None, 'combine_off': '',
                 'waiting_text': _waiting_text(s),
-                'from_screen': (f'Came from the waiting screen after {fmt_duration(s.screen_seconds)}'
-                                if s.left_screen_at is not None else ''),
+                'from_screen': ('' if s.left_screen_at is None
+                                else f'Came from its card after {fmt_duration(s.screen_seconds)}'
+                                if s.pip_row_id is not None
+                                else f'Came from the waiting screen after {fmt_duration(s.screen_seconds)}'),
                 'elapsed': fmt_duration(d['elapsed_seconds']),
                 'sent': fmt_bytes(s.bytes_sent) if s.bytes_sent else '-',
                 'moves': len(s.failovers), 'moves_text': _times(len(s.failovers)),
@@ -446,7 +577,16 @@ def _watching(sessions, by_feed: dict, accounts: dict, sports: dict, now, tz, h2
             view['row_url'] = url_for('sports.league_page', league_id=row.row.league.id)
             tuned, _phase = _sports_tuned(sports.get(row.row.row.id, _NO_SPORTS), now, window)
             view['program'] = tuned.title if tuned is not None else ''
-        elif row is not None:
+        elif row is not None and row.kind == output_feed.KIND_PIP:
+            one = row.row
+            view['row_url'] = '#of-pip'
+            roles = (pip_channels.ROLE_INSET, pip_channels.ROLE_MAIN) if one.swapped else pip_channels.ROLES
+            big, small = (described.get((one.row.id, role)) for role in roles)
+            if big is not None and small is not None:
+                view['pip'] = {'big': big.title, 'small': small.title}
+            view['pip_live'] = _pip_live(s, accounts)
+            view['combine_off'] = s.combine_off
+        elif row is not None and row.kind in (output_feed.KIND_CHANNEL, output_feed.KIND_GROUP):
             view['row_url'] = (url_for('channels.channel_detail', channel_id=row.row.id)
                                if row.kind == output_feed.KIND_CHANNEL
                                else url_for('channel_groups.group_detail', group_id=row.row.id))
@@ -455,6 +595,8 @@ def _watching(sessions, by_feed: dict, accounts: dict, sports: dict, now, tz, h2
                 view['program'] = hit[0] or ''
                 view['program_times'] = (f'{format_local(hit[1], "clock", tz=tz, h24=h24)} - '
                                          f'{format_local(hit[2], "clock", tz=tz, h24=h24)}')
+        elif row is not None:
+            raise ValueError(f'Unknown feed row kind "{row.kind}"')
         out.append(view)
     return out
 
@@ -495,7 +637,9 @@ def _recent(args, mode: str, by_feed: dict, accounts: dict, now, tz, h24) -> dic
         kinds = [FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED]
     else:
         raise ValueError(f'Unknown feed mode "{mode}"')
-    kinds += [k for k in (FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED) if k not in kinds and counts.get(k)]
+    # A picture-in-picture play's small-picture lines get a chip only while there are some.
+    kinds += [k for k in (FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_PICTURE)
+              if k not in kinds and counts.get(k)]
     picked = args.get('plays', PLAYS_ALL)
     if picked not in kinds:
         picked = PLAYS_ALL
@@ -542,6 +686,15 @@ def _recent(args, mode: str, by_feed: dict, accounts: dict, now, tz, h24) -> dic
         elif play.kind == FEED_PLAY_REDIRECTED:
             line['badge'] = ('b-sched', 'Sent to the provider')
             line['played'] = played(play, 'To', '. ChannelBin cannot see when it stopped.')
+        elif play.kind == FEED_PLAY_PICTURE:
+            # A picture-in-picture play's small picture: back on a channel, or stopped and why.
+            if play.reason == FEED_PICTURE_BACK:
+                line['badge'] = ('b-sched', 'Small picture back')
+                line['played'] = played(play, 'On', '')
+            elif play.reason == FEED_PICTURE_STOPPED:
+                line['badge'] = ('b-warn', 'Small picture stopped')
+            else:
+                raise ValueError(f'Unknown small-picture line "{play.reason}"')
         else:
             raise ValueError(f'Unknown play kind "{play.kind}"')
         lines.append(line)
@@ -602,14 +755,18 @@ def _accounts(rows, sessions, accounts: dict, cfg: dict, fcfg: dict) -> list:
             on = set()      # a sports channel plays from whichever account lists the game then
         elif row.kind == output_feed.KIND_UP_NEXT:
             on = set()      # ChannelBin's own picture: no account at all
+        elif row.kind == output_feed.KIND_PIP:
+            on = set()      # each picture plays from whichever account has it then
         else:
             raise ValueError(f'Unknown feed row kind "{row.kind}"')
         for account_id in on:
             if account_id in included:
                 included[account_id] += 1
     streams = {}
-    for s in sessions:
-        streams[s.account_id] = streams.get(s.account_id, 0) + 1
+    # A picture-in-picture play names no account itself: its two pictures each hold a
+    # connection, shared by every play of the row (DESIGN-pip-channels.md 8.1).
+    for account_id in [s.account_id for s in sessions] + pip_engine.picture_accounts():
+        streams[account_id] = streams.get(account_id, 0) + 1
     out = []
     for account in sorted(accounts.values(), key=lambda a: (a.name.lower(), a.id)):
         view = {'account': account, 'on': allowed is None or account.id in allowed,
@@ -647,7 +804,12 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
     watching = {}
     for s in sessions:
         watching[s.feed_id] = watching.get(s.feed_id, 0) + 1
-    views = [_row_view(r, accounts, blocked, allowed, sports, carrying, watching, now, tz, h24, window, fcfg)
+    pip_rows = list({r.row.row.id: r.row.row for r in rows if r.kind == output_feed.KIND_PIP}.values())
+    described = (pip_channels.describe(
+        pip_rows, now, guide=[r for r in rows if r.kind in (output_feed.KIND_CHANNEL, output_feed.KIND_GROUP)],
+        after=window[1]) if pip_rows else {})
+    views = [_row_view(r, accounts, blocked, allowed, sports, carrying, watching, now, tz, h24, window, fcfg,
+                       described)
              for r in rows]
     address = _address(cfg, host_url)
     max_viewers = int(fcfg.get('max_viewers') or 1)
@@ -667,7 +829,11 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
         'counts': {'all': len(views), 'on': sum(1 for v in views if v['on']),
                    'hidden': sum(1 for v in views if v['state'] == 'hidden'),
                    'problem': sum(1 for v in views if v['problem'])},
-        'watching': _watching(sessions, by_feed, accounts, sports, now, tz, h24, window),
+        'watching': _watching(sessions, by_feed, accounts, sports, now, tz, h24, window, described),
+        'pips': _pip_card(rows, described, watching),
+        'pip_gpu_why': pip_engine.gpu_notice(cfg) if pip_rows else '',
+        'pip_boot': {'boxes': pip_boxes(), 'corners': pip_channels.CORNER_WORDS, 'sizes': pip_channels.SIZE_WORDS,
+                     'name_max': pip_channels.NAME_MAX, 'query_max': pip_channels.QUERY_MAX},
         'at_limit': sum(1 for s in sessions if s.counted) >= max_viewers,
         'max_viewers': max_viewers,
         'recent': _recent(args, mode, by_feed, accounts, now, tz, h24),

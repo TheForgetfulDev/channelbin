@@ -394,6 +394,13 @@ class _Showing:
     start: datetime
     stop: datetime
     score: int
+    # A group's showing of one game (game_sources()): the members that may carry it, those of
+    # them whose guide shows it, and how many were left out because their own guide shows
+    # something else then (sports_match.members_for_game(), dev/changelog/1690). None on every
+    # other showing.
+    members: frozenset | None = None
+    carriers: frozenset | None = None
+    other_members: int = 0
 
 
 @dataclass
@@ -1010,22 +1017,25 @@ def _mark_broken(rule_id, revision, message, now) -> RuleOutcome:
     return RuleOutcome(rule_id=rule_id, stopped=message)
 
 
-def _search_rule(state, run):
-    """(entries, group wins) for the rule's search, start order, at most MAX_SHOWINGS - or
-    None when it matches more. Readiness is re-read before and after: a search that ran
-    while an index it used stopped being ready is run again unindexed and never acted on
-    (§4.2, R13)."""
+def _search_rule(state, run, capped=True):
+    """(entries, group wins) for the rule's search, start order, at most MAX_SHOWINGS - or None
+    when it matches more. `capped` False reads every page. Readiness is re-read before and after: a
+    search that ran while an index it used stopped being ready is run again unindexed and
+    never acted on (§4.2, R13)."""
     from .channel_search import MAX_PAGE_SIZE, search
     from .search_index import readiness_map
 
-    pages = MAX_SHOWINGS // MAX_PAGE_SIZE
+    cap = MAX_SHOWINGS if capped else None
+    pages = None if cap is None else cap // MAX_PAGE_SIZE
     base = replace(state, sort='when', sort_desc=False, page_size=MAX_PAGE_SIZE, page=1,
                    facets=())
     while True:
         before = readiness_map()
         run.ctx.readiness = before
         entries, wins = [], {}
-        for page in range(1, pages + 1):
+        page = 0
+        while pages is None or page < pages:
+            page += 1
             result = search(replace(base, page=page), run.ctx, want_counts=False,
                             want_facets=False)
             entries += [_EntrySnap.of(e) for e in result.rows]
@@ -1033,8 +1043,8 @@ def _search_rule(state, run):
             if len(result.rows) < MAX_PAGE_SIZE:
                 break
         more = False
-        if len(entries) >= MAX_SHOWINGS:
-            probe = search(replace(base, page=MAX_SHOWINGS + 1, page_size=1), run.ctx,
+        if cap is not None and len(entries) >= cap:
+            probe = search(replace(base, page=cap + 1, page_size=1), run.ctx,
                            want_counts=False, want_facets=False)
             more = bool(probe.rows)
         after = readiness_map()
@@ -1960,7 +1970,6 @@ WHY_UNSURE = 'unsure'       # listings ahead, none a strong enough match to pick
 WHY_NO_START = 'no_start'   # only an event channel names it, with no start to stand behind
 WHY_UNLISTED = 'unlisted'   # nothing in the guide or any channel's name
 WHY_UNKNOWN = 'unknown'     # the game is not in the window a pick reads
-WHY_TOO_MANY = 'too_many'   # more listings than MAX_SHOWINGS
 
 
 @dataclass
@@ -1994,11 +2003,9 @@ def game_pick(event_id, now=None, cfg=None):
 
 
 
-def _held(showings, listings) -> list:
-    """The showings that are one of `listings`, (channel id, guide start) pairs a play holds. A
-    group's showing is the one member listing the search kept for it (the `grpdedup` collapse),
-    which may be a member whose match is weak where another member's is strong, so a group counts
-    when any member of it is one. One query, and none with no group."""
+def _group_member_ids(showings) -> dict:
+    """{group id: {member channel id}} for the groups among `showings`. One query, and none with
+    no group."""
     from .database import ChannelGroupMember
     group_ids = sorted({s.group_id for s in showings if s.group_id is not None})
     members = {}
@@ -2006,8 +2013,30 @@ def _held(showings, listings) -> list:
         for gid, cid in db.session.query(ChannelGroupMember.group_id, ChannelGroupMember.channel_id).filter(
                 ChannelGroupMember.group_id.in_(group_ids)):
             members.setdefault(gid, set()).add(cid)
+    return members
+
+
+def _held(showings, listings, members) -> list:
+    """The showings that are one of `listings`, (channel id, guide start) pairs a play holds. A
+    group's showing is the one member listing the search kept for it (the `grpdedup` collapse),
+    which may be a member whose match is weak where another member's is strong, so a group counts
+    when any member of it is one. `members` is _group_member_ids()."""
     return [s for s in showings if (s.channel_id, s.start) in listings
             or any((cid, s.start) in listings for cid in members.get(s.group_id, ()))]
+
+
+def _mark_game_members(showings, event_id, members):
+    """Give each group showing of the game `event_id` the members that may carry it
+    (sports_match.members_for_game()). A group of local stations shows each city's own game in a
+    regional window, and the search's group collapse keeps the group because one member lists
+    this game, so without this a play took the group's healthiest member whatever it showed
+    (dev/changelog/1690). `members` is _group_member_ids()."""
+    from .sports_match import members_for_game
+    for s in showings:
+        if s.group_id is None:
+            continue
+        found = members_for_game(members.get(s.group_id, ()), event_id, s.start, s.title_key)
+        s.members, s.carriers, s.other_members = found.keep, found.carry, len(found.other)
 
 @dataclass
 class GameSources:
@@ -2093,8 +2122,12 @@ def channel_reason(program, used) -> tuple:
     if used is not program.lead:
         return CHANNEL_MOVED, '', None, 0
     if used.group_id is not None:
+        # A group of local stations can show another game in some cities (dev/changelog/1690).
+        one = used.other_members == 1
+        left_out = (f' {used.other_members} of its channels {"shows" if one else "show"} something else at that '
+                    f'time and {"is" if one else "are"} left out.' if used.other_members else '')
         return CHANNEL_GROUP, (f'Of the {n} channels with that listing, your channel group "{used.group_name}" goes '
-                               'first, since a group can switch channels if one fails.'), None, 0
+                               f'first, since a group can switch channels if one fails.{left_out}'), None, 0
     tied = sum(1 for s in program.showings if s.group_id is None and s.score == used.score)
     if tied == 1:
         return CHANNEL_HEALTH, (f'Of the {n} channels with that listing, this one has the best health score '
@@ -2164,20 +2197,22 @@ def game_sources(event_id, now=None, cfg=None, listings=None):
                         filters=(DimensionFilter('event', (str(event.tsdb_id),)),))
     if listings is not None:
         state = replace(state, standing=default_standing_for(GRAIN_AIRINGS) | {'showpast'})
-    entries, wins = _search_rule(state, SimpleNamespace(ctx=SearchContext.build(cfg or load_config())))
-    if entries is None:
-        # More listings of one game than a rule may act on, which a rule's search is refused for
-        # too. Not seen on any real guide.
-        log.warning('Record: %s has more than %d listings, too many to pick from', game.title, MAX_SHOWINGS)
-        return GameSources(GamePick(PICK_NONE, game=game, why=WHY_TOO_MANY))
+    # Uncapped: the event filter already narrows the search to one game's matched listings, so
+    # its size is how many channels carry the game, never a search too broad to mean anything.
+    # A network game on every local station is past a rule's MAX_SHOWINGS (1,722 listings of
+    # one Sunday night game, dev/changelog/1691).
+    entries, wins = _search_rule(state, SimpleNamespace(ctx=SearchContext.build(cfg or load_config())),
+                                 capped=False)
     if listings is None:
         entries = [e for e in entries if e.stop is not None and e.stop > now]
     else:
         starts = {start for _channel, start in listings}
         entries = [e for e in entries if e.start in starts]
     showings = _showings(entries, wins)
+    members = _group_member_ids(showings)
     if listings is not None:
-        showings = _held(showings, listings)
+        showings = _held(showings, listings, members)
+    _mark_game_members(showings, event.id, members)
     slots = _Slots()
     for s in showings:
         slots.add(s.title_key, s.start, s.episode_raw)
@@ -2714,6 +2749,7 @@ def _move_recording(m, rec, showing, rule_name, run, now) -> dict:
     rec.start_time = rec.scheduled_start_time = start
     rec.stop_time = rec.scheduled_stop_time = stop
     rec.program_start_time, rec.program_stop_time = showing.start, showing.stop
+    rec.source_channel_id = showing.channel_id
 
     renamed = ''
     if m.rec_name is not None and rec.name == m.rec_name:

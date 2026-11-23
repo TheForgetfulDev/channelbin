@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app.config as cfgmod  # noqa: E402
 import app.postprocessor as ppmod  # noqa: E402
 from app import db, toolchain  # noqa: E402
+from app import normalize as nz  # noqa: E402
 from app.alerts import GPU_ENCODER_UNAVAILABLE  # noqa: E402
 from app.database import (Alert, Recording, RecordingEvent, RecordingSegment, CONVERSION_DONE,  # noqa: E402
                           CONVERSION_RESTARTED, SEEK_DAMAGE_DETECTED,
@@ -121,6 +122,9 @@ def _build_sources(d):
           vf='tinterlace=mode=interleave_top,setfield=tff',
           extra=('-flags', '+ildct+ilme', '-x264opts', 'tff=1'))
     _clip(os.path.join(d, 'ana.ts'), '1440x1080', '25', 2, vf='setsar=4/3')
+    # Progressive then interlaced at one size and rate: a file one GPU chain cannot serve.
+    _concat(os.path.join(d, 'intmix.ts'),
+            [os.path.join(d, 'b1080.ts'), os.path.join(d, 'int.ts')], d)
     # setparams, not -color_trc: the encoder takes its color tags from the frames.
     pq = 'setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc'
     _clip(os.path.join(d, 'hdr.ts'), '1280x720', '25', 2, vf=pq)
@@ -282,6 +286,14 @@ class SurveyTests(_NormalizeCase):
         self.assertEqual(got['audio_channels'], [2, 6])
         self.assertEqual(len(got['video_rates']), 2)
         self.assertAlmostEqual(max(got['video_rates']), 59.94, delta=0.05)
+        self.assertTrue(got['progressive'])
+        self.assertFalse(got['interlaced'])
+
+    def test_the_survey_sees_interlaced_and_progressive_stretches_in_one_file(self):
+        from app.probe import survey_formats
+        got = survey_formats(os.path.join(self.src, 'intmix.ts'))
+        self.assertTrue(got['interlaced'])
+        self.assertTrue(got['progressive'])
 
     def test_a_change_inside_one_segment_still_comes_out_at_the_biggest_format(self):
         """One row, which saw only the 720p30 start: the survey finds the rest."""
@@ -455,17 +467,38 @@ class GpuCommandTests(_NormalizeCase):
                             _trial(1, 'No VA display found'))[0]
         self.assertEqual(self._arg(cmd, '-c:v'), 'libx264')
 
-    def test_gpu_decode_only_on_a_clean_single_format_recording(self):
+    def test_gpu_decode_needs_the_damage_scan_and_says_so(self):
         self._use('b1080.ts', [('1920x1080', 59.94, 6, False)])
         cmd = self._convert(_config(video_encoder='vaapi', vaapi_decode=True,
                                     reencode_mode='always'))[0]
         # 'always' with health data off never scanned for damage, so nothing proved it clean.
         self.assertNotIn('-hwaccel', cmd)
+        evs = self._events(DIAGNOSTICS, 'conversion_cpu_decode')
+        self.assertEqual(len(evs), 1)
+        self.assertIn('the damage scan did not run', evs[0].detail)
 
-    def test_gpu_decode_is_refused_on_a_mixed_recording(self):
+    def test_gpu_decode_runs_on_a_recording_that_changes_size(self):
+        """720p29.97 then 1080p59.94 decodes on the GPU, with ffmpeg's software output scaler
+        turned off: that scaler, added when a size change rebuilds the graph, is what died
+        (dev/docs/BUGS.md 2026-11-22 03:34 PM)."""
         self._use('mixed.ts', MIXED_ROWS)
         cmd = self._convert(_config(video_encoder='vaapi', vaapi_decode=True))[0]
+        self.assertEqual(self._arg(cmd, '-hwaccel'), 'vaapi')
+        self.assertIn('-noautoscale', cmd)
+        vf = self._arg(cmd, '-vf')
+        self.assertIn(nz.gpu_fit_filter(1920, 1080), vf)
+        self.assertEqual(self._events(DIAGNOSTICS, 'conversion_cpu_decode'), [])
+
+    def test_gpu_decode_refused_on_a_mix_of_interlaced_and_progressive_says_why(self):
+        """deinterlace_vaapi at field rate doubles every progressive frame, so a file holding
+        both kinds decodes on the CPU, and the recording says why."""
+        self._use('intmix.ts', [('1920x1080', 59.94, 2, False), ('1920x1080', 59.94, 2, True)])
+        cmd = self._convert(_config(video_encoder='vaapi', vaapi_decode=True))[0]
         self.assertNotIn('-hwaccel', cmd)
+        self.assertNotIn('-noautoscale', cmd)
+        evs = self._events(DIAGNOSTICS, 'conversion_cpu_decode')
+        self.assertEqual(len(evs), 1)
+        self.assertIn('interlaced and progressive', evs[0].detail)
 
     def test_gpu_decode_runs_where_the_scan_found_a_clean_single_format(self):
         self._use('b1080.ts', [('1920x1080', 59.94, 6, False)])
@@ -473,7 +506,18 @@ class GpuCommandTests(_NormalizeCase):
         cmd = self._convert(cfg)[0]
         self.assertEqual(self._arg(cmd, '-hwaccel'), 'vaapi')
         self.assertEqual(self._arg(cmd, '-hwaccel_device'), DEVICE)
-        self.assertIn('scale_vaapi=w=1280:h=720:format=nv12', self._arg(cmd, '-vf'))
+        self.assertIn(nz.gpu_fit_filter(1280, 720), self._arg(cmd, '-vf'))
+        self.assertIn('-noautoscale', cmd)
+
+    def test_gpu_decode_is_on_by_default_and_needs_the_gpu_encoder(self):
+        """On by default since dev/changelog/1687; with the software encoder it is never asked."""
+        from app.config import _DEFAULTS
+        self.assertIs(_DEFAULTS['recording']['post_process']['vaapi_decode'], True)
+        self._use('mixed.ts', MIXED_ROWS)
+        cmd = self._convert(_config(video_encoder='software', vaapi_decode=True))[0]
+        self.assertNotIn('-hwaccel', cmd)
+        self.assertNotIn('-noautoscale', cmd)
+        self.assertEqual(self._events(DIAGNOSTICS, 'conversion_cpu_decode'), [])
 
     def test_hdr_on_the_gpu_keeps_hdr10_with_hevc(self):
         self._use('hdrmixed.ts', [('1280x720', 25.0, 2, False), ('1920x1080', 50.0, 2, False)])

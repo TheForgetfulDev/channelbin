@@ -963,6 +963,8 @@ def survey_formats(filepath: str, timeout: int = 600, on_progress=None) -> dict:
     Returns {} on any failure (unknown must never read as "one format"), else:
         video_sizes     [[width, height, sar], ...] distinct, sar a float (1.0 when unstated)
         interlaced      True when any keyframe was coded interlaced
+        progressive     True when any keyframe was coded progressive; both True is a file
+                        that mixes the two, which one GPU chain cannot serve
         video_rates     distinct frame rates, from each keyframe's own duration
         transfers       distinct color_transfer values a keyframe stated
         audio_channels  distinct channel counts across every audio stream
@@ -988,7 +990,7 @@ def survey_formats(filepath: str, timeout: int = 600, on_progress=None) -> dict:
            'frame=media_type,stream_index,pts_time,best_effort_timestamp_time,width,height,'
            'sample_aspect_ratio,interlaced_frame,color_transfer,duration_time,channels',
            '-of', 'compact=p=0', filepath]
-    st = {'sizes': set(), 'interlaced': False, 'transfers': set(), 'channels': set(),
+    st = {'sizes': set(), 'interlaced': False, 'progressive': False, 'transfers': set(), 'channels': set(),
           'rates': [], 'video_stream': None, 'keyframes': 0, 'audio_frames': 0}
     runs = _FormatRuns()
 
@@ -1011,6 +1013,8 @@ def survey_formats(filepath: str, timeout: int = 600, on_progress=None) -> dict:
             st['sizes'].add((w, h, round(_parse_sar(fields.get('sample_aspect_ratio')) or 1.0, 4)))
             if fields.get('interlaced_frame') == '1':
                 st['interlaced'] = True
+            elif fields.get('interlaced_frame') == '0':
+                st['progressive'] = True
             # A keyframe's duration is one frame at the rate in force there, so a rate change
             # inside one segment shows up here as it does nowhere else.
             duration = _packet_time(fields.get('duration_time', ''))
@@ -1049,6 +1053,7 @@ def survey_formats(filepath: str, timeout: int = 600, on_progress=None) -> dict:
     return {
         'video_sizes': [list(s) for s in sorted(st['sizes'])],
         'interlaced': st['interlaced'],
+        'progressive': st['progressive'],
         'video_rates': sorted(st['rates']),
         'transfers': sorted(st['transfers']),
         'audio_channels': sorted(st['channels']),

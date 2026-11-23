@@ -510,6 +510,7 @@ const offerView = () => {
 };
 let reencodeAnswer = { success: true, available: true, reason: '' };
 let reencodeAsked = 0;
+let reDecodeNote = '';   // the decode_note a re-encode's status carries (dev/changelog/1688)
 const reAnswer = (check) => (url) => {
   if (url.endsWith('/file/check')) return respond(200, check);
   if (url === '/api/preview/reencode') { reencodeAsked += 1; return respond(200, reencodeAnswer); }
@@ -518,7 +519,7 @@ const reAnswer = (check) => (url) => {
     return respond(200, { ...s, reencode: !!(posted.length && posted[posted.length - 1][1].reencode) });
   }
   const m = url.match(/^\/api\/preview\/(s\d+)\/status$/);
-  if (m) return respond(200, { success: true, session_id: m[1], state: 'READY' });
+  if (m) return respond(200, { success: true, session_id: m[1], state: 'READY', decode_note: reDecodeNote });
   if (url.endsWith('/stop')) return respond(200, { success: true, stopped: true });
   return respond(404, { error: `unexpected ${url}` });
 };
@@ -545,6 +546,14 @@ tick(500); await settle();
 const reHls = hlsMade[hlsMade.length - 1] || new FakeHls({});
 rv.dispatchEvent(new w.Event('playing'));
 out.re.nativePlaying = offerView();
+// The server restarted the re-encode decoding on the CPU: the next poll says so, and so does
+// playing after it.
+reDecodeNote = 'The GPU could not decode this recording, so ChannelBin restarted it decoding on the CPU. ffmpeg said: Error reinitializing filters!';
+tick(3000); await settle();
+out.re.restartNoted = offerView();
+rv.dispatchEvent(new w.Event('playing'));
+out.re.restartPlaying = offerView();
+reDecodeNote = '';
 // The re-encode fails as well: no second offer, and the failure says it was the re-encode.
 setMedia(rv, { error: DECODE });
 reHls.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferAppendError' });

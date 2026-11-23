@@ -2427,7 +2427,7 @@ def start_recording_playback(recording_id):
         session = preview.start_file_playback(
             rec.id, rec.name, path, offset,
             transcode_audio=preview.audio_needs_transcode(rec.recorded_audio_codec),
-            reencode=reencode)
+            reencode=reencode, interlaced=rec.recorded_interlaced)
     except playback.PlaybackRefused as exc:
         return jsonify({'error': exc.message}), exc.status
     except preview.PreviewRefused as exc:
@@ -2485,7 +2485,8 @@ def _start_capture_playback(rec, body: dict, offset: float):
         session = preview.start_file_playback(
             rec.id, rec.name, path, at,
             transcode_audio=preview.audio_needs_transcode(acodec),
-            capture=place, reencode=bool(body.get('reencode')))
+            capture=place, reencode=bool(body.get('reencode')),
+            interlaced=seg.probe_interlaced)
     except playback.PlaybackRefused as exc:
         return jsonify({'error': exc.message}), exc.status
     except preview.PreviewRefused as exc:
@@ -2943,7 +2944,9 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
     program_start_time = program_stop_time = None
     program_title = program_sub_title = None
     metadata_description = metadata_category = metadata_rating = None
+    source_channel_id = None
     if entry is not None:
+        source_channel_id = entry.channel_id
         program_start_time = entry.start_time
         program_stop_time = entry.stop_time
         program_title = entry.title
@@ -2971,6 +2974,7 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
             program_stop_time=program_stop_time,
             program_title=program_title,
             program_sub_title=program_sub_title,
+            source_channel_id=source_channel_id,
             sports_name_template=sports_name_template,
             sports_record_tsdb_id=sports_record_tsdb_id,
             # The start a recording made after its own start time is given, so it stays ChannelBin's.

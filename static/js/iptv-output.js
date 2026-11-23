@@ -15,7 +15,7 @@
    row is never replaced by the save of the one before it. */
 (() => {
   const ALL = ['#of-state', '#of-sections'];
-  const CARDS = ['#of-state', '#of-connect', '#of-watching', '#of-channels', '#of-recent', '#of-accounts'];
+  const CARDS = ['#of-state', '#of-connect', '#of-watching', '#of-pip', '#of-channels', '#of-recent', '#of-accounts'];
   const STATE_ONLY = ['#of-state'];
   // What moves on its own. The channel list and the settings rows are left out of the timer,
   // so a search in progress or a number being typed is never replaced under the person.
@@ -317,6 +317,74 @@
     refresh(CARDS);
   }
 
+  /* ---- Picture-in-picture channels (static/js/pip-setup.js is the setup dialog) ---------- */
+  const reloads = 'An IPTV player shows it the next time it reloads its channel list.';
+  const cutNote = (n) => (n ? ` ${players(n)} watching it ${n === 1 ? 'was' : 'were'} cut.` : '');
+  const changingNote = (n) => (n ? ` ${players(n)} watching it ${n === 1 ? 'sees' : 'see'} the change within a few seconds.` : '');
+  const keptNote = (n) => (n ? ` ${players(n)} watching it ${n === 1 ? 'keeps' : 'keep'} the picture ${n === 1 ? 'it has' : 'they have'} until ${n === 1 ? 'it tunes' : 'they tune'} in again.` : '');
+
+  async function pipSaved(d, creating) {
+    await refresh(CARDS);
+    if (creating) {
+      showToast(d.num ? `${d.name} is on the output as channel ${d.num}${d.swapped_num ? `, and its swapped copy as ${d.swapped_num}` : ''}. ${reloads}`
+        : `${d.name} is created. It is on the output once the IPTV output is turned on.`);
+    } else {
+      showToast(d.kept || d.changing ? `Saved.${changingNote(d.changing)}${keptNote(d.kept)}${cutNote(d.cut)}` : `Saved. ${d.name} shows it the next time a TV tunes in.${cutNote(d.cut)}`);
+    }
+  }
+
+  const pipSetup = (tr) => guarded(openPipSetup)(tr ? JSON.parse(tr.dataset.spec) : null, { onSaved: guarded(pipSaved) });
+
+  async function pipSwap(tr) {
+    const d = await post(`/api/iptv-output/pip/${tr.dataset.pip}/swap`);
+    await refresh(CARDS);
+    showToast(`Swapped the two pictures of ${d.name}.${changingNote(d.changing)}${keptNote(d.kept)}`);
+  }
+
+  async function pipClear(tr) {
+    const name = tr.dataset.name;
+    const ok = await confirmModal({
+      title: `Clear ${name}?`,
+      message: `${name} stays on the output with nothing set up, and a TV on it gets a card saying so.`,
+      confirmLabel: 'Clear',
+    });
+    if (!ok) return;
+    const d = await post(`/api/iptv-output/pip/${tr.dataset.pip}/clear`);
+    await refresh(CARDS);
+    showToast(`${name} is cleared.${d.moved ? ` ${players(d.moved)} watching it ${d.moved === 1 ? 'is' : 'are'} being moved to its card.` : ''}${cutNote(d.cut)}`);
+  }
+
+  async function pipRemove(tr) {
+    const name = tr.dataset.name;
+    const twin = tr.querySelector('[data-act="pip-twin"]').checked;
+    const n = Number(tr.dataset.watching) || 0;
+    const ok = await confirmModal({
+      title: `Remove ${name} from the output?`,
+      message: `${name}${twin ? ' and its swapped copy leave' : ' leaves'} the channel list IPTV players get, and what it was set up to show is deleted.`,
+      consequence: `A player still shows it until it reloads its channel list.${n ? ` ${players(n)} watching it right now ${n === 1 ? 'is' : 'are'} cut.` : ''}`,
+      confirmLabel: 'Remove',
+      danger: true,
+    });
+    if (!ok) return;
+    const d = await jsonFetch(`/api/iptv-output/pip/${tr.dataset.pip}`, { method: 'DELETE' });
+    await refresh(CARDS);
+    showToast(`${name} is removed from the output.${cutNote(d.cut)}`);
+  }
+
+  async function pipTwin(input) {
+    const tr = input.closest('tr');
+    const on = input.checked;
+    try {
+      const d = await post(`/api/iptv-output/pip/${tr.dataset.pip}/swapped-copy`, { on });
+      await refresh(CARDS);
+      showToast(on ? (d.swapped_num ? `${tr.dataset.twin} is on the output as channel ${d.swapped_num}. ${reloads}` : `${tr.dataset.twin} is offered once ${tr.dataset.name} is on the output.`)
+        : `${tr.dataset.twin} left the output.${cutNote(d.cut)}`);
+    } catch (err) {
+      input.checked = !on;
+      fail(err);
+    }
+  }
+
   const guarded = (fn) => (...args) => Promise.resolve(fn(...args)).catch(fail);
 
   document.addEventListener('click', (e) => {
@@ -336,12 +404,18 @@
     else if (act === 'show') { view.show = t.dataset.show; view.page = 1; applyFilter(); }
     else if (act === 'page') { view.page += Number(t.dataset.dir); applyFilter(); }
     else if (act === 'hide-address-notice') guarded(hideAddressNotice)(t);
+    else if (act === 'pip-add') pipSetup(null);
+    else if (act === 'pip-setup') pipSetup(t.closest('tr'));
+    else if (act === 'pip-swap') guarded(pipSwap)(t.closest('tr'));
+    else if (act === 'pip-clear') guarded(pipClear)(t.closest('tr'));
+    else if (act === 'pip-remove') guarded(pipRemove)(t.closest('tr'));
   });
   document.addEventListener('change', (e) => {
     const t = e.target;
     if (t.dataset.act === 'row') setRow(t);
     else if (t.dataset.act === 'account') setAccount(t);
     else if (t.dataset.act === 'held') setHeld(t);
+    else if (t.dataset.act === 'pip-twin') pipTwin(t);
     else if (t.dataset.settingPath) saveSetting(t);
     else if (t.id === 'of-cat') { view.cat = t.value; view.page = 1; applyFilter(); }
   });

@@ -1026,8 +1026,9 @@ def tick(now: datetime = None) -> str:
             # New games take their place on a league's numbered feed channels once they are
             # stored (app/sports_feed.py). Its own unit, after the schedule's, so nothing it does
             # can undo the answer just stored.
+            from .output_feed import guide_horizon
             from .sports_feed import place_all_guarded
-            place_all_guarded(now)
+            place_all_guarded(now, guide_horizon(cfg))
         if kind in (SPORTS_KIND_ROUND, *ONE_GAME_KINDS) and answer.rows:
             # Longer than the call spacing, so the answers that arrive while one run is armed share it.
             # An armed run is never moved later (scheduler.queue_sports_match).
@@ -1492,11 +1493,17 @@ def recording_matches(rec, rejected: bool = False) -> list:
     ids = recording_channel_ids(rec)
     if not ids:
         return []
-    q = SportsMatch.query.filter(SportsMatch.kind == SPORTS_MATCH_KIND_GUIDE, SportsMatch.channel_id.in_(ids),
+    q = SportsMatch.query.filter(SportsMatch.kind == SPORTS_MATCH_KIND_GUIDE,
                                  SportsMatch.program_start_time == rec.program_start_time)
     if not rejected:
         q = q.filter(SportsMatch.rejected_at.is_(None))
-    return q.all()
+    if rec.source_channel_id is not None and rec.source_channel_id in ids:
+        # The listing it was made from first: a group of local stations lists one game on some
+        # members and another on the rest at the same time (dev/changelog/1690).
+        own = q.filter(SportsMatch.channel_id == rec.source_channel_id).all()
+        if own:
+            return own
+    return q.filter(SportsMatch.channel_id.in_(ids)).all()
 
 
 #: How near a channel-name match's game must start to a recording's program start to be the game
