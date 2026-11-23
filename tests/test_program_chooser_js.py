@@ -318,6 +318,40 @@ class PhoneTests(_Base, unittest.TestCase):
         self.assertNotIn('Evening News', after['dialogs'])
 
 
+class PhoneReopenTests(_Base, unittest.TestCase):
+    """dev/changelog/1699 - a second program opened on a phone replaces the open
+    sheet instead of stacking a second one over it."""
+    SCENARIO = 'phone_reopen'
+
+    def test_two_openings_leave_one_sheet_showing_the_second_program(self):
+        self.assertEqual(self.obs['reopened']['dialogs'], ['Late Show'])
+
+    def test_one_escape_leaves_nothing_open_and_the_page_unlocked(self):
+        self.assertEqual(self.obs['afterEscape'], {'dialogs': [], 'scrollLocked': False})
+
+
+class UnderDialogTests(_Base):
+    """dev/changelog/1699 - with the record dialog open, a cell click that reaches
+    the grid anyway opens no chooser over the dialog."""
+
+    def test_the_record_dialog_was_the_only_thing_open(self):
+        self.assertEqual(len(self.obs['before']), 1)
+
+    def test_nothing_opens_over_the_record_dialog(self):
+        after = self.obs['after']
+        self.assertFalse(after['panelOpen'])
+        self.assertEqual(after['dialogs'], self.obs['before'])
+        self.assertEqual(after['recordModal'], {'open': True, 'title': 'Schedule recording'})
+
+
+class UnderDialogDesktopTests(UnderDialogTests, unittest.TestCase):
+    SCENARIO = 'under_dialog_desktop'
+
+
+class UnderDialogPhoneTests(UnderDialogTests, unittest.TestCase):
+    SCENARIO = 'under_dialog_phone'
+
+
 def _read(rel):
     with open(os.path.join(REPO, rel), encoding='utf-8') as fh:
         return fh.read()

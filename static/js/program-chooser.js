@@ -145,11 +145,15 @@
   // ── Running an action ─────────────────────────────────────────────────────
 
   // What the chooser is showing: {prog, ch} while the side panel is open. The phone's sheet
-  // is a dialog, which holds the guide's refresh by itself, so it is never tracked here.
+  // is a dialog, which holds the guide's refresh by itself, so no program is kept for it.
   let current = null;
+  // The phone's sheet element only, so a second program replaces it rather than stacking.
+  let sheet = null;
 
   function closeChooser() {
     if (current) closeSidePanel();
+    if (sheet && sheet.isConnected) sheet.closeModal();
+    sheet = null;
   }
 
   function startTest(t, btn) {
@@ -217,7 +221,7 @@
 
   function openSheet(prog, ch) {
     const acts = chooserActions(prog, ch);
-    openMenuSheet(acts, {
+    sheet = openMenuSheet(acts, {
       title: prog.title,
       tiles: true,
       head: headHtml(prog, ch),
@@ -226,7 +230,16 @@
     });
   }
 
+  // Any other dialog open means the cell is behind its backdrop, which a pointer cannot click
+  // through; a click that gets there anyway (a script, an assistive tool) opens nothing over
+  // the dialog (dev/changelog/1699).
+  function dialogOpen() {
+    return Array.from(document.querySelectorAll('.modal'))
+      .some((m) => m !== sheet && m.getClientRects().length > 0);
+  }
+
   function openProgramChooser(prog, ch) {
+    if (dialogOpen()) return;
     if (isPhone()) {
       closeChooser();
       openSheet(prog, ch);

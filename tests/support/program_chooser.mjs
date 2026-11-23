@@ -355,6 +355,39 @@ await record('phone', async () => {
            afterRecord: { dialogs: c.dialogs(), recordModal: c.recordModal() } };
 });
 
+// Two openings in a row on a phone (dev/changelog/1699): the second program
+// replaces the first one's sheet rather than stacking a second sheet over it.
+await record('phone_reopen', async () => {
+  const c = boot({ phone: true });
+  c.open(prog(), row([]));
+  await c.settle();
+  c.open(prog({ id: 502, title: 'Late Show' }), row([]));
+  await c.settle();
+  const reopened = { dialogs: c.dialogs(), scrollLocked: c.document.body.classList.contains('scroll-locked') };
+  c.escape();
+  await c.settle();
+  return { errors: c.errors, reopened,
+           afterEscape: { dialogs: c.dialogs(),
+                          scrollLocked: c.document.body.classList.contains('scroll-locked') } };
+});
+
+// A cell under the open record dialog is behind its backdrop. A click that reaches one anyway
+// opens nothing over the dialog, on either form (dev/changelog/1699).
+for (const phone of [false, true]) {
+  await record(phone ? 'under_dialog_phone' : 'under_dialog_desktop', async () => {
+    const c = boot({ phone });
+    c.open(prog(), row([]));
+    await c.settle();
+    c.click('Schedule recording');
+    await c.settle();
+    const before = c.dialogs();
+    c.open(prog({ id: 502, title: 'Late Show' }), row([]));
+    await c.settle();
+    return { errors: c.errors, before,
+             after: { panelOpen: c.panelOpen(), dialogs: c.dialogs(), recordModal: c.recordModal() } };
+  });
+}
+
 console.log(JSON.stringify(out));
 // /guide's own intervals keep the event loop alive otherwise.
 process.exit(0);
