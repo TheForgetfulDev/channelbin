@@ -1820,11 +1820,15 @@ def skips_context(league, cfg: dict, one: str) -> dict:
         if length in skips.own_minutes:
             changes.append(f'the shortest {names[length]} listing set to {skips.own_minutes[length]} minutes')
     own = sports_skips.LEAGUE_WORDS.get(str(league.tsdb_id))
+    own_minutes = sports_skips.LEAGUE_MINUTES.get(str(league.tsdb_id)) or {}
     return {
         'game': game, 'one': one, 'a_one': a_one, 'kind': kind, 'shows': shows, 'space': space,
         'words': list(skips.words(kind)),
         'lengths': [{'key': key, 'label': label, 'desc': desc, 'value': skips.own_minutes.get(key, ''),
-                     'default': sports_skips.BUILTIN_MINUTES[key]} for key, label, desc in lengths],
+                     'default': sports_skips.builtin_minutes(key, league.tsdb_id),
+                     'own_note': (f'built in for {league.name}: {own_minutes["why"]}'
+                                  if key in own_minutes.get('minutes', {}) else '')}
+                    for key, label, desc in lengths],
         'max_minutes': sports_skips.MAX_MINUTES, 'max_word': sports_skips.MAX_WORD,
         'own_note': (f'{quoted(own["words"])} are built in for {league.name} only: {own["why"]}' if own else ''),
         'changes': '; '.join(changes), 'changed': skips.changed,

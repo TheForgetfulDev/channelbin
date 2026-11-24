@@ -1326,6 +1326,102 @@ class SessionTests(MatchCase):
         self.assertIn('the one starting nearest it', self.matches(ev['q37'])[0].reason)
 
 
+class RaceWeekendTests(MatchCase):
+    """A race listing on a weekend of races on consecutive days, in the shape of prod's guide for
+    Supercars' Adelaide round on 2026-11-24 (dev/docs/BUGS.md 2026-11-24): a race day's band holds the
+    race, the day before's and after's, and their qualifying and shootouts, so a listing that names the
+    race by number only, or not at all, matched nothing. The league is Supercars' id for its built-in
+    one-hour race length; its name and the listings' are made up."""
+
+    def setUp(self):
+        super().setUp()
+        self.series = self.league(4489, 'Pretend Touring Car Series', ['Pretend Touring Car Series', 'PTCS'],
+                                  sport='Motorsport')
+        self.ev = {}
+        for key, name, start in (
+                ('p2', 'Harbor Grand Final Practice 2', datetime(2099, 11, 26, 23, 30)),
+                ('q35', 'Harbor Grand Final Qualifying Race 35', datetime(2099, 11, 27, 2, 40)),
+                ('r35', 'Harbor Grand Final Race 35', datetime(2099, 11, 27, 5, 50)),
+                ('q36', 'Harbor Grand Final Qualifying Race 36', datetime(2099, 11, 28, 1, 15)),
+                ('s36', 'Harbor Grand Final Top 10 Shootout Race 36', datetime(2099, 11, 28, 2, 5)),
+                ('r36', 'Harbor Grand Final Race 36', datetime(2099, 11, 28, 4, 50)),
+                ('r37', 'Harbor Grand Final Race 37', datetime(2099, 11, 29, 4, 45))):
+            self.ev[key] = self.race(name, start, (start + timedelta(hours=10)).date(), self.series)
+
+    maxDiff = None
+
+    def found(self, key, **kw):
+        return [(m.program_title, m.program_sub_title, m.program_start_time, m.strength, m.airing)
+                for m in self.matches(self.ev[key], **kw)]
+
+    def test_adelaides_race_listings_match_their_race_and_its_shows_do_not(self):
+        at = lambda h, m: datetime(2099, 11, 27, h, m)  # noqa: E731
+        champ = [self.channel('PTCS Championship') for _ in range(2)]
+        for ch in champ:
+            self.row('PTCS Championship', sub_title='PTCS: Race 35', start=at(4, 45), minutes=150, channel=ch)
+            self.row('PTCS Championship', sub_title='PTCS: Race 35', start=at(8, 0), minutes=90, channel=ch)
+            self.row('PTCS Championship', sub_title='PTCS: Friday Supports', start=at(3, 20), minutes=85, channel=ch)
+        self.row('LIVE: PTCS Harbor Grand Final - Race 35', start=at(5, 50), minutes=85)
+        self.row('PTCS : Harbor PTCS Race 35 (KAYO) ᴸᶦᵛᵉ', start=at(5, 50), minutes=85)
+        self.row('PTCS Harbor Grand Final - Race 35', start=at(8, 30), minutes=60)
+        self.row('LIVE: PTCS Harbor Grand Final - The Grid', start=at(4, 45), minutes=65)
+        self.row('PTCS : PTCS Harbor Grand Final ᴸᶦᵛᵉ', start=at(4, 45), minutes=65)
+        self.row('PTCS Mini - 2098 Harbor Race 35', start=at(13, 40), minutes=21)
+        self.run_match(now=datetime(2099, 11, 24, 12))
+        first, replay, strong = SPORTS_AIRING_FIRST, SPORTS_AIRING_REPLAY, SPORTS_MATCH_STRONG
+        self.assertEqual(sorted(self.found('r35')), sorted([
+            ('PTCS Championship', 'PTCS: Race 35', at(4, 45), strong, first),
+            ('PTCS Championship', 'PTCS: Race 35', at(4, 45), strong, first),
+            ('PTCS Harbor Grand Final - Race 35', None, at(5, 50), strong, first),
+            ('PTCS : Harbor PTCS Race 35 (KAYO)', None, at(5, 50), strong, first),
+            ('PTCS Championship', 'PTCS: Race 35', at(8, 0), strong, replay),
+            ('PTCS Championship', 'PTCS: Race 35', at(8, 0), strong, replay),
+            ('PTCS Harbor Grand Final - Race 35', None, at(8, 30), strong, replay)]))
+        self.assertEqual(db.session.get(SportsEvent, self.ev['r35'].id).guide_start, at(5, 50))
+        self.assertIn('the listing names race 35', self.matches(self.ev['r35'])[0].reason)
+        for key in ('p2', 'q35', 'q36', 's36', 'r36', 'r37'):
+            self.assertEqual(self.found(key), [], key)
+
+    def test_a_listing_naming_no_race_goes_to_the_race_starting_nearest_it(self):
+        r36 = self.ev['r36'].start_at
+        self.row('PTCS Championship', start=r36 - timedelta(minutes=10), minutes=150)
+        self.row('PTCS Harbor Grand Final', start=r36 - timedelta(minutes=10), minutes=150)
+        self.row('PTCS Grand Final Countdown Show', start=r36 - timedelta(minutes=30), minutes=120)
+        self.run_match(now=datetime(2099, 11, 24, 12))
+        got = {(t, s) for t, _sub, _at, s, _a in self.found('r36')}
+        self.assertEqual(got, {('PTCS Championship', SPORTS_MATCH_STRONG), ('PTCS Harbor Grand Final', SPORTS_MATCH_STRONG)})
+        reasons = {m.reason for m in self.matches(self.ev['r36'])}
+        self.assertEqual(reasons, {'Matched on the series and the date. The listing does not say which race, and '
+                                   'this is the race starting nearest it, 10 minutes from it.'})
+        for key in ('r35', 'r37', 'q36', 's36'):
+            self.assertEqual(self.found(key), [], key)
+
+    def test_the_nearest_race_match_is_weak_when_the_listing_says_more(self):
+        r37 = self.ev['r37'].start_at
+        self.row('PTCS Harbor Street Party', start=r37 - timedelta(minutes=15), minutes=120)
+        self.run_match(now=datetime(2099, 11, 24, 12))
+        [match] = self.matches(self.ev['r37'])
+        self.assertEqual(match.strength, SPORTS_MATCH_WEAK)
+        self.assertIn('the race starting nearest it, 15 minutes from it, but the guide calls it', match.reason)
+
+    def test_a_listing_naming_no_race_far_from_every_race_or_over_before_it_matches_none(self):
+        r36 = self.ev['r36'].start_at
+        self.row('PTCS Championship', start=r36 - timedelta(hours=2), minutes=150)
+        self.row('PTCS Championship', start=r36 - timedelta(minutes=70), minutes=70)
+        self.run_match(now=datetime(2099, 11, 24, 12))
+        for key in self.ev:
+            self.assertEqual(self.found(key), [], key)
+
+    def test_a_listing_numbering_another_race_is_never_this_one(self):
+        """A replay of last round's `Race 34` on a day this round's Race 35 is the only event."""
+        alone = self.race('Lakeside Race 35', datetime(2099, 12, 6, 5, 0), date(2099, 12, 6), self.series)
+        self.row('PTCS - Sandown Race 34', start=datetime(2099, 12, 6, 1, 0), minutes=60)
+        self.row('PTCS: Race 35', start=datetime(2099, 12, 6, 4, 55), minutes=90)
+        self.run_match(now=datetime(2099, 12, 4, 12))
+        self.assertEqual([(m.program_title, m.strength) for m in self.matches(alone)],
+                         [('PTCS: Race 35', SPORTS_MATCH_STRONG)])
+
+
 class StorageTests(MatchCase):
     """A match survives an import, is marked gone rather than deleted, and a rejection sticks (design 9)."""
 
