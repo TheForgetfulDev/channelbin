@@ -915,13 +915,6 @@ def channel_detail(channel_id):
     # The hide/un-hide sentence, built in one place so the header, the kebab and the sticky
     # bar cannot word the same state three ways. Free: `in_group` comes off the membership
     # rows already loaded on the line above, not a query of its own.
-    # `epg_gap` costs no query of its own: total_epg_count is already fetched above, and the
-    # hide purge deletes ALL of a channel's entries, so zero of them on a visible channel
-    # that carries an EPG id is exactly the un-hidden-with-a-stale-guide case.
-    hide = channel_hiding.hide_state(
-        channel, in_group=bool(channel_kind_groups),
-        epg_gap=(not channel.hidden and bool(channel.epg_channel_id)
-                 and total_epg_count == 0))
     # Groups and health checks are two distinct things, so the header shows two chip
     # kinds rather than one "memberships" pile (dev/changelog/323).
     health_checks = _health_checks_for_channel(channel)
@@ -1006,6 +999,15 @@ def channel_detail(channel_id):
     # handful of queries whatever the number of sources.
     from ..epg_sources import case_sensitive_matching, channel_guide_view
     guide_source = channel_guide_view(channel, case_sensitive_matching(cfg))
+    # `epg_gap` costs no query of its own: total_epg_count is already fetched above, and the
+    # hide purge deletes ALL of a channel's entries, so zero of them on a visible channel
+    # that carries an EPG id is exactly the un-hidden-with-a-stale-guide case. Not when the
+    # user stopped using its provider id: no sync fills that in (dev/changelog/1716).
+    hide = channel_hiding.hide_state(
+        channel, in_group=bool(channel_kind_groups),
+        epg_gap=(not channel.hidden and bool(channel.epg_channel_id)
+                 and total_epg_count == 0
+                 and not any(r['ignored_id'] for r in guide_source['rows'])))
 
     return render_template('channels/detail.html',
         channel=channel,

@@ -11,9 +11,12 @@ read here and never written here by anything a sync reaches (DESIGN-epg-sources.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import re
+import unicodedata
+from collections import Counter
 from datetime import date, datetime, timedelta
 from typing import NamedTuple
 from urllib.parse import urlsplit
@@ -24,7 +27,7 @@ from . import db
 from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_KEY_CHANGED,
                        CHANNEL_EPG_SOURCE_CHANGED, CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED, EPGEntry, EpgAlternateEntry, EpgChannelKey,
                        EpgSource, EpgSourceChannel, EpgSourceSubscription, EPG_KEY_ACCEPTED,
-                       EPG_KEY_ORIGIN_MANUAL, EPG_KEY_ORIGIN_NAME_MATCH, EPG_KEY_REJECTED,
+                       EPG_KEY_IGNORED, EPG_KEY_ORIGIN_MANUAL, EPG_KEY_ORIGIN_NAME_MATCH, EPG_KEY_REJECTED,
                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, EPG_STATUS_FAILED, EPG_STATUS_OK,
                        EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED)
 from .db_utils import chunked, retry_on_locked
@@ -196,7 +199,7 @@ def keys_read_into(pairs, case_sensitive: bool) -> dict[tuple[int, int | None], 
     (chunked when the list is long), so a guide-wide caller pays it once."""
     pairs = list(pairs)
     sids = {sid for _ch, sid in pairs if sid is not None}
-    user = accepted_keys(sids)
+    user = key_answers(sids)
     out: dict[tuple[int, int | None], KeyRead] = {}
     wanted: dict[int, set] = {}
     for ch, sid in pairs:
@@ -294,8 +297,18 @@ def subscriber_ids(source_id: int) -> list[int]:
             .filter(EpgSourceSubscription.source_id == source_id)]
 
 
-def accepted_keys(source_ids) -> dict[tuple[int, int], str]:
-    """{(channel_id, source_id): key} for every accepted user key on these sources.
+class IgnoredId(NamedTuple):
+    """A user's "not the provider's id" for one channel and source (EPG_KEY_IGNORED): the
+    provider id they stopped using. Never a str, so a reader that takes a key answer for a
+    key without going through channel_key() fails instead of matching on it."""
+    provider_id: str
+
+
+def key_answers(source_ids) -> dict[tuple[int, int], str | IgnoredId]:
+    """{(channel_id, source_id): answer} for every user answer about a channel's key on
+    these sources: the accepted key (a str), or an IgnoredId for a provider id the user
+    stopped using. Every reader hands the answer to channel_key(), the one place that turns
+    it into the key a channel matches on. Rejected rows are not answers about the key.
 
     Queried by source rather than by channel: the table holds only the user's own answers,
     so it is small, where a channel IN (...) over a large account would not be."""
@@ -303,16 +316,29 @@ def accepted_keys(source_ids) -> dict[tuple[int, int], str]:
     if not source_ids:
         return {}
     rows = (db.session.query(EpgChannelKey.channel_id, EpgChannelKey.source_id,
-                             EpgChannelKey.key)
+                             EpgChannelKey.key, EpgChannelKey.status)
             .filter(EpgChannelKey.source_id.in_(source_ids),
-                    EpgChannelKey.status == EPG_KEY_ACCEPTED,
+                    EpgChannelKey.status.in_((EPG_KEY_ACCEPTED, EPG_KEY_IGNORED)),
                     EpgChannelKey.key.isnot(None), EpgChannelKey.key != ''))
-    return {(ch, src): key for ch, src, key in rows}
+    return {(ch, src): (IgnoredId(key) if status == EPG_KEY_IGNORED else key)
+            for ch, src, key, status in rows}
 
 
-def channel_key(epg_channel_id: str | None, user_key: str | None) -> str | None:
+def ignores(epg_channel_id: str | None, answer) -> bool:
+    """Whether a key answer is an IgnoredId still in force: the provider gives the channel
+    the id the user stopped using. Compared case-folded whatever the matching setting, so a
+    provider re-spelling the id's case does not bring it back."""
+    return (isinstance(answer, IgnoredId) and bool(epg_channel_id)
+            and epg_channel_id.lower() == answer.provider_id.lower())
+
+
+def channel_key(epg_channel_id: str | None, user_key) -> str | None:
     """key(channel, source) (DESIGN-epg-sources.md §7.1): the user's accepted key for this
-    source if there is one, else the provider's id, else None (never matched)."""
+    source if there is one, else the provider's id, else None (never matched). An IgnoredId
+    still in force (ignores()) matches nothing; one whose id the provider has since changed
+    falls through to the provider's new id (dev/changelog/1716)."""
+    if isinstance(user_key, IgnoredId):
+        return None if ignores(epg_channel_id, user_key) else (epg_channel_id or None)
     return user_key or epg_channel_id or None
 
 
@@ -613,6 +639,7 @@ def apply_winners(changes: dict[int, tuple[int | None, int | None]],
 KEY_COPIED = 'copied'              # another channel already held the key's listings
 KEY_SAME_LISTINGS = 'same'         # the new key matches what the old one did
 KEY_HIDDEN = 'hidden'              # hidden channels import nothing from any source
+KEY_DROPPED = 'dropped'            # the provider's id is ignored: the source's listings went
 KEY_WAITS = 'waits'                # in the file, but no channel holds its listings
 KEY_NOT_IN_FILE = 'not-in-file'    # not in the source's last refresh
 KEY_NO_KEY = 'no-key'              # cleared with no provider id to fall back to
@@ -630,6 +657,7 @@ def _key_outcome_text(outcome: str, source_name: str, donor_name: str | None = N
         KEY_COPIED: f'listings copied from {donor_name}, which already carries it',
         KEY_SAME_LISTINGS: 'it matches the same listings as before',
         KEY_HIDDEN: 'the channel is hidden, so no listings are imported for it',
+        KEY_DROPPED: f'its listings from {source_name} were removed',
         KEY_WAITS: f'listings arrive at the next refresh of {source_name}',
         KEY_NOT_IN_FILE: (f"not in {source_name}'s last refresh, so it matches nothing "
                           'until it appears there'),
@@ -639,15 +667,19 @@ def _key_outcome_text(outcome: str, source_name: str, donor_name: str | None = N
 
 
 def _channel_directory(channel: Channel, source_ids, case_sensitive: bool):
-    """For one channel over these sources: the user's accepted keys {source_id: (key,
-    origin)}, the key each source is matched on {source_id: key} (§7.1), and the directory
-    row that key hits in each source {source_id: EpgSourceChannel} - the one the import
-    reads (file_id_for()), when case-variant ids fold together. Three queries whatever the
-    source count."""
+    """For one channel over these sources: the user's key answers {source_id: (answer,
+    origin)} - an accepted key, or an IgnoredId (key_answers()) - the key each source is
+    matched on {source_id: key} (§7.1), and the directory row that key hits in each source
+    {source_id: EpgSourceChannel} - the one the import reads (file_id_for()), when
+    case-variant ids fold together. Three queries whatever the source count."""
     source_ids = list(source_ids)
-    keys = {k.source_id: (k.key, k.origin) for k in EpgChannelKey.query.filter(
-        EpgChannelKey.channel_id == channel.id, EpgChannelKey.status == EPG_KEY_ACCEPTED,
-        EpgChannelKey.source_id.in_(source_ids))} if source_ids else {}
+    keys = {k.source_id: ((IgnoredId(k.key) if k.status == EPG_KEY_IGNORED else k.key),
+                          k.origin)
+            for k in EpgChannelKey.query.filter(
+                EpgChannelKey.channel_id == channel.id,
+                EpgChannelKey.status.in_((EPG_KEY_ACCEPTED, EPG_KEY_IGNORED)),
+                EpgChannelKey.key.isnot(None), EpgChannelKey.key != '',
+                EpgChannelKey.source_id.in_(source_ids))} if source_ids else {}
     wanted = {}
     for sid in source_ids:
         k = channel_key(channel.epg_channel_id, keys.get(sid, (None,))[0])
@@ -701,7 +733,7 @@ def _key_donor(channel: Channel, source: EpgSource, key: str, case_sensitive: bo
     ids = sorted(by_provider | by_user)
     if not ids:
         return None
-    user_keys = {ch: k for (ch, _src), k in accepted_keys([source.id]).items() if ch in ids}
+    user_keys = {ch: k for (ch, _src), k in key_answers([source.id]).items() if ch in ids}
     subscribed = set(subscribers)
     for cid, name, provider_id, hidden, account_id in (
             db.session.query(Channel.id, Channel.name, Channel.epg_channel_id, Channel.hidden,
@@ -794,24 +826,84 @@ def _set_winner(channel: Channel, old_winner: int | None, winner: int | None,
             channel.id, old_winner, winner, names, why)))
 
 
+def _drop_source_now(channel: Channel, source: EpgSource, case_sensitive: bool) -> str:
+    """The channel stopped matching `source` (its provider id is ignored there): delete what
+    the source holds for it in both tables now, and when the source was its winner, hand the
+    guide to the next source that holds listings for it. Without committing; nothing is
+    fetched. A next source the directory names but whose rows are not here yet leaves the
+    channel with no winner until that source's import, which picks it up - the source just
+    removed is not left as the winner of nothing."""
+    if channel.hidden:
+        return KEY_HIDDEN
+    for model in (EPGEntry, EpgAlternateEntry):
+        db.session.execute(delete(model).where(_of_source(model, source.id),
+                                               model.channel_id == channel.id))
+    old_winner = channel.epg_source_id
+    if old_winner != source.id:
+        return KEY_DROPPED
+    order = subscriptions_for([channel.account_id]).get(channel.account_id, [])
+    _keys, _wanted, directory = _channel_directory(channel, order, case_sensitive)
+    winner, why = resolve_active_source(channel.epg_source_override_id, order,
+                                        _channel_coverage(channel, order, directory))
+    if winner is not None and (winner, channel.id) not in holding_rows([winner], [channel.id]):
+        winner, why = None, REASON_NONE
+    if winner is not None:
+        _move_rows([channel.id], winner, EpgAlternateEntry, EPGEntry)
+    else:
+        db.session.execute(delete(EpgAlternateEntry).where(
+            EpgAlternateEntry.channel_id == channel.id))
+    _set_winner(channel, old_winner, winner, why)
+    return KEY_DROPPED
+
+
 def set_channel_key(channel: Channel, source: EpgSource, key: str | None, *,
                     case_sensitive: bool, origin: str = EPG_KEY_ORIGIN_MANUAL,
-                    matched_on: str | None = None) -> KeyChange | None:
+                    matched_on: str | None = None,
+                    ignore_provider_id: bool = False) -> KeyChange | None:
     """The one writer of the user's per-channel, per-source key (DESIGN-epg-sources.md
     §6.1). A blank `key` clears it, and the channel goes back to the provider's id. Writes
     CHANNEL_EPG_KEY_CHANGED and applies what it can at once (`_apply_key_now`). Does not
     commit - the caller owns the unit, as with channel_groups.set_participation().
 
-    Returns the outcome (KEY_*) and the event's text, or None when nothing changed. A rejected row is left alone
-    by a clear: it records a name-match refusal, not a key."""
+    `ignore_provider_id` (with no `key`) stores the user's "not the provider's id": an
+    EPG_KEY_IGNORED row holding the channel's provider id, so the channel matches nothing in
+    this source while the provider gives it that id, and the source's listings for it go
+    now (_drop_source_now()). A clear takes it away again (dev/changelog/1716).
+
+    Returns the outcome (KEY_*) and the event's text, or None when nothing changed. A
+    rejected row is left alone by a clear: it records a name-match refusal, not a key; so
+    is the refusal an ignored row carries in `matched_on`, which a clear turns back into a
+    rejected row."""
     key = (key or '').strip() or None
+    if ignore_provider_id and (key is not None or not channel.epg_channel_id):
+        raise ValueError('ignoring needs a channel with a provider id and no key')
     row = EpgChannelKey.query.filter_by(channel_id=channel.id, source_id=source.id).first()
     user_key = row.key if row is not None and row.status == EPG_KEY_ACCEPTED else None
-    if key == user_key and (key is None or row.origin == origin):
+    ignored = (row.key if row is not None and row.status == EPG_KEY_IGNORED
+               and ignores(channel.epg_channel_id, IgnoredId(row.key or '')) else None)
+    if ignore_provider_id:
+        if ignored is not None or user_key is not None:
+            # Already ignored, or the user's own key is what this source reads.
+            return None
+    elif key == user_key and ignored is None and (key is None or row.origin == origin):
         return None
-    old_key = channel_key(channel.epg_channel_id, user_key)
-    if key is None:
-        db.session.delete(row)
+    old_key = channel_key(channel.epg_channel_id,
+                          IgnoredId(ignored) if ignored is not None else user_key)
+    if ignore_provider_id:
+        if row is None:
+            db.session.add(EpgChannelKey(channel_id=channel.id, source_id=source.id,
+                                         key=channel.epg_channel_id, origin=origin,
+                                         status=EPG_KEY_IGNORED))
+        else:
+            # A rejected row's refusal survives in matched_on (§7.5).
+            refused = row.matched_on if row.status != EPG_KEY_ACCEPTED else None
+            row.key, row.origin, row.status = channel.epg_channel_id, origin, EPG_KEY_IGNORED
+            row.matched_on = refused
+    elif key is None:
+        if row.status == EPG_KEY_IGNORED and row.matched_on:
+            row.key, row.status = None, EPG_KEY_REJECTED
+        else:
+            db.session.delete(row)
     elif row is None:
         db.session.add(EpgChannelKey(channel_id=channel.id, source_id=source.id, key=key,
                                      origin=origin, status=EPG_KEY_ACCEPTED,
@@ -820,13 +912,20 @@ def set_channel_key(channel: Channel, source: EpgSource, key: str | None, *,
         row.key = key
         row.origin, row.status, row.matched_on = origin, EPG_KEY_ACCEPTED, matched_on
     db.session.flush()
-    new_key = channel_key(channel.epg_channel_id, key)
-    outcome, donor = _apply_key_now(channel, source, old_key, new_key, case_sensitive)
+    if ignore_provider_id:
+        outcome, donor = _drop_source_now(channel, source, case_sensitive), None
+    else:
+        new_key = channel_key(channel.epg_channel_id, key)
+        outcome, donor = _apply_key_now(channel, source, old_key, new_key, case_sensitive)
 
     was = (f'your key "{user_key}"' if user_key
+           else f'not using the provider id "{ignored}"' if ignored is not None
            else f'the provider id "{channel.epg_channel_id}"' if channel.epg_channel_id
            else 'no key')
-    if key is None:
+    if ignore_provider_id:
+        what = (f'EPG key for {source.name}: the provider id "{channel.epg_channel_id}" '
+                f'is no longer used (was {was})')
+    elif key is None:
         now = (f'back to the provider id "{channel.epg_channel_id}"' if channel.epg_channel_id
                else 'no key left')
         what = f'EPG key for {source.name} cleared, {now} (was {was})'
@@ -836,7 +935,10 @@ def set_channel_key(channel: Channel, source: EpgSource, key: str | None, *,
     db.session.add(ChannelEvent(
         channel_id=channel.id, event_type=CHANNEL_EPG_KEY_CHANGED, detail=detail,
         extra_data=json.dumps({'source_id': source.id, 'key': key, 'previous': user_key,
-                               'origin': origin, 'outcome': outcome})))
+                               'origin': origin, 'outcome': outcome,
+                               'ignored': channel.epg_channel_id if ignore_provider_id
+                               else None,
+                               'previous_ignored': ignored})))
     return KeyChange(outcome, detail)
 
 
@@ -1147,7 +1249,7 @@ def reresolve_channels(channel_ids, case_sensitive: bool, *,
     order = subscriptions_for({r.account_id for r in rows})
     candidates = {sid for sids in order.values() for sid in sids}
     candidates |= {r.epg_source_override_id for r in rows if r.epg_source_override_id}
-    keys = accepted_keys(candidates)
+    keys = key_answers(candidates)
     coverage = directory_coverage(candidates, case_sensitive)
 
     unrefreshed = sources_without_directory(candidates)
@@ -1292,7 +1394,7 @@ def retire_expired_listings(source_id: int, case_sensitive: bool,
     just_now = {norm_key(x, case_sensitive) for _id, x in due} & retired
     on_source = db.session.query(Channel.id, Channel.epg_channel_id).filter(
         Channel.epg_source_id == source_id, Channel.hidden.is_(False)).all()
-    keys = accepted_keys([source_id])
+    keys = key_answers([source_id])
 
     def retired_key(ch_id, epg_channel_id):
         k = channel_key(epg_channel_id, keys.get((ch_id, source_id)))
@@ -1558,7 +1660,7 @@ def borrowable_sources(account_id: int, case_sensitive: bool) -> list[dict]:
         Channel.account_id == account_id, Channel.hidden.is_(False)).all()
     ids = set(order) | {s.id for s in cands} | {
         r.epg_source_override_id for r in rows if r.epg_source_override_id}
-    keys = accepted_keys(ids)
+    keys = key_answers(ids)
     coverage = directory_coverage(ids, case_sensitive)
     unrefreshed = sources_without_directory(ids)
     held_rows = held_coverage(unrefreshed, [r.id for r in rows]) if unrefreshed else None
@@ -1607,7 +1709,7 @@ def _held_listings(source_id: int, case_sensitive: bool,
             holding.setdefault(cid, model)
     if not holding:
         return {}
-    user = {ch: k for (ch, _sid), k in accepted_keys([source_id]).items()}
+    user = {ch: k for (ch, _sid), k in key_answers([source_id]).items()}
     out: dict[str, tuple[int, type]] = {}
     for cid, provider_id in (db.session.query(Channel.id, Channel.epg_channel_id)
                              .filter(Channel.account_id.in_(readers),
@@ -1694,7 +1796,7 @@ def subscribe_to_source(account_id: int, source_id: int,
 
     turned_on = _subscribe_and_commit()
     coverage = directory_coverage([source_id], case_sensitive)[source_id]
-    user = {ch: k for (ch, _sid), k in accepted_keys([source_id]).items()}
+    user = {ch: k for (ch, _sid), k in key_answers([source_id]).items()}
     covered, pairs = 0, []
     for cid, provider_id in db.session.query(Channel.id, Channel.epg_channel_id).filter(
             Channel.account_id == account_id, Channel.hidden.is_(False)).order_by(Channel.id):
@@ -2123,11 +2225,15 @@ def channel_guide_view(channel: Channel, case_sensitive: bool) -> dict:
         s = by_id[sid]
         d = directory.get(sid) or coverage.get(sid)
         user_key, origin = keys.get(sid, (None, None))
+        ignored_id = (user_key.provider_id if ignores(channel.epg_channel_id, user_key)
+                      else None)
+        if isinstance(user_key, IgnoredId):
+            user_key = None
         rows.append({
             'id': sid, 'name': s.name, 'kind': KIND_LABELS.get(s.kind, s.kind),
             'subscribed': sid in source_ids,
             'key': wanted.get(sid), 'key_origin': origin if user_key else 'provider',
-            'user_key': user_key, 'key_pending': pending.get(sid),
+            'user_key': user_key, 'ignored_id': ignored_id, 'key_pending': pending.get(sid),
             'owner_id': s.owner_account_id, 'owner_name': s.owner.name if s.owner else None,
             'covers': sid in coverage,
             'entry_count': d.entry_count if d else 0,
@@ -2270,13 +2376,23 @@ def name_match_proposals(directory, channels, decided, case_sensitive: bool,
     return NameMatchResult(proposals, ambiguous, single_hidden)
 
 
-def _load_directory(source_id: int) -> list[DirectoryEntry]:
-    rows = (db.session.query(EpgSourceChannel.xml_id, EpgSourceChannel.display_names,
-                             EpgSourceChannel.entry_count, EpgSourceChannel.distinct_titles,
-                             EpgSourceChannel.sole_title, EpgSourceChannel.horizon_until,
-                             EpgSourceChannel.upcoming_titles)
-            .filter(EpgSourceChannel.source_id == source_id,
-                    EpgSourceChannel.entry_count > 0))
+def _load_directory(source_id: int, lowered_ids=None) -> list[DirectoryEntry]:
+    """The source's directory rows with listings, or only those whose id lower-cased is in
+    `lowered_ids` (bound as IN lists of 500)."""
+    def _query(piece=None):
+        q = (db.session.query(EpgSourceChannel.xml_id, EpgSourceChannel.display_names,
+                              EpgSourceChannel.entry_count, EpgSourceChannel.distinct_titles,
+                              EpgSourceChannel.sole_title, EpgSourceChannel.horizon_until,
+                              EpgSourceChannel.upcoming_titles)
+             .filter(EpgSourceChannel.source_id == source_id,
+                     EpgSourceChannel.entry_count > 0))
+        if piece is not None:
+            q = q.filter(func.lower(EpgSourceChannel.xml_id).in_(piece))
+        return q.all()
+    if lowered_ids is None:
+        rows = _query()
+    else:
+        rows = [r for piece in chunked(sorted(lowered_ids), 500) for r in _query(piece)]
     out = []
     for xml_id, names, count, titles, sole, horizon, upcoming in rows:
         try:
@@ -2307,12 +2423,26 @@ def _key_rows(source_id: int) -> dict[int, EpgChannelKey]:
     return {k.channel_id: k for k in EpgChannelKey.query.filter_by(source_id=source_id)}
 
 
+def _refused(row: EpgChannelKey) -> bool:
+    """A key row that is a person's answer to name matching: an accepted or rejected key,
+    or an ignored provider id that also carries a rejected name (matched_on). An ignored
+    row alone is not one - name matching is how such a channel finds its right id."""
+    return row.status != EPG_KEY_IGNORED or bool(row.matched_on)
+
+
 def name_match_review(source: EpgSource, case_sensitive: bool,
                       include_single: bool = False) -> NameMatchResult:
     """name_match_proposals() over what the database holds for `source`. Four queries,
-    whatever the channel count."""
-    return name_match_proposals(_load_directory(source.id), _reader_channels(source.id),
-                                set(_key_rows(source.id)), case_sensitive, include_single)
+    whatever the channel count. A channel whose provider id is ignored here is matched as
+    one with no id, so its proposals are new matches, not disagreements."""
+    rows = _key_rows(source.id)
+    channels = [ch._replace(epg_channel_id=None)
+                if ch.id in rows and rows[ch.id].status == EPG_KEY_IGNORED
+                and ignores(ch.epg_channel_id, IgnoredId(rows[ch.id].key or '')) else ch
+                for ch in _reader_channels(source.id)]
+    decided = {cid for cid, row in rows.items() if _refused(row)}
+    return name_match_proposals(_load_directory(source.id), channels, decided,
+                                case_sensitive, include_single)
 
 
 def rejected_name_matches(source_id: int) -> list[dict]:
@@ -2322,7 +2452,9 @@ def rejected_name_matches(source_id: int) -> list[dict]:
                              EpgChannelKey.updated_at, Channel.name, Channel.account_id)
             .join(Channel, Channel.id == EpgChannelKey.channel_id)
             .filter(EpgChannelKey.source_id == source_id,
-                    EpgChannelKey.status == EPG_KEY_REJECTED)
+                    db.or_(EpgChannelKey.status == EPG_KEY_REJECTED,
+                           and_(EpgChannelKey.status == EPG_KEY_IGNORED,
+                                EpgChannelKey.matched_on.isnot(None))))
             .order_by(Channel.account_id, func.lower(Channel.name), Channel.id))
     return [{'channel_id': cid, 'matched_on': matched_on, 'rejected_at': at,
              'channel_name': name, 'account_id': account_id}
@@ -2400,9 +2532,13 @@ def reject_name_matches(source: EpgSource, picks, case_sensitive: bool) -> NameM
 
 def reject_name_match(channel_id: int, source_id: int, matched_on: str) -> None:
     """The one writer of a `rejected` key row. Never touches an accepted key, and never
-    sets `key`: a refusal is not an answer to "which id is this channel". Does not commit."""
+    sets `key`: a refusal is not an answer to "which id is this channel". On a channel
+    whose provider id is ignored here the refusal is kept on that row's matched_on, since
+    one row holds both answers (dev/changelog/1716). Does not commit."""
     row = EpgChannelKey.query.filter_by(channel_id=channel_id, source_id=source_id).first()
     if row is not None:
+        if row.status == EPG_KEY_IGNORED:
+            row.matched_on = (matched_on or '')[:512] or None
         return
     db.session.add(EpgChannelKey(channel_id=channel_id, source_id=source_id, key=None,
                                  origin=EPG_KEY_ORIGIN_NAME_MATCH, status=EPG_KEY_REJECTED,
@@ -2410,8 +2546,9 @@ def reject_name_match(channel_id: int, source_id: int, matched_on: str) -> None:
 
 
 def propose_again(source_id: int, channel_ids) -> int:
-    """Undo rejections: delete the rejected rows, so the channels are proposed again if their
-    names still match. Returns how many were deleted."""
+    """Undo rejections: delete the rejected rows, and forget the refusal an ignored row
+    carries, so the channels are proposed again if their names still match. Returns how
+    many were undone."""
     ids = [int(c) for c in channel_ids]
     if not ids:
         return 0
@@ -2424,10 +2561,273 @@ def propose_again(source_id: int, channel_ids) -> int:
                 EpgChannelKey.source_id == source_id,
                 EpgChannelKey.status == EPG_KEY_REJECTED,
                 EpgChannelKey.channel_id.in_(chunk)).delete(synchronize_session=False)
+            n += EpgChannelKey.query.filter(
+                EpgChannelKey.source_id == source_id,
+                EpgChannelKey.status == EPG_KEY_IGNORED, EpgChannelKey.matched_on.isnot(None),
+                EpgChannelKey.channel_id.in_(chunk)).update(
+                {EpgChannelKey.matched_on: None}, synchronize_session=False)
         db.session.commit()
         return n
 
     return _delete_and_commit()
+
+
+# ── One id shared by unrelated channels (dev/changelog/1716) ──────────────────
+#
+# A provider can give one guide id to many channels that are not that channel: 180 on one
+# prod account, BBC 3 and ITV London among them, all on a Greek radio station's id. Only
+# the names can tell, never the count - 23 copies of one sports channel share an id and are
+# right. A finding is only ever shown; a person stops using the id through
+# set_channel_key(ignore_provider_id=True).
+
+#: Words that say how a copy is delivered, not which channel it is.
+_DELIVERY_WORDS = frozenset(
+    'hd fhd uhd sd 4k 8k hevc h265 hdr raw backup alt 50fps 60fps 1080p 720p 1080p50 '
+    '1080p25 720p25 576p25'.split())
+#: A leading country or language tag (`UK:`, `US|`, `CA EN:`, `PT - `).
+_COUNTRY_TAG = re.compile(r'^\s*[A-Za-z]{2,3}(?:\s+[A-Za-z]{2})?\s*[:|]\s*'
+                          r'|^\s*[A-Za-z]{2,3}\s+-\s+')
+#: Two cores this alike (difflib's ratio) are one channel spelled two ways: "premier
+#: league" against an id's "premiere league", a "sport" against a "sports".
+_SAME_NAME_RATIO = 0.8
+
+
+def name_core(name: str | None) -> str:
+    """What a channel name says about WHICH channel it is, for comparing two names: the
+    country tag, accents, marks and delivery words gone, and what is left run together
+    (`UK: SKY SPORTS F1 ᴴᴰ ◉` -> `skysportsf1`). NFKD turns a superscript `ᴿᴬᵂ` into the
+    word `raw` so it drops with the rest. Letters of every script survive, as in
+    normalize_name(), whose separators it uses."""
+    text = unicodedata.normalize('NFKD', _COUNTRY_TAG.sub('', name or ''))
+    text = ''.join(c for c in text if not unicodedata.combining(c))
+    return ''.join(t for t in normalize_name(text).split()
+                   if t not in _DELIVERY_WORDS and any(c.isalnum() for c in t))
+
+
+def _id_core(xml_id: str) -> str:
+    """An XMLTV id as a name: `skysportsf1.uk` -> `skysportsf1`."""
+    stem = xml_id.rsplit('.', 1)[0] if '.' in xml_id else xml_id
+    return ''.join(c for c in stem.casefold() if c.isalnum())
+
+
+def same_channel_name(a: str, b: str) -> bool:
+    """Whether two name_core()s name one channel: one holds the other (`nflnetwork` in
+    `nflnetworkn507savannah`), or they differ by a spelling (_SAME_NAME_RATIO). Cores
+    under three characters only match exactly."""
+    return _alike(a, b, Counter(a), Counter(b))
+
+
+def _alike(a: str, b: str, chars_a: Counter, chars_b: Counter) -> bool:
+    """same_channel_name() with each core's letter counts already made, for a caller
+    comparing every pair of a group's cores."""
+    if not a or not b:
+        return False
+    if len(a) >= 3 and len(b) >= 3 and (a in b or b in a):
+        return True
+    # difflib's two quick ratios, worked out without building a SequenceMatcher: both are
+    # upper bounds of ratio() and rule out nearly every pair, where building the matcher
+    # for each pair cost 2.1 s over one prod account's shared ids (dev/changelog/1716).
+    total = len(a) + len(b)
+    if 2 * min(len(a), len(b)) < _SAME_NAME_RATIO * total:
+        return False
+    if 2 * sum((chars_a & chars_b).values()) < _SAME_NAME_RATIO * total:
+        return False
+    return difflib.SequenceMatcher(None, a, b).ratio() >= _SAME_NAME_RATIO
+
+
+class SharedId(NamedTuple):
+    source_id: int
+    account_id: int
+    entry: DirectoryEntry       # what the id lists in the source
+    channels: tuple             # every visible channel on the account reading the id
+    wrong: tuple                # those whose name is not the id's: the ones misled by it
+    named: tuple                # those whose name is the id's; the rest had no name to compare
+
+
+def _names_mostly_agree(cores) -> bool:
+    """Whether at least half of `cores` share a name with each other: one group linked by
+    same_channel_name() holds half of them (union-find over the distinct cores, weighted by
+    how many channels carry each, stopping as soon as one group is big enough)."""
+    weight: dict[str, int] = {}
+    for c in cores:
+        weight[c] = weight.get(c, 0) + 1
+    need = (len(cores) + 1) // 2
+    if max(weight.values()) >= need:
+        return True
+    distinct = sorted(weight)
+    chars = {c: Counter(c) for c in distinct}
+    parent = {c: c for c in distinct}
+
+    def root(c):
+        while parent[c] != c:
+            parent[c] = parent[parent[c]]
+            c = parent[c]
+        return c
+    for i, a in enumerate(distinct):
+        for b in distinct[i + 1:]:
+            ra, rb = root(a), root(b)
+            if ra != rb and _alike(a, b, chars[a], chars[b]):
+                parent[ra] = rb
+                weight[rb] += weight[ra]
+                if weight[rb] >= need:
+                    return True
+    return False
+
+
+def find_shared_ids(source_id: int, channels, keys: dict, directory,
+                    case_sensitive: bool) -> list[SharedId]:
+    """The ids of one source that many channels share while their names disagree. Pure:
+    no database, so the review page, the account page and the findings work run one rule.
+
+    `channels` are ChannelForMatch rows of the accounts reading the source, `keys`
+    {channel id: the key it reads in this source} (channel_key()), `directory` the
+    source's DirectoryEntry rows. Per account and folded id, with the id listing a real
+    schedule (an id listing one program all day misleads nobody about a program):
+      - fewer than half the channels whose name says anything have a name the id's own
+        names (its display names, the id itself) agree with, and
+      - no group of channels whose names agree with each other holds half of them.
+    Either test alone flagged mostly spellings and local stations on prod (60 and 12 ids);
+    the two together flagged one id, the wrong one (dev/changelog/1716). Ordered by how
+    many channels each misleads."""
+    rows = _folded_rows(directory, case_sensitive)
+    groups: dict[tuple[int, str], list] = {}
+    for ch in channels:
+        k = keys.get(ch.id)
+        if k:
+            nk = norm_key(k, case_sensitive)
+            if nk in rows:
+                groups.setdefault((ch.account_id, nk), []).append(ch)
+    out = []
+    for (account_id, nk), members in groups.items():
+        entry = rows[nk]
+        if len(members) < 2 or entry.distinct_titles < REAL_SCHEDULE_MIN_TITLES:
+            continue
+        cores = {ch.id: name_core(ch.name) for ch in members}
+        judged = [ch for ch in members if cores[ch.id]]
+        if len(judged) < 2:
+            continue
+        guide = {name_core(n) for n in entry.display_names or ()} | {_id_core(entry.xml_id)}
+        wrong = [ch for ch in judged
+                 if not any(same_channel_name(cores[ch.id], g) for g in guide)]
+        if (len(judged) - len(wrong)) * 2 >= len(judged):
+            continue
+        if _names_mostly_agree([cores[ch.id] for ch in judged]):
+            continue
+        wrong_ids = {ch.id for ch in wrong}
+        out.append(SharedId(source_id, account_id, entry, tuple(members), tuple(wrong),
+                            tuple(ch for ch in judged if ch.id not in wrong_ids)))
+    out.sort(key=lambda f: (-len(f.wrong), f.account_id, f.entry.xml_id))
+    return out
+
+
+def shared_ids(source_ids, account_ids, case_sensitive: bool) -> list[SharedId]:
+    """find_shared_ids() over what the database holds: each of `source_ids` against the
+    visible channels of whichever `account_ids` read it. One channel query, one key-answer
+    query, and per source a directory read of only the ids two or more channels share."""
+    account_ids = list(account_ids)
+    order = subscriptions_for(account_ids)
+    wanted_sources = set(source_ids)
+    readers: dict[int, list[int]] = {}
+    for aid, sids in order.items():
+        for sid in sids:
+            if sid in wanted_sources:
+                readers.setdefault(sid, []).append(aid)
+    if not readers:
+        return []
+    channels = [ChannelForMatch(*r) for r in db.session.query(
+        Channel.id, Channel.name, Channel.account_id, Channel.epg_channel_id,
+        Channel.epg_source_id)
+        .filter(Channel.account_id.in_({a for aids in readers.values() for a in aids}),
+                Channel.hidden.is_(False))
+        .order_by(Channel.account_id, func.lower(Channel.name), Channel.id)]
+    answers = key_answers(list(readers))
+    out = []
+    for sid in sorted(readers):
+        accounts = set(readers[sid])
+        mine = [ch for ch in channels if ch.account_id in accounts]
+        keys = {}
+        counts: dict[tuple[int, str], int] = {}
+        for ch in mine:
+            k = channel_key(ch.epg_channel_id, answers.get((ch.id, sid)))
+            if k:
+                keys[ch.id] = k
+                unit = (ch.account_id, k.lower())
+                counts[unit] = counts.get(unit, 0) + 1
+        lowered = {k for (_aid, k), n in counts.items() if n > 1}
+        if not lowered:
+            continue
+        shared = [ch for ch in mine if ch.id in keys
+                  and counts[(ch.account_id, keys[ch.id].lower())] > 1]
+        out += find_shared_ids(sid, shared, keys, _load_directory(sid, lowered),
+                               case_sensitive)
+    return out
+
+
+class SharedIdIgnored(NamedTuple):
+    applied: int        # channels that stopped using the id
+    skipped: int        # shown, but no longer misled by it through the provider's id
+
+
+def ignore_shared_id(source_id: int, account_id: int, xml_id: str, channel_ids,
+                     case_sensitive: bool) -> SharedIdIgnored:
+    """Stop using a shared id for the channels a person was shown (§16): each one gets an
+    ignored row on every source its account reads, through set_channel_key(), and those
+    sources' listings for it go now. Each id is checked against the finding as it stands -
+    a channel no longer misled by the id, or one reading it through its own key rather than
+    the provider's id, is skipped and counted - and nothing outside the shown ids is
+    touched. Commits a chunk of channels at a time, each its own retry_on_locked unit."""
+    finding = next((f for f in shared_ids([source_id], [account_id], case_sensitive)
+                    if f.account_id == account_id
+                    and norm_key(f.entry.xml_id, case_sensitive) == norm_key(xml_id,
+                                                                               case_sensitive)),
+                   None)
+    # Only a channel reading the id through the provider's id: one whose own key on this
+    # source names it was put there by the user, and an ignore would not reach it.
+    own_keys = key_answers([source_id])
+    wrong = ({ch.id for ch in finding.wrong
+              if ch.epg_channel_id
+              and norm_key(ch.epg_channel_id, case_sensitive) == norm_key(xml_id,
+                                                                          case_sensitive)
+              and not isinstance(own_keys.get((ch.id, source_id)), str)}
+             if finding else set())
+    shown = list(dict.fromkeys(int(c) for c in channel_ids))
+    valid = [cid for cid in shown if cid in wrong]
+    order = subscriptions_for([account_id]).get(account_id, [])
+    applied = 0
+    for chunk in chunked(valid, 100):
+
+        @retry_on_locked()
+        def _ignore_and_commit(chunk=chunk):
+            sources = {s.id: s for s in (db.session.get(EpgSource, sid) for sid in order)
+                       if s is not None}
+            done = 0
+            for cid in chunk:
+                channel = db.session.get(Channel, cid)
+                if channel is None or not channel.epg_channel_id:
+                    continue
+                # The source the guide comes from goes last: ignored first, it would hand
+                # the guide to a source the next step then takes away, and the channel's
+                # timeline would name a move that never stood.
+                last = channel.epg_source_id
+                ordered = ([sid for sid in order if sid != last]
+                           + ([last] if last in sources else []))
+                for sid in ordered:
+                    set_channel_key(channel, sources[sid], None,
+                                    case_sensitive=case_sensitive, ignore_provider_id=True)
+                done += 1
+            db.session.commit()
+            return done
+
+        applied += _ignore_and_commit()
+
+    if valid:
+        @retry_on_locked()
+        def _recount_and_commit():
+            for sid in order:
+                refresh_source_counts(sid)
+            db.session.commit()
+        _recount_and_commit()
+    return SharedIdIgnored(applied, len(shown) - len(valid))
 
 
 # ── Comparing what two sources say about one channel (DESIGN-epg-sources.md §4, §12,

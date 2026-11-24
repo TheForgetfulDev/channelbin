@@ -41,7 +41,8 @@ from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, dir
                            add_url_source, borrowable_sources, clean_url_source_fields,
                            delete_sources_for_account, delete_url_source,
                            ensure_provider_source, foreign_guided_channels, foreign_readers, has_directory,
-                           forget_reader, move_source, name_match_review, propose_again,
+                           forget_reader, ignore_shared_id, move_source, name_match_review,
+                           propose_again, shared_ids,
                            refresh_busy_message, refreshing_source_names, reject_name_matches,
                            rejected_name_matches, reresolve_channels, subscriber_ids,
                            stop_using_source, subscribe_to_source, update_url_source,
@@ -506,6 +507,16 @@ def _account_detail_payload(account, cfg, stats):
     # cannot disagree.
     span = account_reach({s['id']: s['active_here'] for s in sources},
                          {s['id']: s['reach_day'] for s in sources})
+    # Ids the provider gives to channels whose names disagree (dev/changelog/1716), as a
+    # line under each source that has one; the list itself is the review page's.
+    shared: dict[int, list] = {}
+    for f in shared_ids([s['id'] for s in sources if s['subscribed']], [account.id],
+                        case_sensitive_matching(cfg)):
+        shared.setdefault(f.source_id, []).append(f)
+    for s in sources:
+        found = shared.get(s['id'], [])
+        s['shared'] = ({'ids': [f.entry.xml_id for f in found],
+                        'channels': sum(len(f.wrong) for f in found)} if found else None)
     return {
         'cur': stats['current'][account.id],
         'group_any': GROUP_ANY,
@@ -2065,7 +2076,7 @@ def epg_readers_api(account_id):
 # ── Name matching review (DESIGN-epg-sources.md §7.5, dev/changelog/1105) ─────────
 
 _REVIEW_PER_PAGE = 100
-_REVIEW_VIEWS = ('proposals', 'disagreements', 'rejected')
+_REVIEW_VIEWS = ('proposals', 'disagreements', 'rejected', 'shared')
 
 
 def _upcoming_view(entry, tz, h24) -> list[dict]:
@@ -2110,7 +2121,11 @@ def epg_source_review(source_id):
     if unguided_only:
         new = [p for p in new if p.channel.epg_source_id is None]
     rejected = rejected_name_matches(source_id)
-    listed = {'proposals': new, 'disagreements': disagree, 'rejected': rejected}[view]
+    # One id shared by channels whose names disagree (dev/changelog/1716); counted for
+    # the tab on every view, so it is computed whichever view is shown.
+    shared = shared_ids([source_id], subscriber_ids(source_id), _case_sensitive())
+    listed = {'proposals': new, 'disagreements': disagree, 'rejected': rejected,
+              'shared': shared}[view]
     pages = max((len(listed) + _REVIEW_PER_PAGE - 1) // _REVIEW_PER_PAGE, 1)
     page = min(page, pages)
     shown = listed[(page - 1) * _REVIEW_PER_PAGE:page * _REVIEW_PER_PAGE]
@@ -2120,6 +2135,9 @@ def epg_source_review(source_id):
     tz, h24 = get_display_tz(), is_24h()
     rows = []
     for item in shown:
+        if view == 'shared':
+            rows.append(_shared_row_view(item, account_names, source_names, tz, h24))
+            continue
         if view == 'rejected':
             rows.append({**item, 'account_name': account_names.get(item['account_id'], '?'),
                          'rejected_at': format_local(item['rejected_at'], 'monthday_time',
@@ -2144,11 +2162,26 @@ def epg_source_review(source_id):
         'epg_source_review.html', source=source, owner=owner, view=view, rows=rows,
         page=page, pages=pages, total=len(listed), per_page=_REVIEW_PER_PAGE,
         counts={'proposals': len(new), 'disagreements': len(disagree),
-                'rejected': len(rejected)},
+                'rejected': len(rejected), 'shared': len(shared)},
         ambiguous=result.ambiguous, single_hidden=result.single_hidden,
         include_single=include_single, unguided_only=unguided_only,
         refreshed=has_directory(source.id), has_upcoming=has_upcoming,
         can_refresh=source.kind == EPG_SOURCE_URL and source.enabled)
+
+
+def _shared_row_view(finding, account_names, source_names, tz, h24) -> dict:
+    """One shared id on the review page: what the id lists, and the channels it misleads."""
+    return {
+        'account_id': finding.account_id,
+        'account_name': account_names.get(finding.account_id, '?'),
+        'file': _file_row_view(finding.entry, tz, h24),
+        'guide_name': (finding.entry.display_names or [finding.entry.xml_id])[0],
+        'total': len(finding.channels),
+        'wrong': [{'id': ch.id, 'name': ch.name,
+                   'guide_from': source_names.get(ch.epg_source_id)
+                   if ch.epg_source_id else None} for ch in finding.wrong],
+        'kept': [ch.name for ch in finding.named],
+    }
 
 
 def _review_picks(data) -> list[tuple[int, str]]:
@@ -2207,6 +2240,41 @@ def reject_name_matches_api(source_id):
         msg += f' {done.stale:,} were no longer proposed and were left alone.'
     return jsonify({'success': True, 'rejected': done.applied, 'stale': done.stale,
                     'message': msg})
+
+
+@accounts_bp.route('/api/epg-sources/<int:source_id>/shared-ids/ignore', methods=['POST'])
+def ignore_shared_id_api(source_id):
+    """Body {account_id, xml_id, channel_ids}: stop using a shared id for the channels the
+    page showed (DESIGN-epg-sources.md §16, dev/changelog/1716). Each id is checked against
+    the finding as it stands now; the rest are counted as skipped."""
+    source, err = _review_source_or_error(source_id)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    try:
+        account_id = int(data.get('account_id'))
+        ids = [int(c) for c in data.get('channel_ids') or []]
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Bad request.'}), 400
+    xml_id = str(data.get('xml_id') or '').strip()
+    if not ids or not xml_id:
+        return jsonify({'error': 'Nothing selected.'}), 400
+    if account_id not in subscriber_ids(source_id):
+        return jsonify({'error': "That account doesn't read this source."}), 400
+    # Each channel's listings are deleted and its guide may move to another source of the
+    # account, which an import of any of them would rewrite underneath.
+    order = [s.source_id for s in EpgSourceSubscription.query.filter_by(account_id=account_id)]
+    busy = refreshing_source_names([account_id], order)
+    if busy:
+        return jsonify({'error': refresh_busy_message(busy)}), 409
+    done = ignore_shared_id(source_id, account_id, xml_id, ids, _case_sensitive())
+    parts = [f'Stopped using {xml_id} for {done.applied:,} '
+             f'channel{"s" if done.applied != 1 else ""}. Name matches may now suggest '
+             'the right id for them.']
+    if done.skipped:
+        parts.append(f'{done.skipped:,} were no longer on it and were left alone.')
+    return jsonify({'success': True, 'applied': done.applied, 'skipped': done.skipped,
+                    'message': ' '.join(parts)})
 
 
 @accounts_bp.route('/api/epg-sources/<int:source_id>/name-matches/propose-again',

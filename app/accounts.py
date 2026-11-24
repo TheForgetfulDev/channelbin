@@ -47,7 +47,7 @@ from .database import (
 )
 from .db_utils import chunked, current_wal_size_bytes, retry_on_locked
 from .epg_sources import (
-    DISTINCT_TITLE_CAP, UPCOMING_TITLES, DirectoryRow, accepted_keys,
+    DISTINCT_TITLE_CAP, UPCOMING_TITLES, DirectoryRow, key_answers,
     apply_winners, case_sensitive_matching, channel_key, demote,
     directory_coverage, drop_alternates,
     ensure_provider_source, file_id_for, held_coverage, holding_rows, norm_key, promote,
@@ -3566,7 +3566,7 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
     candidate_sources |= {c.epg_source_override_id for c in channels
                           if c.epg_source_override_id}
     candidate_sources.add(source_id)
-    user_keys = accepted_keys(candidate_sources)
+    user_keys = key_answers(candidate_sources)
 
     # {key as the channel spells it: [channel ids]} over this source's key for each channel
     # (§7.1). Not normalized here: the scan pass folds it and picks one of the file's ids per

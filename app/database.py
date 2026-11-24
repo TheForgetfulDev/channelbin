@@ -3261,6 +3261,10 @@ EPG_KEY_ORIGIN_MANUAL     = 'manual'
 EPG_KEY_ORIGIN_NAME_MATCH = 'name_match'
 EPG_KEY_ACCEPTED = 'accepted'
 EPG_KEY_REJECTED = 'rejected'
+# Not the provider's id: `key` holds the provider id the user stopped using for this channel
+# in this source, and while the provider still gives the channel that id it matches nothing
+# there. Once the provider's id changes, the row stops counting (dev/changelog/1716).
+EPG_KEY_IGNORED = 'ignored'
 
 
 class EpgSource(db.Model):
@@ -3383,9 +3387,11 @@ class EpgChannelKey(db.Model):
     id         = db.Column(db.Integer, primary_key=True)
     channel_id = db.Column(db.Integer, db.ForeignKey('channels.id'), nullable=False)
     source_id  = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
-    key        = db.Column(db.String(255))           # NULL with status rejected
+    key        = db.Column(db.String(255))           # NULL with status rejected; the refused provider id with ignored
     origin     = db.Column(db.String(16), nullable=False)   # EPG_KEY_ORIGIN_*
-    status     = db.Column(db.String(16), nullable=False)   # EPG_KEY_ACCEPTED / _REJECTED
+    status     = db.Column(db.String(16), nullable=False)   # EPG_KEY_ACCEPTED / _REJECTED / _IGNORED
+    # The display name an accepted match matched on; on a rejected or ignored row, the one
+    # a person rejected, so the pair is not proposed again.
     matched_on = db.Column(db.String(512))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

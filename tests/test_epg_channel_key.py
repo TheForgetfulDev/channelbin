@@ -189,12 +189,12 @@ class ApplyNowTests(_KeyFixture):
         # against last_success_at, so that must be no later than the keys were read.
         self._channel('Alpha One', 'a1.test')
         read_at = []
-        real = accounts_mod.accepted_keys
+        real = accounts_mod.key_answers
 
         def _spy(ids):
             read_at.append(datetime.utcnow())
             return real(ids)
-        with mock.patch.object(accounts_mod, 'accepted_keys', _spy):
+        with mock.patch.object(accounts_mod, 'key_answers', _spy):
             import_source(self.src, _xmltv(_schedule('a1.test', REAL)), epg_days=3, cfg=CFG)
         db.session.expire_all()
         self.assertLessEqual(db.session.get(EpgSource, self.src.id).last_success_at, read_at[0])

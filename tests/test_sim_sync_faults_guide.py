@@ -25,7 +25,7 @@ from app.config import load_config  # noqa: E402
 from app.database import (SPORTS_MATCH_KIND_CHANNEL_NAME, SPORTS_MATCH_STRONG, Channel, EPGEntry,  # noqa: E402
                           EpgAlternateEntry, EpgSource, EpgSourceChannel, SportsEvent, SportsLeague,
                           SportsMatch, SportsTeam, XtreamAccount)
-from app.epg_sources import add_url_source  # noqa: E402
+from app.epg_sources import add_url_source, ignore_shared_id, shared_ids  # noqa: E402
 from app.logo_cache import _fetch_one_logo  # noqa: E402
 from sim.faults import _GAME_SLOT  # noqa: E402
 from tests.support.sim_sync import FAULT_WORLD, SimSyncCase, names_a_cut_chunk  # noqa: E402
@@ -390,6 +390,37 @@ class GuideContentFaultTests(_GuideCase):
         first = schedules.get(on_it[0].id)
         self.assertTrue(first)
         self.assertTrue(all(schedules.get(c.id) == first for c in on_it))
+
+    def test_unrelated_channels_on_one_guide_id_can_stop_using_it(self):
+        """Guards dev/docs/BUGS.md 2026-11-24 @ 11:15:12 AM: a provider giving one guide id
+        to channels that are not that channel is found by their names, and stopping it takes
+        that id's listings off them at once and after the next sync, while the channel the id
+        is named for keeps them."""
+        aid = self.add_xtream()
+        lineup = self.world.panel_lineups['north-tv']
+        shared = next(g.guide_id for g in lineup.guide if g.has_programs)
+        owners = {r.channel.stream_id for r in lineup.rows if r.tvg_id == shared}
+        self.sim.inject('shared_guide_id', 'north-tv', count=12)
+        self.assertEqual(self.sync(aid).status, 'SUCCESS')
+        source = EpgSource.query.filter_by(owner_account_id=aid).one()
+
+        found = shared_ids([source.id], [aid], False)
+        self.assertEqual([f.entry.xml_id for f in found], [shared])
+        wrong = {c.id for c in found[0].wrong}
+        owner_ids = {c.id for c in self.channels(aid) if c.stream_id in owners}
+        self.assertEqual(len(wrong), 12)
+        self.assertTrue(owner_ids)
+        self.assertFalse(wrong & owner_ids, 'the channel the id is named for is not misled')
+
+        done = ignore_shared_id(source.id, aid, shared, sorted(wrong), False)
+        db.session.expire_all()
+        self.assertEqual((done.applied, done.skipped), (12, 0))
+        for phase in ('at once', 'after the next sync'):
+            schedules = self.schedules(aid)
+            self.assertFalse(wrong & set(schedules), phase)
+            self.assertTrue(owner_ids <= set(schedules), phase)
+            if phase == 'at once':
+                self.assertEqual(self.sync(aid).status, 'SUCCESS')
 
     def test_an_entity_expansion_guide_is_stopped_and_imports_nothing_from_it(self):
         """Characterization of dev/changelog/482's hardening: the entity chain is refused by

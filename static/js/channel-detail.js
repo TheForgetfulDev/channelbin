@@ -498,7 +498,13 @@
   }
 
   async function clearEpgKey(el) {
-    if (!(await confirmModal({
+    // An ignored provider id (dev/changelog/1716) is undone by the same clear.
+    const ignored = el.dataset.ignoredId;
+    if (!(await confirmModal(ignored ? {
+      title: 'Use the provider id',
+      message: `This channel matches ${el.dataset.sourceName} on the provider id ${ignored} again.`,
+      confirmLabel: 'Use provider id',
+    } : {
       title: 'Clear EPG key',
       message: `Your EPG key for ${el.dataset.sourceName} is cleared.`,
       consequence: "This channel goes back to the provider's id for that source.",
