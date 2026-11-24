@@ -655,7 +655,7 @@ def resume_in_progress_recordings(app):
             ACCOUNT_STATUS_SYNCING, ACCOUNT_STATUS_ERROR, ACCOUNT_STATUS_UNSYNCED,
             SYNC_LOG_CANCELLED,
         )
-        from .recorder import (start_recording, resume_recording, stop_recording,
+        from .recorder import (resume_recording, stop_recording,
                                close_open_segment_after_unclean_stop, OPEN_SEG_REFUSED,
                                close_segments_left_open_on_ended_recordings)
         from .concatenator import do_concatenation, run_postprocess_claimed
@@ -1036,7 +1036,7 @@ def resume_in_progress_recordings(app):
                 rec.id, RECORDING_RESUMED,
                 f'Started late by {missed_by:.0f}s after service restart',
             )
-            _t.Thread(target=start_recording, args=(app, rec.id), daemon=True).start()
+            _t.Thread(target=_start_watched, args=(app, rec.id), daemon=True).start()
             _register_stop_job(rec)
 
         # Case 3: future SCHEDULED recordings - re-register with scheduler
@@ -1214,12 +1214,8 @@ def _clear_job_error(job, recording_id):
 def _rollback_quietly(recording_id):
     """Roll the session back on a path that is already handling a failure: a rollback that
     raises too (the database is usually why we are here) must not end the retry."""
-    from . import db
-    try:
-        db.session.rollback()
-    except Exception:
-        log.warning('Recording %d: rollback after a job error also failed', recording_id,
-                    exc_info=True)
+    from .db_utils import rollback_quietly
+    rollback_quietly(f'a job error on recording {recording_id}')
 
 
 def _write_job_error_event(job, recording_id, entry, detail):
@@ -1381,10 +1377,18 @@ def _start_job_raised(recording_id, exc):
 
 
 def _start_job(recording_id):
-    with _app.app_context():
+    _start_watched(_app, recording_id)
+
+
+def _start_watched(app, recording_id):
+    """Run a recording's start, and answer a raise as _start_job_raised() does. Every caller
+    that starts a SCHEDULED recording comes through here, the startup sweep's late start
+    included: its thread has no scheduler job behind it, so a raise there left the row
+    SCHEDULED with nothing armed to start it (dev/docs/BUGS.md 2026-11-23 @ 10:40:09 PM)."""
+    with app.app_context():
         from .recorder import start_recording
         try:
-            start_recording(_app, recording_id)
+            start_recording(app, recording_id)
         except Exception as exc:
             _start_job_raised(recording_id, exc)
             return
