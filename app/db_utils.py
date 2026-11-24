@@ -368,6 +368,17 @@ def _is_locked_error(exc: OperationalError) -> bool:
     return 'database is locked' in msg or 'database table is locked' in msg
 
 
+def rollback_quietly(after):
+    """Roll the session back on a path that is already handling a failure. A rollback that
+    raises too (the database is usually why we are here) is logged, never raised: it must not
+    turn the handled failure into an unhandled one. `after` names what failed, for the log."""
+    from . import db
+    try:
+        db.session.rollback()
+    except Exception:
+        log.warning('Rollback after %s also failed', after, exc_info=True)
+
+
 def retry_on_locked(max_attempts=5, base_delay=0.15, rollback_session=True):
     """Retry a whole function on SQLite lock contention that outlasts busy_timeout.
 

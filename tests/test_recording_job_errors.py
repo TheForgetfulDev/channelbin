@@ -556,6 +556,48 @@ class StartupSweepTests(unittest.TestCase):
         self.assertEqual(FAILURE_MISSED_AT_STARTUP, rec.failure_reason)
 
 
+class StartupLateStartTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-23 @ 10:40:09 PM: the startup sweep starts a recording that
+    missed its start time on a thread of its own, after dropping the overdue start job. A
+    raise on that thread is answered like a start job's raise."""
+
+    def setUp(self):
+        self.t = make_test_app(start_scheduler=True)
+        self.addCleanup(self.t.cleanup)
+        self.addCleanup(scheduler._job_errors.clear)
+
+    def test_a_late_start_that_raises_says_so_and_is_armed_again(self):
+        now = datetime.utcnow()
+        rec = seed.make_recording(status=REC_STATUS_SCHEDULED, name='late start',
+                                  start_time=now - timedelta(minutes=2),
+                                  stop_time=now + timedelta(hours=1))
+        db.session.commit()
+        rid = rec.id
+        ran = threading.Event()
+
+        def _raise(app, recording_id):
+            ran.set()
+            raise TimeoutError('pool')
+
+        with mock.patch('app.recorder.start_recording', side_effect=_raise):
+            scheduler.resume_in_progress_recordings(self.t.app)
+            self.assertTrue(ran.wait(15), 'the sweep never started the late recording')
+            deadline = datetime.utcnow() + timedelta(seconds=15)
+            while (('start', rid) not in scheduler._job_errors
+                   or scheduler._scheduler.get_job(f'start_{rid}') is None):
+                if datetime.utcnow() > deadline:
+                    break
+                threading.Event().wait(0.05)
+        self.assertIsNotNone(scheduler._scheduler.get_job(f'start_{rid}'),
+                             'nothing is armed to start the recording again')
+        db.session.expire_all()
+        events = RecordingEvent.query.filter_by(
+            recording_id=rid, event_type=RECORDING_JOB_ERROR).all()
+        self.assertEqual(1, len(events))
+        self.assertIn('TimeoutError: pool', events[0].detail)
+        self.assertEqual(REC_STATUS_SCHEDULED, db.session.get(Recording, rid).status)
+
+
 class AlertHandlerContextTests(unittest.TestCase):
     """The scheduler's own threads log a job's exception outside any app context."""
 

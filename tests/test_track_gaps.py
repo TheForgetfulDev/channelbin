@@ -355,6 +355,30 @@ class TrackGapsEventTests(unittest.TestCase):
         self.assertTrue(json.loads(events[0].extra_data).get('scan_failed'))
         self.assertIn('could not be measured', events[0].detail)
 
+    def test_a_gap_read_that_raises_does_not_end_the_post_process(self):
+        """dev/docs/BUGS.md 2026-11-23 @ 10:42:29 PM: the read measures only, so a raise in
+        it must not strand the recording in ANALYZING, and it is recorded as not measured
+        rather than left looking never measured."""
+        from app.database import Recording, REC_STATUS_ANALYZING
+        self._use('clean.ts')
+        with mock.patch('app.probe.track_gaps', side_effect=RuntimeError('boom')):
+            self._postprocess()
+        db.session.expire_all()
+        self.assertNotEqual(REC_STATUS_ANALYZING, db.session.get(Recording, self.rid).status)
+        events = self._events()
+        self.assertEqual(len(events), 1, [e.detail for e in events])
+        self.assertTrue(json.loads(events[0].extra_data).get('scan_failed'))
+        self.assertIn('RuntimeError', events[0].detail)
+
+    def test_a_gap_event_that_cannot_be_written_does_not_raise(self):
+        """dev/docs/BUGS.md 2026-11-23 @ 10:42:29 PM."""
+        self._use('clean.ts')
+        with mock.patch('app.database.add_recording_event',
+                        side_effect=RuntimeError('no write')):
+            gaps = ppmod._scan_track_gaps(self.rid, self.ts)
+        # The read itself succeeded, so its measurement is still returned.
+        self.assertIn('both', gaps)
+
 
 if __name__ == '__main__':
     unittest.main()

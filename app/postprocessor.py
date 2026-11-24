@@ -4145,9 +4145,14 @@ def _scan_track_gaps(recording_id, ts_path, analysis_plan=None):
     picture over silence - on recordings made after the capture fixes of dev/changelog/1415
     and 1423 (dev/changelog/1649). The numbers stay in extra_data until something sorts,
     filters or displays them (CLAUDE.md, measurements that earn a column).
+
+    Never raises: it runs inside do_postprocess(), where a raise would leave the recording
+    ANALYZING with nothing running (dev/docs/BUGS.md 2026-11-23 @ 10:42:29 PM). A read that
+    raises is recorded as not measured, like one that returns nothing.
     """
     from . import db
     from .database import DIAGNOSTICS, add_recording_event
+    from .db_utils import rollback_quietly
     from .probe import track_gaps
 
     if not ts_path or not os.path.exists(ts_path):
@@ -4157,8 +4162,16 @@ def _scan_track_gaps(recording_id, ts_path, analysis_plan=None):
 
     # ffprobe is a non-idempotent side effect and stays OUTSIDE the retry closure below.
     joined = _joined_segment_count(recording_id)
-    with _analysis_pass(recording_id, ANALYSIS_PASS_TRACK_GAPS, ts_path, analysis_plan) as hook:
-        gaps = track_gaps(ts_path, on_progress=hook)
+    read_error = None
+    try:
+        with _analysis_pass(recording_id, ANALYSIS_PASS_TRACK_GAPS, ts_path,
+                            analysis_plan) as hook:
+            gaps = track_gaps(ts_path, on_progress=hook)
+    except Exception as exc:
+        log.warning('Recording %d: the picture and sound gap read raised; recorded as not '
+                    'measured and the rest of the analysis goes on', recording_id, exc_info=True)
+        rollback_quietly(f'the gap read of recording {recording_id}')
+        gaps, read_error = {}, exc
 
     extra = {'kind': 'track_gaps', 'joined_segments': joined}
     if gaps:
@@ -4185,8 +4198,12 @@ def _scan_track_gaps(recording_id, ts_path, analysis_plan=None):
     else:
         # Observable failure path: an absent event would read as "never measured" and a
         # silent one as "no gaps".
-        detail = (f'{_TRACK_GAPS_DETAIL_PREFIX}could not be measured - ffprobe could not read '
-                  f'the packets of {os.path.basename(ts_path)}')
+        if read_error is not None:
+            detail = (f'{_TRACK_GAPS_DETAIL_PREFIX}could not be measured - the read of '
+                      f'{os.path.basename(ts_path)} failed ({type(read_error).__name__})')
+        else:
+            detail = (f'{_TRACK_GAPS_DETAIL_PREFIX}could not be measured - ffprobe could not '
+                      f'read the packets of {os.path.basename(ts_path)}')
         extra['scan_failed'] = True
     log.info('Recording %d: %s', recording_id, detail)
 
@@ -4195,7 +4212,12 @@ def _scan_track_gaps(recording_id, ts_path, analysis_plan=None):
         add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
         db.session.commit()
 
-    _commit_track_gaps()
+    try:
+        _commit_track_gaps()
+    except Exception:
+        log.warning('Recording %d: the picture and sound gap event could not be written: %s',
+                    recording_id, detail, exc_info=True)
+        rollback_quietly(f'the gap event of recording {recording_id}')
     return gaps
 
 
