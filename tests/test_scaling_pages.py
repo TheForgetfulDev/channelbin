@@ -835,6 +835,14 @@ def _seed_name_match_review(n):
         ch = seed.make_channel(acc, name=f'Named {i}',
                                epg_channel_id=f'other{i}.test' if i % 3 == 1 else None)
         ch.epg_source_id = src.id if i % 2 else None
+        # Three channels of unrelated names on one id per i: the Shared ids view lists n of
+        # them (dev/changelog/1716), each with its channels.
+        db.session.add(EpgSourceChannel(
+            source_id=src.id, xml_id=f'trio{i}.test', display_names=_json.dumps([f'Station {i}']),
+            entry_count=10, distinct_titles=5, horizon_until=soon,
+            upcoming_titles=_json.dumps([[soon.isoformat(), f'Station show {i}']])))
+        for word in ('Alpha', 'Bravo', 'Charlie'):
+            seed.make_channel(acc, name=f'{word} {i}', epg_channel_id=f'trio{i}.test')
         if i % 3 == 2:
             db.session.flush()
             db.session.add(EpgChannelKey(channel_id=ch.id, source_id=src.id, key=None,
@@ -1262,7 +1270,7 @@ class PageScalingTests(unittest.TestCase):
                                      lambda: f'/accounts/{_scaling_account_id()}')
 
     def test_epg_source_review_page(self):
-        for view in ('proposals', 'disagreements', 'rejected'):
+        for view in ('proposals', 'disagreements', 'rejected', 'shared'):
             with self.subTest(view=view):
                 self._assert_row_independent(
                     _seed_name_match_review,

@@ -1179,7 +1179,7 @@ _KINDS = (
           'another feed\'s schedule', {'share': (0.3, _share)}, apply=_model_guide_id_twins),
     _kind('shared_guide_id', SCOPE_PANEL, LAYER_MODEL, _ROWS, MEASURED,
           'BUGS.md 2026-08-16 06:38 PM; 16% to 69% of an account\'s channels with an id share '
-          'it',
+          'it; BUGS.md 2026-11-24 11:15 AM: 180 unrelated channels on one id (dev/changelog/1716)',
           'many channels in the playlist on one guide id', {'count': (12, _count(1))},
           apply=_model_shared_guide_id),
     _kind('xml_entities', SCOPE_PANEL, LAYER_BYTES, (EP_GUIDE,), ASSUMED,

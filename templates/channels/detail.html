@@ -1001,12 +1001,14 @@
               </div>{% endif %}</td>
             <td data-label="Key">{% if r.key %}<code>{{ r.key }}</code>
               <div class="text-faint small">{{ 'provider id' if r.key_origin == 'provider' else ('your key' if r.key_origin == 'manual' else 'accepted name match') }}</div>
+              {% elif r.ignored_id %}<span class="text-faint">none - you stopped using the provider id <code>{{ r.ignored_id }}</code> here</span>
               {% else %}<span class="text-faint">none - cannot be matched</span>{% endif %}
               {% if r.key_pending %}<div class="small text-warning">{{ gs_pending[r.key_pending] }}
                 {% if r.key_pending != 'not-in-file' and r.key_pending != 'no-key' %}<a href="{{ url_for('accounts.account_detail', account_id=r.owner_id) }}">{{ r.owner_name }} {{ icon('forward') }}</a>{% endif %}</div>{% endif %}
               {% if r.subscribed %}<div class="gs-key-actions">
                 <button type="button" class="btn btn-sm" data-act="epg-key-set" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}" data-key="{{ r.user_key or '' }}">Set key</button>
-                {% if r.user_key %}<button type="button" class="btn btn-sm" data-act="epg-key-clear" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}">Clear key</button>{% endif %}
+                {% if r.user_key %}<button type="button" class="btn btn-sm" data-act="epg-key-clear" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}">Clear key</button>
+                {% elif r.ignored_id %}<button type="button" class="btn btn-sm" data-act="epg-key-clear" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}" data-ignored-id="{{ r.ignored_id }}">Use provider id</button>{% endif %}
               </div>{% endif %}</td>
             <td data-label="Listings">
               {% if not r.covers %}<span class="text-faint">{% if r.ran_out %}ran out {{ r.horizon_until | local_time }}, and this source has not refreshed since{% else %}{{ 'none' if r.refreshed else 'no successful refresh yet' }}{% endif %}</span>

@@ -35,6 +35,27 @@
     }
   };
 
+  // Stop using a shared id (dev/changelog/1716): the ids sent are exactly the channels the
+  // row showed, and the server checks each against the finding as it stands.
+  const ignoreShared = async (btn, tr) => {
+    const ids = JSON.parse(tr.dataset.channelIds || '[]');
+    const n = ids.length;
+    const ok = await confirmModal({
+      title: `Stop using ${tr.dataset.xmlId}`,
+      message: `${n.toLocaleString()} channel${n === 1 ? '' : 's'} on ${tr.dataset.accountName} `
+        + `stop matching the id ${tr.dataset.xmlId} in every guide that account reads.`,
+      consequence: `The ${tr.dataset.guideName} schedule is removed from them now. A `
+        + 'channel keeps a guide only from a source where it has a key of its own; name '
+        + "matches can suggest one. A channel's own page can switch the provider's id back on.",
+      confirmLabel: 'Stop using it',
+      danger: true,
+    });
+    if (!ok) return;
+    send(btn, `/api/epg-sources/${sourceId()}/shared-ids/ignore`, {
+      account_id: Number(tr.dataset.accountId), xml_id: tr.dataset.xmlId, channel_ids: ids,
+    });
+  };
+
   document.addEventListener('change', (ev) => {
     const el = ev.target;
     if (!main() || !main().contains(el)) return;
@@ -75,6 +96,9 @@
       case 'again-selected':
         send(btn, api('propose-again'),
              { channel_ids: pickedRows().map((r) => Number(r.dataset.channelId)) });
+        break;
+      case 'ignore-shared':
+        ignoreShared(btn, tr);
         break;
       case 'refresh':
         send(btn, `/api/accounts/${main().dataset.ownerId}/epg-sources/${sourceId()}/refresh`, {});

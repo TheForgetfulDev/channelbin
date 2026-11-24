@@ -697,6 +697,8 @@
             <td data-label="Source">{% if s.subscribed and n_read > 1 %}<span class="text-faint">{{ loop.index }}.</span> {% endif %}{{ s.name }}
               <div class="text-faint small">{{ s.kind }}{% if not s.owned %} - from <a href="{{ url_for('accounts.account_detail', account_id=s.owner_id) }}">{{ s.owner_name }}</a>{% endif %}{% if not s.subscribed %} - not used by this account{% elif not s.enabled %} - turned off{% endif %}</div>
               {% if s.url %}<div class="small"><code>{{ s.url }}</code></div>{% endif %}
+              {% if s.shared %}<div class="small text-warning">{{ '{:,}'.format(s.shared.channels) }} channel{{ '' if s.shared.channels == 1 else 's' }} with different names share {% if s.shared.ids | length == 1 %}the id <code>{{ s.shared.ids[0] }}</code>{% else %}{{ s.shared.ids | length }} ids{% endif %}, so this guide gives them all one channel's schedule.
+                <a href="{{ url_for('accounts.epg_source_review', source_id=s.id, view='shared') }}">Shared ids {{ icon('forward') }}</a></div>{% endif %}
               {% if s.readers %}<div class="text-faint small">Also read by {% for r in s.readers %}<a href="{{ url_for('accounts.account_detail', account_id=r.id) }}">{{ r.name }}</a> ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}</div>{% endif %}
               {% if s.is_url and s.subscribed and s.enabled %}
               <div class="text-faint small">{% if s.refresh_interval_hours %}Refreshes every {{ s.refresh_interval_hours }}h{% if s.next_refresh_at %}, next {{ s.next_refresh_at | local_time }}{% endif %}{% else %}Refreshes with this account's sync{% endif %}</div>

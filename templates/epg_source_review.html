@@ -43,7 +43,8 @@
   Channels whose name matches exactly one channel in this source's file. Nothing changes until
   you accept a match, and every channel you don't accept keeps matching on the EPG id its
   provider gives it. Check the programs coming up before accepting: a name can point at the
-  wrong channel.
+  wrong channel. Shared ids lists the ids the provider gives to several differently named
+  channels at once.
 {% endcall %}
 
 <div id="nm-main" data-source-id="{{ source.id }}" data-owner-id="{{ owner.id }}">
@@ -58,9 +59,15 @@
   <a href="{{ qs('disagreements') }}" class="tab{{ ' active' if view == 'disagreements' else '' }}"
      data-tip="Channels whose provider id matches one channel in the file while the name matches another. Sometimes the provider's id is the wrong one, sometimes the name is.">Disagreements <span class="cnt">{{ '{:,}'.format(counts.disagreements) }}</span></a>
   <a href="{{ qs('rejected') }}" class="tab{{ ' active' if view == 'rejected' else '' }}">Rejected <span class="cnt">{{ '{:,}'.format(counts.rejected) }}</span></a>
+  <a href="{{ qs('shared') }}" class="tab{{ ' active' if view == 'shared' else '' }}"
+     data-tip="Ids in this file that the provider gives to several channels with different names, so they all show one channel's schedule.">Shared ids <span class="cnt">{{ '{:,}'.format(counts.shared) }}</span></a>
 </div>
 
-{% if view != 'rejected' %}
+{% if view == 'shared' %}
+<p class="page-intro">The provider gives each id below to channels whose names say they are different channels, so this file gives every one of them the same channel's schedule. Stopping it for them removes that schedule from them in every guide their account reads, now and at every later refresh; name matches can then suggest the right id for each one.</p>
+{% endif %}
+
+{% if view != 'rejected' and view != 'shared' %}
 <div class="nm-filters">
   <label><input type="checkbox" data-filter="single"{% if include_single %} checked{% endif %}> Include channels listing one program</label>
   {% if view == 'proposals' %}
@@ -74,12 +81,14 @@
 {% endif %}
 
 <div class="toolbar nm-bar">
+  {% if view != 'shared' %}
   <label class="nm-all"><input type="checkbox" data-act="select-all"> Select all on this page</label>
   {% if view == 'rejected' %}
   <button class="btn btn-sm" data-act="again-selected" disabled>Propose again</button>
   {% else %}
   <button class="btn btn-sm btn-primary" data-act="accept-selected" disabled>Accept selected</button>
   <button class="btn btn-sm" data-act="reject-selected" disabled>Reject selected</button>
+  {% endif %}
   {% endif %}
   {% if can_refresh %}
   <button class="btn btn-sm" data-act="refresh"
@@ -90,8 +99,35 @@
 {% if not rows %}
 <div class="empty-state">
   {% if view == 'rejected' %}<p>No rejected matches.</p>
+  {% elif view == 'shared' %}<p>No id in this file is shared by channels with different names.</p>
   {% elif view == 'disagreements' %}<p>No channel's name disagrees with its provider id.</p>
   {% else %}<p>No name matches to review.</p>{% endif %}
+</div>
+{% elif view == 'shared' %}
+<div class="table-scroll">
+  <table class="tbl tbl-cards nm-tbl">
+    <thead><tr><th>Id in the file</th><th>Coming up</th><th>Channels on it</th><th></th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+      {% if loop.first or r.account_id != rows[loop.index0 - 1].account_id %}
+      <tr class="nm-group"><td colspan="4">{{ r.account_name }}</td></tr>
+      {% endif %}
+      <tr data-account-id="{{ r.account_id }}" data-account-name="{{ r.account_name }}"
+          data-xml-id="{{ r.file.xml_id }}" data-guide-name="{{ r.guide_name }}"
+          data-channel-ids="{{ r.wrong | map(attribute='id') | list | tojson | forceescape }}">
+        <td data-label="Id in the file">{{ file_cell(r.file) }}
+          <div class="small">The file calls it &ldquo;{{ r.guide_name }}&rdquo;</div></td>
+        <td data-label="Coming up">{{ coming_up(r.file) }}</td>
+        <td data-label="Channels on it">{{ '{:,}'.format(r.wrong | length) }} of {{ '{:,}'.format(r.total) }} have other names
+          <details class="sid-list"><summary class="small">Show them</summary>
+            <ul>{% for c in r.wrong %}<li><a href="{{ url_for('channels.channel_detail', channel_id=c.id) }}">{{ c.name }}</a>{% if not c.guide_from %} <span class="text-faint small">no guide today</span>{% endif %}</li>{% endfor %}</ul>
+          </details>
+          {% if r.kept %}<div class="text-faint small">Left alone, named for this id: {{ r.kept | join(', ') }}</div>{% endif %}</td>
+        <td class="num nm-acts"><button class="btn btn-sm btn-danger" data-act="ignore-shared">Stop using it</button></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
 </div>
 {% else %}
 <div class="table-scroll">
@@ -156,6 +192,7 @@
   .nm-group td { font-weight: 600; background: var(--bg2); }
   .nm-acts { white-space: nowrap; }
   .nm-pager { margin-top: 0.75rem; }
+  .sid-list ul { margin: 0.25rem 0 0; padding-left: 1.1rem; max-height: 16rem; overflow-y: auto; }
 </style>
 {% endblock %}
 
