@@ -607,6 +607,9 @@
           {% if cur.guide_channels %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id, 'f.other': 'guide'}) }}">{{ '{:,}'.format(cur.guide_channels) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
         <div class="srow"><span class="sk tip-plain" data-tip="Program entries.&#10;Every listing in this account's guide data: one per showing, across all its channels and every day the provider sends, the ones that already aired included. Search Programs counts only the showings still to come.">Program entries</span><span class="sv">
           {% if account.epg_entry_count %}{{ '{:,}'.format(account.epg_entry_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
+        {% if guide_reach %}
+        <div class="srow"><span class="sk tip-plain" data-tip="Guide reaches.&#10;The last day most of this account's channels have listings for. A range means its channels take their guide from sources that run out on different days; the EPG sources card has each one.">Guide reaches</span><span class="sv">{% if guide_reach.ran_out %}Ran out {{ guide_reach.inline }}{% else %}{{ guide_reach.text }}{% endif %}</span></div>
+        {% endif %}
         {{ m.stat_row('Channels with listings',
                       '{:,}'.format(cur.epg.with_epg),
                       'ok' if cur.epg.with_epg else 'faint',
@@ -681,7 +684,9 @@
       {% endif %}
       <div class="table-scroll">
         <table class="tbl tbl-cards">
-          <thead><tr><th>Source</th><th>Last refresh</th><th class="num">Entries</th>
+          <thead><tr><th>Source</th><th>Last refresh</th>
+            <th><span class="tip-plain" data-tip="Reaches.&#10;The last day at least half of this source's channels have listings for, counted over every channel in its guide. Point at a date for the full count by day.">Reaches</span></th>
+            <th class="num">Entries</th>
             <th class="num"><span class="tip-plain" data-tip="Channels covered.&#10;Channels reading this source that it has at least one listing for in the import window.">Covered</span></th>
             <th class="num"><span class="tip-plain" data-tip="Guide from here.&#10;Channels on this account whose guide listings come from this source right now.">Guide from here</span></th>
             <th></th></tr></thead>
@@ -703,6 +708,10 @@
               {% if s.retry_at and not s.refreshing %}<div class="small">Waiting behind other work - retries {{ s.retry_at | local_time }}</div>{% endif %}
               {% if s.last_error %}<div class="small">{{ s.last_error }}</div>{% endif %}
               {% if s.ran_out_note %}<div class="small">{{ s.ran_out_note }}</div>{% endif %}</td>
+            <td data-label="Reaches">
+              {% if s.reach %}<span class="tip-plain" data-tip="{{ s.reach.tip }}">{% if s.reach.words.ran_out %}Ran out {{ s.reach.words.inline }}{% else %}{{ s.reach.words.text }}{% endif %}</span>
+              {% if s.reach.later %}<div class="text-faint small">{{ s.reach.later }}</div>{% endif %}
+              {% else %}<span class="text-faint">Nothing ahead</span>{% endif %}</td>
             <td data-label="Entries" class="num">{% if s.entry_count %}{{ '{:,}'.format(s.entry_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</td>
             <td data-label="Covered" class="num">{% if s.channel_count %}{{ '{:,}'.format(s.channel_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</td>
             <td data-label="Guide from here" class="num">{% if s.active_here %}{{ '{:,}'.format(s.active_here) }}{% else %}<span class="text-faint">0</span>{% endif %}</td>

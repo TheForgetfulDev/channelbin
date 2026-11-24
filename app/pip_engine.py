@@ -467,6 +467,10 @@ class Picture:
         # (the small window's card, Watching now's clause) for `pane`, worked out when the
         # pane is set and never per frame: a game's start time reads the display timezone.
         self.words = ('Waiting for a connection', 'waiting for a connection')
+        # Moves on every pane write, under feed._lock: ended() names a stopped session's pane
+        # after letting the lock go, and an ask landing in that gap has already named what is
+        # next, which a stale "reconnecting" must not overwrite (dev/changelog/1715).
+        self.pane_writes = 0
         self.failed_ids: set = set()
         self.seconds: dict = {}
         # Why a recording has its connection, '' while none has: what tells a picture a
@@ -616,6 +620,7 @@ class Picture:
                 self.yielded = False
                 self.event_id = play.event_id
                 self.pane, self.words = pane, ('', '')
+                self.pane_writes += 1
         if closed:
             feed._finish(session, feed.REASON_CLIENT_GONE)
             self._forget(session)
@@ -704,11 +709,16 @@ class Picture:
         with feed._lock:
             feed._internal.pop(session.id, None)
 
-    def _set_pane(self, pane) -> None:
+    def _set_pane(self, pane, unless_after: Optional[int] = None) -> None:
+        """Name the pane. With `unless_after`, a count of pane_writes read earlier, only when
+        nothing has been written since."""
         words = pip_channels.pane_words(pane)
         with feed._lock:
+            if unless_after is not None and self.pane_writes != unless_after:
+                return
             changed = (pane.state, pane.why) != (self.pane.state, self.pane.why)
             self.pane, self.words = pane, words
+            self.pane_writes += 1
         if changed:
             log.info('Picture in picture: %s is not playing (%s%s)', self.label(), pane.state,
                      f': {pane.why}' if pane.why else '')
@@ -731,6 +741,7 @@ class Picture:
             reason = session.reason
             self.ask_due = True
             yielded = self.yielded
+            writes = self.pane_writes
         if yielded:
             pane = P.Pane(P.PANE_YIELDED, source, name, why='the big picture needed its connection')
         elif reason == feed.REASON_PREEMPTED:
@@ -750,7 +761,7 @@ class Picture:
             log.error('Picture in picture: %s stopped for a reason a picture is not expected to (%s)',
                       self.label(), reason)
             pane = P.Pane(P.PANE_RECONNECTING, source, name, why=session.detail)
-        self._set_pane(pane)
+        self._set_pane(pane, unless_after=writes)
         log.warning('Picture in picture: %s stopped playing "%s" (%s%s)', self.label(),
                     session.channel_name, session.reason, f': {session.detail}' if session.detail else '')
         return True
