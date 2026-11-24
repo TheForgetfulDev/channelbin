@@ -31,5 +31,5 @@ def _build_stamp():
     return '+' + stamp if stamp else ''
 
 
-__version__ = '0.49.0'
+__version__ = '0.49.1'
 __version__ += _build_stamp()
