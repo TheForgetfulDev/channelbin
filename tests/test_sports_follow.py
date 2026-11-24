@@ -653,6 +653,73 @@ class NamedRunningTests(Case):
         self.assertEqual(self.window(rid), (self.listed - PRE, self.stop + POST))
 
 
+class HeldStartTests(Case):
+    """A recording still SCHEDULED after its start (the recorder is holding it for a connection) is
+    not moved to "now" by each pass (dev/docs/BUGS.md 2026-11-23 @ 11:12:32 PM): its start
+    stays, so its wait and its place among the waiters stay."""
+
+    ahead = timedelta(minutes=-10)
+    early = timedelta(0)
+
+    def assert_left(self, rid):
+        before = self.window(rid)
+        out = self.follow()
+        self.assertEqual(out['moved'], 0)
+        self.assertEqual(self.window(rid), before)
+        self.assertEqual(self.events(rid, RECORDING_SPORTS_RETIMED), [])
+        self.end_capture_wait.assert_not_called()
+
+    def test_a_held_rule_recording_keeps_its_start(self):
+        rid = self.recording(kind='rule')
+        self.assert_left(rid)
+        m = RuleMatch.query.filter_by(recording_id=rid).one()
+        self.assertEqual(m.rec_start_time, self.listed - PRE)
+
+    def test_a_held_record_recording_keeps_its_start(self):
+        self.assert_left(self.recording())
+
+    def test_an_earlier_time_already_passed_does_not_move_a_held_start(self):
+        self.move_tsdb(self.listed - timedelta(minutes=30))
+        self.assert_left(self.recording())
+
+
+class PassedGameFutureStartTests(Case):
+    """The other half of _start_from_now (dev/docs/BUGS.md 2026-11-23 @ 11:12:32 PM): a game whose
+    start moved to before now, while its recording's start is still ahead, starts now - keeping
+    the later start would miss the start of the game."""
+
+    ahead = timedelta(minutes=20)
+    early = timedelta(hours=1)
+
+    def test_a_future_start_for_a_game_already_under_way_moves_to_now(self):
+        rid = self.recording()
+        self.assertGreater(self.window(rid)[0], self.now)
+        out = self.follow()
+        self.assertEqual(out['moved'], 1)
+        self.assertEqual(self.window(rid)[0], self.now)
+
+
+class HeldSecondTests(Case):
+    """Cover both's second recording, held past its start, is not moved on each pass either
+    (dev/docs/BUGS.md 2026-11-23 @ 11:12:32 PM)."""
+
+    early = timedelta(hours=2)
+    hours = 1
+    ahead = timedelta(minutes=110)
+
+    def test_a_held_second_keeps_its_start(self):
+        sports_times.set_league(9001, {'go_by': sports_times.GO_BOTH})
+        rid = self.recording()
+        self.assertEqual(self.follow()['added'], 1)
+        db.session.expire_all()
+        (second,) = Recording.query.filter_by(sports_cover_for_id=rid).all()
+        sid, before = second.id, (second.start_time, second.stop_time)
+        out = sports_follow.follow(now=self.now + timedelta(minutes=10))
+        self.assertEqual(out['moved'], 0)
+        self.assertEqual(self.window(sid), before)
+        self.assertEqual(self.events(sid, RECORDING_SPORTS_RETIMED), [])
+
+
 class HookTests(Case):
     def test_a_matcher_run_follows_the_games_times(self):
         from app import sports_match

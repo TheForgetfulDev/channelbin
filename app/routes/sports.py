@@ -132,7 +132,8 @@ def lookup():
     if data.get('tsdb_id'):
         kind, value = 'league', data['tsdb_id']
     else:
-        kind, value = sports_data.parse_entry(data.get('text') or '')
+        text = data.get('text')
+        kind, value = sports_data.parse_entry(text if isinstance(text, str) else '')
     if kind == 'team' and not value:
         return jsonify({'error': 'Type a league, a team or a link.'}), 400
     if kind == 'badlink':
@@ -194,8 +195,12 @@ def add_league():
     team_ids, error = _team_ids(data.get('team_ids'))
     if error:
         return jsonify({'error': error}), 400
-    stored = _stored_league(data.get('tsdb_id'))
-    league = _recall(_checked_leagues, data.get('tsdb_id')) or (_stored_payload(stored) if stored else None)
+    # Anything but a whole number names no league, and a list or an object cannot be looked up at all.
+    tsdb_id = data.get('tsdb_id')
+    if not isinstance(tsdb_id, int) or isinstance(tsdb_id, bool):
+        tsdb_id = None
+    stored = _stored_league(tsdb_id)
+    league = _recall(_checked_leagues, tsdb_id) or (_stored_payload(stored) if stored else None)
     if league is None:
         return jsonify({'error': 'Look that league up again first: the check has expired.'}), 409
     checked, refused = _vouched(league, stored, team_ids)

@@ -406,8 +406,8 @@ def _follow_one(rec, ctx, run, counts):
     pad = padding(rec, kind, ctx.profiles, ctx.stored)
     wins = padded(raw, *pad)
     listing = padded([(rec.program_start_time, rec.program_stop_time)], *pad)[0]
-    want = (max(wins[0][0], run.now), wins[0][1])
     current = (rec.start_time, rec.stop_time)
+    want = (_start_from_now(wins[0][0], current[0], run.now), wins[0][1])
     seconds = ctx.seconds.get(rec.id) or []
     if not owned:
         # Unclamped, so a start already passed does not read as a new window on every pass.
@@ -421,13 +421,14 @@ def _follow_one(rec, ctx, run, counts):
             _rearm(rec.id, want[0], want[1], want[0] != current[0])
     live = [s for s in seconds if s.status == REC_STATUS_SCHEDULED]
     if len(wins) == 2:
-        target = apart(want, wins[1])
-        target = (max(target[0], run.now), target[1])
+        apart_from = apart(want, wins[1])
         if not seconds:
+            target = (max(apart_from[0], run.now), apart_from[1])
             if not _second_was_removed(rec.id) and _add_second(rec.id, target, pad, game, run, raw):
                 counts['added'] += 1
             return
         for s in live:
+            target = (_start_from_now(apart_from[0], s.start_time, run.now), apart_from[1])
             if _owned_second(s) and (s.start_time, s.stop_time) != target:
                 if _move_second(s.id, rec.id, (s.start_time, s.stop_time), target, pad, game, run, raw):
                     counts['moved'] += 1
@@ -440,6 +441,18 @@ def _follow_one(rec, ctx, run, counts):
                    else 'one recording covers both times now')
             if _remove_second(s.id, rec.id, why, run):
                 counts['removed'] += 1
+
+
+def _start_from_now(wanted, current, now):
+    """The start to give a SCHEDULED recording whose game's window starts at `wanted`: never a time
+    already passed, and a start that has itself passed stays where it is. A recording whose start
+    is held for a connection is still SCHEDULED past its start; moved to `now` it would be moved
+    again on every pass, each move ending its wait (routes/recordings._rearm_replanned) and taking
+    its place among the waiters, who are ordered on start_time (recorder._earlier_waiter_for_slot).
+    dev/docs/BUGS.md 2026-11-23 @ 11:12:32 PM."""
+    if wanted >= now:
+        return wanted
+    return current if current <= now else now
 
 
 def _owned_running(rec, ctx) -> bool:
