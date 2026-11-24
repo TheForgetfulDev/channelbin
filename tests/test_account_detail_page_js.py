@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
-from app.database import Account, AccountHost, AccountSyncLog  # noqa: E402
+from app.database import Account, AccountHost, AccountSyncLog, EpgSourceChannel  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HARNESS = os.path.join(REPO, 'tests', 'support', 'account_detail_page.mjs')
@@ -67,6 +67,14 @@ def _observe():
         # A host row, so the page carries a Use switch (dev/changelog/1671).
         host = AccountHost(account_id=busy.id, host='tv1.example.test', is_active=True)
         db.session.add(host)
+        # A guide covering one channel, so the Sources card has a scorecard line to load
+        # after the page draws (dev/changelog/1717).
+        src = seed.make_epg_source(busy)
+        seed.make_channel(busy, name='Guided', epg_channel_id='g1.test', epg_source_id=src.id)
+        db.session.add(EpgSourceChannel(source_id=src.id, xml_id='g1.test', entry_count=12,
+                                        distinct_titles=1, horizon_until=now + timedelta(days=2),
+                                        described=6, subtitled=0, categorized=0, rated=0,
+                                        flagged=0, doubled=0))
         db.session.commit()
         ids = {'fresh': fresh.id, 'busy': busy.id}
         with open(os.path.join(tmp, 'meta.json'), 'w', encoding='utf-8') as f:
@@ -76,7 +84,8 @@ def _observe():
             urls = {'fresh.html': f'/accounts/{ids["fresh"]}',
                     'busy.html': f'/accounts/{ids["busy"]}',
                     'nav.json': '/api/nav-status',
-                    'syncs.json': f'/api/accounts/{ids["busy"]}/syncs'}
+                    'syncs.json': f'/api/accounts/{ids["busy"]}/syncs',
+                    'scores.json': f'/api/accounts/{ids["busy"]}/epg-scorecard?view=card'}
             for suffix, url in urls.items():
                 resp = client.get(url)
                 if resp.status_code != 200:
@@ -337,6 +346,49 @@ class UseSwitchTests(_Base, unittest.TestCase):
         self.assertTrue(self.obs['refusedChecked'])
         self.assertFalse(self.obs['refusedDisabled'])
         self.assertEqual(self.obs['refusedPageFetches'], 1)
+
+
+class ScorecardLineTests(_Base, unittest.TestCase):
+    """dev/changelog/1717: each source's scorecard line costs 0.6 s on prod's largest
+    accounts, so the page draws without it and fills it in from the API's card view."""
+    SCENARIO = 'scores'
+
+    def test_the_page_draws_with_the_line_hidden_and_empty(self):
+        lines = self.obs['atFirstPaint']['scoreLines']
+        self.assertEqual(len(lines), 1)
+        self.assertEqual((lines[0]['hidden'], lines[0]['text']), (True, ''))
+        self.assertNotIn('by the last day it runs through', self.obs['atFirstPaint']['reachTip'])
+
+    def test_the_line_and_the_days_arrive_after_it(self):
+        line = self.obs['loaded']['scoreLines'][0]
+        self.assertEqual(self.obs['loaded']['scoreFetches'], 1)
+        self.assertFalse(line['hidden'])
+        self.assertEqual(line['text'], 'Covers 1 channel here, 1 only here. 1 lists one program all day.')
+        self.assertIn('50% described', line['tip'])
+        tip = self.obs['loaded']['reachTip']
+        self.assertTrue(tip.startswith('Guide reaches.'), tip)
+        self.assertIn('1 channel with a guide here, by the last day it runs through:', tip)
+
+    def test_a_swap_puts_the_line_back_without_asking_again(self):
+        aged = self.obs['aged']
+        self.assertEqual(aged['pageFetches'], 1, 'the minute-old render was swapped')
+        self.assertEqual(aged['scoreFetches'], 1)
+        self.assertEqual(aged['scoreLines'], self.obs['loaded']['scoreLines'])
+        self.assertEqual(aged['reachTip'], self.obs['loaded']['reachTip'],
+                         'the days are added once, never twice')
+
+    def test_a_sync_reads_it_again(self):
+        self.assertEqual(self.obs['synced']['scoreFetches'], 2)
+        self.assertFalse(self.obs['synced']['scoreLines'][0]['hidden'])
+
+
+class ScorecardFailedTests(_Base, unittest.TestCase):
+    SCENARIO = 'scores_failed'
+
+    def test_a_failed_read_leaves_the_page_as_it_was_drawn(self):
+        self.assertEqual([(x['hidden'], x['text']) for x in self.obs['scoreLines']],
+                         [(True, '')])
+        self.assertTrue([w for w in self.obs['warnings'] if 'scorecard' in w])
 
 
 if __name__ == '__main__':

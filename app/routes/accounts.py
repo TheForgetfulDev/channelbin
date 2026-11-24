@@ -49,7 +49,7 @@ from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, dir
                            use_source_again)
 from ..logo_cache import delete_cached_logos
 from ..storage_dirs import manual_screenshot_paths
-from ..tz_utils import format_local, get_display_tz, is_24h, parse_form_time
+from ..tz_utils import date_label, format_local, get_display_tz, is_24h, parse_form_time
 from .. import account_activity, history_filter, host_checks, stream_check
 from ..stream_check import delete_for_account as delete_stream_checks
 from ..account_blocks import (NO_END, account_limits, add_account_block, add_login_block,
@@ -2000,6 +2000,35 @@ def borrowable_epg_sources_api(account_id):
                                 if s['last_success_at'] else None)
         sources.append(s)
     return jsonify({'success': True, 'sources': sources})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-scorecard', methods=['GET'])
+def epg_scorecard_api(account_id):
+    """The account's EPG source scorecard (app/epg_scorecard.py, dev/changelog/1717). Read
+    only; nothing is fetched.
+
+    `?view=card` is what the account page loads after it draws: each source's line and
+    tooltip and the by-day count of the account's guided channels, as text. It is read
+    after the page because it costs 0.6 s on prod's two largest accounts, almost all of it
+    reading each guide's whole directory. Without it, every number unformatted, with each
+    channel two or more sources cover, the source that serves it best and the name matches
+    the review page would propose (another 2.9 s on account 5)."""
+    _account, err = _json_account(account_id)
+    if err:
+        return err
+    from ..epg_scorecard import (account_scorecard, card_json, name_match_counts,
+                                 scorecard_json)
+    from ..epg_sources import last_local_day, to_local_date
+    tz, now, cs = get_display_tz(), datetime.utcnow(), _case_sensitive()
+    if request.args.get('view') == 'card':
+        card = account_scorecard(account_id, tz, cs)
+        return jsonify({'success': True,
+                        **card_json(card, lambda day: date_label(day, now, tz),
+                                    to_local_date(now, tz))})
+    card = account_scorecard(account_id, tz, cs, with_channels=True,
+                             day_of=lambda h: date_label(last_local_day(h, tz), now, tz))
+    names = name_match_counts(account_id, [s.source_id for s in card.sources], cs)
+    return jsonify({'success': True, **scorecard_json(card, names)})
 
 
 def _borrowed_message(source, owner_name: str, done) -> str:

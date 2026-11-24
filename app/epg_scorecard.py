@@ -1,0 +1,650 @@
+"""The EPG source scorecard: the numbers that say which of an account's guides to keep
+(DESIGN-epg-sources.md §12.13, dev/changelog/1717).
+
+Read from what the database already holds, never fetched: the source directory (coverage,
+one title all day, reach, the detail counts the import's scan pass makes), the key answers,
+the refresh history and the stored agreement of two sources per channel. The numbers a page
+load cannot afford are stored by the import or by the check below; everything else is
+computed per request in a fixed number of queries whatever the channel count.
+
+Agreement is compare_listings()'s verdict, the one judge of "the same program", over the
+listings both sources hold from now on. It costs about 3 ms a channel and pair (27 s for
+account 5's three sources on prod), so it runs in the background after an import
+(run_check(), admission kind KIND_EPG_CHECK) and is stored in epg_source_agreements.
+
+Nothing here writes a channel's guide. "Best here" is a suggestion with its reasons; acting
+on it is the user's, through set_source_override()."""
+from __future__ import annotations
+
+import logging
+import time as time_mod
+from collections import Counter
+from datetime import date, datetime
+from typing import NamedTuple
+
+from sqlalchemy import delete, select
+
+from . import admission, db
+from .database import (Channel, EPGEntry, EpgAlternateEntry, EpgSource, EpgSourceAgreement,
+                       EpgSourceChannel, EpgSourceRefresh, EpgSourceSubscription,
+                       EPG_STATUS_FAILED, EPG_STATUS_OK, EPG_STATUS_REFUSED,
+                       EPG_STATUS_TRUNCATED)
+from .db_utils import chunked, retry_on_locked
+from .epg_sources import (CMP_DESCRIPTIONS, CMP_IDENTICAL, CMP_MOSTLY, CMP_NO_OVERLAP,
+                          CMP_SHIFTED, CMP_UNRELATED, REAL_SCHEDULE_MIN_TITLES, Listing,
+                          Reach, channel_key, compare_listings, file_id_for, key_answers,
+                          norm_key, of_sources, reach_from_horizons, sources_without_directory)
+from .fmt_utils import counted, iso_or_none, plural
+
+log = logging.getLogger(__name__)
+
+#: Verdicts that say two sources list the same channel's schedule (§14.3's "agree").
+AGREEING = frozenset({CMP_IDENTICAL, CMP_DESCRIPTIONS, CMP_MOSTLY, CMP_SHIFTED})
+
+#: A difference in the share of described listings smaller than this is not a reason to
+#: prefer one source (percentage points).
+DETAIL_MARGIN = 10
+
+_CHUNK = 500
+RETRY_MINUTES = 10
+
+
+# ── What the directory says about one channel ────────────────────────────────
+
+class ChannelSource(NamedTuple):
+    """One source's directory row for one channel: what that channel reads from it."""
+    source_id: int
+    programs: int
+    distinct_titles: int
+    horizon_until: datetime | None
+    described: int | None
+    subtitled: int | None
+    categorized: int | None
+    rated: int | None
+    flagged: int | None
+    doubled: int | None
+
+    @property
+    def real_schedule(self) -> bool:
+        return self.distinct_titles >= REAL_SCHEDULE_MIN_TITLES
+
+    def share(self, field: str) -> int | None:
+        n = getattr(self, field)
+        if n is None or not self.programs:
+            return None
+        return round(n * 100 / self.programs)
+
+
+class Reliability(NamedTuple):
+    """A source's kept refreshes (EPG_REFRESH_HISTORY_LIMIT at most), by how they ended."""
+    refreshes: int
+    ok: int
+    failed: int
+    refused: int
+    truncated: int
+    since: datetime | None          # the oldest kept refresh
+    last_trouble: datetime | None   # the latest one that did not end OK
+    last_trouble_status: str | None
+
+
+class SourceScore(NamedTuple):
+    source_id: int
+    name: str
+    priority: int
+    has_directory: bool
+    covered: int            # visible channels whose key reads listings here
+    only_here: int          # ... that no other source the account reads covers
+    guides: int             # channels whose guide comes from it now
+    real_schedule: int
+    one_title: int
+    programs: int           # in-window listings across the covered channels
+    counted: int            # ... of which the detail counts exist for (NULL rows left out)
+    described: int
+    subtitled: int
+    categorized: int
+    rated: int
+    flagged: int
+    doubled_channels: int   # covered channels listing two programs at one moment
+    doubled_unknown: int    # covered channels whose doubles were not counted
+    reach: Reach | None     # over the covered channels' own rows
+    compared: int           # covered channels judged against at least one other source
+    agree: int              # ... agreeing with every source it was judged against
+    disagree: int           # ... unrelated to at least one
+    outvoted: int           # ... unrelated to all, where the others agree with each other
+    reliability: Reliability
+
+
+class AccountScorecard(NamedTuple):
+    account_id: int
+    sources: list           # [SourceScore], in the account's order
+    guided: Reach | None    # the account's guided channels, each at its own guide's last day
+    channels: list          # [ChannelScore] for channels two or more sources cover
+
+
+class ChannelScore(NamedTuple):
+    channel_id: int
+    name: str | None
+    current: int | None     # Channel.epg_source_id
+    best: int
+    reasons: list           # [str]
+    sources: list           # [ChannelSource], in the account's order
+    verdicts: dict          # {(earlier, later): CMP_*}
+
+
+# ── The one batch reader ─────────────────────────────────────────────────────
+
+_DIR = EpgSourceChannel.__table__
+_ROW_COLUMNS = (_DIR.c.source_id, _DIR.c.xml_id, _DIR.c.entry_count, _DIR.c.distinct_titles,
+                _DIR.c.horizon_until, _DIR.c.described, _DIR.c.subtitled, _DIR.c.categorized,
+                _DIR.c.rated, _DIR.c.flagged, _DIR.c.doubled)
+
+
+def _directories(source_ids, case_sensitive: bool):
+    """({source_id: {folded key: {xml_id: entry_count}}}, {(source_id, xml_id): row}) over
+    directory rows with listings: the variants file_id_for() chooses among, so a channel is
+    scored on exactly the id the import reads for it. One query.
+
+    Read through the table, not the mapped class: the ORM's row loading was two thirds of
+    a 0.6 s Sources card over epg-full's 43,000 rows, of which account 5 uses 3,000."""
+    variants: dict[int, dict[str, dict[str, int]]] = {sid: {} for sid in source_ids}
+    rows: dict[tuple[int, str], tuple] = {}
+    if not variants:
+        return variants, rows
+    for r in db.session.execute(select(*_ROW_COLUMNS).where(
+            _DIR.c.source_id.in_(list(variants)), _DIR.c.entry_count > 0)):
+        sid, xml_id, n = r[0], r[1], r[2]
+        variants[sid].setdefault(norm_key(xml_id, case_sensitive), {})[xml_id] = n
+        rows[(sid, xml_id)] = r
+    return variants, rows
+
+
+def channel_sources(channels, order, answers, variants, rows,
+                    case_sensitive: bool) -> dict[int, list[ChannelSource]]:
+    """{channel_id: [ChannelSource]} in `order` for each channel some source covers - pure.
+    `channels` is (id, epg_channel_id) pairs; `answers` key_answers() over `order`."""
+    out: dict[int, list[ChannelSource]] = {}
+    for cid, provider_id in channels:
+        found = []
+        for sid in order:
+            key = channel_key(provider_id, answers.get((cid, sid)))
+            if not key:
+                continue
+            fid = file_id_for(key, variants.get(sid, {}).get(norm_key(key, case_sensitive), {}))
+            if fid is None:
+                continue
+            r = rows[(sid, fid)]
+            found.append(ChannelSource(sid, r[2], r[3] or 0, r[4], *r[5:]))
+        if found:
+            out[cid] = found
+    return out
+
+
+def reliability(history) -> Reliability:
+    """Reliability from [(finished_at, status), ...], newest first - pure."""
+    by = Counter(status for _at, status in history)
+    trouble = next(((at, status) for at, status in history if status != EPG_STATUS_OK),
+                   (None, None))
+    return Reliability(len(history), by[EPG_STATUS_OK], by[EPG_STATUS_FAILED],
+                       by[EPG_STATUS_REFUSED], by[EPG_STATUS_TRUNCATED],
+                       history[-1][0] if history else None, *trouble)
+
+
+def _refresh_history(source_ids) -> dict[int, list]:
+    out: dict[int, list] = {sid: [] for sid in source_ids}
+    if out:
+        for sid, at, status in (db.session.query(EpgSourceRefresh.source_id,
+                                                 EpgSourceRefresh.finished_at,
+                                                 EpgSourceRefresh.status)
+                                .filter(EpgSourceRefresh.source_id.in_(list(out)))
+                                .order_by(EpgSourceRefresh.finished_at.desc(),
+                                          EpgSourceRefresh.id.desc())):
+            out[sid].append((at, status))
+    return out
+
+
+def _stored_verdicts(account_id: int, order) -> dict[int, dict[tuple[int, int], str]]:
+    """{channel_id: {(earlier, later): verdict}} for this account's channels, keeping only
+    pairs of sources it reads now, in its order now. One query."""
+    rank = {sid: i for i, sid in enumerate(order)}
+    out: dict[int, dict] = {}
+    rows = (db.session.query(EpgSourceAgreement.channel_id, EpgSourceAgreement.source_id,
+                             EpgSourceAgreement.other_source_id, EpgSourceAgreement.verdict)
+            .join(Channel, Channel.id == EpgSourceAgreement.channel_id)
+            .filter(Channel.account_id == account_id))
+    for cid, a, b, verdict in rows:
+        if a in rank and b in rank:
+            pair = (a, b) if rank[a] < rank[b] else (b, a)
+            out.setdefault(cid, {})[pair] = verdict
+    return out
+
+
+def outvoted(verdicts: dict, source_ids) -> set[int]:
+    """The sources unrelated to every other source judged against them on a channel, where
+    at least two of those others agree with each other - pure. Two sources disagreeing
+    with each other is not a vote: neither is left out."""
+    def v(a, b):
+        return verdicts.get((a, b)) or verdicts.get((b, a))
+
+    out = set()
+    for s in source_ids:
+        judged = [o for o in source_ids if o != s and v(s, o) not in (None, CMP_NO_OVERLAP)]
+        if len(judged) < 2 or any(v(s, o) != CMP_UNRELATED for o in judged):
+            continue
+        if any(v(a, b) in AGREEING for i, a in enumerate(judged) for b in judged[i + 1:]):
+            out.add(s)
+    return out
+
+
+def best_source(sources: list, verdicts: dict, names: dict, day_of) -> tuple[int, list]:
+    """(source_id, [reason, ...]) - which of a channel's sources serves it best, and why, in
+    the order the rules are applied. Pure. `sources` is [ChannelSource] in the account's
+    order; `day_of(horizon)` the local day a horizon runs through, as display text.
+
+    1. A source the others outvote (outvoted()) is left out.
+    2. A full schedule beats one program all day.
+    3. One that never lists two programs at a moment beats one that does, when every source's
+       doubles were counted.
+    4. The longest reach, by whole days.
+    5. More described listings, by DETAIL_MARGIN points or more.
+    6. Otherwise the first in the account's order.
+    Reach comes before detail because a rule or Record cannot schedule past the guide's end;
+    detail is a better listing of a program the guide already has."""
+    left = list(sources)
+    reasons = []
+
+    def narrow(keep, why):
+        nonlocal left
+        kept = [s for s in left if keep(s)]
+        dropped = [s for s in left if not keep(s)]
+        if kept and dropped:
+            reasons.append(why(kept, dropped))
+            left = kept
+
+    def named(group):
+        return ', '.join(names.get(s.source_id, f'source {s.source_id}') for s in group)
+
+    gone = outvoted(verdicts, [s.source_id for s in left])
+    narrow(lambda s: s.source_id not in gone,
+           lambda k, d: f'{named(d)} does not match the other sources, which match each other')
+    narrow(lambda s: s.real_schedule,
+           lambda k, d: f'{named(d)} lists one program all day')
+    # Only when every source was counted: None is "not counted", never "never doubles".
+    if all(s.doubled is not None for s in left):
+        narrow(lambda s: not s.doubled,
+               lambda k, d: f'{named(d)} lists two programs at the same time')
+    days = {s.source_id: day_of(s.horizon_until) for s in left if s.horizon_until}
+    if days:
+        last = max(s.horizon_until for s in left if s.horizon_until)
+        top = day_of(last)
+        narrow(lambda s: s.horizon_until is not None and day_of(s.horizon_until) == top,
+               lambda k, d: f'{named(k)} runs to {top}, {named(d)} stops sooner')
+    shares = {s.source_id: s.share('described') for s in left}
+    if all(v is not None for v in shares.values()) and shares:
+        most = max(shares.values())
+        narrow(lambda s: shares[s.source_id] >= most - DETAIL_MARGIN,
+               lambda k, d: (f'{named(k)} describes {shares[k[0].source_id]}% of its listings, '
+                             f'{named(d)} {shares[d[0].source_id]}%'))
+    if len(left) > 1:
+        reasons.append(f'{named(left[:1])} is first in this account\'s order')
+    return left[0].source_id, reasons
+
+
+def account_scorecard(account_id: int, tz, case_sensitive: bool,
+                      day_of=None, with_channels: bool = False) -> AccountScorecard:
+    """The scorecard for one account. Seven queries whatever the channel or source count
+    (subscriptions, sources, channels, key answers, directories, refresh history and, with
+    `with_channels` or more than one source, the stored agreements). `day_of(horizon)` is
+    the display text of a horizon's last local day, for the per-channel reasons."""
+    subs = (db.session.query(EpgSourceSubscription.source_id, EpgSourceSubscription.priority)
+            .filter(EpgSourceSubscription.account_id == account_id)
+            .order_by(EpgSourceSubscription.priority).all())
+    order = [sid for sid, _p in subs]
+    if not order:
+        return AccountScorecard(account_id, [], None, [])
+    names = dict(db.session.query(EpgSource.id, EpgSource.name)
+                 .filter(EpgSource.id.in_(order)))
+    ch = Channel.__table__.c
+    channels = db.session.execute(
+        select(ch.id, ch.epg_channel_id, ch.epg_source_id, ch.name)
+        .where(ch.account_id == account_id, ch.hidden.is_(False))).all()
+    answers = key_answers(order)
+    variants, rows = _directories(order, case_sensitive)
+    per_channel = channel_sources([(c[0], c[1]) for c in channels], order, answers, variants,
+                                  rows, case_sensitive)
+    history = _refresh_history(order)
+    verdicts = _stored_verdicts(account_id, order) if len(order) > 1 else {}
+    no_directory = sources_without_directory(order)
+
+    guides = Counter(c[2] for c in channels if c[2] is not None)
+    # Horizons are counted by value: channels share a few hundred of them, and turning each
+    # into a local day is what costs (0.5 s per call over account 2's 29,000 channels).
+    guided_horizons = Counter()
+    for cid, _pid, current, _name in channels:
+        for cs in per_channel.get(cid, ()):
+            if cs.source_id == current and cs.horizon_until is not None:
+                guided_horizons[cs.horizon_until] += 1
+    scores = []
+    for sid, priority in subs:
+        tally = Counter()
+        horizons = Counter()
+        for cid, found in per_channel.items():
+            cs = next((x for x in found if x.source_id == sid), None)
+            if cs is None:
+                continue
+            tally['covered'] += 1
+            if len(found) == 1:
+                tally['only_here'] += 1
+            if cs.real_schedule:
+                tally['real'] += 1
+            elif cs.distinct_titles == 1:
+                tally['one'] += 1
+            tally['programs'] += cs.programs
+            if cs.described is not None:
+                tally['counted'] += cs.programs
+                for f in ('described', 'subtitled', 'categorized', 'rated', 'flagged'):
+                    tally[f] += getattr(cs, f) or 0
+            if cs.doubled is None:
+                tally['doubled_unknown'] += 1
+            elif cs.doubled:
+                tally['doubled'] += 1
+            if cs.horizon_until is not None:
+                horizons[cs.horizon_until] += 1
+            mine = {pair: v for pair, v in verdicts.get(cid, {}).items()
+                    if sid in pair and v != CMP_NO_OVERLAP}
+            if mine:
+                tally['compared'] += 1
+                if all(v in AGREEING for v in mine.values()):
+                    tally['agree'] += 1
+                else:
+                    tally['disagree'] += 1
+                    if sid in outvoted(verdicts[cid], [x.source_id for x in found]):
+                        tally['outvoted'] += 1
+        scores.append(SourceScore(
+            sid, names.get(sid, f'source {sid}'), priority, sid not in no_directory,
+            tally['covered'], tally['only_here'], guides.get(sid, 0), tally['real'],
+            tally['one'], tally['programs'], tally['counted'], tally['described'],
+            tally['subtitled'], tally['categorized'], tally['rated'], tally['flagged'],
+            tally['doubled'], tally['doubled_unknown'], reach_from_horizons(horizons.items(), tz),
+            tally['compared'], tally['agree'], tally['disagree'], tally['outvoted'],
+            reliability(history.get(sid, []))))
+
+    channel_scores = []
+    if with_channels:
+        by_id = {c[0]: c for c in channels}
+        day_of = day_of or (lambda h: h.date().isoformat())
+        for cid, found in per_channel.items():
+            if len(found) < 2:
+                continue
+            v = verdicts.get(cid, {})
+            best, reasons = best_source(found, v, names, day_of)
+            channel_scores.append(ChannelScore(cid, by_id[cid][3], by_id[cid][2], best, reasons,
+                                               found, v))
+        channel_scores.sort(key=lambda c: ((c.name or '').lower(), c.channel_id))
+    return AccountScorecard(account_id, scores, reach_from_horizons(guided_horizons.items(), tz),
+                            channel_scores)
+
+
+def name_match_counts(account_id: int, source_ids, case_sensitive: bool) -> dict[int, dict]:
+    """{source_id: {'new': n, 'disagree': n}} - this account's channels the review page
+    would propose a name match for: channels with no listings there today that a name
+    would give some, and channels whose key and name point at different rows. Read
+    through name_match_review(), so it is the review page's own count; a full read of each
+    directory, so the API pays it and the Sources card does not."""
+    from .epg_sources import MATCH_DISAGREE, MATCH_NEW, name_match_review
+    out = {}
+    for source in EpgSource.query.filter(EpgSource.id.in_(list(source_ids))):
+        kinds = Counter(p.kind for p in name_match_review(source, case_sensitive).proposals
+                        if p.channel.account_id == account_id)
+        out[source.id] = {'new': kinds[MATCH_NEW], 'disagree': kinds[MATCH_DISAGREE]}
+    return out
+
+
+# ── What the Sources card and the API show ───────────────────────────────────
+
+def _pct(n: int, total: int) -> int | None:
+    return round(n * 100 / total) if total else None
+
+
+def card_line(score: SourceScore) -> str | None:
+    """The Sources card's one line for a source: 'Covers 3,123 channels here, 461 only here.
+    437 list one program all day.' None for a source with no directory."""
+    if not score.has_directory:
+        return None
+    if not score.covered:
+        return "Covers none of this account's channels."
+    text = f"Covers {counted(score.covered, 'channel')} here"
+    text += f', {score.only_here:,} only here.' if score.only_here else ', all also in another source.'
+    if score.one_title:
+        text += (f' {score.one_title:,} {plural(score.one_title, "lists", "list")} one program '
+                 'all day.')
+    if score.disagree:
+        text += (f' {score.disagree:,} {plural(score.disagree, "does", "do")} not match another '
+                 'source.')
+    return text
+
+
+def reliability_words(r: Reliability) -> str:
+    """The tooltip line for a source's refreshes."""
+    if not r.refreshes:
+        return 'No refreshes recorded yet.'
+    text = f'{r.ok:,} of the last {counted(r.refreshes, "refresh")} succeeded'
+    trouble = [(r.failed, 'failed to download'), (r.refused, 'refused as too small'),
+               (r.truncated, 'stopped partway')]
+    parts = [f'{n:,} {what}' for n, what in trouble if n]
+    return text + (f' ({", ".join(parts)}).' if parts else '.')
+
+
+def card_tip(score: SourceScore) -> str:
+    """The tooltip under the card line: detail shares, doubled listings, reliability."""
+    lines = []
+    if score.counted:
+        shares = [(score.described, 'described'), (score.subtitled, 'with a subtitle'),
+                  (score.categorized, 'with a category'), (score.rated, 'with a rating'),
+                  (score.flagged, 'marked new or live')]
+        lines.append(f'Of {counted(score.counted, "listing")} for this account\'s channels: '
+                     + ', '.join(f'{_pct(n, score.counted)}% {what}' for n, what in shares) + '.')
+    elif score.covered:
+        lines.append('How much detail its listings carry is counted at its next refresh.')
+    if score.doubled_channels:
+        lines.append(f'{counted(score.doubled_channels, "channel")} '
+                     f'{plural(score.doubled_channels, "lists", "list")} two programs at the '
+                     'same time.')
+    if score.doubled_unknown:
+        lines.append(f'Two programs at once is not counted yet on '
+                     f'{counted(score.doubled_unknown, "channel")}: it is counted at the '
+                     'next refresh.')
+    if score.compared:
+        lines.append(f'Compared with the other sources on {counted(score.compared, "channel")}: '
+                     f'{score.agree:,} match, {score.disagree:,} do not'
+                     + (f' ({score.outvoted:,} where the others match each other)'
+                        if score.outvoted else '') + '.')
+    lines.append(reliability_words(score.reliability))
+    return '\n'.join(lines)
+
+
+def _reach_json(reach: Reach | None):
+    if reach is None:
+        return None
+    return {'day': reach.day.isoformat(), 'latest': reach.latest.isoformat(),
+            'channels': reach.channels,
+            'days': [[d.isoformat(), n] for d, n in reach.days]}
+
+
+def scorecard_json(card: AccountScorecard, names: dict | None = None) -> dict:
+    """The API's body: every number, unformatted, for the EPG Manager to lay out. `names`
+    is name_match_counts()."""
+    sources = []
+    for s in card.sources:
+        d = s._asdict()
+        d['name_matches'] = (names or {}).get(s.source_id)
+        d['reach'] = _reach_json(s.reach)
+        d['reliability'] = {**s.reliability._asdict(), 'since': iso_or_none(s.reliability.since),
+                            'last_trouble': iso_or_none(s.reliability.last_trouble)}
+        sources.append(d)
+    channels = [{'channel_id': c.channel_id, 'name': c.name, 'current': c.current,
+                 'best': c.best, 'reasons': c.reasons,
+                 'sources': [{**cs._asdict(), 'horizon_until': iso_or_none(cs.horizon_until),
+                              'described_pct': cs.share('described')} for cs in c.sources],
+                 'verdicts': [{'source_id': a, 'other_source_id': b, 'verdict': v}
+                              for (a, b), v in c.verdicts.items()]}
+                for c in card.channels]
+    return {'account_id': card.account_id, 'sources': sources,
+            'guided': _reach_json(card.guided), 'channels': channels}
+
+
+def card_json(card: AccountScorecard, label, today: date) -> dict:
+    """What the account page fills in after it draws: {'sources': [{'source_id', 'line',
+    'tip'}], 'guide_days': text or None}. `label(day)` is a day's display text."""
+    return {'sources': [{'source_id': s.source_id, 'line': card_line(s), 'tip': card_tip(s)}
+                        for s in card.sources if card_line(s)],
+            'guide_days': days_breakdown(card.guided, today, label)}
+
+
+def days_breakdown(reach: Reach | None, today: date, label) -> str | None:
+    """The account's guided channels by the last day their guide runs through, for the
+    Content card's reach tooltip: 'Fri Nov 28: 2,341 (70%)'. `label(day)` is the day's
+    display text."""
+    if reach is None or not reach.days:
+        return None
+    lines = [f'{counted(reach.channels, "channel")} with a guide here, by the last day it runs '
+             'through:']
+    gone = 0
+    for day, n in reach.days:
+        if day < today:
+            gone += n
+            continue
+        lines.append(f'{label(day)}: {n:,} ({_pct(n, reach.channels)}%)')
+    if gone:
+        lines.append(f'Already ran out: {gone:,} ({_pct(gone, reach.channels)}%)')
+    return '\n'.join(lines)
+
+
+# ── The check that stores agreement ──────────────────────────────────────────
+
+def _held_listings(channel_ids, source_ids, now) -> dict[int, dict[int, list]]:
+    """{channel_id: {source_id: [Listing] by start}} from now on, from both tables."""
+    out: dict[int, dict[int, list]] = {}
+    for model in (EPGEntry, EpgAlternateEntry):
+        q = (db.session.query(model.channel_id, model.source_id, model.title, model.sub_title,
+                              model.description, model.start_time, model.stop_time)
+             .filter(model.channel_id.in_(list(channel_ids)), model.stop_time > now,
+                     of_sources(model, source_ids)))
+        for cid, sid, title, sub, desc, start, stop in q:
+            out.setdefault(cid, {}).setdefault(sid, []).append(
+                Listing(title, sub, desc, start, stop))
+    for by_source in out.values():
+        for listings in by_source.values():
+            listings.sort(key=lambda x: x.start)
+    return out
+
+
+def judge(held: dict[int, list], order) -> list[tuple[int, int, object]]:
+    """[(earlier, later, Comparison)] for every pair of sources holding listings - pure."""
+    present = [sid for sid in order if held.get(sid)]
+    return [(a, b, compare_listings(held[a], held[b]))
+            for i, a in enumerate(present) for b in present[i + 1:]]
+
+
+def check_account(account_id: int, order, now: datetime) -> int:
+    """Rewrite the stored agreement for one account's channels. Returns the pairs judged.
+
+    Only channels with a guide can hold listings from two sources (the alternates are kept
+    for a channel with an active source, §4), so those are read, a chunk at a time. Each
+    chunk's rows are replaced in one retry_on_locked unit; comparing happens before it."""
+    judged = 0
+    if len(order) < 2:
+        _clear_account(account_id)
+        return 0
+    guided = [cid for (cid,) in db.session.query(Channel.id).filter(
+        Channel.account_id == account_id, Channel.hidden.is_(False),
+        Channel.epg_source_id.isnot(None))]
+    _clear_unguided(account_id)
+    for chunk in chunked(guided, _CHUNK):
+        held = _held_listings(chunk, order, now)
+        db.session.rollback()   # end the read before the CPU work, so no snapshot is held
+        found = []
+        for cid in chunk:
+            for a, b, cmp in judge(held.get(cid, {}), order):
+                found.append({'channel_id': cid, 'source_id': a, 'other_source_id': b,
+                              'verdict': cmp.verdict, 'compared': cmp.compared,
+                              'paired': cmp.same + cmp.moved, 'checked_at': now})
+            time_mod.sleep(0)   # yield the GIL to request threads between channels
+        judged += len(found)
+
+        @retry_on_locked()
+        def _replace_and_commit(chunk=chunk, found=found):
+            db.session.execute(delete(EpgSourceAgreement)
+                               .where(EpgSourceAgreement.channel_id.in_(chunk)))
+            if found:
+                db.session.bulk_insert_mappings(EpgSourceAgreement, found)
+            db.session.commit()
+
+        _replace_and_commit()
+    return judged
+
+
+def _clear_account(account_id: int) -> None:
+    @retry_on_locked()
+    def _clear_and_commit():
+        db.session.execute(delete(EpgSourceAgreement).where(
+            EpgSourceAgreement.channel_id.in_(
+                select(Channel.id).where(Channel.account_id == account_id))))
+        db.session.commit()
+    _clear_and_commit()
+
+
+def _clear_unguided(account_id: int) -> None:
+    """A channel hidden or left with no guide since the last check has nothing to compare."""
+    @retry_on_locked()
+    def _clear_and_commit():
+        db.session.execute(delete(EpgSourceAgreement).where(
+            EpgSourceAgreement.channel_id.in_(
+                select(Channel.id).where(Channel.account_id == account_id,
+                                         db.or_(Channel.hidden.is_(True),
+                                                Channel.epg_source_id.is_(None))))))
+        db.session.commit()
+    _clear_and_commit()
+
+
+def _clear_unread(account_ids) -> None:
+    """An account that reads no source any more keeps no agreement."""
+    @retry_on_locked()
+    def _clear_and_commit():
+        accounts = select(Channel.id)
+        if account_ids:
+            accounts = accounts.where(Channel.account_id.notin_(account_ids))
+        db.session.execute(delete(EpgSourceAgreement).where(
+            EpgSourceAgreement.channel_id.in_(accounts)))
+        db.session.commit()
+    _clear_and_commit()
+
+
+def run_check(now: datetime | None = None) -> str:
+    """One run over every account that reads an EPG source: the agreement of its sources,
+    stored. Takes a KIND_EPG_CHECK ticket; a refusal queues the next try. Returns a note for
+    the log."""
+    from .scheduler import queue_epg_check
+    ticket = admission.try_start(admission.KIND_EPG_CHECK, 'EPG sources')
+    if not ticket.granted:
+        queue_epg_check(RETRY_MINUTES * 60, 'its last run was refused')
+        note = f'EPG source check waiting: {ticket.reason}. Tries again in {RETRY_MINUTES} minutes.'
+        log.info(note)
+        return note
+    started = time_mod.monotonic()
+    try:
+        now = now or datetime.utcnow()
+        orders: dict[int, list] = {}
+        for aid, sid in (db.session.query(EpgSourceSubscription.account_id,
+                                          EpgSourceSubscription.source_id)
+                         .order_by(EpgSourceSubscription.account_id,
+                                   EpgSourceSubscription.priority)):
+            orders.setdefault(aid, []).append(sid)
+        db.session.rollback()
+        _clear_unread(list(orders))
+        judged = sum(check_account(aid, order, now) for aid, order in orders.items())
+        note = (f'EPG source check: {counted(judged, "channel and source pair")} compared over '
+                f'{counted(len(orders), "account")} in {time_mod.monotonic() - started:.1f} s.')
+        log.info(note)
+        return note
+    finally:
+        admission.release(ticket)

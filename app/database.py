@@ -2774,6 +2774,8 @@ class Channel(db.Model):
     epg_alternate_entries = db.relationship('EpgAlternateEntry', lazy=True,
                                             cascade='all, delete-orphan')
     epg_keys = db.relationship('EpgChannelKey', lazy=True, cascade='all, delete-orphan')
+    epg_agreements = db.relationship('EpgSourceAgreement', lazy=True,
+                                     cascade='all, delete-orphan')
 
     # Declared here as well as in migration 24, because a FRESH database never runs
     # migrations - run_migrations() stamps it at CURRENT_SCHEMA_VERSION and returns - so an
@@ -3339,6 +3341,16 @@ class EpgSourceChannel(db.Model):
     # JSON [[start (naive UTC ISO), title], ...]: the first programs not yet over at the
     # import, so the name-match review page can show which channel a proposal is (§7.5).
     upcoming_titles = db.Column(db.Text)
+    # How much the in-window programs carry, for the scorecard (dev/changelog/1717): how many
+    # have a description, a subtitle, a category, a rating, a <new/> or <live/> mark, and how
+    # many start at a moment already listed for this id. NULL = not counted: a row written
+    # before the columns, or (doubled only) an id no visible channel read at the import.
+    described       = db.Column(db.Integer)
+    subtitled       = db.Column(db.Integer)
+    categorized     = db.Column(db.Integer)
+    rated           = db.Column(db.Integer)
+    flagged         = db.Column(db.Integer)
+    doubled         = db.Column(db.Integer)
 
     __table_args__ = (
         db.UniqueConstraint('source_id', 'xml_id', name='uq_epg_source_channel'),
@@ -3398,6 +3410,52 @@ class EpgChannelKey(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint('channel_id', 'source_id', name='uq_epg_channel_key'),
+    )
+
+
+#: Refreshes kept per source for the scorecard's reliability numbers.
+EPG_REFRESH_HISTORY_LIMIT = 50
+
+
+class EpgSourceRefresh(db.Model):
+    """One refresh of an EPG source and how it ended (dev/changelog/1717): the scorecard's "how
+    reliably it refreshes", which EpgSource.last_status alone cannot answer. Written beside
+    that status by accounts._report_source_outcome() and nothing else; the last
+    EPG_REFRESH_HISTORY_LIMIT per source are kept, and a deleted source takes its rows."""
+    __tablename__ = 'epg_source_refreshes'
+
+    id          = db.Column(db.Integer, primary_key=True)
+    source_id   = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
+    started_at  = db.Column(db.DateTime, nullable=False)
+    finished_at = db.Column(db.DateTime, nullable=False)
+    status      = db.Column(db.String(16), nullable=False)   # EPG_STATUS_*
+    entries     = db.Column(db.Integer, nullable=False, default=0)   # listings imported
+
+    __table_args__ = (
+        db.Index('ix_epg_source_refreshes_source', 'source_id', 'finished_at'),
+    )
+
+
+class EpgSourceAgreement(db.Model):
+    """Whether two sources an account reads list the same schedule for one channel
+    (dev/changelog/1717): compare_listings()'s verdict, with `source_id` the earlier of the two
+    in the account's order as its active side, the direction the channel page compares in.
+    Derived and rewritten whole by epg_scorecard.run_agreement(), never the user's. A deleted
+    channel or source takes its rows."""
+    __tablename__ = 'epg_source_agreements'
+
+    id              = db.Column(db.Integer, primary_key=True)
+    channel_id      = db.Column(db.Integer, db.ForeignKey('channels.id'), nullable=False)
+    source_id       = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
+    other_source_id = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
+    verdict         = db.Column(db.String(16), nullable=False)   # epg_sources.CMP_*
+    compared        = db.Column(db.Integer, nullable=False, default=0)
+    paired          = db.Column(db.Integer, nullable=False, default=0)
+    checked_at      = db.Column(db.DateTime, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint('channel_id', 'source_id', 'other_source_id',
+                            name='uq_epg_source_agreement'),
     )
 
 

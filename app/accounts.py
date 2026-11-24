@@ -36,7 +36,7 @@ from .account_links import (clear_rolled_alert_after_sync, host_list, list_playl
 from .channel_groups import touch_group
 from .database import (
     Account, Alert, Channel, ChannelEvent, ChannelGroupMember, EPGEntry, AccountSyncLog,
-    EpgAlternateEntry, EpgSource, EPG_SOURCE_PROVIDER, EPG_SOURCE_URL,
+    EpgAlternateEntry, EpgSource, EpgSourceRefresh, EPG_SOURCE_PROVIDER, EPG_SOURCE_URL,
     EPG_STATUS_FAILED, EPG_STATUS_OK, EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED,
     Recording, add_recording_event,
     CHANNEL_URL_CHANGED, CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE,
@@ -52,7 +52,8 @@ from .epg_sources import (
     directory_coverage, drop_alternates,
     ensure_provider_source, file_id_for, held_coverage, holding_rows, norm_key, promote,
     retire_expired_listings,
-    provider_xmltv_url, refresh_source_counts, resolve_row, sources_refreshed_by_sync,
+    provider_xmltv_url, prune_refresh_history, refresh_source_counts, resolve_row,
+    sources_refreshed_by_sync,
     subscriber_ids, subscriptions_for, sources_without_directory, write_directory,
 )
 from .fmt_utils import fmt_bytes, plural
@@ -3242,6 +3243,96 @@ def _program_window(elem, window_start: datetime, window_end: datetime):
     return start_dt, stop_dt
 
 
+def _program_fields(elem):
+    """(title, description, sub_title, category, rating, is_live, is_new) of a <programme>
+    element, as a listing stores them. The one reading of these elements, for the import loop
+    and the scan pass's detail counts alike, so a count of "described" programs and the
+    described listings stored can never disagree (dev/changelog/1717).
+
+    One pass over the children, keeping the first of each as find() would: seven find()
+    calls cost the scan pass more than this on a guide carrying every element."""
+    title = desc = sub = cat = None
+    rated = live = new = False
+    for child in elem:
+        tag = child.tag
+        if tag == 'title':
+            if title is None:
+                title = (child.text or '').strip()
+        elif tag == 'desc':
+            if desc is None:
+                desc = (child.text or '').strip()
+        elif tag == 'sub-title':
+            if sub is None:
+                sub = (child.text or '').strip()
+        elif tag == 'category':
+            if cat is None:
+                cat = (child.text or '').strip()
+        elif tag == 'rating':
+            rated = True
+        elif tag == 'live':
+            live = True   # an empty element: being there is the whole statement
+        elif tag == 'new':
+            new = True
+    rating = None
+    if rated:
+        value = elem.find('rating/value')
+        rating = (value.text or '').strip() if value is not None else None
+    return title or '', desc, sub, cat, rating, live, new
+
+
+class _DetailCounts:
+    """Per file id, how many in-window programs carry each kind of detail, and how many start
+    at a moment already listed. `watched` is the folded ids some visible channel reads:
+    starts are remembered only for those, since remembering every start of a 44,000-channel
+    file would hold over a million of them for ids no channel uses (their `doubled` stays
+    None, "not counted"). Written for the scan pass's inner loop: one dict lookup per
+    program for the counts, and the watched test made once per id."""
+    __slots__ = ('counts', 'starts', 'doubled', 'watched', 'case_sensitive')
+
+    def __init__(self, watched: set, case_sensitive: bool):
+        self.counts: dict[str, list] = {}    # [described, subtitled, categorized, rated, flagged]
+        self.starts: dict[str, set | None] = {}   # None = an id no channel reads
+        self.doubled: dict[str, int] = {}
+        self.watched = watched
+        self.case_sensitive = case_sensitive
+
+    def add(self, xml_id: str, fields, start_dt: datetime) -> None:
+        _title, description, sub_title, category, rating, is_live, is_new = fields
+        c = self.counts.get(xml_id)
+        if c is None:
+            c = self.counts[xml_id] = [0, 0, 0, 0, 0]
+            watched = norm_key(xml_id, self.case_sensitive) in self.watched
+            self.starts[xml_id] = set() if watched else None
+            if watched:
+                self.doubled[xml_id] = 0
+        if description:
+            c[0] += 1
+        if sub_title:
+            c[1] += 1
+        if category:
+            c[2] += 1
+        if rating:
+            c[3] += 1
+        if is_live or is_new:
+            c[4] += 1
+        seen = self.starts[xml_id]
+        if seen is not None:
+            if start_dt in seen:
+                self.doubled[xml_id] += 1
+            else:
+                seen.add(start_dt)
+
+    def of(self, xml_id: str) -> dict:
+        """The directory row's columns for one id; an id with no in-window programs has zero
+        of each, not "not counted"."""
+        c = self.counts.get(xml_id)
+        if c is None:
+            return dict(described=0, subtitled=0, categorized=0, rated=0, flagged=0,
+                        doubled=0)
+        return dict(described=c[0], subtitled=c[1], categorized=c[2], rated=c[3],
+                    flagged=c[4], doubled=self.doubled.get(xml_id))
+
+
 def _match_program(elem, feed_map: dict, window_start: datetime, window_end: datetime):
     """(channel_ids, start_dt, stop_dt) this <programme> element imports into, or None if
     out of scope (an id no channel reads, unparseable timestamps, or outside the window).
@@ -3326,6 +3417,7 @@ def _count_projected_epg_entries(xml_bytes: bytes, channel_map: dict, case_sensi
     # Per channel, the UPCOMING_TITLES programs starting soonest among those not over yet.
     # Kept as a small sorted list rather than every program, so memory stays per channel.
     upcoming: dict[str, list] = {}
+    detail = _DetailCounts({norm_key(k, case_sensitive) for k in channel_map}, case_sensitive)
     now = datetime.utcnow()
     error = None
     try:
@@ -3342,8 +3434,9 @@ def _count_projected_epg_entries(xml_bytes: bytes, channel_map: dict, case_sensi
                 if window is not None:
                     start_dt, stop_dt = window
                     counts[xml_id] = counts.get(xml_id, 0) + 1
-                    title_el = elem.find('title')
-                    title = (title_el.text or '').strip() if title_el is not None else ''
+                    fields = _program_fields(elem)
+                    title = fields[0]
+                    detail.add(xml_id, fields, start_dt)
                     seen_titles = titles.setdefault(xml_id, set())
                     if len(seen_titles) < DISTINCT_TITLE_CAP:
                         seen_titles.add(title)
@@ -3376,7 +3469,8 @@ def _count_projected_epg_entries(xml_bytes: bytes, channel_map: dict, case_sensi
             entry_count=counts.get(xml_id, 0), distinct_titles=len(t),
             sole_title=next(iter(t)) if len(t) == 1 else None,
             horizon_until=horizon.get(xml_id),
-            upcoming=tuple(upcoming.get(xml_id, ()))))
+            upcoming=tuple(upcoming.get(xml_id, ())),
+            **detail.of(xml_id)))
     feed_map = _feed_map(channel_map, counts, case_sensitive)
     total = sum(counts[fid] * len(ids) for fid, ids in feed_map.items())
     return ProjectedEpgCount(total, error, seen, channels, directory, feed_map)
@@ -3512,7 +3606,8 @@ def import_source(source: EpgSource, xml_bytes: bytes, epg_days: int,
     result = _import_source(source, xml_bytes, epg_days, case_sensitive, cfg,
                             force_epg_resync, stop_event, track_progress)
     note = _report_source_outcome(source_id, result.reason, result.lost_channel_ids, began_at,
-                                  guided_before=result.guided_before, cfg=cfg)
+                                  guided_before=result.guided_before, cfg=cfg,
+                                  entries=result.synced)
     if note and notes is not None:
         notes.append(note)
     # Every import that wrote to the guide asks the auto-record rules to look again
@@ -3526,6 +3621,9 @@ def import_source(source: EpgSource, xml_bytes: bytes, epg_days: int,
         if run_needed():
             from .scheduler import queue_sports_match
             queue_sports_match(reason=f'EPG source #{source_id} imported')
+        # And the scorecard's agreement of the sources is compared again (dev/changelog/1717).
+        from .scheduler import queue_epg_check
+        queue_epg_check(reason=f'EPG source #{source_id} imported')
     return result.synced, result.reason
 
 
@@ -3772,21 +3870,8 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
                 elem.clear()
                 continue
             channel_ids, start_dt, stop_dt = match
-
-            title_el = elem.find('title')
-            desc_el = elem.find('desc')
-            sub_title_el = elem.find('sub-title')
-            cat_el = elem.find('category')
-            rating_el = elem.find('rating/value')
-
-            title = (title_el.text or '').strip() if title_el is not None else ''
-            description = (desc_el.text or '').strip() if desc_el is not None else None
-            sub_title = (sub_title_el.text or '').strip() if sub_title_el is not None else None
-            category = (cat_el.text or '').strip() if cat_el is not None else None
-            rating = (rating_el.text or '').strip() if rating_el is not None else None
-            # Empty elements: being there is the whole statement.
-            is_live = elem.find('live') is not None
-            is_new = elem.find('new') is not None
+            title, description, sub_title, category, rating, is_live, is_new = \
+                _program_fields(elem)
 
             for channel_id in channel_ids:
                 winner = winners.get(channel_id)
@@ -3873,8 +3958,9 @@ def report_refresh_interrupted(source_id: int) -> None:
 def _report_source_outcome(source_id: int, reason: str | None,
                            lost_channel_ids: list | None,
                            began_at: datetime | None = None, guided_before: int = 0,
-                           cfg: dict | None = None) -> str | None:
-    """Write one refresh's outcome onto the source and raise or clear its alerts
+                           cfg: dict | None = None, entries: int = 0) -> str | None:
+    """Write one refresh's outcome onto the source, and into its refresh history (the
+    scorecard's reliability, dev/changelog/1717), and raise or clear its alerts
     (DESIGN-epg-sources.md §9.1). The three refresh types are evaluated on every refresh, so
     whichever one is not this refresh's reason is auto-resolved if it was standing from an
     earlier one. A loss inside an import is evaluated only when the import got as far as
@@ -3903,12 +3989,16 @@ def _report_source_outcome(source_id: int, reason: str | None,
             # was not in its channel map, and the channel page's "waiting for the next
             # refresh" compares against this (epg_sources._pending_keys).
             source.last_success_at = began_at or now
+        db.session.add(EpgSourceRefresh(source_id=source_id, started_at=began_at or now,
+                                        finished_at=now, status=source.last_status,
+                                        entries=entries))
         db.session.commit()
         return source.name
 
     name = _record_status_and_commit()
     if name is None:
         return None
+    prune_refresh_history(source_id)
 
     fetch_failed = alert_type == 'EPG_SOURCE_FETCH_FAILED'
     refused = alert_type == 'EPG_SOURCE_COLLAPSE_REFUSED'
