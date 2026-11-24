@@ -106,6 +106,19 @@ class WriteTests(_Pip):
                 pip.clean(self.spec(**over))
             self.assertIn(said, ctx.exception.message)
 
+    def test_a_body_of_the_wrong_shape_is_refused_in_words_never_raised(self):
+        """dev/docs/BUGS.md 2026-11-23 @ 10:14:38 PM: a list for the body, a list or an object for a
+        layout field, a list for a name or a search, and an id past what SQLite stores each
+        raised instead of being refused."""
+        for body in ([1], 'x', 7):
+            with self.assertRaises(pip.PipRefused, msg=body):
+                pip.clean(body)
+        for over in ({'size': []}, {'size': {}}, {'layout': ['corner']}, {'corner': {'a': 1}},
+                     {'name': ['PiP']}, {'main': src(PIP_SOURCE_SEARCH, query=['a'])},
+                     {'main': src(PIP_SOURCE_CHANNEL, 2 ** 63)}):
+            with self.assertRaises(pip.PipRefused, msg=over):
+                pip.clean(self.spec(**over))
+
     def test_a_picture_that_is_not_in_the_guide_is_refused(self):
         for over in ({'main': src(PIP_SOURCE_CHANNEL, self.loose.id)}, {'main': src(PIP_SOURCE_CHANNEL, 99999)},
                      {'inset': src(PIP_SOURCE_GROUP, 99999)}, {'main': src(PIP_SOURCE_GAME, 424242)}):
@@ -473,6 +486,17 @@ class RouteTests(_Pip):
         changed = self.post(f'/api/iptv-output/pip/{made["id"]}', self.spec(name='Race day')).get_json()
         self.assertEqual((changed['name'], changed['kept'], changed['swapped_num']), ('Race day', 0, 0))
         self.assertEqual(db.session.get(PipChannel, made['id']).name, 'Race day')
+
+    def test_a_malformed_body_is_a_400_on_every_route_that_reads_one(self):
+        """dev/docs/BUGS.md 2026-11-23 @ 10:14:38 PM."""
+        for body in ([1], self.spec(size=[]), self.spec(main=src(PIP_SOURCE_CHANNEL, 2 ** 63))):
+            resp = self.client.post('/api/iptv-output/pip', json=body)
+            self.assertEqual(resp.status_code, 400, body)
+            self.assertIn('error', resp.get_json())
+        self.assertEqual(PipChannel.query.count(), 0)
+        resp = self.client.post('/api/iptv-output/pip/would-play', json=[1])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()['seats'], '')
 
     def test_a_refused_create_names_why_and_makes_nothing(self):
         resp = self.post('/api/iptv-output/pip', self.spec(inset=src(PIP_SOURCE_CHANNEL, self.alpha.id)))

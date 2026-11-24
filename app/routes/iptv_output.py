@@ -104,6 +104,8 @@ def pip_would_play():
     """What the two pictures of the draft in the setup dialog would start from right now, and
     the connections that takes. A read: nothing is saved and no connection is taken."""
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
     main, inset = (pip_channels.clean_draft_source(data.get(k)) for k in ('main', 'inset'))
     return jsonify({'success': True, **pip_channels.would_play(main, inset, load_config())})
 

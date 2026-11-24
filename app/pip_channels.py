@@ -45,6 +45,9 @@ QUERY_MAX = 80
 SEARCH_WALK = 20
 #: The most coming games the setup dialog is handed.
 PICKER_GAMES = 2000
+#: The largest id a picture may name: what SQLite stores in an INTEGER. A larger one is no
+#: row's id, and binding it raises before any query runs.
+REF_MAX = 2 ** 63 - 1
 
 # What one window of a picture-in-picture channel shows (dev/docs/DESIGN-pip-channels.md 11).
 # Every branch over a pane's state names each of them.
@@ -156,14 +159,16 @@ def _clean_source(raw, which: str) -> Source:
     if kind not in PIP_SOURCE_KINDS:
         raise PipRefused(f'Choose what the {which} picture shows.')
     if kind == PIP_SOURCE_SEARCH:
-        words = ' '.join(str(raw.get('query') or '').split())
+        if not isinstance(raw.get('query') or '', str):
+            raise PipRefused(f'Type part of a channel name for the {which} picture\'s search.')
+        words = ' '.join((raw.get('query') or '').split())
         if not words:
             raise PipRefused(f'Type part of a channel name for the {which} picture\'s search.')
         if len(words) > QUERY_MAX:
             raise PipRefused(f'A search is at most {QUERY_MAX} characters.')
         return Source(kind, None, words)
     ref = raw.get('ref')
-    if isinstance(ref, bool) or not isinstance(ref, int) or ref <= 0:
+    if isinstance(ref, bool) or not isinstance(ref, int) or not 0 < ref <= REF_MAX:
         raise PipRefused(f'Choose what the {which} picture shows.')
     return Source(kind, ref)
 
@@ -172,14 +177,20 @@ def clean(data: dict) -> dict:
     """A create or a change as it came in, checked and tidied: {'name', 'main', 'inset' (each a
     Source), 'layout', 'corner', 'size', 'swapped_copy'}. Raises PipRefused, in the words the
     setup dialog shows. Reads nothing: whether the pictures exist is check_sources()."""
-    name = ' '.join(str(data.get('name') or '').split())
+    if not isinstance(data, dict):
+        raise PipRefused('That is not a picture-in-picture channel.')
+    if not isinstance(data.get('name') or '', str):
+        raise PipRefused('Give it a name.')
+    name = ' '.join((data.get('name') or '').split())
     if not name:
         raise PipRefused('Give it a name.')
     if len(name) > NAME_MAX:
         raise PipRefused(f'A name is at most {NAME_MAX} characters.')
     layout = data.get('layout', PIP_LAYOUT_CORNER)
     corner, size = data.get('corner', 'br'), data.get('size', 'm')
-    if layout not in PIP_LAYOUTS or corner not in PIP_CORNERS or size not in PIP_CORNER_SIZES:
+    # Strings only: PIP_CORNER_SIZES is a dict, and a list or an object asked of one raises.
+    if (not all(isinstance(v, str) for v in (layout, corner, size))
+            or layout not in PIP_LAYOUTS or corner not in PIP_CORNERS or size not in PIP_CORNER_SIZES):
         raise PipRefused('That is not a layout a picture-in-picture channel has.')
     if not isinstance(data.get('swapped_copy', False), bool):
         raise PipRefused('Say whether a swapped copy is offered.')
