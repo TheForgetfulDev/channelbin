@@ -5,6 +5,20 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.49.1 - 2026-11-23
+
+The TV Guide's program chooser opens one at a time.
+
+**Changed**
+
+- The test workflow runs the suite once for each change, instead of up to four times over the
+  same files.
+
+**Fixed**
+
+- In the TV Guide, the program chooser replaces its own open sheet instead of stacking another
+  on top of it, and opens nothing while a dialog such as Record is already open. (#80)
+
 ## 0.49.0 - 2026-11-23
 
 Picture-in-picture channels, and GPU decoding on by default.
