@@ -2837,6 +2837,11 @@ class Channel(db.Model):
         # stamps on every row, is not in it, so a steady-state re-sync does no index
         # maintenance here (0.63s vs 0.64s over 57,173 rows).
         db.Index('ix_channels_lower_name', db.func.lower(name), 'id'),
+        # A key's donor lookup (epg_sources._key_donor()) finds the channels a provider gave
+        # an id, case-folded: 23 ms a lookup over 137,000 channels without this, 0.1 ms with
+        # it, which made accepting thousands of name matches take minutes rather than
+        # seconds (dev/changelog/1718).
+        db.Index('ix_channels_lower_epg_id', db.func.lower(epg_channel_id)),
     )
 
 
@@ -3355,6 +3360,13 @@ class EpgSourceChannel(db.Model):
     __table_args__ = (
         db.UniqueConstraint('source_id', 'xml_id', name='uq_epg_source_channel'),
         db.Index('ix_epg_source_channels_count', 'source_id', 'entry_count'),
+        # Setting a key looks its id up case-folded (folded_variants(), _channel_directory()),
+        # which ix_epg_source_channels_count cannot answer: 35 ms a lookup over a 44,000-row
+        # file, 0.1 ms with this. Covering entry_count so the planner takes it over the
+        # count index. Spelled `lower(xml_id)` to match func.lower() character for character
+        # (dev/changelog/1718).
+        db.Index('ix_epg_source_channels_lower_id', 'source_id', db.func.lower(xml_id),
+                 'entry_count'),
     )
 
 
@@ -3410,6 +3422,9 @@ class EpgChannelKey(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint('channel_id', 'source_id', name='uq_epg_channel_key'),
+        # A key's donor lookup (epg_sources._key_donor()) matches keys case-folded
+        # (dev/changelog/1718).
+        db.Index('ix_epg_channel_keys_lower_key', 'source_id', db.func.lower(key)),
     )
 
 
@@ -3440,7 +3455,7 @@ class EpgSourceAgreement(db.Model):
     """Whether two sources an account reads list the same schedule for one channel
     (dev/changelog/1717): compare_listings()'s verdict, with `source_id` the earlier of the two
     in the account's order as its active side, the direction the channel page compares in.
-    Derived and rewritten whole by epg_scorecard.run_agreement(), never the user's. A deleted
+    Derived and rewritten whole by epg_scorecard.run_check(), never the user's. A deleted
     channel or source takes its rows."""
     __tablename__ = 'epg_source_agreements'
 
@@ -3456,6 +3471,39 @@ class EpgSourceAgreement(db.Model):
     __table_args__ = (
         db.UniqueConstraint('channel_id', 'source_id', 'other_source_id',
                             name='uq_epg_source_agreement'),
+    )
+
+
+# What the EPG findings check found an account could improve (dev/changelog/1718). Every
+# branch over a kind names all four.
+EPG_FINDING_NAME_MATCHES  = 'name_matches'    # channels with no guide a name here would guide
+EPG_FINDING_SHARED_ID     = 'shared_id'       # one id here gives unrelated channels its schedule
+EPG_FINDING_ADDS_NOTHING  = 'adds_nothing'    # nothing here is not served as well by another
+EPG_FINDING_BETTER_SOURCE = 'better_source'   # serves channels better than where theirs comes from
+EPG_FINDING_KINDS = (EPG_FINDING_NAME_MATCHES, EPG_FINDING_SHARED_ID, EPG_FINDING_ADDS_NOTHING,
+                     EPG_FINDING_BETTER_SOURCE)
+
+
+class EpgFinding(db.Model):
+    """One thing an account could improve about its guide, found by the EPG check
+    (epg_scorecard.run_check(), dev/changelog/1718) from what the database holds. Derived and
+    rewritten whole per account by that check, never the user's, and never an alert: a page
+    shows it and a person acts on it through the writer the page names. `count` is the
+    number a page shows; `detail` (JSON) holds only the breakdown a tooltip spells out. A
+    deleted account or source, or an account that stops reading a source, takes its rows."""
+    __tablename__ = 'epg_findings'
+
+    id         = db.Column(db.Integer, primary_key=True)
+    account_id = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False)
+    source_id  = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
+    kind       = db.Column(db.String(16), nullable=False)    # EPG_FINDING_*
+    subject    = db.Column(db.String(255))     # the shared id, for EPG_FINDING_SHARED_ID
+    count      = db.Column(db.Integer, nullable=False)
+    detail     = db.Column(db.Text)
+    found_at   = db.Column(db.DateTime, nullable=False)
+
+    __table_args__ = (
+        db.Index('ix_epg_findings_account', 'account_id'),
     )
 
 

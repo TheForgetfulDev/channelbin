@@ -3696,6 +3696,9 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .dash-head .sortable:hover { color: var(--text-muted); }
 .dash-head .sorted { color: var(--accent-text); }
 .dash-rows { display: flex; flex-direction: column; gap: 6px; }
+/* The EPG findings someone should act on, under the account rows (dev/changelog/1718). */
+.dash-findings { display: flex; flex-direction: column; gap: 4px; margin: 10px 2px 0; font-size: var(--fs-sm); color: var(--text-muted); }
+.dash-findings p { margin: 0; }
 .dash-rows .drow {
   background: var(--bg1); border: 1px solid var(--border-soft); border-left: none; border-radius: var(--radius);
   position: relative; overflow: hidden;

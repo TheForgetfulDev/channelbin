@@ -366,6 +366,9 @@ class RouteTests(_Fixture):
         self.assertIn('Left alone, named for this id: GR: SPORT FM TV 1 HD</div>', html)
 
     def test_the_account_page_says_so_under_the_source(self):
+        # The line is the stored finding the EPG check writes (dev/changelog/1718).
+        from app.epg_scorecard import check_findings
+        check_findings({self.acct.id: [self.src.id, self.ext.id]}, datetime.utcnow())
         html = self.client.get(f'/accounts/{self.acct.id}').get_data(as_text=True)
         self.assertIn('4 channels with different names share the id', html)
         self.assertIn(f'/epg-sources/{self.src.id}/review?view=shared', html)

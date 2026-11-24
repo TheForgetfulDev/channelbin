@@ -316,6 +316,13 @@
         </div>
         {% endfor %}
       </div>
+      {#- What the EPG check found someone should act on (dev/changelog/1718): a page line,
+          never an alert. -#}
+      {% if epg_findings %}
+      <div class="dash-findings">
+        {% for f in epg_findings %}<p>{{ f.account }}: {{ f.text }}. <a href="{{ f.url }}">EPG sources {{ icon('forward') }}</a></p>{% endfor %}
+      </div>
+      {% endif %}
     {% endif %}
 
   {#- ── Channel health check. One row when a run is active, else the empty state. -#}

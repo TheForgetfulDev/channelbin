@@ -31,7 +31,8 @@
 
 {% macro qs(v=view, p=1) -%}
 {{ url_for('accounts.epg_source_review', source_id=source.id, view=v, page=p,
-           single='1' if include_single else none, unguided='1' if unguided_only else none) }}
+           single='1' if include_single else none, unguided='1' if unguided_only else none,
+           account=only_account) }}
 {%- endmacro %}
 
 {% block content %}
@@ -47,7 +48,7 @@
   channels at once.
 {% endcall %}
 
-<div id="nm-main" data-source-id="{{ source.id }}" data-owner-id="{{ owner.id }}">
+<div id="nm-main" data-source-id="{{ source.id }}" data-owner-id="{{ owner.id }}" data-source-name="{{ source.name }}">
 {% if not refreshed %}
 <div class="empty-state">
   <p>{{ source.name }} has no successful refresh yet.</p>
@@ -74,6 +75,10 @@
   <label><input type="checkbox" data-filter="unguided"{% if unguided_only %} checked{% endif %}> Only channels with no guide today</label>
   {% endif %}
 </div>
+{% if only_account %}
+<p class="small">Only {{ only_account_name or 'one account' }}'s channels.
+  <a href="{{ url_for('accounts.epg_source_review', source_id=source.id, view=view, single='1' if include_single else none, unguided='1' if unguided_only else none) }}">Every account's {{ icon('forward') }}</a></p>
+{% endif %}
 <p class="text-faint small">
   {% if ambiguous %}{{ '{:,}'.format(ambiguous) }} channel name{{ 's' if ambiguous != 1 else '' }} fit more than one channel in the file and {{ 'are' if ambiguous != 1 else 'is' }} not proposed.{% endif %}
   {% if single_hidden and not include_single %}{{ '{:,}'.format(single_hidden) }} more match a channel listing one program all day.{% endif %}
@@ -87,6 +92,10 @@
   <button class="btn btn-sm" data-act="again-selected" disabled>Propose again</button>
   {% else %}
   <button class="btn btn-sm btn-primary" data-act="accept-selected" disabled>Accept selected</button>
+  {% if view == 'proposals' and total %}
+  <button class="btn btn-sm" data-act="accept-all"
+          data-tip="Accept every proposal listed here under these filters, on every page.">Accept all {{ '{:,}'.format(total) }}</button>
+  {% endif %}
   <button class="btn btn-sm" data-act="reject-selected" disabled>Reject selected</button>
   {% endif %}
   {% endif %}

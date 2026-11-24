@@ -559,6 +559,28 @@ def _postcapture_row_cells(rows):
     return cells
 
 
+def _epg_finding_lines(accounts) -> list[dict]:
+    """One line per account whose EPG findings someone should act on, under the account rows
+    (dev/changelog/1718), linking to the account's EPG sources card, where each source's line
+    and its page are. Stored by the EPG check; three queries whatever the account count."""
+    from ..database import EpgSource
+    from ..epg_scorecard import dashboard_text, stored_findings
+    found = stored_findings([a.id for a in accounts])
+    if not any(found.values()):
+        return []
+    names = dict(db.session.query(EpgSource.id, EpgSource.name)
+                 .filter(EpgSource.id.in_({f.source_id for rows in found.values()
+                                           for f, _at in rows})))
+    lines = []
+    for a in accounts:
+        text = dashboard_text([f for f, _at in found[a.id]], names)
+        if text:
+            lines.append({'account': a.name, 'text': text,
+                          'url': url_for('accounts.account_detail', account_id=a.id,
+                                         _anchor='acct-sources-head')})
+    return lines
+
+
 @dashboard_bp.route('/')
 def dashboard():
     # Read before the rows: a change landing between the two then makes the next poll
@@ -590,6 +612,7 @@ def dashboard():
     # above; see its docstring.
     cfg = load_config()
     acct_stats = account_stats_view.rows_context(cfg, accounts)
+    epg_findings = _epg_finding_lines(accounts)
     health_check = get_active_run_summary()
     # What the Channel health section says while nothing runs: when the guide's own check
     # next tests anything. It used to send a new user to Channel Groups to start one, beside
@@ -634,7 +657,7 @@ def dashboard():
         'dashboard.html',
         recordings=active, accounts=accounts, health_check=health_check,
         guide_check=guide_check, feed=feed,
-        acct_stats=acct_stats,
+        acct_stats=acct_stats, epg_findings=epg_findings,
         next_sync=next_sync_map(accounts),
         live=live, upcoming=upcoming, now=now, live_stats=_live_row_stats(live, now),
         postcapture_cells=_postcapture_row_cells(live),

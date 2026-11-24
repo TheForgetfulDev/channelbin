@@ -26,7 +26,7 @@ from sqlalchemy import and_, case, delete, func, insert, literal, select, union_
 from . import db
 from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_KEY_CHANGED,
                        CHANNEL_EPG_SOURCE_CHANGED, CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED, EPGEntry, EpgAlternateEntry, EpgChannelKey,
-                       EpgSource, EpgSourceAgreement, EpgSourceChannel, EpgSourceRefresh,
+                       EpgFinding, EpgSource, EpgSourceAgreement, EpgSourceChannel, EpgSourceRefresh,
                        EpgSourceSubscription, EPG_KEY_ACCEPTED,
                        EPG_KEY_IGNORED, EPG_REFRESH_HISTORY_LIMIT, EPG_KEY_ORIGIN_MANUAL, EPG_KEY_ORIGIN_NAME_MATCH, EPG_KEY_REJECTED,
                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, EPG_STATUS_FAILED, EPG_STATUS_OK,
@@ -305,22 +305,30 @@ class IgnoredId(NamedTuple):
     provider_id: str
 
 
-def key_answers(source_ids) -> dict[tuple[int, int], str | IgnoredId]:
+def key_answers(source_ids, channel_ids=None) -> dict[tuple[int, int], str | IgnoredId]:
     """{(channel_id, source_id): answer} for every user answer about a channel's key on
     these sources: the accepted key (a str), or an IgnoredId for a provider id the user
     stopped using. Every reader hands the answer to channel_key(), the one place that turns
     it into the key a channel matches on. Rejected rows are not answers about the key.
 
     Queried by source rather than by channel: the table holds only the user's own answers,
-    so it is small, where a channel IN (...) over a large account would not be."""
+    so it is small, where a channel IN (...) over a large account would not be. A caller
+    asking about a handful of channels passes `channel_ids`: a bulk accept of name matches
+    grows the table by thousands of rows, and reading all of them per channel made that
+    accept quadratic (dev/changelog/1718)."""
     source_ids = list(source_ids)
     if not source_ids:
         return {}
-    rows = (db.session.query(EpgChannelKey.channel_id, EpgChannelKey.source_id,
-                             EpgChannelKey.key, EpgChannelKey.status)
-            .filter(EpgChannelKey.source_id.in_(source_ids),
-                    EpgChannelKey.status.in_((EPG_KEY_ACCEPTED, EPG_KEY_IGNORED)),
-                    EpgChannelKey.key.isnot(None), EpgChannelKey.key != ''))
+    q = (db.session.query(EpgChannelKey.channel_id, EpgChannelKey.source_id,
+                          EpgChannelKey.key, EpgChannelKey.status)
+         .filter(EpgChannelKey.source_id.in_(source_ids),
+                 EpgChannelKey.status.in_((EPG_KEY_ACCEPTED, EPG_KEY_IGNORED)),
+                 EpgChannelKey.key.isnot(None), EpgChannelKey.key != ''))
+    if channel_ids is None:
+        rows = q.all()
+    else:
+        rows = [r for piece in chunked(sorted(set(channel_ids)), 500)
+                for r in q.filter(EpgChannelKey.channel_id.in_(piece))]
     return {(ch, src): (IgnoredId(key) if status == EPG_KEY_IGNORED else key)
             for ch, src, key, status in rows}
 
@@ -745,16 +753,22 @@ def _key_donor(channel: Channel, source: EpgSource, key: str, case_sensitive: bo
     if target is None:
         return None
     lowered = key.lower()
-    by_provider = {cid for (cid,) in db.session.query(Channel.id).filter(
-        Channel.account_id.in_(subscribers), Channel.hidden.is_(False), Channel.id != channel.id,
-        func.lower(Channel.epg_channel_id) == lowered)}
+    # By the folded id alone, then filtered here: with the account and hidden filters in the
+    # statement SQLite can plan it through ix_channels_standing and scan, which made a key
+    # write 23 ms slower per channel; an id is shared by a few hundred channels at most
+    # (dev/changelog/1718).
+    subscribed_accounts = set(subscribers)
+    by_provider = {cid for cid, account_id, hidden in db.session.query(
+        Channel.id, Channel.account_id, Channel.hidden).filter(
+        func.lower(Channel.epg_channel_id) == lowered)
+        if account_id in subscribed_accounts and not hidden and cid != channel.id}
     by_user = {cid for (cid,) in db.session.query(EpgChannelKey.channel_id).filter(
         EpgChannelKey.source_id == source.id, EpgChannelKey.status == EPG_KEY_ACCEPTED,
         EpgChannelKey.channel_id != channel.id, func.lower(EpgChannelKey.key) == lowered)}
     ids = sorted(by_provider | by_user)
     if not ids:
         return None
-    user_keys = {ch: k for (ch, _src), k in key_answers([source.id]).items() if ch in ids}
+    user_keys = {ch: k for (ch, _src), k in key_answers([source.id], ids).items()}
     subscribed = set(subscribers)
     for cid, name, provider_id, hidden, account_id in (
             db.session.query(Channel.id, Channel.name, Channel.epg_channel_id, Channel.hidden,
@@ -1164,16 +1178,17 @@ def delete_sources_for_account(account_id: int) -> None:
         db.session.execute(delete(EpgSource).where(EpgSource.id.in_(owned)))
     db.session.execute(delete(EpgSourceSubscription)
                        .where(EpgSourceSubscription.account_id == account_id))
+    db.session.execute(delete(EpgFinding).where(EpgFinding.account_id == account_id))
 
 
 def _delete_source_rows(source_ids) -> None:
     """Every row keyed on these sources, short of the sources themselves: listings in both
     tables, directory, user keys, subscriptions, refresh history and agreements on either
-    side. The one list both source deletes share, so a table added to one cannot be missed
+    side, findings. The one list both source deletes share, so a table added to one cannot be missed
     by the other. Does not commit."""
     ids = list(source_ids)
     for model in (EPGEntry, EpgAlternateEntry, EpgSourceChannel, EpgChannelKey,
-                  EpgSourceSubscription, EpgSourceRefresh):
+                  EpgSourceSubscription, EpgSourceRefresh, EpgFinding):
         db.session.execute(delete(model).where(model.source_id.in_(ids)))
     db.session.execute(delete(EpgSourceAgreement).where(db.or_(
         EpgSourceAgreement.source_id.in_(ids), EpgSourceAgreement.other_source_id.in_(ids))))
@@ -1550,6 +1565,8 @@ def stop_using_source(account_id: int, source_id: int,
         db.session.execute(delete(EpgSourceSubscription).where(
             EpgSourceSubscription.account_id == account_id,
             EpgSourceSubscription.source_id == source_id))
+        db.session.execute(delete(EpgFinding).where(EpgFinding.account_id == account_id,
+                                                    EpgFinding.source_id == source_id))
         for model in (EPGEntry, EpgAlternateEntry):
             db.session.execute(delete(model).where(_of_source(model, source_id),
                                                    model.channel_id.in_(mine)))
