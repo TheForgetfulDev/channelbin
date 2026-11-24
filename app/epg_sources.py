@@ -26,8 +26,9 @@ from sqlalchemy import and_, case, delete, func, insert, literal, select, union_
 from . import db
 from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_KEY_CHANGED,
                        CHANNEL_EPG_SOURCE_CHANGED, CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED, EPGEntry, EpgAlternateEntry, EpgChannelKey,
-                       EpgSource, EpgSourceChannel, EpgSourceSubscription, EPG_KEY_ACCEPTED,
-                       EPG_KEY_IGNORED, EPG_KEY_ORIGIN_MANUAL, EPG_KEY_ORIGIN_NAME_MATCH, EPG_KEY_REJECTED,
+                       EpgSource, EpgSourceAgreement, EpgSourceChannel, EpgSourceRefresh,
+                       EpgSourceSubscription, EPG_KEY_ACCEPTED,
+                       EPG_KEY_IGNORED, EPG_REFRESH_HISTORY_LIMIT, EPG_KEY_ORIGIN_MANUAL, EPG_KEY_ORIGIN_NAME_MATCH, EPG_KEY_REJECTED,
                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, EPG_STATUS_FAILED, EPG_STATUS_OK,
                        EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED)
 from .db_utils import chunked, retry_on_locked
@@ -408,12 +409,22 @@ class DirectoryRow(NamedTuple):
     sole_title: str | None
     horizon_until: object   # datetime | None
     upcoming: tuple = ()    # ((start datetime, title), ...), soonest first
+    # The scorecard's detail counts (dev/changelog/1717); None = not counted.
+    described: int | None = None
+    subtitled: int | None = None
+    categorized: int | None = None
+    rated: int | None = None
+    flagged: int | None = None
+    doubled: int | None = None
 
 
 def write_directory(source_id: int, rows) -> None:
     """Replace a source's directory in full (DESIGN-epg-sources.md §7.4) - it is a cache of
     the file's <channel> block plus the counts the import pass already makes."""
     mappings = [{'source_id': source_id, 'xml_id': r.xml_id[:255],
+                 'described': r.described, 'subtitled': r.subtitled,
+                 'categorized': r.categorized, 'rated': r.rated, 'flagged': r.flagged,
+                 'doubled': r.doubled,
                  'display_names': json.dumps(r.display_names) if r.display_names else None,
                  'entry_count': r.entry_count, 'distinct_titles': r.distinct_titles,
                  'sole_title': (r.sole_title or '')[:512] or None,
@@ -456,6 +467,16 @@ def _of_source(model, source_id: int):
     if model is EPGEntry:
         return (model.source_id + 0) == source_id
     return model.source_id == source_id
+
+
+def of_sources(model, source_ids):
+    """_of_source() for several sources: `model.source_id IN (...)`, compared as
+    `source_id + 0` on epg_entries for the same reason, for a statement that also names its
+    channels."""
+    ids = list(source_ids)
+    if model is EPGEntry:
+        return (model.source_id + 0).in_(ids)
+    return model.source_id.in_(ids)
 
 
 def _move_rows(channel_ids, source_id: int, src_model, dst_model) -> int:
@@ -1084,6 +1105,22 @@ def refresh_source_counts(source_id: int, covered_channels: int | None = None) -
         source.channel_count = covered_channels
 
 
+def prune_refresh_history(source_id: int) -> None:
+    """Keep a source's last EPG_REFRESH_HISTORY_LIMIT refreshes. Its own commit, separate from
+    the one that wrote the refresh, so a retry here never writes a refresh twice."""
+    @retry_on_locked()
+    def _prune_and_commit():
+        stale = [i for (i,) in db.session.query(EpgSourceRefresh.id)
+                 .filter(EpgSourceRefresh.source_id == source_id)
+                 .order_by(EpgSourceRefresh.finished_at.desc(), EpgSourceRefresh.id.desc())
+                 .offset(EPG_REFRESH_HISTORY_LIMIT)]
+        if stale:
+            db.session.execute(delete(EpgSourceRefresh).where(EpgSourceRefresh.id.in_(stale)))
+            db.session.commit()
+
+    _prune_and_commit()
+
+
 def active_counts_by_account(account_id: int) -> dict[int, int]:
     """{source_id: channels on this account whose guide comes from it}. One grouped query."""
     return active_counts_by_accounts([account_id]).get(account_id, {})
@@ -1120,15 +1157,26 @@ def delete_sources_for_account(account_id: int) -> None:
     owned = [sid for (sid,) in db.session.query(EpgSource.id)
              .filter(EpgSource.owner_account_id == account_id)]
     if owned:
-        for model in (EPGEntry, EpgAlternateEntry, EpgSourceChannel, EpgChannelKey,
-                      EpgSourceSubscription):
-            db.session.execute(delete(model).where(model.source_id.in_(owned)))
+        _delete_source_rows(owned)
         for col in (Channel.epg_source_id, Channel.epg_source_override_id):
             db.session.execute(update(Channel).where(col.in_(owned)).values({col: None})
                                .execution_options(synchronize_session=False))
         db.session.execute(delete(EpgSource).where(EpgSource.id.in_(owned)))
     db.session.execute(delete(EpgSourceSubscription)
                        .where(EpgSourceSubscription.account_id == account_id))
+
+
+def _delete_source_rows(source_ids) -> None:
+    """Every row keyed on these sources, short of the sources themselves: listings in both
+    tables, directory, user keys, subscriptions, refresh history and agreements on either
+    side. The one list both source deletes share, so a table added to one cannot be missed
+    by the other. Does not commit."""
+    ids = list(source_ids)
+    for model in (EPGEntry, EpgAlternateEntry, EpgSourceChannel, EpgChannelKey,
+                  EpgSourceSubscription, EpgSourceRefresh):
+        db.session.execute(delete(model).where(model.source_id.in_(ids)))
+    db.session.execute(delete(EpgSourceAgreement).where(db.or_(
+        EpgSourceAgreement.source_id.in_(ids), EpgSourceAgreement.other_source_id.in_(ids))))
 
 
 # ── Managing sources from the account page (DESIGN-epg-sources.md §9.2) ────────
@@ -1459,9 +1507,7 @@ def delete_url_source(source_id: int, case_sensitive: bool) -> SourceRemoval | N
 
     @retry_on_locked()
     def _delete_and_commit():
-        for model in (EPGEntry, EpgAlternateEntry, EpgSourceChannel, EpgChannelKey,
-                      EpgSourceSubscription):
-            db.session.execute(delete(model).where(model.source_id == source_id))
+        _delete_source_rows([source_id])
         for col in (Channel.epg_source_id, Channel.epg_source_override_id):
             db.session.execute(update(Channel).where(col == source_id).values({col: None})
                                .execution_options(synchronize_session=False))
@@ -1919,7 +1965,7 @@ def to_local_date(dt: datetime, tz) -> date:
     return to_local(dt, tz).date()
 
 
-def _last_local_day(until: datetime, tz) -> date:
+def last_local_day(until: datetime, tz) -> date:
     # A listing ending at midnight leaves the next day empty: the day it runs through is the
     # one before.
     return to_local_date(until - timedelta(seconds=1), tz)
@@ -1931,7 +1977,7 @@ def reach_from_horizons(horizons, tz) -> Reach | None:
     for until, n in horizons:
         if until is None or not n:
             continue
-        day = _last_local_day(until, tz)
+        day = last_local_day(until, tz)
         per_day[day] = per_day.get(day, 0) + n
     if not per_day:
         return None

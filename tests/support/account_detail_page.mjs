@@ -32,12 +32,13 @@ for (const s of ['never', 'syncing', 'done']) {
     busy: read(`${s}.busy.html`),
     nav: JSON.parse(read(`${s}.nav.json`)),
     syncs: JSON.parse(read(`${s}.syncs.json`)),
+    scores: JSON.parse(read(`${s}.scores.json`)),
   };
 }
 const JS = ['util.js', 'account-modal.js', 'account-actions.js', 'account-detail.js', 'account-stats.js']
   .map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
 
-function boot(which, start, { serve = start } = {}) {
+function boot(which, start, { serve = start, scoresStatus = 200 } = {}) {
   const errors = [];
   const navigations = [];
   const warnings = [];
@@ -51,7 +52,7 @@ function boot(which, start, { serve = start } = {}) {
 
   const id = META[which];
   const pagePath = `/accounts/${id}`;
-  const server = { state: serve, pageStatus: 200, postStatus: 200 };
+  const server = { state: serve, pageStatus: 200, postStatus: 200, scoresStatus };
   const sent = [];
   const posts = [];
   const respond = (status, payload, text) => Promise.resolve({
@@ -76,6 +77,10 @@ function boot(which, start, { serve = start } = {}) {
     }
     if (url.pathname === '/api/nav-status') return respond(200, st.nav);
     if (url.pathname === `/api/accounts/${id}/syncs`) return respond(200, st.syncs);
+    if (url.pathname === `/api/accounts/${id}/epg-scorecard`) {
+      if (server.scoresStatus !== 200) return respond(server.scoresStatus, { error: 'Failed.' });
+      return respond(200, st.scores);
+    }
     return respond(200, { success: true });
   };
 
@@ -113,6 +118,7 @@ function boot(which, start, { serve = start } = {}) {
     click: (el) => el.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true })),
     pageFetches: () => sent.filter((p) => p === pagePath).length,
     syncsFetches: () => sent.filter((p) => p === `/api/accounts/${id}/syncs`).length,
+    scoreFetches: () => sent.filter((p) => p === `/api/accounts/${id}/epg-scorecard`).length,
     snap: () => ({
       barMsg: text('#acct-actionbar .gd-ab-msg'),
       barActs: Array.from(document.querySelectorAll('#acct-actionbar .gd-ab-actions > [data-act]'))
@@ -130,6 +136,10 @@ function boot(which, start, { serve = start } = {}) {
       histEmpty: Boolean($('#acct-hist-body .empty-state')),
       moreBtn: text('#acct-hist-more'),
       activity: text('#acct-activity-body'),
+      scoreLines: Array.from(document.querySelectorAll('[data-score-for]'))
+        .map((el) => ({ hidden: el.hidden, text: el.textContent.trim(),
+          tip: el.querySelector('[data-tip]') ? el.querySelector('[data-tip]').getAttribute('data-tip') : null })),
+      reachTip: $('#acct-reach-key') ? $('#acct-reach-key').getAttribute('data-tip') : null,
     }),
   };
   return c;
@@ -321,6 +331,33 @@ await record('switch', async (start) => {
     refusedDisabled: input.disabled,
     refusedPageFetches: c.pageFetches(),
   };
+});
+
+/* ── The scorecard line loads after the page and survives the live swap ── */
+await record('scores', async (start) => {
+  const c = start('busy', 'done');
+  const atFirstPaint = c.snap();
+  await c.settle();
+  const loaded = { scoreFetches: c.scoreFetches(), ...c.snap() };
+  // A minute later nothing has synced: the regions are swapped, the line is put back from
+  // what was read, and the API is not asked again.
+  const realNow = c.window.Date.now.bind(c.window.Date);
+  c.window.Date.now = () => realNow() + 61 * 1000;
+  await c.poll();
+  const aged = { pageFetches: c.pageFetches(), scoreFetches: c.scoreFetches(), ...c.snap() };
+  c.window.Date.now = realNow;
+  // A sync runs: the swap carries a new signature, so the line is read again.
+  c.server.state = 'syncing';
+  await c.poll();
+  const synced = { pageFetches: c.pageFetches(), scoreFetches: c.scoreFetches(), ...c.snap() };
+  return { errors: c.errors, atFirstPaint, loaded, aged, synced };
+});
+
+/* ── The scorecard read fails: the page stays as it was drawn ─────────── */
+await record('scores_failed', async (start) => {
+  const c = start('busy', 'done', { scoresStatus: 500 });
+  await c.settle();
+  return { errors: c.errors, warnings: c.warnings, ...c.snap() };
 });
 
 process.stdout.write(JSON.stringify(out), () => process.exit(0));

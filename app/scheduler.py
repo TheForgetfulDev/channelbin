@@ -2700,6 +2700,34 @@ def queue_sports_match(delay_seconds: int = 60, reason: str = '') -> bool:
     return True
 
 
+EPG_CHECK_JOB_ID = 'epg_check'
+
+
+def queue_epg_check(delay_seconds: int = 120, reason: str = '') -> bool:
+    """Arm the one-shot that compares each account's EPG sources for the scorecard
+    (app/epg_scorecard.py::run_check, dev/changelog/1717). A fixed id, so the imports of one
+    sync become one run, and an armed run is only ever brought forward, as
+    queue_sports_match(). False, and nothing queued, when no scheduler is running."""
+    if not scheduler_is_live():
+        return False
+    run_date = datetime.utcnow() + timedelta(seconds=delay_seconds)
+    job = _scheduler.get_job(EPG_CHECK_JOB_ID)
+    armed = to_naive_utc(job.next_run_time) if job is not None and job.next_run_time else None
+    if armed is not None and armed <= run_date:
+        return True
+    _add_job(func=_epg_check_job, trigger='date', run_date=run_date, id=EPG_CHECK_JOB_ID,
+             replace_existing=True, max_instances=2, kwargs={'reason': reason or None})
+    log.info('EPG source check queued for %s%s', run_date, f' ({reason})' if reason else '')
+    return True
+
+
+def _epg_check_job(reason: str = None):
+    """The queued check. `reason` only names why it was queued, for /jobs."""
+    with _app.app_context():
+        from .epg_scorecard import run_check
+        run_check()
+
+
 def _sports_match_job(reason: str = None):
     """The queued match. `reason` only names why it was queued, for /jobs."""
     with _app.app_context():

@@ -3997,6 +3997,45 @@ def _m145_pip_channels(conn, cur):
     conn.commit()
 
 
+def _m146_epg_scorecard(conn, cur):
+    """The EPG source scorecard's stored numbers (app/epg_scorecard.py, dev/changelog/1717): six
+    detail counts on each directory row, one row per source refresh, and the agreement of two
+    sources per channel. No backfill and no obligation to register: the counts are NULL ("not
+    counted") until a source's next import rewrites its directory, a refresh history starts
+    with the next refresh, and the agreement job fills its table after the next import.
+    Re-runnable from the top: each ADD COLUMN asks PRAGMA table_info first, IF NOT EXISTS
+    throughout."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(epg_source_channels)').fetchall()}
+    if cols:
+        for name in ('described', 'subtitled', 'categorized', 'rated', 'flagged', 'doubled'):
+            if name not in cols:
+                cur.execute(f'ALTER TABLE epg_source_channels ADD COLUMN {name} INTEGER')
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS epg_source_refreshes (
+            id INTEGER NOT NULL PRIMARY KEY,
+            source_id INTEGER NOT NULL REFERENCES epg_sources (id),
+            started_at DATETIME NOT NULL,
+            finished_at DATETIME NOT NULL,
+            status VARCHAR(16) NOT NULL,
+            entries INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_epg_source_refreshes_source
+            ON epg_source_refreshes (source_id, finished_at);
+        CREATE TABLE IF NOT EXISTS epg_source_agreements (
+            id INTEGER NOT NULL PRIMARY KEY,
+            channel_id INTEGER NOT NULL REFERENCES channels (id),
+            source_id INTEGER NOT NULL REFERENCES epg_sources (id),
+            other_source_id INTEGER NOT NULL REFERENCES epg_sources (id),
+            verdict VARCHAR(16) NOT NULL,
+            compared INTEGER NOT NULL,
+            paired INTEGER NOT NULL,
+            checked_at DATETIME NOT NULL,
+            CONSTRAINT uq_epg_source_agreement UNIQUE (channel_id, source_id, other_source_id)
+        );
+    """)
+    conn.commit()
+
+
 def _m135_rule_sports_sessions(conn, cur):
     """auto_rules.sports_sessions: whether a rule about a league counts its practice, qualifying and
     shootouts among its games (app/auto_rules_sports.py, dev/changelog/1633). No backfill: before this a
@@ -4739,6 +4778,8 @@ SCHEMA_MIGRATIONS = [
     (144, 'recordings.source_channel_id: the channel whose listing a recording was made from',
      _m144_recording_source_channel),
     (145, 'pip_channels: picture-in-picture channels on the output feed', _m145_pip_channels),
+    (146, 'epg_source_channels detail counts + epg_source_refreshes + epg_source_agreements: '
+          'the EPG source scorecard', _m146_epg_scorecard),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

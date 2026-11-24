@@ -153,7 +153,7 @@ class SourceReachDbTests(unittest.TestCase):
         db.session.commit()
         r = source_reach([self.src.id], ET)[self.src.id]
         self.assertEqual(r.channels, 4)
-        self.assertEqual(r.day, epg_sources._last_local_day(far, ET))
+        self.assertEqual(r.day, epg_sources.last_local_day(far, ET))
         self.assertEqual(r.latest, r.day)
         self.assertEqual(sum(n for _d, n in r.days), 4)
 
@@ -193,7 +193,7 @@ class AccountPagesTests(unittest.TestCase):
     def _expected(self):
         from app.tz_utils import get_display_tz
         tz = get_display_tz()
-        day = epg_sources._last_local_day(self.until, tz)
+        day = epg_sources.last_local_day(self.until, tz)
         return reach_words((day, day), datetime.utcnow(), tz)
 
     def test_the_list_row_says_how_far_the_guide_reaches(self):
@@ -201,7 +201,7 @@ class AccountPagesTests(unittest.TestCase):
         the count of days in its tooltip."""
         from app.tz_utils import date_label, get_display_tz
         tz = get_display_tz()
-        day = epg_sources._last_local_day(self.until, tz)
+        day = epg_sources.last_local_day(self.until, tz)
         html = self.client.get('/accounts').get_data(as_text=True)
         notes = re.findall(r'<span class="a-note tip-plain" data-tip="Guide reaches\.([^"]*)">'
                            r'([^<]*)</span>', html)

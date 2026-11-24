@@ -608,7 +608,7 @@
         <div class="srow"><span class="sk tip-plain" data-tip="Program entries.&#10;Every listing in this account's guide data: one per showing, across all its channels and every day the provider sends, the ones that already aired included. Search Programs counts only the showings still to come.">Program entries</span><span class="sv">
           {% if account.epg_entry_count %}{{ '{:,}'.format(account.epg_entry_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
         {% if guide_reach %}
-        <div class="srow"><span class="sk tip-plain" data-tip="Guide reaches.&#10;The last day most of this account's channels have listings for. A range means its channels take their guide from sources that run out on different days; the EPG sources card has each one.">Guide reaches</span><span class="sv">{% if guide_reach.ran_out %}Ran out {{ guide_reach.inline }}{% else %}{{ guide_reach.text }}{% endif %}</span></div>
+        <div class="srow"><span class="sk tip-plain" data-tip="Guide reaches.&#10;The last day most of this account's channels have listings for. A range means its channels take their guide from sources that run out on different days; the EPG sources card has each one." id="acct-reach-key">Guide reaches</span><span class="sv">{% if guide_reach.ran_out %}Ran out {{ guide_reach.inline }}{% else %}{{ guide_reach.text }}{% endif %}</span></div>
         {% endif %}
         {{ m.stat_row('Channels with listings',
                       '{:,}'.format(cur.epg.with_epg),
@@ -699,6 +699,7 @@
               {% if s.url %}<div class="small"><code>{{ s.url }}</code></div>{% endif %}
               {% if s.shared %}<div class="small text-warning">{{ '{:,}'.format(s.shared.channels) }} channel{{ '' if s.shared.channels == 1 else 's' }} with different names share {% if s.shared.ids | length == 1 %}the id <code>{{ s.shared.ids[0] }}</code>{% else %}{{ s.shared.ids | length }} ids{% endif %}, so this guide gives them all one channel's schedule.
                 <a href="{{ url_for('accounts.epg_source_review', source_id=s.id, view='shared') }}">Shared ids {{ icon('forward') }}</a></div>{% endif %}
+              <div class="small" data-score-for="{{ s.id }}" hidden></div>
               {% if s.readers %}<div class="text-faint small">Also read by {% for r in s.readers %}<a href="{{ url_for('accounts.account_detail', account_id=r.id) }}">{{ r.name }}</a> ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}</div>{% endif %}
               {% if s.is_url and s.subscribed and s.enabled %}
               <div class="text-faint small">{% if s.refresh_interval_hours %}Refreshes every {{ s.refresh_interval_hours }}h{% if s.next_refresh_at %}, next {{ s.next_refresh_at | local_time }}{% endif %}{% else %}Refreshes with this account's sync{% endif %}</div>

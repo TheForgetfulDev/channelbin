@@ -863,6 +863,7 @@
         renderedAt = Date.now();
         Object.assign(A, readState());
         reapply();
+        if (A.syncSig !== scoresSig) loadScores(); else applyScores();
         const moved = JSON.stringify(A.logs || []) !== shownLogs;
         // Redrawn only when the runs changed, so a minute tick leaves a hovered row alone.
         if (!moved && $('#acct-hist') && $('#acct-hist').childElementCount) return null;
@@ -877,6 +878,38 @@
         if (again) { again = false; refresh(); }
       });
   }
+
+  // ── The EPG sources scorecard line (dev/changelog/1717) ──────────────────────
+  // Read after the page draws, from the API's card view: it costs 0.6 s on the largest
+  // accounts, and the page should not wait for it. The server renders each placeholder
+  // empty and hidden, so a page whose read fails shows what it showed before. The live
+  // swap redraws those placeholders, so the last answer is applied again after every swap
+  // and read again only when a sync has run since it was read.
+  let scores = null;
+  let scoresSig = null;
+  const reachTip = (el) => el && (el.dataset.baseTip || (el.dataset.baseTip = el.getAttribute('data-tip') || ''));
+
+  function applyScores() {
+    if (!scores) return;
+    const lines = new Map((scores.sources || []).map((r) => [String(r.source_id), r]));
+    document.querySelectorAll('[data-score-for]').forEach((el) => {
+      const r = lines.get(el.dataset.scoreFor);
+      el.hidden = !r;
+      el.innerHTML = r ? `<span class="tip-plain" data-tip="${escHtml(r.tip)}">${escHtml(r.line)}</span>` : '';
+    });
+    const key = $('#acct-reach-key');
+    const base = reachTip(key);
+    if (key) key.setAttribute('data-tip', scores.guide_days ? `${base}\n\n${scores.guide_days}` : base);
+  }
+
+  function loadScores() {
+    if (!document.querySelector('[data-score-for]')) return Promise.resolve();
+    const sig = A.syncSig;
+    return jsonFetch(`/api/accounts/${A.id}/epg-scorecard?view=card`)
+      .then((body) => { scores = body; scoresSig = sig; applyScores(); })
+      .catch((err) => console.warn('EPG source scorecard did not load.', err));
+  }
+  loadScores();
 
   window.__applyAccountSync = (sig) => {
     if (typeof sig !== 'string' || inFlight || busy()) return;

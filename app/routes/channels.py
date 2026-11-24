@@ -12,7 +12,7 @@ from werkzeug.datastructures import MultiDict
 from .. import db
 from ..database import (
     Account, Channel, ChannelGroup, ChannelGroupMember, EPGEntry, EpgAlternateEntry,
-    EpgChannelKey, Recording,
+    EpgChannelKey, EpgSourceAgreement, Recording,
     ChannelTest, ChannelEvent, ChannelHealthExclusion, OnDemandTestJob, Tag,
     RecordingProfile, HealthCheckProfile, SportsMatch, detach_channel_references,
     CHANNEL_REMOVED_FROM_GUIDE,
@@ -1445,6 +1445,8 @@ def missing_delete():
                 EpgAlternateEntry.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.query(EpgChannelKey).filter(
                 EpgChannelKey.channel_id.in_(chunk)).delete(synchronize_session=False)
+            db.session.query(EpgSourceAgreement).filter(
+                EpgSourceAgreement.channel_id.in_(chunk)).delete(synchronize_session=False)
             # Channel ids are re-issued, so a match left behind would be inherited by the next
             # channel to get this id (DESIGN-sports-data.md 9).
             db.session.query(SportsMatch).filter(

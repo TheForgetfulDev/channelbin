@@ -58,6 +58,7 @@ KIND_LEDGER = 'ledger'
 KIND_RULES = 'rules'
 KIND_EPG_SCAN = 'epg_scan'
 KIND_SPORTS_MATCH = 'sports_match'
+KIND_EPG_CHECK = 'epg_check'
 
 # Human prose for a refusal message, so a refused caller can hand the reason straight to a
 # user-facing surface without restating it. Keep these lowercase noun phrases - they are
@@ -72,6 +73,7 @@ KIND_LABELS = {
     KIND_RULES: 'an auto-record rule check',
     KIND_EPG_SCAN: 'an EPG similarity scan',
     KIND_SPORTS_MATCH: 'matching sports schedules to the guide',
+    KIND_EPG_CHECK: 'comparing EPG sources',
 }
 
 # The yield order, as a table rather than as branches scattered across four modules.
@@ -121,6 +123,11 @@ KIND_LABELS = {
 #   yields to sync and to a rebuild, which rewrite the listings it reads, to maintenance,
 #   whose EPG cleanup deletes them, and to itself. Nothing yields to it but maintenance: it is
 #   a few seconds per league and queues itself again when refused (DESIGN-sports-data.md 6.6).
+# - **EPG check** - comparing the EPG sources an account reads, channel by channel, for the
+#   scorecard (app/epg_scorecard.py, dev/changelog/1717). About half a minute on prod, queued
+#   after a guide import. It yields to sync and to maintenance, which rewrite and delete the
+#   listings it reads, and to itself; maintenance yields to it in turn, as to the EPG scan.
+#   A refusal queues the next try.
 # - **Up next** - making the Up next channels' pictures ahead (app/sports_up_next.py). It is CPU
 #   work, an encode of about 14 s for four pages at a low priority, and a few reads, so it yields
 #   only to itself: the next run is five minutes away, and two at once would make one clip twice.
@@ -139,8 +146,9 @@ BLOCKED_BY = {
     KIND_RULES: (KIND_SYNC, KIND_REBUILD, KIND_MAINTENANCE, KIND_RULES),
     KIND_EPG_SCAN: (KIND_SYNC, KIND_MAINTENANCE, KIND_EPG_SCAN),
     KIND_SPORTS_MATCH: (KIND_SYNC, KIND_REBUILD, KIND_MAINTENANCE, KIND_SPORTS_MATCH),
+    KIND_EPG_CHECK: (KIND_SYNC, KIND_MAINTENANCE, KIND_EPG_CHECK),
     KIND_MAINTENANCE: (KIND_TESTER, KIND_SYNC, KIND_REBUILD, KIND_HIDING, KIND_RULES,
-                       KIND_EPG_SCAN, KIND_SPORTS_MATCH, KIND_MAINTENANCE),
+                       KIND_EPG_SCAN, KIND_SPORTS_MATCH, KIND_EPG_CHECK, KIND_MAINTENANCE),
 }
 
 

@@ -775,10 +775,41 @@ def _seed_account_history(n):
     day - however many rows it folds. And a health score and a group membership per
     channel, so the Content card's current numbers and the Usage card (dev/changelog/1031)
     have something to count that grows with the account."""
+    from app.database import (EpgSource, EpgSourceAgreement, EpgSourceChannel,
+                              EpgSourceRefresh, EpgSourceSubscription)
     acc = (Account.query.filter_by(name='Scaling Account Detail').first()
            or seed.make_account(name='Scaling Account Detail'))
+    # Two EPG sources, each covering every channel with its own directory row, a refresh
+    # and an agreement per row. The Sources card's scorecard line is read after the page
+    # draws (dev/changelog/1717); these keep the page itself from starting to read them.
+    guides = []
+    for name in ('Scaling Detail Guide A', 'Scaling Detail Guide B'):
+        src = EpgSource.query.filter_by(name=name).first()
+        if src is None:
+            src = EpgSource(kind='url', owner_account_id=acc.id, name=name,
+                            url='http://scaling.test/epg.xml')
+            db.session.add(src)
+            db.session.flush()
+            db.session.add(EpgSourceSubscription(source_id=src.id, account_id=acc.id,
+                                                 priority=len(guides) + 1))
+        guides.append(src)
     for i in range(n):
         ch = _seed_ledger_sources(acc, i, in_guide=(i % 2 == 0))
+        ch.epg_channel_id = f'sd{ch.id}.test'
+        ch.epg_source_id = guides[0].id
+        for src in guides:
+            db.session.add(EpgSourceChannel(
+                source_id=src.id, xml_id=ch.epg_channel_id, entry_count=20,
+                distinct_titles=1 + i % 5, horizon_until=datetime.utcnow() + timedelta(days=i % 4),
+                described=i % 20, subtitled=0, categorized=5, rated=0, flagged=1,
+                doubled=i % 2))
+            db.session.add(EpgSourceRefresh(source_id=src.id, started_at=datetime.utcnow(),
+                                            finished_at=datetime.utcnow(),
+                                            status='OK' if i % 3 else 'REFUSED', entries=i))
+        db.session.add(EpgSourceAgreement(channel_id=ch.id, source_id=guides[0].id,
+                                          other_source_id=guides[1].id,
+                                          verdict='identical' if i % 2 else 'unrelated',
+                                          compared=5, paired=5, checked_at=datetime.utcnow()))
         ch.health_score = float(20 + (i * 7) % 80)
         ch.consecutive_test_failures = i % 4
         seed.make_group(name=f'Scaling Detail Group {i}', members=[ch])
