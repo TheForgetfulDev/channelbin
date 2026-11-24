@@ -1614,6 +1614,8 @@ def set_channel_epg_key(channel_id):
         return jsonify({'error': result}), status
     if result is None:
         return jsonify({'success': True, 'changed': False, 'message': 'Nothing changed.'})
+    from ..epg_scorecard import recheck_soon
+    recheck_soon(f'EPG key changed on channel #{channel_id}')
     return jsonify({'success': True, 'changed': True, 'outcome': result.outcome,
                     'message': result.detail})
 
@@ -1654,6 +1656,8 @@ def set_channel_epg_source_override(channel_id):
         return jsonify({'error': result}), status
     if result is None:
         return jsonify({'success': True, 'changed': False, 'message': 'Nothing changed.'})
+    from ..epg_scorecard import recheck_soon
+    recheck_soon(f'EPG source override changed on channel #{channel_id}')
     return jsonify({'success': True, 'changed': True, 'state': result.state,
                     'message': result.detail})
 

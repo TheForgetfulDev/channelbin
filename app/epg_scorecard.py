@@ -12,10 +12,15 @@ listings both sources hold from now on. It costs about 3 ms a channel and pair (
 account 5's three sources on prod), so it runs in the background after an import
 (run_check(), admission kind KIND_EPG_CHECK) and is stored in epg_source_agreements.
 
+The same check stores each account's findings (dev/changelog/1718): name matches waiting,
+an id unrelated channels share, a source serving channels better than their own, a source
+adding nothing. Shown on pages, never raised as alerts.
+
 Nothing here writes a channel's guide. "Best here" is a suggestion with its reasons; acting
 on it is the user's, through set_source_override()."""
 from __future__ import annotations
 
+import json
 import logging
 import time as time_mod
 from collections import Counter
@@ -25,13 +30,16 @@ from typing import NamedTuple
 from sqlalchemy import delete, select
 
 from . import admission, db
-from .database import (Channel, EPGEntry, EpgAlternateEntry, EpgSource, EpgSourceAgreement,
-                       EpgSourceChannel, EpgSourceRefresh, EpgSourceSubscription,
-                       EPG_STATUS_FAILED, EPG_STATUS_OK, EPG_STATUS_REFUSED,
-                       EPG_STATUS_TRUNCATED)
+from .database import (Account, Channel, EPGEntry, EpgAlternateEntry, EpgFinding, EpgSource,
+                       EpgSourceAgreement, EpgSourceChannel, EpgSourceRefresh,
+                       EpgSourceSubscription, EPG_FINDING_ADDS_NOTHING,
+                       EPG_FINDING_BETTER_SOURCE, EPG_FINDING_NAME_MATCHES,
+                       EPG_FINDING_SHARED_ID, EPG_STATUS_FAILED, EPG_STATUS_OK,
+                       EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED)
 from .db_utils import chunked, retry_on_locked
 from .epg_sources import (CMP_DESCRIPTIONS, CMP_IDENTICAL, CMP_MOSTLY, CMP_NO_OVERLAP,
-                          CMP_SHIFTED, CMP_UNRELATED, REAL_SCHEDULE_MIN_TITLES, Listing,
+                          CMP_SHIFTED, CMP_UNRELATED, MATCH_DISAGREE, MATCH_NEW,
+                          REAL_SCHEDULE_MIN_TITLES, Listing,
                           Reach, channel_key, compare_listings, file_id_for, key_answers,
                           norm_key, of_sources, reach_from_horizons, sources_without_directory)
 from .fmt_utils import counted, iso_or_none, plural
@@ -129,6 +137,17 @@ class ChannelScore(NamedTuple):
     reasons: list           # [str]
     sources: list           # [ChannelSource], in the account's order
     verdicts: dict          # {(earlier, later): CMP_*}
+    pinned: bool            # the user chose this channel's source (epg_source_override_id)
+    why: str | None         # the RULE_* that set `current` aside, when another source is best
+
+
+#: The rules of best_source(), in the order it applies them: the one that set a source aside.
+RULE_OUTVOTED = 'outvoted'
+RULE_ONE_TITLE = 'one_title'
+RULE_DOUBLED = 'doubled'
+RULE_REACH = 'reach'
+RULE_DETAIL = 'detail'
+RULE_ORDER = 'order'
 
 
 # ── The one batch reader ─────────────────────────────────────────────────────
@@ -235,9 +254,21 @@ def outvoted(verdicts: dict, source_ids) -> set[int]:
     return out
 
 
+class Choice(NamedTuple):
+    best: int
+    reasons: list           # [str], in the order the rules applied
+    dropped: dict           # {source_id: RULE_*} - the rule that set each other source aside
+
+
 def best_source(sources: list, verdicts: dict, names: dict, day_of) -> tuple[int, list]:
-    """(source_id, [reason, ...]) - which of a channel's sources serves it best, and why, in
-    the order the rules are applied. Pure. `sources` is [ChannelSource] in the account's
+    """(source_id, [reason, ...]) - choose_source() without the rule per source."""
+    choice = choose_source(sources, verdicts, names, day_of)
+    return choice.best, choice.reasons
+
+
+def choose_source(sources: list, verdicts: dict, names: dict, day_of) -> Choice:
+    """Which of a channel's sources serves it best, why, and which rule set each other source
+    aside, in the order the rules are applied. Pure. `sources` is [ChannelSource] in the account's
     order; `day_of(horizon)` the local day a horizon runs through, as display text.
 
     1. A source the others outvote (outvoted()) is left out.
@@ -251,13 +282,15 @@ def best_source(sources: list, verdicts: dict, names: dict, day_of) -> tuple[int
     detail is a better listing of a program the guide already has."""
     left = list(sources)
     reasons = []
+    set_aside: dict[int, str] = {}
 
-    def narrow(keep, why):
+    def narrow(keep, why, rule):
         nonlocal left
         kept = [s for s in left if keep(s)]
         dropped = [s for s in left if not keep(s)]
         if kept and dropped:
             reasons.append(why(kept, dropped))
+            set_aside.update((s.source_id, rule) for s in dropped)
             left = kept
 
     def named(group):
@@ -265,28 +298,30 @@ def best_source(sources: list, verdicts: dict, names: dict, day_of) -> tuple[int
 
     gone = outvoted(verdicts, [s.source_id for s in left])
     narrow(lambda s: s.source_id not in gone,
-           lambda k, d: f'{named(d)} does not match the other sources, which match each other')
+           lambda k, d: f'{named(d)} does not match the other sources, which match each other',
+           RULE_OUTVOTED)
     narrow(lambda s: s.real_schedule,
-           lambda k, d: f'{named(d)} lists one program all day')
+           lambda k, d: f'{named(d)} lists one program all day', RULE_ONE_TITLE)
     # Only when every source was counted: None is "not counted", never "never doubles".
     if all(s.doubled is not None for s in left):
         narrow(lambda s: not s.doubled,
-               lambda k, d: f'{named(d)} lists two programs at the same time')
+               lambda k, d: f'{named(d)} lists two programs at the same time', RULE_DOUBLED)
     days = {s.source_id: day_of(s.horizon_until) for s in left if s.horizon_until}
     if days:
         last = max(s.horizon_until for s in left if s.horizon_until)
         top = day_of(last)
         narrow(lambda s: s.horizon_until is not None and day_of(s.horizon_until) == top,
-               lambda k, d: f'{named(k)} runs to {top}, {named(d)} stops sooner')
+               lambda k, d: f'{named(k)} runs to {top}, {named(d)} stops sooner', RULE_REACH)
     shares = {s.source_id: s.share('described') for s in left}
     if all(v is not None for v in shares.values()) and shares:
         most = max(shares.values())
         narrow(lambda s: shares[s.source_id] >= most - DETAIL_MARGIN,
                lambda k, d: (f'{named(k)} describes {shares[k[0].source_id]}% of its listings, '
-                             f'{named(d)} {shares[d[0].source_id]}%'))
+                             f'{named(d)} {shares[d[0].source_id]}%'), RULE_DETAIL)
     if len(left) > 1:
         reasons.append(f'{named(left[:1])} is first in this account\'s order')
-    return left[0].source_id, reasons
+        set_aside.update((s.source_id, RULE_ORDER) for s in left[1:])
+    return Choice(left[0].source_id, reasons, set_aside)
 
 
 def account_scorecard(account_id: int, tz, case_sensitive: bool,
@@ -305,7 +340,7 @@ def account_scorecard(account_id: int, tz, case_sensitive: bool,
                  .filter(EpgSource.id.in_(order)))
     ch = Channel.__table__.c
     channels = db.session.execute(
-        select(ch.id, ch.epg_channel_id, ch.epg_source_id, ch.name)
+        select(ch.id, ch.epg_channel_id, ch.epg_source_id, ch.name, ch.epg_source_override_id)
         .where(ch.account_id == account_id, ch.hidden.is_(False))).all()
     answers = key_answers(order)
     variants, rows = _directories(order, case_sensitive)
@@ -319,7 +354,7 @@ def account_scorecard(account_id: int, tz, case_sensitive: bool,
     # Horizons are counted by value: channels share a few hundred of them, and turning each
     # into a local day is what costs (0.5 s per call over account 2's 29,000 channels).
     guided_horizons = Counter()
-    for cid, _pid, current, _name in channels:
+    for cid, _pid, current, _name, _pin in channels:
         for cs in per_channel.get(cid, ()):
             if cs.source_id == current and cs.horizon_until is not None:
                 guided_horizons[cs.horizon_until] += 1
@@ -376,9 +411,12 @@ def account_scorecard(account_id: int, tz, case_sensitive: bool,
             if len(found) < 2:
                 continue
             v = verdicts.get(cid, {})
-            best, reasons = best_source(found, v, names, day_of)
-            channel_scores.append(ChannelScore(cid, by_id[cid][3], by_id[cid][2], best, reasons,
-                                               found, v))
+            choice = choose_source(found, v, names, day_of)
+            current = by_id[cid][2]
+            channel_scores.append(ChannelScore(cid, by_id[cid][3], current, choice.best,
+                                               choice.reasons, found, v,
+                                               by_id[cid][4] is not None,
+                                               choice.dropped.get(current)))
         channel_scores.sort(key=lambda c: ((c.name or '').lower(), c.channel_id))
     return AccountScorecard(account_id, scores, reach_from_horizons(guided_horizons.items(), tz),
                             channel_scores)
@@ -519,6 +557,246 @@ def days_breakdown(reach: Reach | None, today: date, label) -> str | None:
     return '\n'.join(lines)
 
 
+# ── Findings: what an account could improve (dev/changelog/1718) ─────────────
+#
+# Found by the check below from what the database holds, stored per account, shown on the
+# Sources card and (the two a person should act on) the Dashboard, and never an alert. A
+# finding only reads; acting on it is a person pressing a button that calls the writer the
+# line names (DESIGN-epg-sources.md §16).
+
+class Finding(NamedTuple):
+    source_id: int
+    kind: str               # EPG_FINDING_*
+    subject: str | None     # the shared id
+    count: int
+    detail: dict
+
+
+#: How soon the check runs after a person changes a key, an override or a source's place,
+#: so a finding they just acted on stops being shown (it is about 20 s of background work).
+RECHECK_SECONDS = 15
+
+
+def recheck_soon(reason: str) -> None:
+    """Queue the check after a person's change. Called after the change has committed."""
+    from .scheduler import queue_epg_check
+    queue_epg_check(RECHECK_SECONDS, reason)
+
+
+def account_findings(card: AccountScorecard, proposals: dict, shared) -> list[Finding]:
+    """Every finding for one account - pure. `card` is account_scorecard(with_channels=True);
+    `proposals` {source_id: [NameProposal]} for this account's channels, as the review page
+    proposes them by default; `shared` the account's [SharedId].
+
+    - name matches: channels with no guide that one source's names would guide, the count
+      the review page's "only channels with no guide today" view lists;
+    - a shared id: the channels whose names say it is not theirs (find_shared_ids());
+    - better source: channels another source serves better than their own (choose_source()),
+      left out where the user picked the source, or only the account's order separates them;
+    - adds nothing: a source with a directory that no channel has only here, that serves no
+      channel best, that no channel is pinned to, and whose names would guide no channel
+      that lacks one."""
+    out = []
+    unguided: dict[int, int] = {}
+    for s in card.sources:
+        props = proposals.get(s.source_id, ())
+        new = [p for p in props if p.kind == MATCH_NEW]
+        unguided[s.source_id] = sum(p.channel.epg_source_id is None for p in new)
+        if unguided[s.source_id]:
+            out.append(Finding(s.source_id, EPG_FINDING_NAME_MATCHES, None,
+                               unguided[s.source_id],
+                               {'guided': len(new) - unguided[s.source_id],
+                                'disagree': sum(p.kind == MATCH_DISAGREE for p in props)}))
+    for f in shared:
+        out.append(Finding(f.source_id, EPG_FINDING_SHARED_ID, f.entry.xml_id, len(f.wrong),
+                           {'channels': len(f.channels),
+                            'name': (f.entry.display_names or [f.entry.xml_id])[0]}))
+    best_for = Counter(c.best for c in card.channels)
+    # A source channels are pinned to is the user's answer for them; telling them it adds
+    # nothing would suggest stopping it, which throws the pins away.
+    pinned_to = {c.current for c in card.channels if c.pinned}
+    better: dict[int, dict] = {}
+    for c in card.channels:
+        if (c.pinned or c.current is None or c.best == c.current or c.why in (None, RULE_ORDER)
+                or all(cs.source_id != c.current for cs in c.sources)):
+            continue
+        b = better.setdefault(c.best, {'count': 0, 'why': Counter(), 'from': Counter()})
+        b['count'] += 1
+        b['why'][c.why] += 1
+        b['from'][c.current] += 1
+    for s in card.sources:
+        b = better.get(s.source_id)
+        if b:
+            out.append(Finding(s.source_id, EPG_FINDING_BETTER_SOURCE, None, b['count'],
+                               {'why': dict(b['why']),
+                                'from': {str(k): n for k, n in b['from'].items()}}))
+        if (s.has_directory and not s.only_here and not best_for.get(s.source_id)
+                and not unguided[s.source_id] and s.source_id not in pinned_to):
+            out.append(Finding(s.source_id, EPG_FINDING_ADDS_NOTHING, None, s.covered, {}))
+    return out
+
+
+_WHY_WORDS = {RULE_OUTVOTED: 'the other sources agree with each other and not with theirs',
+              RULE_ONE_TITLE: 'theirs lists one program all day',
+              RULE_DOUBLED: 'theirs lists two programs at the same time',
+              RULE_REACH: 'it runs further ahead',
+              RULE_DETAIL: 'it describes more of its listings'}
+
+
+def finding_text(f: Finding, names: dict) -> tuple[str, str]:
+    """(line, tooltip) for a finding on the Sources card. `names` {source_id: name}."""
+    n = f.count
+    if f.kind == EPG_FINDING_NAME_MATCHES:
+        line = (f'{counted(n, "channel")} with no guide {plural(n, "has", "have")} a name '
+                'that matches a channel in this guide.')
+        tip = ['Accepting a match gives the channel this guide\'s listings for that name.']
+        if f.detail.get('guided'):
+            g = f.detail['guided']
+            tip.append(f'{counted(g, "channel")} that already {plural(g, "has", "have")} a '
+                       f'guide also {plural(g, "matches", "match")} a name.')
+        if f.detail.get('disagree'):
+            d = f.detail['disagree']
+            tip.append(f'{counted(d, "channel")} {plural(d, "has", "have")} a name that points '
+                       'at a different id from the provider\'s.')
+    elif f.kind == EPG_FINDING_SHARED_ID:
+        line = (f'{counted(n, "channel")} with different names share the id {f.subject}, so '
+                f'this guide gives them all the schedule of "{f.detail.get("name") or f.subject}".')
+        tip = [f'{f.detail.get("channels", n):,} channels on this account read that id.']
+    elif f.kind == EPG_FINDING_BETTER_SOURCE:
+        line = (f'Would serve {counted(n, "channel")} better than the source '
+                f'{plural(n, "its", "their")} guide comes from.')
+        tip = []
+        for rule, m in sorted(f.detail.get('why', {}).items(), key=lambda x: -x[1]):
+            if rule in _WHY_WORDS:
+                tip.append(f'{m:,} because {_WHY_WORDS[rule]}')
+            else:
+                log.warning('EPG finding on source %d: no words for rule %r', f.source_id, rule)
+        tip += [f'{m:,} {plural(m, "comes", "come")} from {names.get(int(sid), "another source")} now'
+                for sid, m in sorted(f.detail.get('from', {}).items(), key=lambda x: -x[1])]
+        tip.append('A channel\'s own page picks its source.')
+    elif f.kind == EPG_FINDING_ADDS_NOTHING:
+        line = ('Adds nothing to this account: every channel it covers is served as well by '
+                'another source.' if n else "Gives none of this account's channels a guide.")
+        tip = ['Every source is downloaded at each refresh. One that adds nothing can be '
+               'stopped with Stop using.']
+    else:
+        raise ValueError(f'unknown EPG finding kind {f.kind!r}')
+    return line, '\n'.join(tip)
+
+
+def dashboard_text(findings, names: dict) -> str | None:
+    """One account's Dashboard sentence for the findings someone should act on, or None when
+    there are none: name matches and shared ids, which leave channels with no guide or the
+    wrong one until a person acts. The other two kinds say a choice could be better, which
+    the Sources card says. `findings` is the account's [Finding]; `names` {source_id:
+    name}. One line per account, since its Sources card lists each source's: the largest
+    name-match count, naming its guide, and the channels shared ids mislead - an id read
+    through two guides misleads the same channels in both, so each id counts once, at its
+    largest."""
+    matches = [f for f in findings if f.kind == EPG_FINDING_NAME_MATCHES]
+    shared: dict[str, int] = {}
+    for f in findings:
+        if f.kind == EPG_FINDING_SHARED_ID:
+            shared[f.subject] = max(shared.get(f.subject, 0), f.count)
+        elif f.kind not in (EPG_FINDING_NAME_MATCHES, EPG_FINDING_BETTER_SOURCE,
+                            EPG_FINDING_ADDS_NOTHING):
+            raise ValueError(f'unknown EPG finding kind {f.kind!r}')
+    parts = []
+    if matches:
+        top = max(matches, key=lambda f: f.count)
+        text = (f'{counted(top.count, "channel")} with no guide '
+                f'{plural(top.count, "matches", "match")} a name in '
+                f'{names.get(top.source_id, "a guide")}')
+        if len(matches) > 1:
+            text += f', and more in {counted(len(matches) - 1, "other guide")}'
+        parts.append(text)
+    if shared:
+        n = sum(shared.values())
+        ids = ', '.join(sorted(shared))
+        parts.append(f'{counted(n, "channel")} {plural(n, "gets", "get")} another channel\'s '
+                     f'schedule from a shared id ({ids})')
+    return '; '.join(parts) if parts else None
+
+
+def stored_findings(account_ids) -> dict[int, list]:
+    """{account_id: [(Finding, found_at)]} for these accounts, only for sources each still
+    reads (a stop that raced the check leaves nothing behind on a page). Two queries."""
+    account_ids = list(account_ids)
+    out: dict[int, list] = {aid: [] for aid in account_ids}
+    if not account_ids:
+        return out
+    reads = set(db.session.query(EpgSourceSubscription.account_id, EpgSourceSubscription.source_id)
+                .filter(EpgSourceSubscription.account_id.in_(account_ids)))
+    rows = (db.session.query(EpgFinding.account_id, EpgFinding.source_id, EpgFinding.kind,
+                             EpgFinding.subject, EpgFinding.count, EpgFinding.detail,
+                             EpgFinding.found_at)
+            .filter(EpgFinding.account_id.in_(account_ids))
+            .order_by(EpgFinding.account_id, EpgFinding.id))
+    for aid, sid, kind, subject, n, detail, at in rows:
+        if (aid, sid) not in reads:
+            continue
+        try:
+            parsed = json.loads(detail) if detail else {}
+        except ValueError:
+            log.warning('EPG finding for account %d and source %d: unreadable detail', aid, sid)
+            parsed = {}
+        out[aid].append((Finding(sid, kind, subject, n, parsed), at))
+    return out
+
+
+def _replace_findings(account_id: int, findings, now: datetime) -> None:
+    """Replace an account's rows. An account or source deleted while the check ran (it reads
+    first and writes per account, about 18 s apart on prod) gets none."""
+    @retry_on_locked()
+    def _replace_and_commit():
+        db.session.execute(delete(EpgFinding).where(EpgFinding.account_id == account_id))
+        alive = {sid for (sid,) in db.session.query(EpgSource.id).filter(
+            EpgSource.id.in_({f.source_id for f in findings}))} if findings else set()
+        if db.session.get(Account, account_id) is None:
+            alive = set()
+        kept = [f for f in findings if f.source_id in alive]
+        if kept:
+            db.session.bulk_insert_mappings(EpgFinding, [
+                {'account_id': account_id, 'source_id': f.source_id, 'kind': f.kind,
+                 'subject': f.subject, 'count': f.count,
+                 'detail': json.dumps(f.detail) if f.detail else None, 'found_at': now}
+                for f in kept])
+        db.session.commit()
+    _replace_and_commit()
+
+
+def check_findings(orders: dict, now: datetime) -> int:
+    """Find and store every account's findings. `orders` {account_id: [source_id]}. Each
+    account's rows are replaced in one retry_on_locked unit; reading and judging happen
+    before it. Returns how many were stored."""
+    from .config import load_config
+    from .epg_sources import (case_sensitive_matching, last_local_day, name_match_review,
+                              shared_ids)
+    from .tz_utils import get_display_tz
+    cs = case_sensitive_matching(load_config())
+    tz = get_display_tz()
+    source_ids = sorted({sid for order in orders.values() for sid in order})
+    proposals: dict[int, dict[int, list]] = {}
+    for source in EpgSource.query.filter(EpgSource.id.in_(source_ids)):
+        for p in name_match_review(source, cs).proposals:
+            proposals.setdefault(p.channel.account_id, {}).setdefault(source.id, []).append(p)
+    shared: dict[int, list] = {}
+    for f in shared_ids(source_ids, list(orders), cs):
+        shared.setdefault(f.account_id, []).append(f)
+    db.session.rollback()   # end the reads before the CPU work, so no snapshot is held
+    stored = 0
+    for aid in orders:
+        # Reach is judged by the local day a guide runs through, as the scorecard API judges
+        # it, so a finding and the channel's "best here" never name different sources.
+        card = account_scorecard(aid, tz, cs, with_channels=True,
+                                 day_of=lambda h: last_local_day(h, tz).isoformat())
+        db.session.rollback()
+        found = account_findings(card, proposals.get(aid, {}), shared.get(aid, []))
+        _replace_findings(aid, found, now)
+        stored += len(found)
+    return stored
+
+
 # ── The check that stores agreement ──────────────────────────────────────────
 
 def _held_listings(channel_ids, source_ids, now) -> dict[int, dict[int, list]]:
@@ -607,22 +885,25 @@ def _clear_unguided(account_id: int) -> None:
 
 
 def _clear_unread(account_ids) -> None:
-    """An account that reads no source any more keeps no agreement."""
+    """An account that reads no source any more keeps no agreement and no finding."""
     @retry_on_locked()
     def _clear_and_commit():
         accounts = select(Channel.id)
+        findings = delete(EpgFinding)
         if account_ids:
             accounts = accounts.where(Channel.account_id.notin_(account_ids))
+            findings = findings.where(EpgFinding.account_id.notin_(account_ids))
         db.session.execute(delete(EpgSourceAgreement).where(
             EpgSourceAgreement.channel_id.in_(accounts)))
+        db.session.execute(findings)
         db.session.commit()
     _clear_and_commit()
 
 
 def run_check(now: datetime | None = None) -> str:
     """One run over every account that reads an EPG source: the agreement of its sources,
-    stored. Takes a KIND_EPG_CHECK ticket; a refusal queues the next try. Returns a note for
-    the log."""
+    then its findings, stored. Takes a KIND_EPG_CHECK ticket; a refusal queues the next try.
+    Returns a note for the log."""
     from .scheduler import queue_epg_check
     ticket = admission.try_start(admission.KIND_EPG_CHECK, 'EPG sources')
     if not ticket.granted:
@@ -642,8 +923,10 @@ def run_check(now: datetime | None = None) -> str:
         db.session.rollback()
         _clear_unread(list(orders))
         judged = sum(check_account(aid, order, now) for aid, order in orders.items())
-        note = (f'EPG source check: {counted(judged, "channel and source pair")} compared over '
-                f'{counted(len(orders), "account")} in {time_mod.monotonic() - started:.1f} s.')
+        found = check_findings(orders, now)
+        note = (f'EPG source check: {counted(judged, "channel and source pair")} compared and '
+                f'{counted(found, "finding")} stored over {counted(len(orders), "account")} '
+                f'in {time_mod.monotonic() - started:.1f} s.')
         log.info(note)
         return note
     finally:

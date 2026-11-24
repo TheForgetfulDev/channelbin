@@ -56,6 +56,67 @@
     });
   };
 
+  // Accept all (dev/changelog/1718): every proposal the tab lists under its filters, not
+  // only this page's. The list is read when the button is pressed, counted in the confirm,
+  // and posted in chunks; the server checks each pick again, so a channel that stopped
+  // being proposed in the meantime is counted and left alone.
+  const ACCEPT_CHUNK = 500;
+  const acceptAll = async (btn) => {
+    const filters = new URL(location.href).searchParams;
+    const query = new URLSearchParams();
+    ['single', 'unguided'].forEach((k) => { if (filters.get(k) === '1') query.set(k, '1'); });
+    if (filters.get('account')) query.set('account', filters.get('account'));
+    let picks;
+    btn.disabled = true;
+    try {
+      picks = (await jsonFetch(`/api/epg-sources/${sourceId()}/name-matches?${query}`)).picks;
+    } catch (e) {
+      showToast(e.message, { type: 'error' });
+      btn.disabled = false;
+      return;
+    }
+    const n = picks.length;
+    if (!n) {
+      showToast('No name matches are proposed any more.');
+      await refreshPage();
+      return;
+    }
+    const ok = await confirmModal({
+      title: 'Accept all name matches',
+      message: `${n.toLocaleString()} channel${n === 1 ? '' : 's'} take the matched id as `
+        + `${n === 1 ? 'its' : 'their'} key for ${main().dataset.sourceName}.`,
+      confirmLabel: `Accept ${n.toLocaleString()}`,
+    });
+    if (!ok) {
+      btn.disabled = false;
+      return;
+    }
+    const label = btn.textContent;
+    const sum = { accepted: 0, waiting: 0, stale: 0 };
+    let failed = null;
+    for (let i = 0; i < n; i += ACCEPT_CHUNK) {
+      btn.textContent = `Accepting ${Math.min(i + ACCEPT_CHUNK, n).toLocaleString()} of ${n.toLocaleString()}...`;
+      try {
+        const data = await jsonFetch(api('accept'), {
+          method: 'POST', body: JSON.stringify({ picks: picks.slice(i, i + ACCEPT_CHUNK) }),
+        });
+        sum.accepted += data.accepted;
+        sum.waiting += data.waiting;
+        sum.stale += data.stale;
+      } catch (e) {
+        failed = e.message;
+        break;
+      }
+    }
+    const parts = [`Accepted ${sum.accepted.toLocaleString()} name match${sum.accepted === 1 ? '' : 'es'}.`];
+    if (sum.waiting) parts.push(`${sum.waiting.toLocaleString()} get their listings at the source's next refresh.`);
+    if (sum.stale) parts.push(`${sum.stale.toLocaleString()} were no longer proposed and were left alone.`);
+    if (failed) parts.push(`Stopped before the rest: ${failed}`);
+    showToast(parts.join(' '), { type: failed ? 'error' : undefined, durationMs: 10000 });
+    btn.textContent = label;
+    await refreshPage();
+  };
+
   document.addEventListener('change', (ev) => {
     const el = ev.target;
     if (!main() || !main().contains(el)) return;
@@ -83,6 +144,9 @@
         break;
       case 'reject':
         send(btn, api('reject'), { picks: [rowPick(tr)] });
+        break;
+      case 'accept-all':
+        acceptAll(btn);
         break;
       case 'accept-selected':
         send(btn, api('accept'), { picks: pickedRows().map(rowPick) });

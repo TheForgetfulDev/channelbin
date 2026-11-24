@@ -29,11 +29,13 @@ from ..config import load_config, config_default
 from ..database import (Account, AccountBlock, AccountLogin, AccountStatDay, Channel, Login,
                         AccountSyncLog, ChannelGroupMember, ChannelTest, EpgSource,
                         EpgSourceSubscription, SportsMatch,
-                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, ACCOUNT_STATUS_SYNCING,
+                        EPG_FINDING_ADDS_NOTHING, EPG_FINDING_BETTER_SOURCE, EPG_FINDING_NAME_MATCHES,
+                        EPG_FINDING_SHARED_ID, EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, ACCOUNT_STATUS_SYNCING,
                         ACCOUNT_STATUS_UNSYNCED, SYNC_LOG_SUCCESS, SYNC_LOG_CANCELLED,
                         SYNC_LOG_IMPORTED, HOST_CHECK_ANSWERS, HOST_CHECK_RESOLVES,
                         HOST_PROBE_LOOKUP, detach_channel_references)
 from ..db_utils import chunked, retry_on_locked
+from ..epg_scorecard import finding_text, recheck_soon, stored_findings
 from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, directory_row_summary,
                            case_sensitive_matching,
                            accept_name_matches, account_reach, account_sources_view,
@@ -507,16 +509,19 @@ def _account_detail_payload(account, cfg, stats):
     # cannot disagree.
     span = account_reach({s['id']: s['active_here'] for s in sources},
                          {s['id']: s['reach_day'] for s in sources})
-    # Ids the provider gives to channels whose names disagree (dev/changelog/1716), as a
-    # line under each source that has one; the list itself is the review page's.
-    shared: dict[int, list] = {}
-    for f in shared_ids([s['id'] for s in sources if s['subscribed']], [account.id],
-                        case_sensitive_matching(cfg)):
-        shared.setdefault(f.source_id, []).append(f)
+    # What the EPG check found this account could improve, as lines under each source
+    # (dev/changelog/1718). Stored by the check rather than worked out here: the shared-id
+    # half alone cost 0.5 s a page load on prod (dev/changelog/1716).
+    found_by_source: dict[int, list] = {}
+    names, h24 = {s['id']: s['name'] for s in sources}, is_24h()
+    for f, at in stored_findings([account.id])[account.id]:
+        line, tip = finding_text(f, names)
+        found_by_source.setdefault(f.source_id, []).append({
+            'line': line,
+            'tip': f'{tip}\nFound {format_local(at, "monthday_time", tz=tz, h24=h24)}.',
+            'warn': f.kind == EPG_FINDING_SHARED_ID, 'link': finding_link(f, account.id)})
     for s in sources:
-        found = shared.get(s['id'], [])
-        s['shared'] = ({'ids': [f.entry.xml_id for f in found],
-                        'channels': sum(len(f.wrong) for f in found)} if found else None)
+        s['findings'] = found_by_source.get(s['id'], [])
     return {
         'cur': stats['current'][account.id],
         'group_any': GROUP_ANY,
@@ -561,6 +566,22 @@ def _account_detail_payload(account, cfg, stats):
         'removed_channels_url': url_for('channels.channel_browser',
                                          **{'f.other': OTHER_REMOVED, 'f.acct': account.id}),
     }
+
+
+def finding_link(f, account_id: int) -> tuple[str, str] | None:
+    """(label, url) of the page where an account's EPG finding is acted on, or None where a
+    line says it in words (dev/changelog/1718). Name matches open on that account's
+    channels only, the ones the finding counts."""
+    if f.kind == EPG_FINDING_NAME_MATCHES:
+        return 'Review name matches', url_for('accounts.epg_source_review',
+                                              source_id=f.source_id, unguided='1',
+                                              account=account_id)
+    if f.kind == EPG_FINDING_SHARED_ID:
+        return 'Shared ids', url_for('accounts.epg_source_review', source_id=f.source_id,
+                                     view='shared')
+    if f.kind in (EPG_FINDING_BETTER_SOURCE, EPG_FINDING_ADDS_NOTHING):
+        return None
+    raise ValueError(f'unknown EPG finding kind {f.kind!r}')
 
 
 def _epg_source_schedule() -> dict:
@@ -1005,6 +1026,9 @@ def _delete_account_and_jobs(account_id):
                               readers, guided_elsewhere, outcome)
     if read_elsewhere:
         forget_reader(read_elsewhere)
+    if readers:
+        # Other accounts lost a source they read; their findings are re-found.
+        recheck_soon(f'account "{name}" deleted with sources other accounts read')
     if cached_paths:
         delete_cached_logos(cached_paths)
     if name is not None and screenshot_paths:
@@ -1876,6 +1900,7 @@ def delete_epg_source_api(account_id, source_id):
     remove_epg_source_jobs(source_id)
     done = delete_url_source(source_id, _case_sensitive())
     resolve_source_alerts(source_id)
+    recheck_soon(f'EPG source #{source_id} deleted')
     if readers:
         outcome = dict(db.session.query(Channel.id, Channel.epg_source_id).filter(
             Channel.id.in_(list(guided_elsewhere)))) if guided_elsewhere else {}
@@ -1918,6 +1943,7 @@ def stop_using_epg_source_api(account_id, source_id):
     done = stop_using_source(account_id, source_id, _case_sensitive())
     if done is None:
         return jsonify({'error': 'This account is not using that source.'}), 400
+    recheck_soon(f'account #{account_id} stopped using EPG source #{source_id}')
     from ..scheduler import schedule_epg_source_refresh
     schedule_epg_source_refresh(current_app._get_current_object(), source_id,
                                 force_reschedule=True)
@@ -1943,6 +1969,7 @@ def use_epg_source_again_api(account_id, source_id):
 
     if not _subscribe_and_commit():
         return jsonify({'error': 'This account already uses that source.'}), 400
+    recheck_soon(f'account #{account_id} uses EPG source #{source_id} again')
     from ..scheduler import schedule_epg_source_refresh
     schedule_epg_source_refresh(current_app._get_current_object(), source_id,
                                 force_reschedule=True)
@@ -1971,6 +1998,8 @@ def move_epg_source_api(account_id, source_id):
                        _case_sensitive())
     if done is None:
         return jsonify({'error': 'This account is not using that source.'}), 400
+    if done.moved:
+        recheck_soon(f'EPG source #{source_id} moved on account #{account_id}')
     name = db.session.get(EpgSource, source_id).name
     if not done.moved:
         return jsonify({'success': True, 'message': f'"{name}" is already '
@@ -2078,6 +2107,7 @@ def subscribe_epg_source_api(account_id):
     done = subscribe_to_source(account_id, source.id, _case_sensitive())
     if done is None:
         return jsonify({'error': 'This account already uses that source.'}), 400
+    recheck_soon(f'account #{account_id} reads EPG source #{source.id}')
     from ..scheduler import schedule_epg_source_refresh
     schedule_epg_source_refresh(current_app._get_current_object(), source.id,
                                 force_reschedule=True)
@@ -2142,13 +2172,11 @@ def epg_source_review(source_id):
         view = 'proposals'
     include_single = request.args.get('single') == '1'
     unguided_only = request.args.get('unguided') == '1'
+    only_account = request.args.get('account', type=int)
     page = max(request.args.get('page', 1, type=int) or 1, 1)
 
-    result = name_match_review(source, _case_sensitive(), include_single)
-    new = [p for p in result.proposals if p.kind == MATCH_NEW]
-    disagree = [p for p in result.proposals if p.kind == MATCH_DISAGREE]
-    if unguided_only:
-        new = [p for p in new if p.channel.epg_source_id is None]
+    result, new, disagree = _review_proposals(source, include_single, unguided_only,
+                                              only_account)
     rejected = rejected_name_matches(source_id)
     # One id shared by channels whose names disagree (dev/changelog/1716); counted for
     # the tab on every view, so it is computed whichever view is shown.
@@ -2194,8 +2222,43 @@ def epg_source_review(source_id):
                 'rejected': len(rejected), 'shared': len(shared)},
         ambiguous=result.ambiguous, single_hidden=result.single_hidden,
         include_single=include_single, unguided_only=unguided_only,
+        only_account=only_account,
+        only_account_name=account_names.get(only_account) if only_account else None,
         refreshed=has_directory(source.id), has_upcoming=has_upcoming,
         can_refresh=source.kind == EPG_SOURCE_URL and source.enabled)
+
+
+def _review_proposals(source, include_single: bool, unguided_only: bool,
+                      account_id: int | None = None):
+    """(NameMatchResult, proposals, disagreements) as the review page lists them: the
+    page and Accept all read this one filter, so what is accepted is what was listed.
+    `account_id` keeps one reading account's channels, the set an account's finding counts
+    (dev/changelog/1718)."""
+    result = name_match_review(source, _case_sensitive(), include_single)
+    mine = [p for p in result.proposals
+            if account_id is None or p.channel.account_id == account_id]
+    new = [p for p in mine if p.kind == MATCH_NEW]
+    disagree = [p for p in mine if p.kind == MATCH_DISAGREE]
+    if unguided_only:
+        new = [p for p in new if p.channel.epg_source_id is None]
+    return result, new, disagree
+
+
+@accounts_bp.route('/api/epg-sources/<int:source_id>/name-matches', methods=['GET'])
+def name_match_picks_api(source_id):
+    """Every proposal the Proposals tab lists under `single` and `unguided`, as picks, for
+    Accept all (dev/changelog/1718). The page counts them in its confirm and posts them in
+    chunks to the accept endpoint, which checks each again: the ids a person was shown
+    are what is applied, never a match worked out at write time (DESIGN-epg-sources.md
+    §16)."""
+    source, err = _review_source_or_error(source_id)
+    if err:
+        return err
+    _result, new, _disagree = _review_proposals(source, request.args.get('single') == '1',
+                                                request.args.get('unguided') == '1',
+                                                request.args.get('account', type=int))
+    return jsonify({'success': True, 'picks': [
+        {'channel_id': p.channel.id, 'xml_id': p.entry.xml_id} for p in new]})
 
 
 def _shared_row_view(finding, account_names, source_names, tz, h24) -> dict:
@@ -2244,6 +2307,8 @@ def accept_name_matches_api(source_id):
     if busy:
         return jsonify({'error': refresh_busy_message(busy)}), 409
     done = accept_name_matches(source, picks, _case_sensitive())
+    if done.applied:
+        recheck_soon(f'name matches accepted on EPG source #{source_id}')
     parts = [f'Accepted {done.applied:,} name match{"es" if done.applied != 1 else ""}.']
     if done.waiting:
         when = ('at its next refresh - Refresh now fetches it now'
@@ -2264,6 +2329,8 @@ def reject_name_matches_api(source_id):
     if not picks:
         return jsonify({'error': 'Nothing selected.'}), 400
     done = reject_name_matches(source, picks, _case_sensitive())
+    if done.applied:
+        recheck_soon(f'name matches rejected on EPG source #{source_id}')
     msg = f'Rejected {done.applied:,}. They will not be proposed again.'
     if done.stale:
         msg += f' {done.stale:,} were no longer proposed and were left alone.'
@@ -2297,6 +2364,8 @@ def ignore_shared_id_api(source_id):
     if busy:
         return jsonify({'error': refresh_busy_message(busy)}), 409
     done = ignore_shared_id(source_id, account_id, xml_id, ids, _case_sensitive())
+    if done.applied:
+        recheck_soon(f'a shared id stopped on EPG source #{source_id}')
     parts = [f'Stopped using {xml_id} for {done.applied:,} '
              f'channel{"s" if done.applied != 1 else ""}. Name matches may now suggest '
              'the right id for them.']
@@ -2321,6 +2390,8 @@ def propose_again_api(source_id):
     if not ids:
         return jsonify({'error': 'Nothing selected.'}), 400
     n = propose_again(source_id, ids)
+    if n:
+        recheck_soon(f'name matches proposed again on EPG source #{source_id}')
     return jsonify({'success': True, 'count': n,
                     'message': f'{n:,} channel(s) will be proposed again if their names '
                                'still match.'})
