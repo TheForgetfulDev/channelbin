@@ -241,6 +241,46 @@ class ThreeMoreColumnsTests(_Base):
         self.assertIsNotNone(db.session.get(EpgScanScheduleChannel, scan_id))
 
 
+class SourceListingTests(_Base):
+    """BUGS.md 2026-11-23 @ 11:54:37 PM: recordings.source_channel_id kept a deleted channel's id,
+    which SQLite re-issues to the next channel a sync creates."""
+
+    def _made_from(self, status):
+        ch = seed.make_channel(self.account, stream_id=7, name='Gone')
+        db.session.commit()
+        rec = seed.make_recording(status=status, channel_id=self.kept.id, name='Game')
+        rec.source_channel_id = ch.id
+        db.session.commit()
+        return ch.id, rec.id
+
+    def test_the_account_delete_clears_a_scheduled_recordings_source(self):
+        from app.database import REC_STATUS_SCHEDULED
+        from app.routes.accounts import _delete_account_and_jobs
+        channel_id, rec_id = self._made_from(REC_STATUS_SCHEDULED)
+        _delete_account_and_jobs(self.account.id)
+        db.session.expire_all()
+        rec = db.session.get(Recording, rec_id)
+        self.assertIsNone(db.session.get(Channel, channel_id))
+        self.assertIsNone(rec.source_channel_id)
+        self.assertEqual(rec.channel_id, self.kept.id, 'the channel it records from is untouched')
+
+    def test_the_helper_clears_it_on_a_running_and_a_finished_recording_only_for_its_ids(self):
+        from app.database import detach_channel_references
+        gone_id, live_id = self._made_from(REC_STATUS_IN_PROGRESS)
+        done = seed.make_recording(status=REC_STATUS_COMPLETED, channel_id=self.kept.id, name='Done')
+        done.source_channel_id = gone_id
+        other = seed.make_recording(status=REC_STATUS_COMPLETED, channel_id=self.kept.id, name='Other')
+        other.source_channel_id = self.kept.id
+        db.session.commit()
+        done_id, other_id = done.id, other.id
+        detach_channel_references([gone_id])
+        db.session.commit()
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(Recording, live_id).source_channel_id)
+        self.assertIsNone(db.session.get(Recording, done_id).source_channel_id)
+        self.assertEqual(db.session.get(Recording, other_id).source_channel_id, self.kept.id)
+
+
 class HelperTests(_Base):
     def test_other_channels_rows_are_left_alone(self):
         """A characterization of the helper's scope, not a guard of the defect."""

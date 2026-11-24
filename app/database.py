@@ -1792,8 +1792,9 @@ CHANNEL_NEEDING_STATUSES = (REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_ST
 def detach_channel_references(channel_ids) -> int:
     """Unlink the history rows that name a channels.id and outlive the channel: a recording
     whose capture is over, that recording's segments, a group's event, an auto-record rule's
-    ledger row and a Recent plays line. The EPG similarity scan's per-channel rows are
-    deleted, having nothing of their own to keep. Returns how many recordings were unlinked.
+    ledger row, a Recent plays line and any recording's source listing. The EPG similarity
+    scan's per-channel rows are deleted, having nothing of their own to keep. Returns how many
+    recordings were unlinked.
 
     Mutates without committing, like detach_recording_references above: both channel delete
     paths call it inside the closure that deletes the rows. `channel_ids` is one chunk, sized
@@ -1829,6 +1830,14 @@ def detach_channel_references(channel_ids) -> int:
         Recording.channel_id.in_(ids),
         Recording.status.notin_(CHANNEL_NEEDING_STATUSES),
     ).update({'channel_id': None}, synchronize_session=False)
+    # The listing a recording was made from, whatever the recording's status: it is read only
+    # to ask which game a group recording is of (sports_match.recording_game,
+    # sports_data.recording_matches), and a re-issued id would answer with a stranger's
+    # listing at the same start time. NULL
+    # is "no source", which records from every member as before migration 144
+    # (dev/docs/BUGS.md 2026-11-23).
+    Recording.query.filter(Recording.source_channel_id.in_(ids)).update(
+        {'source_channel_id': None}, synchronize_session=False)
     RecordingSegment.query.filter(
         RecordingSegment.channel_id.in_(ids), RecordingSegment.recording_id.notin_(live),
     ).update({'channel_id': None}, synchronize_session=False)

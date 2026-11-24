@@ -1444,7 +1444,7 @@ def stop_host_checks_api():
     """Stop checking: empty the line. A check already running finishes."""
     n = host_checks.stop()
     return jsonify({'success': True, 'stopped': n,
-                    'message': (f'Stopped. {n} host{"s" if n != 1 else ""} left unchecked.'
+                    'message': (f'Stopped. {n} {plural(n, "host")} left unchecked.'
                                 if n else 'Nothing was waiting to be checked.')})
 
 
