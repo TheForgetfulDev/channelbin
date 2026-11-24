@@ -3,6 +3,23 @@
 Before you start reading the code, see [docs/CONVENTIONS.md](docs/CONVENTIONS.md) - it explains the
 documents that comments and test docstrings cite, which are not part of this repository.
 
+## How `main` and releases work
+
+`main` is current development. It moves after each piece of work I finish, often several times a
+day, so it can hold changes that are not in a release yet. Releases are the `vX.Y.Z` tags, and
+the GitHub Releases and Docker images are built from those. If you are running ChannelBin,
+install a release, not `main`.
+
+Most commits on `main` come from the private repo I develop in. Each arrives as a pull request
+titled after the change it carries, and merges itself once the tests pass.
+
+## Pull requests
+
+Open your pull request against `main`. The tests run on it like on any other, and I review it
+here. If I take it, I merge it here, so the commit on `main` is yours, with your name on it. I
+then bring the same change into my development repo so that it stays on `main` from then on.
+Until that is done, nothing else is synced over it.
+
 ## Commit messages
 
 Commits use [Conventional Commits](https://www.conventionalcommits.org/): a `type:` prefix
@@ -70,5 +87,5 @@ own docstring for the pre-1.0 vs. post-1.0 convention, which this document doesn
 Every published release gets a git tag matching the version at the time of publish
 (`v0.3.0`, etc.). A release is never left untagged, and a tag is never reused - if you're
 preparing a release, bump `app/version.py` first. The publish tooling enforces this: it
-refuses to publish if the current version's tag already exists, rather than silently skipping
-the tag or double-tagging a commit.
+refuses to release a version whose tag already exists, rather than silently skipping the tag
+or double-tagging a commit.
