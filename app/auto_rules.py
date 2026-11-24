@@ -50,6 +50,7 @@ from .database import (
     detach_recording_references,
 )
 from .db_utils import retry_on_locked
+from .epg_sources import latest_listing_start
 from .fmt_utils import counted, iso_seconds_or_none
 from .program_titles import title_key
 
@@ -593,21 +594,12 @@ class _Reach:
 
 def _guide_reach() -> _Reach:
     """The latest listing start per EPG source that wins at least one channel, and across the
-    whole guide. Two index reads per source: the listing that ends last fixes a lower bound
-    on the latest start, and only listings ending after that bound can start later - so the
-    exact answer reads the guide's last few hours, not the whole table (a GROUP BY over it
-    measured 2.6s on 340,678 listings)."""
+    whole guide - the latest single listing, because the question is how far a rule can
+    schedule. Two index reads per source (epg_sources.latest_listing_start()). The pages'
+    "guide reaches" asks where most channels end instead (epg_sources.source_reach())."""
     winning = [sid for (sid,) in db.session.query(Channel.epg_source_id).filter(
         Channel.epg_source_id.isnot(None)).distinct()]
-    by_source = {}
-    for sid in winning:
-        last = db.session.query(EPGEntry.start_time).filter(
-            EPGEntry.source_id == sid).order_by(EPGEntry.stop_time.desc()).limit(1).scalar()
-        if last is None:
-            by_source[sid] = None
-            continue
-        by_source[sid] = db.session.query(func.max(EPGEntry.start_time)).filter(
-            EPGEntry.source_id == sid, EPGEntry.stop_time >= last).scalar()
+    by_source = {sid: latest_listing_start(sid) for sid in winning}
     guide_wide = db.session.query(func.max(EPGEntry.start_time)).scalar()
     return _Reach(by_source=by_source, guide_wide=guide_wide)
 

@@ -255,6 +255,37 @@ class PictureEndTests(_Engine):
         self.assertEqual(small.failed_ids, set(), 'the channel did not fail')
         self.assertFalse(feed._internal.get(small.session.id if small.session else '', None))
 
+    def test_a_stopped_sessions_pane_never_overwrites_a_newer_one(self):
+        """dev/docs/BUGS.md 2026-11-24 @ 10:11:43 AM: ended() names a stopped session's pane
+        after letting the lock go. An ask that lands in that gap names what is next ("taken"),
+        and the reaper's older "reconnecting" must not replace it. Forced here by running the
+        ask from inside ended()'s pane_words call, which is in that gap."""
+        self.combined()
+        _big, small = self.pictures()
+        real, real_ended = engine.pip_channels.pane_words, engine.Picture.ended
+        ran, done = [], []
+
+        def words(pane, *a, **kw):
+            if pane.state == pip.PANE_RECONNECTING and not ran:
+                ran.append(True)
+                small._set_pane(pip.Pane(pip.PANE_TAKEN, pane.source, pane.name,
+                                         why='recording 9 took the connection'))
+            return real(pane, *a, **kw)
+
+        def ended(picture):
+            collected = real_ended(picture)
+            if collected and picture is small:
+                done.append(True)
+            return collected
+
+        with mock.patch.object(engine.pip_channels, 'pane_words', words), \
+                mock.patch.object(engine.Picture, 'ended', ended):
+            feed._finish(small.session, feed.REASON_FFMPEG_EXITED, detail='ffmpeg exited with code 1')
+            self.assertTrue(wait_for(lambda: done, 10), 'the reaper collected the session')
+        self.assertTrue(ran)
+        self.assertEqual(small.pane.state, pip.PANE_TAKEN)
+        self.assertEqual(small.words[0], real(small.pane)[0])
+
 
 class BuildFailureTests(_Engine):
     def test_a_combiner_that_cannot_be_spawned_drops_the_play_to_the_big_picture_alone(self):

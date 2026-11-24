@@ -176,7 +176,10 @@ Sync cancelled before it finished.
     <span class="a-nums">
       <span class="a-num"><span class="a-k">Channels</span>{{ '{:,}'.format(account.channel_count or 0) }}{% if account.hidden_channel_count %}<span class="a-note">{{ m.hidden_channels_link(account.hidden_channel_count) }}</span>{% endif %}</span>
       <span class="a-num"><span class="a-k">In guide</span>{{ '{:,}'.format(guide_counts.get(account.id, 0)) }}</span>
-      <span class="a-num"><span class="a-k">Programs</span>{{ '{:,}'.format(account.epg_entry_count or 0) }}</span>
+      {# The one date the column has room for; the whole span is in the tooltip
+         (dev/changelog/1714). #}
+      {% set gr = guide_reach.get(account.id) %}
+      <span class="a-num"><span class="a-k">Programs</span>{{ '{:,}'.format(account.epg_entry_count or 0) }}{% if gr %}<span class="a-note tip-plain" data-tip="Guide reaches.&#10;{% if gr.most.ran_out %}The guide most of this account's channels read ran out {{ gr.most.inline }}.{% else %}Most of this account's channels have listings through {{ gr.most.inline }}.{% endif %}{% if gr.span.text != gr.most.text %} Its channels take their guide from sources that run out on different days: {{ gr.span.inline }}. The account's EPG sources card has each one.{% endif %}">{{ 'ran out' if gr.date.ran_out else 'to' }} {{ gr.date.inline }}</span>{% endif %}</span>
       <span class="a-num"><span class="a-k">Next sync</span>{{ m.account_next_sync(account, next_sync[account.id]) }}</span>
     </span>
     {# The trailing cell keeps its own class even though it holds one button, or it takes

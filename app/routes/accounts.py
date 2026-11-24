@@ -36,7 +36,8 @@ from ..database import (Account, AccountBlock, AccountLogin, AccountStatDay, Cha
 from ..db_utils import chunked, retry_on_locked
 from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, directory_row_summary,
                            case_sensitive_matching,
-                           accept_name_matches, account_sources_view,
+                           accept_name_matches, account_reach, account_sources_view,
+                           accounts_reach, reach_words,
                            add_url_source, borrowable_sources, clean_url_source_fields,
                            delete_sources_for_account, delete_url_source,
                            ensure_provider_source, foreign_guided_channels, foreign_readers, has_directory,
@@ -212,8 +213,16 @@ def accounts_list():
     # separately-queried total that disagreed with the visible rows would be worse than none.
     total_channels = sum(a.channel_count or 0 for a in accounts)
     total_hidden_channels = sum(a.hidden_channel_count or 0 for a in accounts)
+    tz, now = get_display_tz(), datetime.utcnow()
+    # The row's Programs cell has room for one date: the day most of the account's channels
+    # reach. The tooltip carries the whole span.
+    guide_reach = {aid: {'date': reach_words((r.most, r.most), now, tz, with_days=False),
+                         'most': reach_words((r.most, r.most), now, tz),
+                         'span': reach_words(r, now, tz)}
+                   for aid, r in accounts_reach(account_ids, tz).items()}
     return render_template(
         'accounts.html',
+        guide_reach=guide_reach,
         accounts=accounts,
         next_sync=next_sync,
         sync_prompts=_sync_prompts(accounts, next_sync, cfg),
@@ -491,6 +500,12 @@ def _account_detail_payload(account, cfg, stats):
                              AccountSyncLog.status.in_(SYNC_LOG_IMPORTED))
                      .order_by(AccountSyncLog.started_at.desc())
                      .first())
+    tz, now = get_display_tz(), datetime.utcnow()
+    sources = account_sources_view(account.id, _epg_source_schedule(), tz, now)
+    # From the card's own rows, so the Content card's date and the sources it is made of
+    # cannot disagree.
+    span = account_reach({s['id']: s['active_here'] for s in sources},
+                         {s['id']: s['reach_day'] for s in sources})
     return {
         'cur': stats['current'][account.id],
         'group_any': GROUP_ANY,
@@ -522,7 +537,8 @@ def _account_detail_payload(account, cfg, stats):
         'endpoint': mask_url_path(account.base_url if (account.account_type or 'm3u') == 'xtream'
                                   else account.m3u_url),
         'stream_host_differs': _stream_host_differs(account),
-        'epg_sources': account_sources_view(account.id, _epg_source_schedule()),
+        'epg_sources': sources,
+        'guide_reach': reach_words(span, now, tz),
         'source_hours_choices': REFRESH_HOURS_CHOICES,
         # The filtered channel-browser links the new/missing counts point at. These were also
         # the deep-link targets of the SYNC_CHANNELS_NEW/SYNC_CHANNELS_MISSING alerts until

@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
@@ -28,6 +28,7 @@ from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_KEY_CHANGED,
                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, EPG_STATUS_FAILED, EPG_STATUS_OK,
                        EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED)
 from .db_utils import chunked, retry_on_locked
+from .fmt_utils import counted, plural
 from .program_titles import strip_marks
 
 log = logging.getLogger(__name__)
@@ -983,10 +984,23 @@ def refresh_source_counts(source_id: int, covered_channels: int | None = None) -
 
 def active_counts_by_account(account_id: int) -> dict[int, int]:
     """{source_id: channels on this account whose guide comes from it}. One grouped query."""
-    rows = (db.session.query(Channel.epg_source_id, func.count(Channel.id))
-            .filter(Channel.account_id == account_id, Channel.epg_source_id.isnot(None))
-            .group_by(Channel.epg_source_id))
-    return dict(rows)
+    return active_counts_by_accounts([account_id]).get(account_id, {})
+
+
+def active_counts_by_accounts(account_ids) -> dict[int, dict[int, int]]:
+    """{account_id: active_counts_by_account()} for several accounts in one grouped query
+    (0.14s over prod's 136,130 channels). An account guiding nothing has no entry."""
+    account_ids = [a for a in account_ids if a is not None]
+    if not account_ids:
+        return {}
+    out: dict[int, dict[int, int]] = {}
+    for aid in chunked(account_ids, 500):
+        rows = (db.session.query(Channel.account_id, Channel.epg_source_id, func.count(Channel.id))
+                .filter(Channel.account_id.in_(aid), Channel.epg_source_id.isnot(None))
+                .group_by(Channel.account_id, Channel.epg_source_id))
+        for account_id, sid, n in rows:
+            out.setdefault(account_id, {})[sid] = n
+    return out
 
 
 def delete_sources_for_account(account_id: int) -> None:
@@ -1764,10 +1778,234 @@ def refresh_busy_message(names, then: str = 'Try again once the refresh has fini
     return f'"{names[0]}" is being refreshed right now. {then}'
 
 
-def account_sources_view(account_id: int, schedule: dict | None = None) -> list[dict]:
+# ---------------------------------------------------------------------------
+# How far ahead a guide reaches (dev/changelog/1714)
+# ---------------------------------------------------------------------------
+
+class Reach(NamedTuple):
+    """How far ahead one source's listings run, in local days. `day` is the last day the
+    typical channel's listings run through - the median, so at least half its channels reach
+    it - because the single latest listing is one channel's: on prod 3,570 of a provider's
+    channels ended Nov 25 and one ran to Nov 29. `latest` is that furthest day and `later`
+    how many channels run past `day`. `days` is ((day, channels), ...) latest first, counted
+    over every channel in the source's directory, so a percentage of it is a share of the
+    guide file, not of any one account's channels. A source with no directory is measured
+    from the listings it holds: `from_directory` is False and `days` is empty."""
+    day: date
+    latest: date
+    later: int
+    channels: int
+    days: tuple
+    from_directory: bool
+
+
+def latest_listing_start(source_id: int) -> datetime | None:
+    """The latest listing start the guide holds from this source. Two index reads: the
+    listing that ends last fixes a lower bound on the latest start, and only listings ending
+    after that bound can start later - so the exact answer reads the guide's last few hours,
+    not the whole table (a GROUP BY over it measured 2.6s on 340,678 listings)."""
+    last = db.session.query(EPGEntry.start_time).filter(
+        EPGEntry.source_id == source_id).order_by(EPGEntry.stop_time.desc()).limit(1).scalar()
+    if last is None:
+        return None
+    return db.session.query(func.max(EPGEntry.start_time)).filter(
+        EPGEntry.source_id == source_id, EPGEntry.stop_time >= last).scalar()
+
+
+def to_local_date(dt: datetime, tz) -> date:
+    from .tz_utils import to_local
+    return to_local(dt, tz).date()
+
+
+def _last_local_day(until: datetime, tz) -> date:
+    # A listing ending at midnight leaves the next day empty: the day it runs through is the
+    # one before.
+    return to_local_date(until - timedelta(seconds=1), tz)
+
+
+def reach_from_horizons(horizons, tz) -> Reach | None:
+    """Reach from [(horizon_until, channels), ...] - pure. None when there is nothing."""
+    per_day: dict[date, int] = {}
+    for until, n in horizons:
+        if until is None or not n:
+            continue
+        day = _last_local_day(until, tz)
+        per_day[day] = per_day.get(day, 0) + n
+    if not per_day:
+        return None
+    total = sum(per_day.values())
+    seen, median = 0, None
+    for day in sorted(per_day):
+        seen += per_day[day]
+        if seen * 2 >= total:
+            median = day
+            break
+    days = tuple(sorted(per_day.items(), reverse=True))
+    later = sum(n for d, n in per_day.items() if d > median)
+    return Reach(median, days[0][0], later, total, days, True)
+
+
+def source_reach(source_ids, tz) -> dict[int, Reach]:
+    """{source_id: Reach} in one grouped directory read, whatever the source count; a source
+    with no directory adds latest_listing_start()'s two reads. A source whose directory rows
+    have all run out (retire_expired_listings() zeroes their counts) has no entry.
+
+    Grouped by the hour of `horizon_until` and each group's latest instant taken, so the
+    rows read are a few hundred, not the directory's 76,016 (measured 0.1s on prod). A
+    half-hour timezone can put a group's earliest channel on the day before its latest; it
+    is counted with the latest."""
+    ids = sorted({s for s in source_ids if s is not None})
+    if not ids:
+        return {}
+    hour = func.substr(EpgSourceChannel.horizon_until, 1, 13)
+    rows = (db.session.query(EpgSourceChannel.source_id, func.max(EpgSourceChannel.horizon_until),
+                             func.count(EpgSourceChannel.id))
+            .filter(EpgSourceChannel.source_id.in_(ids), EpgSourceChannel.entry_count > 0,
+                    EpgSourceChannel.horizon_until.isnot(None))
+            .group_by(EpgSourceChannel.source_id, hour))
+    horizons: dict[int, list] = {}
+    for sid, until, n in rows:
+        horizons.setdefault(sid, []).append((until, n))
+    out = {}
+    for sid, values in horizons.items():
+        reach = reach_from_horizons(values, tz)
+        if reach is not None:
+            out[sid] = reach
+    for sid in sources_without_directory([s for s in ids if s not in horizons]):
+        start = latest_listing_start(sid)
+        if start is not None:
+            day = to_local_date(start, tz)
+            out[sid] = Reach(day, day, 0, 0, (), False)
+    return out
+
+
+class AccountReach(NamedTuple):
+    """An account's guide reach from the sources that guide its channels: `first` and `last`
+    are the shortest and longest of their typical days, `most` the day at least half of the
+    account's guided channels reach, each counted at its source's typical day - the one date
+    a list row has room for."""
+    first: date
+    last: date
+    most: date
+
+
+def account_reach(active: dict, days: dict) -> AccountReach | None:
+    """AccountReach for one account - `active` is {source_id: channels guided from it here},
+    `days` {source_id: Reach.day}. A source the account reads that guides none of its
+    channels says nothing about its guide."""
+    found = sorted((days[sid], n) for sid, n in active.items()
+                   if n and days.get(sid) is not None)
+    if not found:
+        return None
+    total, seen, most = sum(n for _d, n in found), 0, found[-1][0]
+    for day, n in found:
+        seen += n
+        if seen * 2 >= total:
+            most = day
+            break
+    return AccountReach(found[0][0], found[-1][0], most)
+
+
+def accounts_reach(account_ids, tz) -> dict[int, AccountReach]:
+    """{account_id: account_reach()} for a list page: two grouped queries whatever the
+    account count, plus source_reach()'s reads for a source with no directory."""
+    active = active_counts_by_accounts(account_ids)
+    reach = source_reach({sid for counts in active.values() for sid in counts}, tz)
+    days = {sid: r.day for sid, r in reach.items()}
+    out = {}
+    for aid, counts in active.items():
+        span = account_reach(counts, days)
+        if span is not None:
+            out[aid] = span
+    return out
+
+
+def _days_ahead(day: date, today: date) -> str:
+    ahead = (day - today).days
+    return f'{ahead:,} days' if ahead >= 2 else ''
+
+
+_RELATIVE_DAYS = ('Today', 'Tomorrow', 'Yesterday')
+
+
+def reach_words(span, now: datetime, tz, with_days: bool = True) -> dict | None:
+    """{'ran_out': bool, 'text': ..., 'inline': ...} for a (first, last, ...) day span:
+    'Fri Nov 28 (4 days)', 'Tue Nov 25 - Thu Nov 27 (up to 3 days)', or the day it ran out
+    when even the longest is behind today. `inline` is `text` for the middle of a sentence
+    ("guide to tomorrow"); `with_days=False` leaves out the count, for a cell with room for
+    a date only. None for no span."""
+    from .tz_utils import date_label
+    if span is None:
+        return None
+    first, last = span[0], span[1]
+    today = to_local_date(now, tz)
+    if last < today:
+        text, ran_out = date_label(last, now, tz), True
+    else:
+        ahead, ran_out = (_days_ahead(last, today) if with_days else ''), False
+        if first == last:
+            text = date_label(last, now, tz) + (f' ({ahead})' if ahead else '')
+        else:
+            text = (f'{date_label(first, now, tz)} - {date_label(last, now, tz)}'
+                    + (f' (up to {ahead})' if ahead else ''))
+    return {'ran_out': ran_out, 'text': text, 'inline': _inline(text)}
+
+
+def _inline(text: str) -> str:
+    for word in _RELATIVE_DAYS:
+        text = text.replace(word, word.lower())
+    return text
+
+
+def _share(n: int, total: int) -> str:
+    pct = n * 100 / total
+    return '<1%' if 0 < pct < 1 else f'{round(pct)}%'
+
+
+def reach_breakdown(reach: Reach, now: datetime, tz) -> str:
+    """The Reaches cell's tooltip: the source's channels by the last day their listings run
+    through, latest first, days already behind today counted together."""
+    from .tz_utils import date_label
+    if not reach.from_directory:
+        return ('Measured from the listings it holds.\nIt has not refreshed successfully yet, '
+                'so there is no directory to count its channels from.')
+    today = to_local_date(now, tz)
+    lines = [f'{counted(reach.channels, "channel")} in this guide, by the last day their '
+             'listings run through.']
+    gone = 0
+    for day, n in reach.days:
+        if day < today:
+            gone += n
+            continue
+        ahead = _days_ahead(day, today)
+        when = date_label(day, now, tz) + (f' ({ahead})' if ahead else '')
+        lines.append(f'{when}: {n:,} ({_share(n, reach.channels)})')
+    if gone:
+        lines.append(f'Already ran out: {gone:,} ({_share(gone, reach.channels)})')
+    return '\n'.join(lines)
+
+
+def source_reach_view(reach: Reach | None, now: datetime, tz) -> dict | None:
+    """What a sources-card row shows of a source's reach: the typical day, a line for the
+    channels that run past it, and the tooltip's breakdown."""
+    from .tz_utils import date_label
+    if reach is None:
+        return None
+    later = None
+    if reach.later and reach.latest > reach.day:
+        later = (f'{counted(reach.later, "channel")} {plural(reach.later, "runs", "run")} later, to '
+                 f'{_inline(date_label(reach.latest, now, tz))}')
+    return {'words': reach_words((reach.day, reach.day), now, tz), 'later': later,
+            'tip': reach_breakdown(reach, now, tz)}
+
+
+def account_sources_view(account_id: int, schedule: dict | None = None, tz=None,
+                         now: datetime | None = None) -> list[dict]:
     """The Sources card's rows (DESIGN-epg-sources.md §9.2): every source the account
     subscribes to, in priority order, then any source it owns and has stopped using (so
-    Use again has a row to sit on). Four queries whatever the count. A `url` source's
+    Use again has a row to sit on). A fixed number of queries whatever the count; `reach` is
+    source_reach_view() and `reach_day` the source's typical last day, from which the
+    account's own span is account_reach() over the rows. A `url` source's
     address is account-owned and secret in full, so it is masked whole. `ran_out_note` is
     the sentence for a source whose listings, kept through failed refreshes, have passed
     in whole or in part (retire_expired_listings()), else None.
@@ -1791,6 +2029,11 @@ def account_sources_view(account_id: int, schedule: dict | None = None) -> list[
         readers.setdefault(fr.source_id, []).append(fr)
     listed = [(sub.source, sub.priority) for sub in subs] + [(s, None) for s in idle]
     ran_out = ran_out_states(s.id for s, _priority in listed)
+    if tz is None:
+        from .tz_utils import get_display_tz
+        tz = get_display_tz()
+    now = now or datetime.utcnow()
+    reach = source_reach([s.id for s, _priority in listed], tz)
     rows = []
     for s, priority in listed:
         badge, label = STATUS_DISPLAY.get(s.last_status, STATUS_DISPLAY[None])
@@ -1809,6 +2052,8 @@ def account_sources_view(account_id: int, schedule: dict | None = None) -> list[
             'entry_count': s.entry_count or 0, 'channel_count': s.channel_count or 0,
             'active_here': active_here.get(s.id, 0),
             'ran_out_note': RAN_OUT_NOTES.get(ran_out.get(s.id)),
+            'reach': source_reach_view(reach.get(s.id), now, tz),
+            'reach_day': reach[s.id].day if s.id in reach else None,
             'readers': [{'id': fr.account_id, 'name': fr.account_name, 'guided': fr.guided}
                         for fr in readers.get(s.id, [])],
         })
