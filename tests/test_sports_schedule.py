@@ -827,6 +827,25 @@ class AddingALeagueTests(SportsCase):
         self.assertEqual(sports_data.parse_entry('https://www.thesportsdb.com/player/1-X')[0], 'badlink')
         self.assertEqual(sports_data.parse_entry('https://example.test/x')[0], 'badlink')
 
+    def test_text_that_is_not_text_is_refused_with_no_call(self):
+        """dev/docs/BUGS.md 2026-11-23 @ 11:15:56 PM: a number, a list or an object for `text` raised
+        in parse_entry and answered 500."""
+        calls = len(self.fake.calls)
+        for bad in (5, ['NFL'], {'a': 1}, True):
+            r = self.post(text=bad)
+            self.assertEqual(r.status_code, 400, bad)
+            self.assertIn('Type a league', r.get_json()['error'])
+        self.assertEqual(len(self.fake.calls), calls)
+
+    def test_a_league_number_that_is_not_a_number_is_refused_and_nothing_is_followed(self):
+        """dev/docs/BUGS.md 2026-11-23 @ 11:15:56 PM: a list or an object for `tsdb_id` is unhashable,
+        and the lookup of what was checked raised and answered 500."""
+        for bad in ([4391], {'id': 4391}, '4391', True, None, 4391.5):
+            r = self.client.post('/api/sports/leagues', json={'tsdb_id': bad})
+            self.assertEqual(r.status_code, 409, bad)
+            self.assertIn('Look that league up again', r.get_json()['error'])
+        self.assertEqual(SportsFollow.query.count(), 0)
+
     def test_a_link_to_something_else_names_both_shapes_with_no_call(self):
         r = self.post(text='https://www.thesportsdb.com/player/1-X')
         self.assertEqual(r.status_code, 400)
