@@ -932,11 +932,22 @@ def _nearest_alone(events: list, start: datetime):
     return near[0] if len(near) == 1 else None
 
 
+def _race_number(text: str) -> int | None:
+    """The race a normalized name numbers, `Race 35`, or None."""
+    found = _RACE_NUMBER.search(text)
+    return int(found.group(1)) if found else None
+
+
 def _race_hit(row, lt: LeagueText, events: list, kinds: dict):
     """(event, strength, why) for a listing that names no session, or None. Only a race is ever its
-    event, but one that does not name the race is matched only when the race is the one event of any
-    kind in its band: `Formula 1` on qualifying day is as likely the qualifying, and a race-day replay
-    of another race is not a practice's (dev/changelog/1633)."""
+    event. One that does not name the race in full is matched by the race's number when it gives one
+    (`Supercars: Race 35`), and never to a race with another number. One that gives neither is matched
+    when the race is the one event of any kind in its band: `Formula 1` on qualifying day is as likely
+    the qualifying, and a race-day replay of another race is not a practice's (dev/changelog/1633).
+    On a weekend of races on consecutive days every race-time listing sits in several races' bands,
+    so there it goes to the race whose start is nearest it, within OFF_LIMIT and alone, and only one
+    still on the air when that race starts: the grid show before it names the weekend too
+    (dev/changelog/1712)."""
     banded = [e for e in events if _band(e)[0] <= row.start < _band(e)[1]]
     in_band = [e for e in banded if kinds[e.id].kind == SESSION_RACE]
     if not in_band:
@@ -946,15 +957,34 @@ def _race_hit(row, lt: LeagueText, events: list, kinds: dict):
     if agreeing:
         event = min(agreeing, key=lambda e: abs(row.start - _anchor(e)))
         return event, SPORTS_MATCH_STRONG, 'Matched on the series and the date, and the listing names this race.'
-    if len(banded) != 1:
+    said = _race_number(row.text)
+    numbered = {e.id: n for e in in_band if (n := _race_number(normalize(e.name))) is not None}
+    if said is not None and numbered:
+        named = [e for e in in_band if numbered.get(e.id) == said]
+        if len(named) != 1:
+            return None
+        return (named[0], SPORTS_MATCH_STRONG,
+                f'Matched on the series and the date, and the listing names race {said}.')
+    if len(banded) == 1:
+        event = in_band[0]
+        if not words:
+            return (event, SPORTS_MATCH_STRONG,
+                    'Matched on the series and the date. The listing names no race, and this is the only one that day.')
+        return (event, SPORTS_MATCH_WEAK,
+                f'Matched on the series and the date, but the guide calls it "{strip_marks(row.sub_title or row.title)}" '
+                f'and TheSportsDB calls it "{event.name}".')
+    event = _nearest_alone(in_band, row.start)
+    if event is None or not row.start <= event.start_at < row.stop:
         return None
-    event = in_band[0]
-    if not words:
+    off = abs(event.start_at - row.start)
+    when = f'{_minutes(off)} from it' if off else 'at the same time'
+    if words <= _race_words(normalize(event.name), lt):
         return (event, SPORTS_MATCH_STRONG,
-                'Matched on the series and the date. The listing names no race, and this is the only one that day.')
+                f'Matched on the series and the date. The listing does not say which race, and this is the '
+                f'race starting nearest it, {when}.')
     return (event, SPORTS_MATCH_WEAK,
-            f'Matched on the series and the date, but the guide calls it "{strip_marks(row.sub_title or row.title)}" '
-            f'and TheSportsDB calls it "{event.name}".')
+            f'Matched on the series and the race starting nearest it, {when}, but the guide calls it '
+            f'"{strip_marks(row.sub_title or row.title)}" and TheSportsDB calls it "{event.name}".')
 
 
 def _session_hit(row, said: Session, lt: LeagueText, events: list, kinds: dict):

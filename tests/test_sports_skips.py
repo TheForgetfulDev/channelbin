@@ -73,6 +73,17 @@ class HowAWordIsReadTests(unittest.TestCase):
             self.assertFalse(other.says(sk.KIND_RACE, normalize(title)), title)
         self.assertNotIn('academy', f1.words(sk.KIND_GAME)[:len(sk.BUILTIN_WORDS[sk.KIND_GAME])])
 
+    def test_supercars_alone_has_a_one_hour_race_length(self):
+        """dev/docs/BUGS.md 2026-11-24: prod's guides list a Supercars race for 85 minutes and its
+        replays for 60 or 90, so under the 2-hour floor none of Adelaide's race listings matched."""
+        self.assertEqual(sk.BUILTIN.of(4489).minutes(sk.LENGTH_RACE), 60)
+        self.assertEqual(sk.BUILTIN.of(4489).minutes(sk.LENGTH_SESSION), 30)
+        self.assertEqual(sk.BUILTIN.of(4370).minutes(sk.LENGTH_RACE), 120)
+        self.assertEqual(sk.Skips('4489', own_minutes={sk.LENGTH_RACE: 75}).minutes(sk.LENGTH_RACE), 75,
+                         "a person's own length beats the league's built-in one")
+        self.assertEqual(sk.reason(sk.BUILTIN.of(4489), [], 20, sk.LENGTH_RACE, 'race'),
+                         'It is 20 minutes long, shorter than the 60 a race listing needs.')
+
     def test_the_reason_names_every_word_a_person_added_and_the_length(self):
         s = sk.Skips('4370', added=('chequered flag',))
         text = normalize('F1 Chequered Flag Highlights')
@@ -151,6 +162,12 @@ class StoredChangesTests(unittest.TestCase):
         with mock.patch.dict(sk.BUILTIN_WORDS, {sk.KIND_RACE: sk.BUILTIN_WORDS[sk.KIND_RACE] + ('formation lap',)}):
             self.assertIn('formation lap', self.own().words(sk.KIND_RACE))
 
+    def test_restore_puts_back_a_leagues_own_built_in_length(self):
+        sk.set_minutes(4489, sk.LENGTH_RACE, 120)
+        self.assertEqual(self.own(4489).minutes(sk.LENGTH_RACE), 120)
+        sk.restore(4489)
+        self.assertEqual(self.own(4489).minutes(sk.LENGTH_RACE), 60)
+
     def test_a_hand_edited_typo_falls_back_and_an_unquoted_id_reads_back(self):
         rules = sk.SkipRules({'sports_data': {'skip_words': {'leagues': {4370: {
             'added': ['Gameday', 7, ''], 'removed': 'pole', 'minutes': {'race': 'x', 'session': 45, 'lap': 3}}}}}})
@@ -199,6 +216,17 @@ class PageAndRoutesTests(unittest.TestCase):
         self.assertNotIn('data-skip-length="session"', html, 'no session length without sessions')
         self.assertNotIn('data-act="restore-skips"', html)
         self.assertIn("These are ChannelBin's defaults for Formula 1.", html)
+
+    def test_supercars_page_shows_its_own_race_length_and_why(self):
+        cars = SportsLeague(tsdb_id=4489, name='V8 Supercars', sport='Motorsport', match_terms='["Supercars"]',
+                            created_at=datetime.utcnow())
+        db.session.add(cars)
+        db.session.commit()
+        html = self.page(cars)
+        self.assertIn('Default: <code>60 minutes</code>, built in for V8 Supercars: its races air in 60 to 90 '
+                      'minutes, and its highlights shows in 20. Leave it empty to use it.', html)
+        self.assertIn('placeholder="60"', html)
+        self.assertIn('Default: <code>120 minutes</code>. Leave it empty to use it.', self.page(self.f1))
 
     def test_a_league_with_sessions_gets_the_session_length(self):
         db.session.add(SportsEvent(tsdb_id=3, league_id=self.f1.id, name='Harbor Grand Prix Practice 1',

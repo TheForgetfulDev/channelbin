@@ -289,7 +289,7 @@
           {% for l in sk.lengths %}
           <div class="frow"><div class="fl"><div class="fl-label"><span class="fl-name">{{ l.label }}</span></div>
             <div class="fl-desc">{{ l.desc }}</div>
-            <div class="fl-default">Default: <code>{{ l.default }} minutes</code>. Leave it empty to use it.</div>
+            <div class="fl-default">Default: <code>{{ l.default }} minutes</code>{% if l.own_note %}, {{ l.own_note }}{% else %}.{% endif %} Leave it empty to use it.</div>
           </div><div class="fr-side"><div class="fr-ctl">
             <input type="number" min="0" max="{{ sk.max_minutes }}" data-skip-length="{{ l.key }}" aria-label="{{ l.label }}" value="{{ l.value }}" placeholder="{{ l.default }}">
           </div></div></div>

@@ -59,6 +59,11 @@ BUILTIN_WORDS = {
 #: qualifying on prod), and guides spell it both ways (`F1 Académie`).
 LEAGUE_WORDS = {'4370': {'words': ('academy', 'academie'),
                          'why': 'F1 Academy is another series, and its listings say F1 too.'}}
+#: Lengths built in for one league only. Supercars (4489): a race is about 250 km, and prod's guides
+#: list the live race for 85 minutes, its replays for 60 or 90, and the "Mini" highlights for 20, so
+#: under the 2-hour floor no Adelaide race listing could match (dev/changelog/1712).
+LEAGUE_MINUTES = {'4489': {'minutes': {LENGTH_RACE: 60},
+                           'why': 'its races air in 60 to 90 minutes, and its highlights shows in 20.'}}
 
 _PATH = 'sports_data.skip_words.leagues'
 
@@ -78,6 +83,14 @@ def builtin_words(kind: str, league_tsdb_id) -> tuple:
 def league_words(league_tsdb_id) -> tuple:
     """The words built in for this league alone."""
     return (LEAGUE_WORDS.get(str(league_tsdb_id)) or {}).get('words', ())
+
+
+def builtin_minutes(length: str, league_tsdb_id) -> int:
+    """The built-in shortest listing of `length` for this league: its own when it has one."""
+    if length not in LENGTHS:
+        raise ValueError(f'unknown length {length!r}')
+    own = (LEAGUE_MINUTES.get(str(league_tsdb_id)) or {}).get('minutes', {})
+    return own.get(length, BUILTIN_MINUTES[length])
 
 
 def _pattern(words) -> re.Pattern | None:
@@ -118,9 +131,9 @@ class Skips:
         return [w for w in getattr(self, f'_{kind}_words') if _pattern((w,)).search(text)]
 
     def minutes(self, length: str) -> int:
-        if length not in LENGTHS:
-            raise ValueError(f'unknown length {length!r}')
-        return self.own_minutes.get(length, BUILTIN_MINUTES[length])
+        if length in self.own_minutes:
+            return self.own_minutes[length]
+        return builtin_minutes(length, self.league_tsdb_id)
 
     @property
     def changed(self) -> bool:
