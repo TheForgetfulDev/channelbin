@@ -23,7 +23,7 @@ from .sports_times import Rules
 from .fmt_utils import counted, fmt_duration_phrase, length_words, plural
 from .sports_data import (
     MISSING_KEEP_DAYS, ONE_GAME_KINDS, ROUND_ROW_CAP, SHIPPED_LEAGUES, search_parts, _settings, capped_spans, event_game_name, event_shape_is_matchup,
-    link_has_time, queue_line, seconds_until_call, _is_day,
+    is_followed, link_has_time, queue_line, seconds_until_call, still_ahead, _is_day,
 )
 from .tz_utils import ago, date_label, day_label, format_local, get_display_tz, is_24h, to_local, to_naive_utc
 
@@ -178,8 +178,7 @@ def _game_row(event, rule, now, tz, h24) -> dict:
 
 
 def _is_followed(event, follows) -> bool:
-    teams = {f.team_tsdb_id for f in follows}
-    return 0 in teams or event.home_team_id in teams or event.away_team_id in teams
+    return is_followed(event, {f.team_tsdb_id for f in follows})
 
 
 def _upcoming_query(now, settings, tz, since=None):
@@ -193,12 +192,6 @@ def _upcoming_query(now, settings, tz, since=None):
         or_(SportsEvent.start_at.is_(None),
             SportsEvent.start_at <= now + timedelta(days=settings['horizon_days'])),
     ).order_by(SportsEvent.start_at.is_(None), SportsEvent.start_at, SportsEvent.id)
-
-
-def _still_ahead(event, now, tz) -> bool:
-    if event.start_at is None or (not event_shape_is_matchup(event) and (event.start_at.hour, event.start_at.minute) == (0, 0)):
-        return event.local_date >= to_local(now, tz).date()
-    return event.start_at >= now
 
 
 #: How long after its start a league page keeps a game that began before today: a late game is
@@ -217,7 +210,7 @@ def _on_league_page(event, since, now, tz) -> bool:
     """A league page keeps a game for the rest of the day it starts on, and at least
     LEAGUE_PAGE_KEEP after its start, so a game being recorded, one on now and a morning game's
     later replay can still be acted on there (dev/changelog/1539). The All Leagues list's next
-    game is still the next one to start (_still_ahead)."""
+    game is still the next one to start (still_ahead)."""
     if event.start_at is None or (not event_shape_is_matchup(event) and (event.start_at.hour, event.start_at.minute) == (0, 0)):
         return event.local_date >= to_local(now, tz).date()
     return event.start_at >= since
@@ -327,7 +320,7 @@ def list_context() -> dict:
     settings = _settings()
     leagues = SportsLeague.query.order_by(SportsLeague.name).all()
     fetches, follows, missing, teams = _load_all()
-    upcoming = _group([e for e in _upcoming_query(now, settings, tz).all() if _still_ahead(e, now, tz)],
+    upcoming = _group([e for e in _upcoming_query(now, settings, tz).all() if still_ahead(e, now, tz)],
                       lambda e: e.league_id)
     from .database import AutoRule
     rule_names = dict(db.session.query(AutoRule.id, AutoRule.name).filter(AutoRule.sports_league_id.isnot(None)))
@@ -418,7 +411,7 @@ def follow_state(league) -> dict:
     tz = get_display_tz()
     settings = _settings()
     events = [e for e in _upcoming_query(now, settings, tz).filter(SportsEvent.league_id == league.id).all()
-              if _still_ahead(e, now, tz)]
+              if still_ahead(e, now, tz)]
     follows = SportsFollow.query.filter_by(league_id=league.id).all()
     ids = {f.team_tsdb_id for f in follows if f.team_tsdb_id}
     ids |= {i for e in events for i in (e.home_team_id, e.away_team_id) if i}

@@ -712,6 +712,7 @@
               {% if s.url %}<div class="small"><code>{{ s.url }}</code></div>{% endif %}
               {% for f in s.findings %}<div class="small{{ ' text-warning' if f.warn }}"><span class="tip-plain" data-tip="{{ f.tip }}">{{ f.line }}</span>
                 {% if f.link %}<a href="{{ f.link[1] }}">{{ f.link[0] }} {{ icon('forward') }}</a>{% endif %}</div>{% endfor %}
+              {% if s.games %}<div class="small"><span class="tip-plain" data-tip="{{ s.games.tip }}">{{ s.games.line }}</span></div>{% endif %}
               <div class="small" data-score-for="{{ s.id }}" hidden></div>
               {% if s.readers %}<div class="text-faint small">Also read by {% for r in s.readers %}<a href="{{ url_for('accounts.account_detail', account_id=r.id) }}">{{ r.name }}</a> ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}</div>{% endif %}
               {% if s.is_url and s.subscribed and s.enabled %}
@@ -783,6 +784,8 @@
           </tbody>
         </table>
       </div>
+      {# Followed games read from channel names belong to no one source (dev/changelog/1726). #}
+      {% if sports_names %}<p class="card-note" id="acct-sports-names"><span class="tip-plain" data-tip="{{ sports_names.tip }}">{{ sports_names.line }}</span></p>{% endif %}
       {% endif %}
     </div>
   </div>

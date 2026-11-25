@@ -3606,6 +3606,36 @@ class EpgFinding(db.Model):
     )
 
 
+class EpgSourceGames(db.Model):
+    """Which followed sports games one source an account reads would match on its own
+    (dev/changelog/1726): the sports matcher's own judge run over that source's listings for
+    the account's channels, as a dry run that writes no match (sports_match.source_games()).
+    Derived and rewritten whole per account by epg_scorecard.run_check(), only for an account
+    reading two or more sources, never the user's. A deleted account or source, or an account
+    that stops reading a source, takes its rows."""
+    __tablename__ = 'epg_source_games'
+
+    id           = db.Column(db.Integer, primary_key=True)
+    account_id   = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False)
+    source_id    = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
+    # The last local day the source typically reaches (epg_sources.source_reach()), which
+    # `followed` and `listed` are counted through. NULL = it reaches nothing ahead, and
+    # every followed game still to come is counted.
+    through_day  = db.Column(db.Date)
+    followed     = db.Column(db.Integer, nullable=False)   # followed games through that day
+    listed       = db.Column(db.Integer, nullable=False)   # ... that it lists
+    listed_later = db.Column(db.Integer, nullable=False)   # games it lists after that day
+    live         = db.Column(db.Integer, nullable=False)   # listed games with a live airing
+    channels     = db.Column(db.Integer, nullable=False)   # channels it lists them on
+    only_here    = db.Column(db.Integer, nullable=False)   # listed games no other source lists
+    event_ids    = db.Column(db.Text, nullable=False)      # JSON: every listed sports_events.id
+    counted_at   = db.Column(db.DateTime, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint('account_id', 'source_id', name='uq_epg_source_games'),
+    )
+
+
 # ── The EPG similarity scan (app/epg_similarity.py, dev/changelog/1325) ─────────
 # One scan at a time holds rows: the run that finishes replaces the last one's rows in
 # the commit that marks it SUCCESS, so the pages always read one whole result.
