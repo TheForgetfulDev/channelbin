@@ -38,7 +38,8 @@
 {% block content %}
 <div class="page-head">
   <h1>Name matches <span class="sub">{{ source.name }}</span></h1>
-  <a href="{{ url_for('accounts.account_detail', account_id=owner.id) }}" class="btn">{{ icon('back') }} {{ owner.name }}</a>
+  {% if owner %}<a href="{{ url_for('accounts.account_detail', account_id=owner.id) }}" class="btn">{{ icon('back') }} {{ owner.name }}</a>
+  {% else %}<a href="{{ url_for('accounts.accounts_list') }}" class="btn">{{ icon('back') }} Accounts</a>{% endif %}
 </div>
 {% call page_about() %}
   Channels whose name matches exactly one channel in this source's file. Nothing changes until
@@ -48,7 +49,7 @@
   channels at once.
 {% endcall %}
 
-<div id="nm-main" data-source-id="{{ source.id }}" data-owner-id="{{ owner.id }}" data-source-name="{{ source.name }}">
+<div id="nm-main" data-source-id="{{ source.id }}" data-owner-id="{{ owner.id if owner else '' }}" data-source-name="{{ source.name }}">
 {% if not refreshed %}
 <div class="empty-state">
   <p>{{ source.name }} has no successful refresh yet.</p>

@@ -48,7 +48,10 @@ from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, dir
                            refresh_busy_message, refreshing_source_names, reject_name_matches,
                            rejected_name_matches, reresolve_channels, subscriber_ids,
                            stop_using_source, subscribe_to_source, update_url_source,
-                           use_source_again)
+                           use_source_again, NeedsOwnOrder, account_order_view,
+                           follow_provider_again, move_source_to_provider, owner_label,
+                           provider_account_ids,
+                           set_account_guide)
 from ..logo_cache import delete_cached_logos
 from ..storage_dirs import manual_screenshot_paths
 from ..tz_utils import date_label, format_local, get_display_tz, is_24h, parse_form_time
@@ -554,6 +557,7 @@ def _account_detail_payload(account, cfg, stats):
                                   else account.m3u_url),
         'stream_host_differs': _stream_host_differs(account),
         'epg_sources': sources,
+        'epg_order': account_order_view(account),
         'guide_reach': reach_words(span, now, tz),
         'source_hours_choices': REFRESH_HOURS_CHOICES,
         # The filtered channel-browser links the new/missing counts point at. These were also
@@ -705,7 +709,10 @@ def new_account():
             db.session.flush()
             if account_type == 'xtream':
                 ensure_provider_source(account)
-            source_id = add_url_source(account, xmltv).id if xmltv else None
+            # An M3U account's EPG URL is its own guide, the one that fills its provider's
+            # "Provider's EPG" slot (DESIGN-epg-sources.md §15.3).
+            source_id = (add_url_source(account, xmltv, account_guide=account_type != 'xtream').id
+                         if xmltv else None)
             if _checkbox(form.get('stream_check')):
                 stream_check.owe_after_first_sync(account.id)
             db.session.commit()
@@ -925,7 +932,8 @@ def _delete_account_and_jobs(account_id):
     read_elsewhere = [sid for (sid,) in db.session.query(EpgSourceSubscription.source_id)
                       .join(EpgSource, EpgSource.id == EpgSourceSubscription.source_id)
                       .filter(EpgSourceSubscription.account_id == account_id,
-                              EpgSource.owner_account_id != account_id)]
+                              db.or_(EpgSource.owner_account_id.is_(None),
+                                     EpgSource.owner_account_id != account_id))]
 
     if get_scheduler():
         from ..scheduler import remove_epg_source_jobs
@@ -1770,15 +1778,19 @@ def cancel_sync_api(account_id):
 
 # ── EPG sources on the account page (DESIGN-epg-sources.md §9.2) ──────────────────
 
-def _json_owned_source(account_id, source_id, *, url_only=True):
+def _json_owned_source(account_id, source_id, *, url_only=True, provider_ok=False):
     """(account, source, error_response) for a source this account owns. Adding, editing,
     deleting and refreshing are the owner's (§3); a provider source is edited only by
-    editing its account."""
+    editing its account. `provider_ok` also accepts a source the account's provider owns
+    (DESIGN-epg-sources.md §15.2), for what any of its accounts may do with it: refresh it,
+    use it again."""
     account, err = _json_account(account_id)
     if err:
         return None, None, err
     source = db.session.get(EpgSource, source_id)
-    if source is None or source.owner_account_id != account_id:
+    theirs = (provider_ok and source is not None and account.provider_id is not None
+              and source.owner_provider_id == account.provider_id)
+    if source is None or (source.owner_account_id != account_id and not theirs):
         return None, None, (jsonify({'error': 'EPG source not found on this account.'}), 404)
     if url_only and source.kind != EPG_SOURCE_URL:
         return None, None, (jsonify({'error': "The provider's guide comes with the account - "
@@ -1914,7 +1926,7 @@ def delete_epg_source_api(account_id, source_id):
 @accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>/refresh',
                    methods=['POST'])
 def refresh_epg_source_api(account_id, source_id):
-    _account, source, err = _json_owned_source(account_id, source_id)
+    _account, source, err = _json_owned_source(account_id, source_id, provider_ok=True)
     if err:
         return err
     if not source.enabled:
@@ -1940,7 +1952,12 @@ def stop_using_epg_source_api(account_id, source_id):
     busy = refreshing_source_names([account_id], [source_id])
     if busy:
         return jsonify({'error': refresh_busy_message(busy)}), 409
-    done = stop_using_source(account_id, source_id, _case_sensitive())
+    confirmed = bool((request.get_json(silent=True) or {}).get('confirm'))
+    try:
+        done = stop_using_source(account_id, source_id, _case_sensitive(),
+                                 own_order_ok=confirmed)
+    except NeedsOwnOrder as exc:
+        return _own_order_refusal(exc)
     if done is None:
         return jsonify({'error': 'This account is not using that source.'}), 400
     recheck_soon(f'account #{account_id} stopped using EPG source #{source_id}')
@@ -1957,7 +1974,8 @@ def use_epg_source_again_api(account_id, source_id):
     """Undo Stop using. The source's listings come back at its next refresh - for the
     provider's guide that is the account's next sync; nothing is fetched here, since that
     fetch is a provider connection and Sync now is the control that makes one."""
-    _account, source, err = _json_owned_source(account_id, source_id, url_only=False)
+    _account, source, err = _json_owned_source(account_id, source_id, url_only=False,
+                                               provider_ok=True)
     if err:
         return err
 
@@ -1987,15 +2005,19 @@ def move_epg_source_api(account_id, source_id):
     _account, err = _json_account(account_id)
     if err:
         return err
-    direction = (request.get_json(silent=True) or {}).get('direction')
+    data = request.get_json(silent=True) or {}
+    direction = data.get('direction')
     if direction not in ('up', 'down'):
         return jsonify({'error': 'direction must be "up" or "down"'}), 400
     # An import resolving these channels at the same time would race the moves.
     busy = refreshing_source_names([account_id])
     if busy:
         return jsonify({'error': refresh_busy_message(busy)}), 409
-    done = move_source(account_id, source_id, -1 if direction == 'up' else 1,
-                       _case_sensitive())
+    try:
+        done = move_source(account_id, source_id, -1 if direction == 'up' else 1,
+                           _case_sensitive(), own_order_ok=bool(data.get('confirm')))
+    except NeedsOwnOrder as exc:
+        return _own_order_refusal(exc)
     if done is None:
         return jsonify({'error': 'This account is not using that source.'}), 400
     if done.moved:
@@ -2010,8 +2032,122 @@ def move_epg_source_api(account_id, source_id):
         switched = f'{done.switched:,} channels now take their guide from a different source.'
     else:
         switched = 'No channel changed where its guide comes from.'
+    own = ' This account has its own EPG order now.' if done.went_own else ''
     return jsonify({'success': True, 'switched': done.switched,
-                    'message': f'Moved "{name}" {direction}. {switched}'})
+                    'message': f'Moved "{name}" {direction}. {switched}{own}'})
+
+
+def _own_order_refusal(exc):
+    """409 with the sentence the confirmation shows (DESIGN-epg-sources.md §15.3): the
+    action would give a following account its own order, and goes ahead once the client
+    sends `confirm`. The server refuses; the flag only says the sentence was shown."""
+    return jsonify({'error': str(exc), 'confirm_required': {'message': str(exc)}}), 409
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-order/follow', methods=['POST'])
+def follow_provider_order_api(account_id):
+    """"Follow <provider>'s order again" (§15.3): the provider's list re-applied, any of
+    its sources this account dropped read again, the account's own sources after."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    view = account_order_view(account)
+    if view is None:
+        return jsonify({'error': 'This account is not on a provider.'}), 400
+    if view['follows']:
+        return jsonify({'error': f'This account already follows {view["provider_name"]}\'s '
+                                 'order.'}), 400
+    busy = refreshing_source_names([account_id])
+    if busy:
+        return jsonify({'error': refresh_busy_message(busy)}), 409
+    switched = follow_provider_again(account_id, _case_sensitive())
+    recheck_soon(f'account #{account_id} follows its provider\'s EPG order again')
+    return jsonify({'success': True, 'switched': switched,
+                    'message': (f'Following {view["provider_name"]}\'s order again. '
+                                f'{_switched_sentence(switched)}')})
+
+
+def _switched_sentence(n: int) -> str:
+    if n == 1:
+        return '1 channel now takes its guide from a different source.'
+    if n:
+        return f'{n:,} channels now take their guide from a different source.'
+    return 'No channel changed where its guide comes from.'
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>/move-to-provider',
+                   methods=['POST'])
+def move_epg_source_to_provider_api(account_id, source_id):
+    """"Move to <provider>" (§15.4): this account's url source becomes its provider's and
+    every account on the provider reads it, with what the database holds copied at once.
+    Body {refresh_interval_hours} when the source refreshed with this account's sync - a
+    provider's source has no sync to ride (§15.2)."""
+    account, source, err = _json_owned_source(account_id, source_id)
+    if err:
+        return err
+    view = account_order_view(account)
+    if view is None:
+        return jsonify({'error': 'This account is not on a provider.'}), 400
+    if source.is_account_guide:
+        return jsonify({'error': f'"{source.name}" is this account\'s own guide, which fills '
+                                 f'{view["provider_name"]}\'s "Provider\'s EPG" slot. Make '
+                                 'another source its own guide first.'}), 400
+    interval = source.refresh_interval_hours
+    if not interval:
+        raw = (request.get_json(silent=True) or {}).get('refresh_interval_hours')
+        try:
+            interval = int(raw)
+        except (TypeError, ValueError):
+            interval = None
+        if interval not in REFRESH_HOURS_CHOICES:
+            return jsonify({'error': 'Choose how often to refresh it: a provider\'s source has '
+                                     'no account sync to refresh with.'}), 400
+    busy = refreshing_source_names(provider_account_ids(view['provider_id']), [source_id])
+    if busy:
+        return jsonify({'error': refresh_busy_message(busy)}), 409
+    done = move_source_to_provider(source_id, view['provider_id'], interval, _case_sensitive())
+    from ..scheduler import schedule_epg_source_refresh
+    schedule_epg_source_refresh(current_app._get_current_object(), source_id,
+                                force_reschedule=True)
+    recheck_soon(f'EPG source #{source_id} moved to provider #{view["provider_id"]}')
+    return jsonify({'success': True, 'message': (
+        f'"{source.name}" belongs to {view["provider_name"]} now, and '
+        f'{done.readers} {"account reads" if done.readers == 1 else "accounts read"} it. '
+        f'Nothing was downloaded again. {_switched_sentence(done.switched)}')})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>/account-guide',
+                   methods=['POST'])
+def set_account_guide_api(account_id, source_id):
+    """Make one of an M3U account's url sources its own guide (§15.3), the one that fills
+    its provider's "Provider's EPG" slot."""
+    account, source, err = _json_owned_source(account_id, source_id)
+    if err:
+        return err
+    if account.account_type == 'xtream':
+        return jsonify({'error': "An Xtream account's own guide is its provider's guide."}), 400
+    busy = refreshing_source_names([account_id])
+    if busy:
+        return jsonify({'error': refresh_busy_message(busy)}), 409
+    switched = set_account_guide(account_id, source_id, _case_sensitive())
+    recheck_soon(f'account #{account_id} own guide set to EPG source #{source_id}')
+    return jsonify({'success': True, 'message': (
+        f'"{source.name}" is this account\'s own guide now. {_switched_sentence(switched)}')})
+
+
+def _review_owner(source, only_account):
+    """The account the review page goes back to: the source's own account, or for a
+    provider's source (§15.2) the account the page was opened for, else the first account
+    reading it. None when no account is on that provider any more."""
+    if source.owner_account_id is not None:
+        return db.session.get(Account, source.owner_account_id)
+    readers = sorted(subscriber_ids(source.id))
+    on_provider = [aid for (aid,) in db.session.query(Account.id).filter(
+        Account.provider_id == source.owner_provider_id).order_by(Account.id)]
+    for aid in ([only_account] if only_account in on_provider else []) + readers + on_provider:
+        if aid in on_provider:
+            return db.session.get(Account, aid)
+    return None
 
 
 @accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/borrowable', methods=['GET'])
@@ -2103,7 +2239,7 @@ def subscribe_epg_source_api(account_id):
     busy = refreshing_source_names([account_id], [source.id])
     if busy:
         return jsonify({'error': refresh_busy_message(busy)}), 409
-    owner_name = source.owner.name if source.owner else 'its account'
+    owner_name = owner_label(source) or 'its account'
     done = subscribe_to_source(account_id, source.id, _case_sensitive())
     if done is None:
         return jsonify({'error': 'This account already uses that source.'}), 400
@@ -2213,7 +2349,7 @@ def epg_source_review(source_id):
             == [u['title'] for u in row['current']['upcoming']])
         rows.append(row)
 
-    owner = db.session.get(Account, source.owner_account_id)
+    owner = _review_owner(source, only_account)
     has_upcoming = any(r.get('file', {}).get('upcoming') for r in rows)
     return render_template(
         'epg_source_review.html', source=source, owner=owner, view=view, rows=rows,
@@ -2225,7 +2361,9 @@ def epg_source_review(source_id):
         only_account=only_account,
         only_account_name=account_names.get(only_account) if only_account else None,
         refreshed=has_directory(source.id), has_upcoming=has_upcoming,
-        can_refresh=source.kind == EPG_SOURCE_URL and source.enabled)
+        # Refresh goes through an account's route; a provider's source no account is on any
+        # more has none to go through.
+        can_refresh=source.kind == EPG_SOURCE_URL and source.enabled and owner is not None)
 
 
 def _review_proposals(source, include_single: bool, unguided_only: bool,

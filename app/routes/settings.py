@@ -13,7 +13,7 @@ from ruamel.yaml.error import YAMLError as RoundTripYAMLError
 from flask import (Blueprint, render_template, request, redirect, url_for, flash,
                    jsonify, send_file, current_app, session)
 
-from .. import health_bands, output_feed
+from .. import db, health_bands, output_feed
 from ..config import (load_config, save_config, config_default, is_restart_needed, public_url, public_url_problem,
                       RESTART_REQUIRED_KEYS, set_nested, mask_config, redact_sensitive_diff_lines, _is_sensitive_path,
                       _load_config_file, config_write_lock, load_for_edit, changed_from_default,
@@ -929,9 +929,11 @@ def _restart_blocking_rows(busy):
         'name': src.name,
         'status': 'REFRESHING',
         'label': f'EPG source "{src.name}" is refreshing',
-    } for src in EpgSource.query.join(Account, Account.id == EpgSource.owner_account_id)
+    } for src in EpgSource.query.outerjoin(Account, Account.id == EpgSource.owner_account_id)
+                              # A provider's source has no owning account (dev/changelog/1721).
                               .filter(EpgSource.refresh_started_at.isnot(None),
-                                      Account.status != ACCOUNT_STATUS_SYNCING)
+                                      db.or_(Account.id.is_(None),
+                                             Account.status != ACCOUNT_STATUS_SYNCING))
                               .order_by(EpgSource.id).all()]
 
     return rows

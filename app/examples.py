@@ -179,7 +179,7 @@ def start(app) -> tuple[bool, str]:
             db.session.add(account)
             db.session.flush()
             _errors, fields = clean_url_source_fields({'url': LISTINGS_URL}, ACCOUNT_NAME)
-            add_url_source(account, fields)
+            add_url_source(account, fields, account_guide=True)
             db.session.commit()
             return account.id
 

@@ -676,14 +676,26 @@
       </div>
     </div>
     <div class="card-body" id="acct-sources-body">
+      {# On a provider, whether this account follows its EPG order (DESIGN-epg-sources.md §15.3). #}
+      {% if epg_order %}
+      {% set prov_href = url_for('accounts.accounts_list') ~ '#provider-' ~ epg_order.provider_id %}
+      {% if epg_order.follows %}
+      <p class="card-note" id="acct-epg-order">Follows <a href="{{ prov_href }}">{{ epg_order.provider_name }}</a>'s EPG order: the sources its list places come first, in its order, and this account's own sources come after.</p>
+      {% else %}
+      <p class="card-note" id="acct-epg-order">This account has its own EPG order, not <a href="{{ prov_href }}">{{ epg_order.provider_name }}</a>'s. A source {{ epg_order.provider_name }} adds later goes at the end.
+        <button class="btn btn-sm" data-act="source-follow">Follow {{ epg_order.provider_name }}'s order again</button></p>
+      {% endif %}
+      {% endif %}
       {% if not epg_sources %}
       <p class="card-note">This account reads no EPG source, so no guide data is imported for its channels. Add source takes an XMLTV URL or another account's guide.</p>
       {% else %}
       {% if epg_sources | selectattr('subscribed') | list | length > 1 %}
       <p class="card-note">When more than one source has listings for a channel, its guide comes from the first one in this order that has a full schedule for it - a source listing one program all day gives way to one with a schedule. A channel's own page can pick a different source for that channel.</p>
       {% endif %}
+      {# Cards below 900px of room: its seven columns need about 820px, and the card column is
+         619px in a 961px window (dev/docs/BUGS.md 2026-11-24 @ 08:50 PM). #}
       <div class="table-scroll">
-        <table class="tbl tbl-cards">
+        <table class="tbl tbl-cards cards-under-900">
           <thead><tr><th>Source</th><th>Last refresh</th>
             <th><span class="tip-plain" data-tip="Reaches.&#10;The last day at least half of this source's channels have listings for, counted over every channel in its guide. Point at a date for the full count by day.">Reaches</span></th>
             <th class="num">Entries</th>
@@ -695,7 +707,7 @@
           {% for s in epg_sources %}
           <tr>
             <td data-label="Source">{% if s.subscribed and n_read > 1 %}<span class="text-faint">{{ loop.index }}.</span> {% endif %}{{ s.name }}
-              <div class="text-faint small">{{ s.kind }}{% if not s.owned %} - from <a href="{{ url_for('accounts.account_detail', account_id=s.owner_id) }}">{{ s.owner_name }}</a>{% endif %}{% if not s.subscribed %} - not used by this account{% elif not s.enabled %} - turned off{% endif %}</div>
+              <div class="text-faint small">{{ s.kind }}{% if not s.owned %} - from {% if s.owner_id %}<a href="{{ url_for('accounts.account_detail', account_id=s.owner_id) }}">{{ s.owner_name }}</a>{% else %}<a href="{{ url_for('accounts.accounts_list') }}#provider-{{ s.owner_provider_id }}">{{ s.owner_name }}</a>{% endif %}{% endif %}{% if s.own_guide and epg_order %} - this account's own guide{% endif %}{% if s.placed %} - placed by {{ epg_order.provider_name }}{% endif %}{% if not s.subscribed %} - not used by this account{% elif not s.enabled %} - turned off{% endif %}</div>
               {% if s.url %}<div class="small"><code>{{ s.url }}</code></div>{% endif %}
               {% for f in s.findings %}<div class="small{{ ' text-warning' if f.warn }}"><span class="tip-plain" data-tip="{{ f.tip }}">{{ f.line }}</span>
                 {% if f.link %}<a href="{{ f.link[1] }}">{{ f.link[0] }} {{ icon('forward') }}</a>{% endif %}</div>{% endfor %}
@@ -737,14 +749,27 @@
                   {% elif s.is_url and s.owned %}
                   <button class="menu-item" data-act="source-refresh" data-source-id="{{ s.id }}"{% if s.refreshing or not s.enabled %} disabled{% endif %}>Refresh now</button>
                   <button class="menu-item" data-act="source-edit" data-source-id="{{ s.id }}">Edit&hellip;</button>
+                  {% if epg_order and not s.own_guide %}
+                  <button class="menu-item" data-act="source-to-provider" data-source-id="{{ s.id }}"
+                          data-source-name="{{ s.name }}" data-has-interval="{{ 1 if s.refresh_interval_hours else '' }}"
+                          data-tip="Make it {{ epg_order.provider_name }}'s, so every account on it reads it. Nothing is downloaded again.">Move to {{ epg_order.provider_name }}&hellip;</button>
+                  {% if account_type != 'xtream' %}
+                  <button class="menu-item" data-act="source-account-guide" data-source-id="{{ s.id }}"
+                          data-tip="The guide that fills {{ epg_order.provider_name }}'s &quot;Provider's EPG&quot; place for this account.">Make this account's own guide</button>
+                  {% endif %}
+                  {% endif %}
                   <div class="sep"></div>
                   <button class="menu-item danger" data-act="source-delete" data-source-id="{{ s.id }}"
                           data-source-name="{{ s.name }}" data-active-here="{{ s.active_here }}"
                           data-readers="{{ readers_attr }}">Delete</button>
                   {% else %}
+                  {% if s.provider_owned %}
+                  <button class="menu-item" data-act="source-refresh" data-source-id="{{ s.id }}"{% if s.refreshing or not s.enabled %} disabled{% endif %}>Refresh now</button>
+                  {% endif %}
                   <button class="menu-item" data-act="source-stop" data-source-id="{{ s.id }}"
                           data-source-name="{{ s.name }}" data-active-here="{{ s.active_here }}"
                           {% if not s.owned %}data-owner-name="{{ s.owner_name }}"{% endif %}
+                          {% if s.provider_owned %}data-provider-owned="1"{% endif %}
                           data-readers="{{ readers_attr }}"
                           data-tip="Stop using this guide on this account. Its listings go, and each channel switches to its next source.">Stop using</button>
                   {% endif %}
@@ -986,6 +1011,7 @@ window.ACCOUNT_DETAIL = {
   isExample: {{ 'true' if account.is_example else 'false' }},
   hostCount: {{ hosts | length }},
   sourceHours: {{ source_hours_choices | list | tojson }},
+  epgProvider: {{ ({'id': epg_order.provider_id, 'name': epg_order.provider_name} if epg_order else none) | tojson }},
   maxConnections: {{ settings.max_connections }},
 };
 </script>

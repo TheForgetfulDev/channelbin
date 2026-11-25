@@ -3139,8 +3139,9 @@ def update_source_stale_alert(source_id: int) -> None:
                 if source.last_success_at else 'it has not had a good refresh since it was added')
         body = (f'EPG source "{source.name}" refreshes every {interval}h, but {last} - more '
                 f'than {interval * OVERDUE_INTERVAL_MULTIPLE}h ago. Its listings are still the '
-                'ones from its last good refresh. The source\'s row on its account page says '
-                'why the refreshes since have not worked.')
+                'ones from its last good refresh. The source\'s row on its account page (for a '
+                'provider\'s source, on the Accounts page) says why the refreshes since have '
+                'not worked.')
     _raise_or_resolve_standing_alert(
         'EPG_SOURCE_STALE', source=f'epg-source:{source_id}:stale', active=active,
         title=f'EPG source "{source.name}" is stale', body=body)

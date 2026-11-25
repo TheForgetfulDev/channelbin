@@ -1,6 +1,7 @@
 /* The Accounts page's Providers section (DESIGN-account-providers.md §6.2,
    dev/changelog/1170): create, rename and delete a provider, put an account on one or take
-   it off, share a login with another account on the same provider or stop sharing it.
+   it off, share a login with another account on the same provider or stop sharing it, and
+   keep the provider's EPG order and its own guides (DESIGN-epg-sources.md §15.4).
 
    Every action is one request to /api/providers* or /api/logins/<id>/share, then a
    server-rendered swap of #acct-providers - the section has exactly one renderer, the
@@ -151,17 +152,145 @@
     });
   }
 
+  // A provider that owns EPG sources asks what becomes of them, on by default and never
+  // assumed (DESIGN-epg-sources.md §15.5): kept, each goes to the lowest-numbered account
+  // reading it and no guide changes; turned off, they are deleted with the provider.
   function confirmDelete(card) {
+    jsonFetch(`/api/providers/${card.dataset.providerId}/delete-preview`)
+      .catch(() => ({ sources: 0 }))
+      .then((pre) => {
+        const body = document.createElement('div');
+        const n = pre.sources || 0;
+        body.innerHTML =
+          `<p>Accounts on ${escHtml(card.dataset.name)} will be unlinked.</p>` +
+          '<p class="text-muted small" style="margin-top:8px">Their channels will stop folding ' +
+          'together. Their hosts and logins stay as they are, and a login two of them share ' +
+          'stays shared until you change it.</p>' +
+          (n ? '<label class="check-row" style="margin-top:10px"><input type="checkbox" id="prov-keep" checked> ' +
+            `Keep its ${n} EPG source${n === 1 ? '' : 's'} for the accounts that use them</label>` +
+            '<p class="text-muted small" id="prov-keep-note"></p>' : '');
+        const note = () => {
+          const el = body.querySelector('#prov-keep-note');
+          if (!el) return;
+          const keep = body.querySelector('#prov-keep').checked;
+          const g = pre.guided || 0;
+          el.textContent = keep
+            ? 'Each goes to the first account reading it, and every account keeps reading it, so no guide changes.' +
+              (pre.unread ? ` ${pre.unread} that no account reads ${pre.unread === 1 ? 'is' : 'are'} deleted.` : '')
+            : `They are deleted. ${g ? `${g.toLocaleString()} channel${g === 1 ? ' takes its' : 's take their'} guide from them now, and each switches to its next source or has no guide.` : 'No channel takes its guide from them now.'}`;
+        };
+        const keepBox = body.querySelector('#prov-keep');
+        if (keepBox) { keepBox.addEventListener('change', note); note(); }
+        buildModal({
+          title: 'Delete provider',
+          body,
+          footer: [
+            { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+            {
+              label: 'Delete provider',
+              class: 'btn btn-danger',
+              onClick: (close) => {
+                const payload = keepBox ? { keep_sources: keepBox.checked } : {};
+                send(`/api/providers/${card.dataset.providerId}`,
+                  { method: 'DELETE', body: JSON.stringify(payload) })
+                  .then(() => close()).catch(() => {});
+                return false;
+              },
+            },
+          ],
+        });
+      });
+  }
+
+  // ── The provider's EPG list (DESIGN-epg-sources.md §15.4) ──────────────────
+  const epgUrl = (card, id) =>
+    `/api/providers/${card.dataset.providerId}/epg-sources${id ? `/${id}` : ''}`;
+
+  // duplicated from static/js/account-detail.js openSourceModal - this dialog is on another
+  // page, always takes an interval (a provider's source has no account sync to ride) and
+  // posts to the provider's endpoint.
+  function openEpgSource(card, src) {
+    const editing = !!src;
+    const s = src || { name: '', url: '', refresh_interval_hours: 24, enabled: true };
+    const hours = readJson(section(), 'sourceHours').map((h) =>
+      `<option value="${h}"${String(s.refresh_interval_hours) === String(h) ? ' selected' : ''}>` +
+      `Every ${h} hour${h === 1 ? '' : 's'}</option>`).join('');
+    const body = document.createElement('div');
+    body.innerHTML =
+      fieldRow({
+        label: 'XMLTV URL', stack: true,
+        meta: `A TV guide file, plain or <code>.gz</code>, read by every account on ${escHtml(card.dataset.name)}. ` +
+          'Kept secret like an account\'s own URLs.',
+        control: `<input type="url" id="pe-url" value="${escHtml(s.url)}" placeholder="http://example.com/guide.xml.gz">`,
+      }) +
+      fieldRow({
+        label: 'Name', meta: 'Blank uses the provider name.',
+        control: `<input type="text" id="pe-name" value="${escHtml(s.name)}">`, wide: true,
+      }) +
+      fieldRow({ label: 'Refresh', meta: 'How often the file is fetched again.',
+        control: `<select id="pe-hours">${hours}</select>` }) +
+      (editing ? fieldRow({
+        label: 'On', meta: 'Turned off, the source keeps its listings and is not fetched again.',
+        control: '<label class="switch"><input type="checkbox" id="pe-on"' +
+          `${s.enabled ? ' checked' : ''}><span class="knob"></span></label>`,
+      }) : '');
+    const $m = (sel) => body.querySelector(sel);
+    buildModal({
+      title: editing ? 'Edit EPG source' : `Add EPG source to ${card.dataset.name}`,
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+        {
+          label: editing ? 'Save' : 'Add source',
+          class: 'btn btn-primary',
+          onClick: (close) => {
+            const url = $m('#pe-url').value.trim();
+            if (!url) { showToast('An XMLTV URL is required.', { type: 'error' }); return false; }
+            send(epgUrl(card, editing ? s.id : null), {
+              method: 'POST',
+              body: JSON.stringify({ url, name: $m('#pe-name').value,
+                refresh_interval_hours: $m('#pe-hours').value,
+                enabled: editing ? $m('#pe-on').checked : true }),
+            }).then(() => close()).catch(() => {});
+            return false;
+          },
+        },
+      ],
+    });
+  }
+
+  function editEpgSource(card, el) {
+    jsonFetch(epgUrl(card, el.dataset.sourceId))
+      .then((res) => openEpgSource(card, res.source))
+      .catch((e) => showToast(e.message || 'Could not load the source.', { type: 'error' }));
+  }
+
+  function confirmEpgDelete(card, el) {
+    const g = Number(el.dataset.guided || 0);
     confirmModal({
-      title: 'Delete provider',
-      message: `Accounts on ${card.dataset.name} will be unlinked.`,
-      consequence: 'Their channels will stop folding together. Their hosts and logins ' +
-        'stay as they are, and a login two of them share stays shared until you change it.',
-      confirmLabel: 'Delete provider',
+      title: 'Delete EPG source',
+      message: `Delete ${el.dataset.sourceName} and every listing it imported, for every account on ${card.dataset.name}?`,
+      consequence: g ? `${g.toLocaleString()} channel${g === 1 ? ' takes its' : 's take their'} guide from it now. ` +
+        'Each switches to its next source, or has no guide.' : 'No channel takes its guide from it right now.',
+      confirmLabel: 'Delete source',
       danger: true,
     }).then((ok) => {
-      if (!ok) return;
-      send(`/api/providers/${card.dataset.providerId}`, { method: 'DELETE' }).catch(() => {});
+      if (ok) send(epgUrl(card, el.dataset.sourceId), { method: 'DELETE' }).catch(() => {});
+    });
+  }
+
+  function confirmEpgGive(card, el) {
+    confirmModal({
+      title: `Move to ${el.dataset.account} only`,
+      message: `${el.dataset.sourceName} becomes ${el.dataset.account}'s alone and leaves ${card.dataset.name}'s order.`,
+      consequence: 'Every other account reading it stops: its listings go from their channels, and each switches to its next source.',
+      confirmLabel: 'Move',
+    }).then((ok) => {
+      if (ok) {
+        send(`${epgUrl(card, el.dataset.sourceId)}/give`,
+          { method: 'POST', body: JSON.stringify({ account_id: Number(el.dataset.accountId) }) })
+          .catch(() => {});
+      }
     });
   }
 
@@ -194,6 +323,19 @@
       case 'prov-delete': confirmDelete(card); return;
       case 'prov-share': share(el); return;
       case 'prov-unshare': confirmUnshare(el); return;
+      case 'prov-epg-add': openEpgSource(card, null); return;
+      case 'prov-epg-edit': editEpgSource(card, el); return;
+      case 'prov-epg-delete': confirmEpgDelete(card, el); return;
+      case 'prov-epg-give': confirmEpgGive(card, el); return;
+      case 'prov-epg-refresh':
+        send(`${epgUrl(card, el.dataset.sourceId)}/refresh`, { method: 'POST' }).catch(() => {});
+        return;
+      case 'prov-epg-move':
+        showToast('Moving it and re-deciding the guides of the accounts following this order...');
+        send(`/api/providers/${card.dataset.providerId}/epg-order/${el.dataset.entryId}/move`,
+          { method: 'POST', body: JSON.stringify({ direction: el.dataset.direction }) })
+          .catch(() => {});
+        return;
       default:
         console.warn('unhandled provider action', act);
     }

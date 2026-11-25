@@ -1004,7 +1004,7 @@
               {% elif r.ignored_id %}<span class="text-faint">none - you stopped using the provider id <code>{{ r.ignored_id }}</code> here</span>
               {% else %}<span class="text-faint">none - cannot be matched</span>{% endif %}
               {% if r.key_pending %}<div class="small text-warning">{{ gs_pending[r.key_pending] }}
-                {% if r.key_pending != 'not-in-file' and r.key_pending != 'no-key' %}<a href="{{ url_for('accounts.account_detail', account_id=r.owner_id) }}">{{ r.owner_name }} {{ icon('forward') }}</a>{% endif %}</div>{% endif %}
+                {% if r.key_pending != 'not-in-file' and r.key_pending != 'no-key' %}<a href="{% if r.owner_id %}{{ url_for('accounts.account_detail', account_id=r.owner_id) }}{% else %}{{ url_for('accounts.accounts_list') }}#provider-{{ r.owner_provider_id }}{% endif %}">{{ r.owner_name }} {{ icon('forward') }}</a>{% endif %}</div>{% endif %}
               {% if r.subscribed %}<div class="gs-key-actions">
                 <button type="button" class="btn btn-sm" data-act="epg-key-set" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}" data-key="{{ r.user_key or '' }}">Set key</button>
                 {% if r.user_key %}<button type="button" class="btn btn-sm" data-act="epg-key-clear" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}">Clear key</button>

@@ -480,9 +480,12 @@
   // the server, which says so in its message; the page reloads to show the new row.
   const sourceUrl = (id) => `/api/accounts/${A.id}/epg-sources${id ? `/${id}` : ''}`;
 
-  function openSourceModal(src) {
+  // `provider` ({id, name}) adds the source to the account's provider instead
+  // (DESIGN-epg-sources.md §15.2): every account on it reads it, and with no account sync to
+  // ride it must refresh on an interval of its own.
+  function openSourceModal(src, provider = null) {
     const editing = !!src;
-    const s = src || { name: '', url: '', refresh_interval_hours: '', enabled: true };
+    const s = src || { name: '', url: '', refresh_interval_hours: provider ? 24 : '', enabled: true };
     const hours = (A.sourceHours || []).map((h) =>
       `<option value="${h}"${String(s.refresh_interval_hours) === String(h) ? ' selected' : ''}>` +
       `Every ${h} hour${h === 1 ? '' : 's'}</option>`).join('');
@@ -506,7 +509,7 @@
         meta: 'How often the file is fetched again. With the account\'s sync, Sync now ' +
           'fetches it too.',
         control: '<select id="src-hours">' +
-          `<option value=""${s.refresh_interval_hours ? '' : ' selected'}>With this account's sync</option>` +
+          (provider ? '' : `<option value=""${s.refresh_interval_hours ? '' : ' selected'}>With this account's sync</option>`) +
           `${hours}</select>`,
       }) +
       (editing ? fieldRow({
@@ -517,7 +520,7 @@
       }) : '');
     const $m = (sel) => body.querySelector(sel);
     buildModal({
-      title: editing ? 'Edit EPG source' : 'Add EPG source',
+      title: editing ? 'Edit EPG source' : (provider ? `Add EPG source to ${provider.name}` : 'Add EPG source'),
       body,
       footer: [
         { label: 'Cancel', class: 'btn', onClick: (c) => c() },
@@ -533,7 +536,9 @@
               refresh_interval_hours: $m('#src-hours').value,
               enabled: editing ? $m('#src-on').checked : true,
             };
-            jsonFetch(sourceUrl(editing ? s.id : null), {
+            const target = provider ? `/api/providers/${provider.id}/epg-sources`
+              : sourceUrl(editing ? s.id : null);
+            jsonFetch(target, {
               method: 'POST', body: JSON.stringify(payload),
             }).then((res) => {
               close();
@@ -572,8 +577,8 @@
   function openAddSource() {
     jsonFetch(sourceUrl('borrowable'))
       .then((res) => {
-        if (!(res.sources || []).length) { openSourceModal(null); return; }
-        openBorrowModal(res.sources);
+        if (!(res.sources || []).length && !A.epgProvider) { openSourceModal(null); return; }
+        openBorrowModal(res.sources || []);
       })
       .catch(() => openSourceModal(null));
   }
@@ -584,11 +589,16 @@
       `<label class="fp-radio"><input type="radio" name="src-pick" value="${value}">` +
       `<strong>${title}</strong><span class="text-muted small">${sub}</span></label>`;
     body.innerHTML =
-      '<p class="text-muted small">Another account\'s guide goes last in this account\'s ' +
+      (sources.length ? '<p class="text-muted small">Another account\'s guide goes last in this account\'s ' +
       'order, so it only gives a guide to channels nothing above it covers. Nothing is ' +
-      'downloaded twice: its account keeps refreshing it.</p>' +
+      'downloaded twice: the account or provider it belongs to keeps refreshing it.</p>' : '') +
       '<div style="margin-top:8px">' +
-      opt('url', 'An XMLTV URL', 'A guide file of your own, fetched right away.') +
+      // On a provider, a guide added once to the provider serves every account on it, so
+      // that is offered first (DESIGN-epg-sources.md §15.4).
+      (A.epgProvider ? opt('provider', `Add to ${escHtml(A.epgProvider.name)}`,
+        `An XMLTV URL every account on ${escHtml(A.epgProvider.name)} reads, fetched right away.`) : '') +
+      opt('url', A.epgProvider ? 'Add to this account only' : 'An XMLTV URL',
+        'A guide file of your own, fetched right away.') +
       sources.map((s) => opt(String(s.id), escHtml(s.name),
         `${escHtml(s.owner_name || '')} - ${escHtml(s.kind)}` +
         `${s.last_success_at ? `, refreshed ${escHtml(s.last_success_at)}` : ''}` +
@@ -606,6 +616,7 @@
             const picked = body.querySelector('input[name="src-pick"]:checked');
             if (!picked) { showToast('Choose a source.', { type: 'error' }); return false; }
             if (picked.value === 'url') { close(); openSourceModal(null); return false; }
+            if (picked.value === 'provider') { close(); openSourceModal(null, A.epgProvider); return false; }
             // Copying a large feed's listings takes a few seconds (dev/changelog/1106).
             showToast('Adding the source and copying the listings it already has...',
               { durationMs: 15000 });
@@ -644,9 +655,75 @@
           label: verb,
           class: 'btn btn-danger',
           onClick: (close) => {
-            post(url, { method: url.endsWith('stop-using') ? 'POST' : 'DELETE' })
-              .then(() => { close(); setTimeout(reload, 1500); })
-              .catch(() => close());
+            const method = url.endsWith('stop-using') ? 'POST' : 'DELETE';
+            close();
+            withOwnOrderConfirm(url, method, {}).then(() => setTimeout(reload, 1500)).catch(() => {});
+            return false;
+          },
+        },
+      ],
+    });
+  }
+
+  // A following account that moves or stops a source its provider's list placed gets its
+  // own order (DESIGN-epg-sources.md §15.3). The server refuses with `confirm_required` and
+  // the sentence to show; the request goes again with `confirm` once the user agrees.
+  function withOwnOrderConfirm(url, method, body) {
+    showActionError('');
+    const send = (extra) => jsonFetch(url, { method, body: JSON.stringify({ ...body, ...extra }) });
+    return send({}).catch((e) => {
+      const need = e && e.data && e.data.confirm_required;
+      if (!need) throw e;
+      return confirmModal({
+        title: 'Give this account its own order?',
+        message: need.message,
+        consequence: 'You can follow the provider\'s order again from this card.',
+        confirmLabel: 'Continue',
+      }).then((ok) => {
+        if (!ok) { const stop = new Error(''); stop.cancelled = true; throw stop; }
+        return send({ confirm: true });
+      });
+    }).then((res) => {
+      showToast(res.message || 'Done.', { durationMs: 7000 });
+      return res;
+    }).catch((e) => {
+      if (!e.cancelled) {
+        showActionError(e.message || 'Request failed.');
+        showToast(e.message || 'Request failed.', { type: 'error' });
+      }
+      throw e;
+    });
+  }
+
+  function openMoveToProvider(el) {
+    const prov = A.epgProvider;
+    const body = document.createElement('div');
+    const hours = (A.sourceHours || []).map((h) =>
+      `<option value="${h}"${h === 24 ? ' selected' : ''}>Every ${h} hour${h === 1 ? '' : 's'}</option>`).join('');
+    body.innerHTML = `<p>Move <strong>${escHtml(el.dataset.sourceName || '')}</strong> to ` +
+      `${escHtml(prov.name)}? Every account on it reads it, and it is no longer deleted with ` +
+      'this account. Nothing is downloaded again: the other accounts get the listings it already has.</p>' +
+      (el.dataset.hasInterval ? '' : fieldRow({
+        label: 'Refresh',
+        meta: 'It refreshed with this account\'s sync. A provider\'s source refreshes on its own.',
+        control: `<select id="src-move-hours">${hours}</select>`,
+      }));
+    buildModal({
+      title: `Move to ${prov.name}`,
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+        {
+          label: `Move to ${prov.name}`,
+          class: 'btn btn-primary',
+          onClick: (close) => {
+            const sel = body.querySelector('#src-move-hours');
+            showToast('Moving the source and copying the listings it already has...',
+              { durationMs: 15000 });
+            post(`${sourceUrl(el.dataset.sourceId)}/move-to-provider`, {
+              method: 'POST',
+              body: JSON.stringify(sel ? { refresh_interval_hours: Number(sel.value) } : {}),
+            }).then(() => { close(); setTimeout(reload, 1500); }).catch(() => {});
             return false;
           },
         },
@@ -656,6 +733,14 @@
 
   const ACTIONS = {
     'source-add': openAddSource,
+    'source-follow': () => {
+      showToast('Following the provider\'s order and re-deciding each channel\'s guide...');
+      return post(`/api/accounts/${A.id}/epg-order/follow`, { method: 'POST' })
+        .then(() => setTimeout(reload, 1500));
+    },
+    'source-to-provider': openMoveToProvider,
+    'source-account-guide': (el) => post(`${sourceUrl(el.dataset.sourceId)}/account-guide`,
+      { method: 'POST' }).then(() => setTimeout(reload, 1500)),
     'source-edit': editSource,
     'source-refresh': (el) => post(`${sourceUrl(el.dataset.sourceId)}/refresh`, { method: 'POST' })
       .then(() => setTimeout(reload, 1500)),
@@ -668,6 +753,10 @@
       url: `${sourceUrl(el.dataset.sourceId)}/stop-using`,
       what: (name, d) => {
         const head = `Stop using <strong>${name}</strong> on this account? Its listings are removed`;
+        if (d.providerOwned) {
+          return `${head} from this account's channels. ${escHtml(d.ownerName)} keeps it, and ` +
+            'Use again on its row brings it back.';
+        }
         if (d.ownerName) {
           return `${head} from this account's channels. ${escHtml(d.ownerName)} keeps it, and ` +
             'Add source brings it back.';
@@ -686,9 +775,9 @@
     // toast says the move is under way rather than leaving the menu looking dead.
     'source-move': (el) => {
       showToast('Moving the source and re-deciding each channel\'s guide...');
-      return post(`${sourceUrl(el.dataset.sourceId)}/move`,
-        { method: 'POST', body: JSON.stringify({ direction: el.dataset.direction }) })
-        .then(() => setTimeout(reload, 1500));
+      return withOwnOrderConfirm(`${sourceUrl(el.dataset.sourceId)}/move`, 'POST',
+        { direction: el.dataset.direction })
+        .then(() => setTimeout(reload, 1500)).catch(() => {});
     },
     'host-add': openAddHost,
     'host-activate': confirmActivateHost,
