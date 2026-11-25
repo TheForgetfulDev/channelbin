@@ -24,7 +24,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -82,7 +82,7 @@ def _observe():
         seed.make_epg_source(ordered)
         db.session.flush()
         second = EpgSource(kind='url', owner_account_id=ordered.id, name='Second',
-                           url='http://second.test/epg.xml')
+                           url='http://second.test/epg.xml', expires_on=date(2026, 12, 31))
         db.session.add(second)
         db.session.flush()
         db.session.add(EpgSourceSubscription(source_id=second.id, account_id=ordered.id,
@@ -100,7 +100,8 @@ def _observe():
                     'scores.json': f'/api/accounts/{ids["busy"]}/epg-scorecard?view=card',
                     'ordered.html': f'/accounts/{ordered.id}',
                     'preview.json': (f'/api/accounts/{ordered.id}/epg-sources/{second.id}/'
-                                     'move-preview?direction=up')}
+                                     'move-preview?direction=up'),
+                    'settings.json': f'/api/accounts/{ordered.id}/epg-sources/{second.id}'}
             for suffix, url in urls.items():
                 resp = client.get(url)
                 if resp.status_code != 200:
@@ -442,6 +443,23 @@ class MovePreviewTests(_Base, unittest.TestCase):
         self.assertEqual(len(self.obs['brokenPosts']), 1)
         self.assertEqual(self.obs['brokenPosts'][0]['body'], {'direction': 'up'},
                          'no confirm: the server still asks about an own order it was not shown')
+
+
+class SourceExpiryDialogTests(_Base, unittest.TestCase):
+    """dev/changelog/1724: the Edit source dialog shows the expiration date the server holds in
+    a date field and sends what the field says on Save - a cleared field as '', which the
+    server reads as no date."""
+    SCENARIO = 'source_expiry'
+
+    def test_the_dialog_shows_the_stored_date(self):
+        self.assertEqual(self.obs['shown'], {'type': 'date', 'value': '2026-12-31'})
+
+    def test_save_sends_the_date_and_a_cleared_field_as_blank(self):
+        bodies = self.obs['bodies']
+        self.assertEqual(len(bodies), 2, bodies)
+        for b in bodies:
+            self.assertTrue(b['path'].endswith(f'/epg-sources/{self.obs["second"]}'), b)
+        self.assertEqual([b['body']['expires_on'] for b in bodies], ['2027-02-01', ''])
 
 
 if __name__ == '__main__':

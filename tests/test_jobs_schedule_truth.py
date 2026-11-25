@@ -89,6 +89,7 @@ SAMPLE_IDS = {
     ('schedule_index_janitor', "'search_index_janitor'"): ['search_index_janitor'],
     ('schedule_storage_dirs_check', "'storage_dirs_check'"): ['storage_dirs_check'],
     ('schedule_host_resolve_check', "'host_resolve_check'"): ['host_resolve_check'],
+    ('schedule_epg_source_expiry_check', 'EPG_EXPIRY_JOB_ID'): ['epg_source_expiry'],
     ('schedule_account_stats_fold', "'account_stats_fold'"): ['account_stats_fold'],
     ('schedule_stream_check', 'stream_check_job_id(check_id)'): ['stream_check_{chk}'],
 }

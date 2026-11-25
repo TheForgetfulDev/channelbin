@@ -13,7 +13,8 @@ from ..accounts import (NORM_DISABLED, NORM_HLS, NORM_MODES, NORM_MPEGTS, NORM_M
                         finalize_sync_state,
                         manual_sync_restarts_schedule, next_sync_map,
                         report_source_removed, resolve_source_alerts,
-                        start_source_refresh, sync_signature, update_source_stale_alert)
+                        start_source_refresh, sync_signature, update_source_expiry_alerts,
+                        update_source_stale_alert)
 from .. import account_stats_view
 from ..fmt_utils import iso_or_none, plural
 from ..account_links import (add_host, add_login, configured_seats, delete_hosts_for_account,
@@ -1843,6 +1844,7 @@ def add_epg_source_api(account_id):
         return source.id
 
     source_id = _add_and_commit()
+    update_source_expiry_alerts(source_id)
     app_obj = current_app._get_current_object()
     from ..scheduler import schedule_epg_source_refresh
     started, message = start_source_refresh(app_obj, source_id)
@@ -1866,7 +1868,8 @@ def epg_source_settings_api(account_id, source_id):
     return jsonify({'success': True, 'source': {
         'id': source.id, 'name': source.name, 'url': source.url or '',
         'refresh_interval_hours': source.refresh_interval_hours or '',
-        'enabled': bool(source.enabled)}})
+        'enabled': bool(source.enabled),
+        'expires_on': source.expires_on.isoformat() if source.expires_on else ''}})
 
 
 @accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>',
@@ -1887,6 +1890,7 @@ def save_epg_source_api(account_id, source_id):
 
     url_changed = _save_and_commit()
     update_source_stale_alert(source_id)
+    update_source_expiry_alerts(source_id)
     app_obj = current_app._get_current_object()
     from ..scheduler import schedule_epg_source_refresh
     message = f'Saved "{fields["name"]}".'
@@ -1972,6 +1976,7 @@ def stop_using_epg_source_api(account_id, source_id):
     if done is None:
         return jsonify({'error': 'This account is not using that source.'}), 400
     recheck_soon(f'account #{account_id} stopped using EPG source #{source_id}')
+    update_source_expiry_alerts(source_id)
     from ..scheduler import schedule_epg_source_refresh
     schedule_epg_source_refresh(current_app._get_current_object(), source_id,
                                 force_reschedule=True)
@@ -1999,6 +2004,7 @@ def use_epg_source_again_api(account_id, source_id):
     if not _subscribe_and_commit():
         return jsonify({'error': 'This account already uses that source.'}), 400
     recheck_soon(f'account #{account_id} uses EPG source #{source_id} again')
+    update_source_expiry_alerts(source_id)
     from ..scheduler import schedule_epg_source_refresh
     schedule_epg_source_refresh(current_app._get_current_object(), source_id,
                                 force_reschedule=True)

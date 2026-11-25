@@ -366,6 +366,7 @@ def init_scheduler(app):
     schedule_storage_dirs_check(app)
     schedule_account_stats_fold(app)
     schedule_host_resolve_check(app)
+    schedule_epg_source_expiry_check(app)
     schedule_auto_rule_sweep(app)
     schedule_sports_worker(app)
 
@@ -3325,6 +3326,37 @@ def _host_resolve_job():
             log.exception('Stream host check failed')
 
 
+EPG_EXPIRY_JOB_ID = 'epg_source_expiry'
+
+
+def schedule_epg_source_expiry_check(app):
+    """Register the hourly check of EPG source expiration dates, first tick a minute after
+    startup so a date that passed while the app was down is said at once. Hourly because a
+    date passes at local midnight, and an hour late is close enough for a subscription
+    (dev/changelog/1724)."""
+    if _scheduler is None:
+        return
+    _add_job(
+        func=_epg_source_expiry_job,
+        trigger='interval',
+        hours=1,
+        next_run_time=datetime.utcnow() + timedelta(seconds=60),
+        id=EPG_EXPIRY_JOB_ID,
+        replace_existing=True,
+    )
+
+
+def _epg_source_expiry_job():
+    """accounts.check_source_expiries(): a few rows, so no admission ticket and no JobRun,
+    the same answer the storage-directory sweep gives."""
+    with _app.app_context():
+        from .accounts import check_source_expiries
+        try:
+            check_source_expiries()
+        except Exception:
+            log.exception('EPG source expiry check failed')
+
+
 _ACCOUNT_STATS_FOLD_INTERVAL_MINUTES = 60
 
 
@@ -3380,6 +3412,7 @@ _RUN_NOW_PLAIN = {
     'storage_dirs_check': _storage_dirs_job,
     'account_stats_fold': _account_stats_fold_job,
     'host_resolve_check': _host_resolve_job,
+    EPG_EXPIRY_JOB_ID: _epg_source_expiry_job,
 }
 RUN_NOW_SYSTEM_JOBS = frozenset(_RUN_NOW_ADMITTED) | frozenset(_RUN_NOW_PLAIN)
 

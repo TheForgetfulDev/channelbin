@@ -1294,9 +1294,57 @@ def clean_url_source_fields(data: dict, account_name: str) -> tuple[list[str], d
     enabled = data.get('enabled', True)
     if not isinstance(enabled, bool):
         errors.append('"enabled" must be true or false.')
+    expires_on = None
+    raw_expiry = _text('expires_on')
+    if raw_expiry:
+        try:
+            expires_on = date.fromisoformat(raw_expiry)
+        except ValueError:
+            errors.append('The expiration date must be a date like 2026-12-31.')
     return errors, {'name': name or default_source_name(account_name, EPG_SOURCE_URL),
                     'url': url, 'refresh_interval_hours': interval,
-                    'enabled': bool(enabled)}
+                    'enabled': bool(enabled), 'expires_on': expires_on}
+
+
+#: How many days before a source's expiration date the heads-up starts (dev/changelog/1724).
+#: Both source dialogs say "a week" in their Expires on help text; change them with it.
+EXPIRY_NOTICE_DAYS = 7
+
+#: Where a source stands against its expiration date (expiry_state()).
+EXPIRY_LATER = 'later'      # more than EXPIRY_NOTICE_DAYS away
+EXPIRY_SOON = 'soon'        # within EXPIRY_NOTICE_DAYS: the heads-up
+EXPIRY_PASSED = 'passed'    # the day has come: expired
+
+
+def expiry_state(expires_on: date | None, today: date) -> str | None:
+    """None when no date is set, else one EXPIRY_*. `today` is the local date in the display
+    timezone: a source expires at the start of its day there."""
+    if expires_on is None:
+        return None
+    if today >= expires_on:
+        return EXPIRY_PASSED
+    if (expires_on - today).days <= EXPIRY_NOTICE_DAYS:
+        return EXPIRY_SOON
+    return EXPIRY_LATER
+
+
+def expiry_view(expires_on: date | None, now: datetime, tz) -> dict | None:
+    """A source row's expiration line: {text, warn}, or None when no date is set."""
+    from .tz_utils import full_date_label
+    today = to_local_date(now, tz)
+    state = expiry_state(expires_on, today)
+    if state is None:
+        return None
+    if state == EXPIRY_PASSED:
+        return {'text': f'Expired {full_date_label(expires_on)}', 'warn': True, 'state': state}
+    if state == EXPIRY_SOON:
+        days = (expires_on - today).days
+        text = ('Expires tomorrow' if days == 1
+                else f'Expires {full_date_label(expires_on)}, in {days} days')
+        return {'text': text, 'warn': True, 'state': state}
+    if state == EXPIRY_LATER:
+        return {'text': f'Expires {full_date_label(expires_on)}', 'warn': False, 'state': state}
+    raise ValueError(f'unknown expiry state {state!r}')
 
 
 def add_url_source(account: Account, fields: dict, *, account_guide: bool = False) -> EpgSource:
@@ -2620,6 +2668,10 @@ def provider_lists_view(provider_ids, tz=None, now: datetime | None = None) -> d
                                   .filter(Channel.epg_source_id.in_(list(sources) or [-1]))
                                   .group_by(Channel.epg_source_id))
     extended = extended_counts(sources)
+    if tz is None:
+        from .tz_utils import get_display_tz
+        tz = get_display_tz()
+    now = now or datetime.utcnow()
     out: dict[int, list[dict]] = {pid: [] for pid in ids}
     for e in entries:
         if e.entry == PROVIDER_ORDER_OWN_GUIDE:
@@ -2639,6 +2691,7 @@ def provider_lists_view(provider_ids, tz=None, now: datetime | None = None) -> d
             'status_badge': badge, 'status_label': label, 'last_error': s.last_error,
             'readers': readers.get(s.id, 0), 'guided': guided.get(s.id, 0),
             'extended': extended.get(s.id, 0),
+            'expiry': expiry_view(s.expires_on, now, tz),
         })
     return out
 
@@ -3002,6 +3055,7 @@ def account_sources_view(account_id: int, schedule: dict | None = None, tz=None,
             # Channels whose guide it continues past the end of an earlier source (§14.6).
             'extends_here': extends_here.get(s.id, 0),
             'ran_out_note': RAN_OUT_NOTES.get(ran_out.get(s.id)),
+            'expiry': expiry_view(s.expires_on, now, tz),
             'reach': source_reach_view(reach.get(s.id), now, tz),
             'reach_day': reach[s.id].day if s.id in reach else None,
             'readers': [{'id': fr.account_id, 'name': fr.account_name, 'guided': fr.guided}

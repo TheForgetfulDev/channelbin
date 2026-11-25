@@ -275,6 +275,13 @@
       }) +
       fieldRow({ label: 'Refresh', meta: 'How often the file is fetched again.',
         control: `<select id="pe-hours">${hours}</select>` }) +
+      fieldRow({
+        // "A week" is epg_sources.EXPIRY_NOTICE_DAYS (dev/changelog/1724).
+        label: 'Expires on',
+        meta: 'Optional. The day a paid guide\'s subscription ends: you get a heads-up a week ' +
+          'before and an alert on the day. Nothing stops using it by itself.',
+        control: `<input type="date" id="pe-expires" value="${escHtml(s.expires_on || '')}">`,
+      }) +
       (editing ? fieldRow({
         label: 'On', meta: 'Turned off, the source keeps its listings and is not fetched again.',
         control: '<label class="switch"><input type="checkbox" id="pe-on"' +
@@ -296,6 +303,7 @@
               method: 'POST',
               body: JSON.stringify({ url, name: $m('#pe-name').value,
                 refresh_interval_hours: $m('#pe-hours').value,
+                expires_on: $m('#pe-expires').value,
                 enabled: editing ? $m('#pe-on').checked : true }),
             }).then(() => close()).catch(() => {});
             return false;

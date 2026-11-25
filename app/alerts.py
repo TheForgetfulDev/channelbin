@@ -228,6 +228,14 @@ ALERT_TYPES = {
     # (DESIGN-epg-sources.md §12.1).
     'EPG_SOURCE_STALE': {
         'label': 'EPG Source Stale', 'severity': 'WARN', 'self_clearing': True},
+    # The expiration date the user gave a source (EpgSource.expires_on) is near, or has come.
+    # Both clear when the date is moved later or taken off, the source is turned off or
+    # deleted; the heads-up also clears when the expired one takes its place
+    # (accounts.update_source_expiry_alerts(), dev/changelog/1724).
+    'EPG_SOURCE_EXPIRING': {
+        'label': 'EPG Source Expires Soon', 'severity': 'INFO', 'self_clearing': True},
+    'EPG_SOURCE_EXPIRED': {
+        'label': 'EPG Source Expired', 'severity': 'WARN', 'self_clearing': True},
     # A source other accounts read was deleted, by hand or with its owner. Not
     # self-clearing: nothing will ever refresh a source that is gone, so this is the one
     # place its readers' lost channels are named (DESIGN-epg-sources.md §9.5).

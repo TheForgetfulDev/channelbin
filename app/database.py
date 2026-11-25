@@ -3339,6 +3339,11 @@ class EpgSource(db.Model):
     # sources; an Xtream account's own guide is its provider-kind source and needs no mark.
     is_account_guide = db.Column(db.Boolean, nullable=False, default=False,
                                  server_default=db.text('0'))
+    # The user's: the day a paid guide's subscription ends, in the display timezone. url kind
+    # only; an Xtream account's own guide ends with Account.provider_exp_date. Read through
+    # epg_sources.expiry_state(); nothing stops using a source when it passes
+    # (dev/changelog/1724).
+    expires_on = db.Column(db.Date)
 
     owner = db.relationship('Account', foreign_keys=[owner_account_id], lazy='joined')
     owner_provider = db.relationship('Provider', foreign_keys=[owner_provider_id], lazy='joined')

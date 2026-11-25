@@ -84,7 +84,7 @@
             {% if e.slot %}
             <span class="prov-meta">each account's own guide</span>
             {% else %}
-            <span class="prov-meta">XMLTV URL &middot; every {{ e.refresh_interval_hours }}h &middot; read by {{ e.readers }} account{{ '' if e.readers == 1 else 's' }}{% if e.guided %} &middot; guide for {{ '{:,}'.format(e.guided) }} channel{{ '' if e.guided == 1 else 's' }}{% endif %}{% if not e.enabled %} &middot; turned off{% endif %}</span>
+            <span class="prov-meta">XMLTV URL &middot; every {{ e.refresh_interval_hours }}h &middot; read by {{ e.readers }} account{{ '' if e.readers == 1 else 's' }}{% if e.guided %} &middot; guide for {{ '{:,}'.format(e.guided) }} channel{{ '' if e.guided == 1 else 's' }}{% endif %}{% if not e.enabled %} &middot; turned off{% endif %}{% if e.expiry %} &middot; <span{% if e.expiry.warn %} class="text-warning"{% endif %}>{{ e.expiry.text }}</span>{% endif %}</span>
             {% if e.refreshing %}<span class="badge b-running"><span class="pulse"></span>Refreshing</span>
             {% else %}{{ m.status_badge(e.status_badge, e.status_label) }}{% endif %}
             {% endif %}

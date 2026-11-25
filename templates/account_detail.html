@@ -708,6 +708,7 @@
           <tr>
             <td data-label="Source">{% if s.subscribed and n_read > 1 %}<span class="text-faint">{{ loop.index }}.</span> {% endif %}{{ s.name }}
               <div class="text-faint small">{{ s.kind }}{% if not s.owned %} - from {% if s.owner_id %}<a href="{{ url_for('accounts.account_detail', account_id=s.owner_id) }}">{{ s.owner_name }}</a>{% else %}<a href="{{ url_for('accounts.accounts_list') }}#provider-{{ s.owner_provider_id }}">{{ s.owner_name }}</a>{% endif %}{% endif %}{% if s.own_guide and epg_order %} - this account's own guide{% endif %}{% if s.placed %} - placed by {{ epg_order.provider_name }}{% endif %}{% if not s.subscribed %} - not used by this account{% elif not s.enabled %} - turned off{% endif %}</div>
+              {% if s.expiry %}<div class="small{{ ' text-warning' if s.expiry.warn else ' text-faint' }}">{{ s.expiry.text }}</div>{% endif %}
               {% if s.url %}<div class="small"><code>{{ s.url }}</code></div>{% endif %}
               {% for f in s.findings %}<div class="small{{ ' text-warning' if f.warn }}"><span class="tip-plain" data-tip="{{ f.tip }}">{{ f.line }}</span>
                 {% if f.link %}<a href="{{ f.link[1] }}">{{ f.link[0] }} {{ icon('forward') }}</a>{% endif %}</div>{% endfor %}

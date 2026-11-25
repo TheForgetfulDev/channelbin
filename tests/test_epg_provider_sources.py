@@ -181,7 +181,15 @@ class MigrationTests(unittest.TestCase):
         stored = self.cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND "
                                   "name='epg_sources'").fetchone()[0]
         self.assertEqual(stored.replace('CREATE TABLE "epg_sources"', 'CREATE TABLE epg_sources'),
-                         self._fresh_epg_sources_sql())
+                         M._EPG_SOURCES_148_DDL.replace('epg_sources_owner_new', 'epg_sources'))
+        # The later steps that add to the table bring it to the model's columns, in a fresh
+        # build's order (each ALTER appends, and the model declares each one last).
+        M._m150_epg_source_expiry(self.conn, self.cur)
+        migrated = [r[1] for r in self.cur.execute('PRAGMA table_info(epg_sources)')]
+        fresh = sqlite3.connect(':memory:')
+        fresh.execute(self._fresh_epg_sources_sql())
+        self.assertEqual(migrated, [r[1] for r in fresh.execute('PRAGMA table_info(epg_sources)')])
+        fresh.close()
         self.assertEqual(self.cur.execute('SELECT COUNT(*) FROM epg_sources').fetchone()[0], 6)
         indexes = {r[0] for r in self.cur.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='epg_sources' "
