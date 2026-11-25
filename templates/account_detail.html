@@ -740,9 +740,9 @@
                   <a class="menu-item" href="{{ url_for('accounts.epg_source_review', source_id=s.id) }}"
                      data-tip="Channels whose name matches one in this source's file, for you to accept or reject. Nothing changes until you accept one.">Name matches {{ icon('forward') }}</a>
                   {% if n_read > 1 %}
-                  <button class="menu-item" data-act="source-move" data-direction="up" data-source-id="{{ s.id }}"{% if loop.index == 1 %} disabled{% endif %}
+                  <button class="menu-item" data-act="source-move" data-direction="up" data-source-id="{{ s.id }}" data-source-name="{{ s.name }}"{% if loop.index == 1 %} disabled{% endif %}
                           data-tip="Earlier sources win a channel when more than one has listings for it. Each channel's guide is re-decided from listings already here.">Move up</button>
-                  <button class="menu-item" data-act="source-move" data-direction="down" data-source-id="{{ s.id }}"{% if loop.index == n_read %} disabled{% endif %}>Move down</button>
+                  <button class="menu-item" data-act="source-move" data-direction="down" data-source-id="{{ s.id }}" data-source-name="{{ s.name }}"{% if loop.index == n_read %} disabled{% endif %}>Move down</button>
                   {% endif %}
                   {% endif %}
                   {% if not s.subscribed %}

@@ -634,8 +634,29 @@
     });
   }
 
-  // Sentence one says what happens; sentence two what it costs, counted from the row.
-  function confirmSourceRemoval(el, { title, verb, url, what }) {
+  // Before an order change, say what it would do (DESIGN-epg-sources.md §15.3): the server
+  // works it out without doing it (util.js previewChange()), and the action runs only once the
+  // user agrees. When the change would also give the account its own order, that sentence is in
+  // the same dialog and the action is sent with `confirm`, so the server's own-order refusal
+  // does not ask again. Resolves to the extras the action is sent with, or null on Cancel.
+  function previewThenConfirm(url, { title, message, confirmLabel }) {
+    showActionError('');
+    return previewChange(url).then((p) => {
+      if (p.noop) return {};
+      return confirmModal({
+        title,
+        message,
+        list: p.lines,
+        consequence: p.own_order
+          ? `${p.own_order} You can follow the provider's order again from this card.` : '',
+        confirmLabel,
+      }).then((ok) => (ok ? (p.own_order ? { confirm: true } : {}) : null));
+    });
+  }
+
+  // Sentence one says what happens; sentence two what it costs, counted from the row, or,
+  // with `previewUrl`, the server's preview of it.
+  function confirmSourceRemoval(el, { title, verb, url, what, previewUrl }) {
     const n = Number(el.dataset.activeHere || 0);
     const more = Number(el.dataset.extendsHere || 0);
     let cost = n
@@ -650,24 +671,33 @@
       cost += ` Other accounts read it too, and lose it: ${escHtml(el.dataset.readers)}. ` +
         'Each of those channels switches to its next source, or has no guide.';
     }
-    buildModal({
-      title,
-      body: `<p>${what(escHtml(el.dataset.sourceName || ''), el.dataset)}</p>` +
-        `<p class="text-muted small" style="margin-top:8px">${cost}</p>`,
-      footer: [
-        { label: 'Cancel', class: 'btn', onClick: (c) => c() },
-        {
-          label: verb,
-          class: 'btn btn-danger',
-          onClick: (close) => {
-            const method = url.endsWith('stop-using') ? 'POST' : 'DELETE';
-            close();
-            withOwnOrderConfirm(url, method, {}).then(() => setTimeout(reload, 1500)).catch(() => {});
-            return false;
+    const open = (preview) => {
+      const extra = preview && preview.own_order ? { confirm: true } : {};
+      const costHtml = preview
+        ? preview.lines.map((line) => `<p class="text-muted small" style="margin-top:8px">${escHtml(line)}</p>`).join('') +
+          (preview.own_order ? `<p class="small" style="margin-top:8px">${escHtml(preview.own_order)}</p>` : '')
+        : `<p class="text-muted small" style="margin-top:8px">${cost}</p>`;
+      buildModal({
+        title,
+        body: `<p>${what(escHtml(el.dataset.sourceName || ''), el.dataset)}</p>${costHtml}`,
+        footer: [
+          { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+          {
+            label: verb,
+            class: 'btn btn-danger',
+            onClick: (close) => {
+              const method = url.endsWith('stop-using') ? 'POST' : 'DELETE';
+              close();
+              withOwnOrderConfirm(url, method, extra).then(() => setTimeout(reload, 1500)).catch(() => {});
+              return false;
+            },
           },
-        },
-      ],
-    });
+        ],
+      });
+    };
+    if (!previewUrl) { open(null); return; }
+    // A failed preview falls back to the counts read from the row.
+    previewChange(previewUrl).then((p) => open(p.failed ? null : p));
   }
 
   // A following account that moves or stops a source its provider's list placed gets its
@@ -738,11 +768,16 @@
 
   const ACTIONS = {
     'source-add': openAddSource,
-    'source-follow': () => {
+    'source-follow': () => previewThenConfirm(`/api/accounts/${A.id}/epg-order/follow-preview`, {
+      title: 'Follow the provider\'s order again',
+      message: 'This account takes its provider\'s EPG order again, its own sources after.',
+      confirmLabel: 'Follow again',
+    }).then((extra) => {
+      if (!extra) return null;
       showToast('Following the provider\'s order and re-deciding each channel\'s guide...');
       return post(`/api/accounts/${A.id}/epg-order/follow`, { method: 'POST' })
         .then(() => setTimeout(reload, 1500));
-    },
+    }).catch(() => {}),
     'source-to-provider': openMoveToProvider,
     'source-account-guide': (el) => post(`${sourceUrl(el.dataset.sourceId)}/account-guide`,
       { method: 'POST' }).then(() => setTimeout(reload, 1500)),
@@ -756,6 +791,7 @@
     'source-stop': (el) => confirmSourceRemoval(el, {
       title: 'Stop using this guide', verb: 'Stop using',
       url: `${sourceUrl(el.dataset.sourceId)}/stop-using`,
+      previewUrl: `${sourceUrl(el.dataset.sourceId)}/stop-using-preview`,
       what: (name, d) => {
         const head = `Stop using <strong>${name}</strong> on this account? Its listings are removed`;
         if (d.providerOwned) {
@@ -779,10 +815,19 @@
     // Re-deciding every channel's guide can take a few seconds on a large account, so the
     // toast says the move is under way rather than leaving the menu looking dead.
     'source-move': (el) => {
-      showToast('Moving the source and re-deciding each channel\'s guide...');
-      return withOwnOrderConfirm(`${sourceUrl(el.dataset.sourceId)}/move`, 'POST',
-        { direction: el.dataset.direction })
-        .then(() => setTimeout(reload, 1500)).catch(() => {});
+      const dir = el.dataset.direction;
+      const name = el.dataset.sourceName || 'this source';
+      return previewThenConfirm(`${sourceUrl(el.dataset.sourceId)}/move-preview?direction=${dir}`, {
+        title: `Move ${name} ${dir}`,
+        message: `Move ${name} one place ${dir} in this account's EPG order.`,
+        confirmLabel: `Move ${dir}`,
+      }).then((extra) => {
+        if (!extra) return null;
+        showToast('Moving the source and re-deciding each channel\'s guide...');
+        return withOwnOrderConfirm(`${sourceUrl(el.dataset.sourceId)}/move`, 'POST',
+          { direction: dir, ...extra })
+          .then(() => setTimeout(reload, 1500));
+      }).catch(() => {});
     },
     'host-add': openAddHost,
     'host-activate': confirmActivateHost,

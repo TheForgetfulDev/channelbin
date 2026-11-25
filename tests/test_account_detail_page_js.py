@@ -31,7 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
-from app.database import Account, AccountHost, AccountSyncLog, EpgSourceChannel  # noqa: E402
+from app.database import (Account, AccountHost, AccountSyncLog, EpgSource,  # noqa: E402
+                          EpgSourceChannel, EpgSourceSubscription)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HARNESS = os.path.join(REPO, 'tests', 'support', 'account_detail_page.mjs')
@@ -75,17 +76,31 @@ def _observe():
                                         distinct_titles=1, horizon_until=now + timedelta(days=2),
                                         described=6, subtitled=0, categorized=0, rated=0,
                                         flagged=0, doubled=0))
+        # Two guides in order, so the Sources card offers Move up on the second, whose
+        # preview the page asks for before it moves anything (dev/changelog/1723).
+        ordered = seed.make_account(name='Ordered')
+        seed.make_epg_source(ordered)
+        db.session.flush()
+        second = EpgSource(kind='url', owner_account_id=ordered.id, name='Second',
+                           url='http://second.test/epg.xml')
+        db.session.add(second)
+        db.session.flush()
+        db.session.add(EpgSourceSubscription(source_id=second.id, account_id=ordered.id,
+                                             priority=2))
         db.session.commit()
         ids = {'fresh': fresh.id, 'busy': busy.id}
         with open(os.path.join(tmp, 'meta.json'), 'w', encoding='utf-8') as f:
-            json.dump({**ids, 'host': host.id}, f)
+            json.dump({**ids, 'host': host.id, 'ordered': ordered.id, 'second': second.id}, f)
 
         def snapshot(state):
             urls = {'fresh.html': f'/accounts/{ids["fresh"]}',
                     'busy.html': f'/accounts/{ids["busy"]}',
                     'nav.json': '/api/nav-status',
                     'syncs.json': f'/api/accounts/{ids["busy"]}/syncs',
-                    'scores.json': f'/api/accounts/{ids["busy"]}/epg-scorecard?view=card'}
+                    'scores.json': f'/api/accounts/{ids["busy"]}/epg-scorecard?view=card',
+                    'ordered.html': f'/accounts/{ordered.id}',
+                    'preview.json': (f'/api/accounts/{ordered.id}/epg-sources/{second.id}/'
+                                     'move-preview?direction=up')}
             for suffix, url in urls.items():
                 resp = client.get(url)
                 if resp.status_code != 200:
@@ -389,6 +404,44 @@ class ScorecardFailedTests(_Base, unittest.TestCase):
         self.assertEqual([(x['hidden'], x['text']) for x in self.obs['scoreLines']],
                          [(True, '')])
         self.assertTrue([w for w in self.obs['warnings'] if 'scorecard' in w])
+
+
+
+class MovePreviewTests(_Base, unittest.TestCase):
+    """dev/changelog/1723: Move up asks the server what the move would change, shows its
+    sentences, and moves only when the user agrees - with `confirm` when the dialog also said
+    the account would get its own order, so the server does not ask a second time."""
+    SCENARIO = 'move_preview'
+
+    def test_the_preview_is_asked_for_before_anything_moves(self):
+        asked = self.obs['asked']
+        self.assertEqual(len(asked['previews']), 1, asked['previews'])
+        self.assertTrue(asked['previews'][0].endswith(
+            f'/epg-sources/{self.obs["second"]}/move-preview?direction=up'), asked['previews'])
+        self.assertEqual(asked['posts'], 0)
+
+    def test_the_dialog_shows_the_servers_sentences(self):
+        self.assertEqual(self.obs['asked']['items'], self.obs['served'])
+        self.assertEqual(self.obs['asked']['title'], 'Move Second up')
+
+    def test_cancel_moves_nothing(self):
+        self.assertEqual(self.obs['cancelled'], {'posts': 0, 'open': False})
+
+    def test_an_own_order_move_says_so_and_confirms_once(self):
+        self.assertTrue(any('its own EPG order' in p for p in self.obs['ownParas']),
+                        self.obs['ownParas'])
+        self.assertEqual(len(self.obs['posts']), 1)
+        post = self.obs['posts'][0]
+        self.assertTrue(post['path'].endswith(f'/epg-sources/{self.obs["second"]}/move'), post)
+        self.assertEqual(post['body'], {'direction': 'up', 'confirm': True})
+
+    def test_a_failed_preview_says_so_and_never_blocks_the_move(self):
+        self.assertEqual(len(self.obs['brokenItems']), 1)
+        self.assertTrue(self.obs['brokenItems'][0].startswith('Could not work out what this '
+                                                             'changes'), self.obs['brokenItems'])
+        self.assertEqual(len(self.obs['brokenPosts']), 1)
+        self.assertEqual(self.obs['brokenPosts'][0]['body'], {'direction': 'up'},
+                         'no confirm: the server still asks about an own order it was not shown')
 
 
 if __name__ == '__main__':

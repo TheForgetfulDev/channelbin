@@ -52,7 +52,8 @@ from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, dir
                            use_source_again, NeedsOwnOrder, account_order_view,
                            follow_provider_again, move_source_to_provider, owner_label,
                            provider_account_ids,
-                           set_account_guide)
+                           set_account_guide, follow_trial, move_trial, preview_json,
+                           stop_trial)
 from ..logo_cache import delete_cached_logos
 from ..storage_dirs import manual_screenshot_paths
 from ..tz_utils import date_label, format_local, get_display_tz, is_24h, parse_form_time
@@ -2045,6 +2046,47 @@ def move_epg_source_api(account_id, source_id):
     own = ' This account has its own EPG order now.' if done.went_own else ''
     return jsonify({'success': True, 'switched': done.switched,
                     'message': f'Moved "{name}" {direction}. {switched}{own}'})
+
+
+def _preview_answer(trial):
+    """The JSON for a reorder preview (DESIGN-epg-sources.md §15.3): what the action would do
+    to each channel's guide, worked out without doing it."""
+    if trial is None:
+        return jsonify({'error': 'This account is not using that source.'}), 400
+    return jsonify(preview_json(trial, _case_sensitive()))
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>/move-preview')
+def move_epg_source_preview_api(account_id, source_id):
+    """What Move up / Move down would change (?direction=up|down). Reads only."""
+    _account, err = _json_account(account_id)
+    if err:
+        return err
+    direction = request.args.get('direction')
+    if direction not in ('up', 'down'):
+        return jsonify({'error': 'direction must be "up" or "down"'}), 400
+    return _preview_answer(move_trial(account_id, source_id, -1 if direction == 'up' else 1))
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>/stop-using-preview')
+def stop_using_epg_source_preview_api(account_id, source_id):
+    """What Stop using would change. Reads only."""
+    _account, err = _json_account(account_id)
+    if err:
+        return err
+    return _preview_answer(stop_trial(account_id, source_id))
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-order/follow-preview')
+def follow_provider_order_preview_api(account_id):
+    """What "Follow <provider>'s order again" would change. Reads only."""
+    _account, err = _json_account(account_id)
+    if err:
+        return err
+    trial = follow_trial(account_id)
+    if trial is None:
+        return jsonify({'error': 'This account is not on a provider.'}), 400
+    return _preview_answer(trial)
 
 
 def _own_order_refusal(exc):

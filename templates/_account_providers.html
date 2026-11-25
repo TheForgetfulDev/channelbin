@@ -93,9 +93,9 @@
               <button class="btn btn-sm btn-icon" data-menu data-sheet aria-label="Actions for {{ e.name }}">{{ icon('more') }}</button>
               <div class="menu">
                 {% if n_epg > 1 %}
-                <button class="menu-item" data-act="prov-epg-move" data-entry-id="{{ e.entry_id }}" data-direction="up"{% if loop.first %} disabled{% endif %}
+                <button class="menu-item" data-act="prov-epg-move" data-entry-id="{{ e.entry_id }}" data-direction="up" data-entry-name="{{ e.name }}"{% if loop.first %} disabled{% endif %}
                         data-tip="Every account following this order has its channels' guides re-decided from listings already here.">Move up</button>
-                <button class="menu-item" data-act="prov-epg-move" data-entry-id="{{ e.entry_id }}" data-direction="down"{% if loop.last %} disabled{% endif %}>Move down</button>
+                <button class="menu-item" data-act="prov-epg-move" data-entry-id="{{ e.entry_id }}" data-direction="down" data-entry-name="{{ e.name }}"{% if loop.last %} disabled{% endif %}>Move down</button>
                 {% endif %}
                 {% if not e.slot %}
                 <button class="menu-item" data-act="prov-epg-refresh" data-source-id="{{ e.id }}"{% if e.refreshing or not e.enabled %} disabled{% endif %}>Refresh now</button>

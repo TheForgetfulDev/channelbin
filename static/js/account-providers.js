@@ -30,6 +30,44 @@
     try { return JSON.parse(el.dataset[key] || '[]'); } catch (e) { return []; }
   };
 
+  // Joining a provider follows its EPG order (DESIGN-epg-sources.md §15.5). When that would
+  // change a channel's guide, or the preview could not say (util.js previewChange()), the
+  // sentences are shown and the join waits for the user; otherwise it goes ahead.
+  function confirmJoin(ids, providerId, providerName) {
+    if (!ids.length) return Promise.resolve(true);
+    const q = `account_ids=${ids.join(',')}${providerId ? `&provider_id=${providerId}` : ''}`;
+    return previewChange(`/api/providers/join-preview?${q}`).then((p) => {
+      if (!(p.failed || p.switched || p.gained || p.lost || p.refilled || p.shorter)) return true;
+      return confirmModal({
+        title: `Follow ${providerName}'s EPG order`,
+        message: `On ${providerName}, ${ids.length === 1 ? 'the account follows' : 'each account follows'} ` +
+          'its EPG order.',
+        list: p.lines,
+        confirmLabel: 'Continue',
+      });
+    });
+  }
+
+  function moveEntry(card, el) {
+    const dir = el.dataset.direction;
+    const name = el.dataset.entryName || 'this entry';
+    const base = `/api/providers/${card.dataset.providerId}/epg-order/${el.dataset.entryId}`;
+    previewChange(`${base}/move-preview?direction=${dir}`)
+      .then((p) => (p.noop ? true : confirmModal({
+        title: `Move ${name} ${dir}`,
+        message: `Move ${name} one place ${dir} on ${card.dataset.name}'s list. Every account ` +
+          'following the list has its channels\' guides re-decided.',
+        list: p.lines,
+        confirmLabel: `Move ${dir}`,
+      })))
+      .then((ok) => {
+        if (!ok) return null;
+        showToast('Moving it and re-deciding the guides of the accounts following this order...');
+        return send(`${base}/move`, { method: 'POST', body: JSON.stringify({ direction: dir }) });
+      })
+      .catch(() => {});
+  }
+
   // ── Dialogs ──────────────────────────────────────────────────────────────
   function accountChecks(choices, providerName) {
     return choices.map((c) => {
@@ -68,8 +106,11 @@
             const ids = Array.from(body.querySelectorAll('#prov-accts input:checked'))
               .map((i) => Number(i.value));
             if (!name) { showToast('Give the provider a name.', { type: 'error' }); return false; }
-            send('/api/providers', { method: 'POST', body: JSON.stringify({ name, account_ids: ids }) })
-              .then(() => close()).catch(() => {});
+            confirmJoin(ids, null, name).then((ok) => {
+              if (!ok) return null;
+              return send('/api/providers', { method: 'POST', body: JSON.stringify({ name, account_ids: ids }) })
+                .then(() => close());
+            }).catch(() => {});
             return false;
           },
         },
@@ -128,9 +169,12 @@
           class: 'btn btn-primary',
           onClick: (close) => {
             const accountId = Number(body.querySelector('#prov-acct').value);
-            send(`/api/providers/${card.dataset.providerId}/accounts`,
-              { method: 'POST', body: JSON.stringify({ account_id: accountId }) })
-              .then(() => close()).catch(() => {});
+            confirmJoin([accountId], card.dataset.providerId, card.dataset.name).then((ok) => {
+              if (!ok) return null;
+              return send(`/api/providers/${card.dataset.providerId}/accounts`,
+                { method: 'POST', body: JSON.stringify({ account_id: accountId }) })
+                .then(() => close());
+            }).catch(() => {});
             return false;
           },
         },
@@ -334,12 +378,7 @@
       case 'prov-epg-refresh':
         send(`${epgUrl(card, el.dataset.sourceId)}/refresh`, { method: 'POST' }).catch(() => {});
         return;
-      case 'prov-epg-move':
-        showToast('Moving it and re-deciding the guides of the accounts following this order...');
-        send(`/api/providers/${card.dataset.providerId}/epg-order/${el.dataset.entryId}/move`,
-          { method: 'POST', body: JSON.stringify({ direction: el.dataset.direction }) })
-          .catch(() => {});
-        return;
+      case 'prov-epg-move': moveEntry(card, el); return;
       default:
         console.warn('unhandled provider action', act);
     }
