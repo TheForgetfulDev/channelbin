@@ -1,8 +1,9 @@
 """EPG sources: where a channel's guide comes from (DESIGN-epg-sources.md).
 
 Canonical home for what a source is, a channel's key into a source's file, which source
-wins a channel, the source directory, and moving a channel's listings between the active
-table (`epg_entries`) and the alternates table when the winner changes. The import itself
+a channel's guide starts with and which continue it, the source directory, and putting a
+channel's listings in the guide table (`epg_entries`) or the alternates table
+(place_stretches()). The import itself
 is `accounts.import_source()`, which calls in here; nothing in this module fetches or
 parses a feed.
 
@@ -15,6 +16,7 @@ import difflib
 import json
 import logging
 import re
+import time as time_mod
 import unicodedata
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -24,7 +26,11 @@ from urllib.parse import urlsplit
 from sqlalchemy import and_, case, delete, func, insert, literal, select, union_all, update
 
 from . import db
-from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_KEY_CHANGED,
+from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_FILL_CHANGED,
+                       CHANNEL_EPG_KEY_CHANGED, EpgChannelStretch, EPG_FINDING_SHARED_ID,
+                       EPG_STRETCH_FILLS, EPG_STRETCH_NOTHING_PAST_END, EPG_STRETCH_NO_OVERLAP,
+                       EPG_STRETCH_NO_SCHEDULE, EPG_STRETCH_SHARED_ID,
+                       EPG_STRETCH_UNRELATED, EPG_STRETCH_WAITING,
                        CHANNEL_EPG_SOURCE_CHANGED, CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED, EPGEntry, EpgAlternateEntry, EpgChannelKey,
                        EpgFinding, EpgSource, EpgSourceAgreement, EpgSourceChannel, EpgSourceRefresh,
                        EpgSourceSubscription, EPG_KEY_ACCEPTED, EPG_ORDER_FOLLOW, EPG_ORDER_MODES,
@@ -34,7 +40,7 @@ from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_KEY_CHANGED,
                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, EPG_STATUS_FAILED, EPG_STATUS_OK,
                        EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED)
 from .db_utils import chunked, retry_on_locked
-from .fmt_utils import counted, plural
+from .fmt_utils import counted, join_labels, plural
 from .program_titles import strip_marks
 
 log = logging.getLogger(__name__)
@@ -382,11 +388,12 @@ def directory_coverage(source_ids, case_sensitive: bool) -> dict[int, dict[str, 
 
 def resolve_active_source(override_id: int | None, ordered_source_ids,
                           coverage: dict[int, Coverage]) -> tuple[int | None, str]:
-    """Which source a channel's guide comes from, and why (DESIGN-epg-sources.md §5.1).
+    """Which source a channel's guide starts with, and why (DESIGN-epg-sources.md §5.1).
 
     `ordered_source_ids` is the channel's account's subscriptions in priority order;
     `coverage` is {source_id: Coverage} for the sources that cover the channel at all.
-    Whole-channel only - one winner, never a spliced timeline.
+    One answer per channel. The sources after it may continue the guide past its end, which
+    is decide_stretches()'s question and not this one's (§14).
 
     1. The override, if the account reads that source and it covers the channel right now.
        If not, fall through; the override is never cleared here (it is the user's, and
@@ -492,11 +499,19 @@ def of_sources(model, source_ids):
     return model.source_id.in_(ids)
 
 
-def _move_rows(channel_ids, source_id: int, src_model, dst_model) -> int:
-    """The statements of one move, without committing: INSERT ... SELECT then DELETE."""
+def _move_rows(channel_ids, source_id: int, src_model, dst_model, *,
+               starting_from: datetime | None = None,
+               starting_before: datetime | None = None) -> int:
+    """The statements of one move, without committing: INSERT ... SELECT then DELETE.
+    `starting_from` / `starting_before` narrow it to the listings on one side of a seam
+    (§14.4)."""
     src_cols = [getattr(src_model, c) for c in _ENTRY_COLUMNS]
     dst_cols = [getattr(dst_model, c) for c in _ENTRY_COLUMNS]
-    where = (_of_source(src_model, source_id), src_model.channel_id.in_(list(channel_ids)))
+    where = [_of_source(src_model, source_id), src_model.channel_id.in_(list(channel_ids))]
+    if starting_from is not None:
+        where.append(src_model.start_time >= starting_from)
+    if starting_before is not None:
+        where.append(src_model.start_time < starting_before)
     db.session.execute(insert(dst_model).from_select(dst_cols, select(*src_cols).where(*where)))
     return db.session.execute(delete(src_model).where(*where)).rowcount
 
@@ -610,6 +625,32 @@ def demote(channel_ids, source_id: int) -> int:
 def promote(channel_ids, source_id: int) -> int:
     """A source became these channels' winner: its kept rows come back to epg_entries."""
     return _move(channel_ids, source_id, EpgAlternateEntry, EPGEntry)
+
+
+def demote_others(channel_ids, keep_source_id: int | None) -> int:
+    """These channels' guide is about to start with another source (or with none, `None`):
+    every other source's rows leave epg_entries first - the old first source's and those of
+    the sources that continued it (§14). Done before the new one is promoted, so a restart
+    between the two leaves a guide that is short, never one holding two sources' programs;
+    place_stretches() puts back what still continues it. One retry_on_locked unit a chunk,
+    as _move()."""
+    cols_src = [getattr(EPGEntry, c) for c in _ENTRY_COLUMNS]
+    cols_dst = [getattr(EpgAlternateEntry, c) for c in _ENTRY_COLUMNS]
+    moved = 0
+    for chunk in _chunks(channel_ids):
+        where = [EPGEntry.channel_id.in_(chunk)]
+        if keep_source_id is not None:
+            where.append((EPGEntry.source_id + 0) != keep_source_id)
+
+        @retry_on_locked()
+        def _move_chunk_and_commit(where=where):
+            db.session.execute(insert(EpgAlternateEntry).from_select(
+                cols_dst, select(*cols_src).where(*where)))
+            n = db.session.execute(delete(EPGEntry).where(*where)).rowcount
+            db.session.commit()
+            return n
+        moved += _move_chunk_and_commit()
+    return moved
 
 
 def drop_alternates(channel_ids) -> None:
@@ -743,7 +784,8 @@ def _coverage_of(directory) -> dict[int, Coverage]:
 
 def _key_donor(channel: Channel, source: EpgSource, key: str, case_sensitive: bool):
     """A visible channel on an account reading `source` whose key into it is `key` and which
-    holds that source's listings right now, as (channel id, name, table model), or None.
+    holds that source's listings right now, as (channel id, name), or None. A donor's rows
+    may sit in either table or, where the source continues its guide (§14), in both.
 
     Its rows are exactly what the next import would write for `channel`: the importer maps
     every channel whose key reads the same file id (file_id_for()) onto the same programs
@@ -788,7 +830,7 @@ def _key_donor(channel: Channel, source: EpgSource, key: str, case_sensitive: bo
         for model in (EPGEntry, EpgAlternateEntry):
             if db.session.query(model.id).filter(_of_source(model, source.id),
                                                  model.channel_id == cid).first():
-                return cid, name, model
+                return cid, name
     return None
 
 
@@ -830,7 +872,7 @@ def _apply_key_now(channel: Channel, source: EpgSource, old_key: str | None,
     donor = _key_donor(channel, source, new_key, case_sensitive)
     if donor is None:
         return KEY_WAITS, None
-    donor_id, donor_name, donor_model = donor
+    donor_id, donor_name = donor
 
     old_winner = channel.epg_source_id
     winner, why = resolve_active_source(channel.epg_source_override_id, order, coverage)
@@ -840,15 +882,17 @@ def _apply_key_now(channel: Channel, source: EpgSource, old_key: str | None,
         db.session.execute(delete(model).where(_of_source(model, source.id),
                                                model.channel_id == channel.id))
     dst = EPGEntry if winner == source.id else EpgAlternateEntry
-    src_cols = [literal(channel.id) if c == 'channel_id' else getattr(donor_model, c)
-                for c in _ENTRY_COLUMNS]
-    db.session.execute(insert(dst).from_select(
-        [getattr(dst, c) for c in _ENTRY_COLUMNS],
-        select(*src_cols).where(_of_source(donor_model, source.id),
-                                donor_model.channel_id == donor_id)))
+    for donor_model in (EPGEntry, EpgAlternateEntry):
+        src_cols = [literal(channel.id) if c == 'channel_id' else getattr(donor_model, c)
+                    for c in _ENTRY_COLUMNS]
+        db.session.execute(insert(dst).from_select(
+            [getattr(dst, c) for c in _ENTRY_COLUMNS],
+            select(*src_cols).where(_of_source(donor_model, source.id),
+                                    donor_model.channel_id == donor_id)))
     if winner is not None and winner not in (old_winner, source.id):
         _move_rows([channel.id], winner, EpgAlternateEntry, EPGEntry)
     _set_winner(channel, old_winner, winner, why)
+    place_channel_now(channel, case_sensitive, coverage)
     return KEY_COPIED, f'{donor_name} (#{donor_id})'
 
 
@@ -880,6 +924,7 @@ def _drop_source_now(channel: Channel, source: EpgSource, case_sensitive: bool) 
                                                model.channel_id == channel.id))
     old_winner = channel.epg_source_id
     if old_winner != source.id:
+        place_channel_now(channel, case_sensitive)
         return KEY_DROPPED
     order = subscriptions_for([channel.account_id]).get(channel.account_id, [])
     _keys, _wanted, directory = _channel_directory(channel, order, case_sensitive)
@@ -893,6 +938,7 @@ def _drop_source_now(channel: Channel, source: EpgSource, case_sensitive: bool) 
         db.session.execute(delete(EpgAlternateEntry).where(
             EpgAlternateEntry.channel_id == channel.id))
     _set_winner(channel, old_winner, winner, why)
+    place_channel_now(channel, case_sensitive)
     return KEY_DROPPED
 
 
@@ -1044,6 +1090,7 @@ def set_source_override(channel: Channel, source: EpgSource | None, *,
         if winner is not None:
             _move_rows([channel.id], winner, EpgAlternateEntry, EPGEntry)
         _set_winner(channel, old_winner, winner, why)
+        place_channel_now(channel, case_sensitive)
     state = _override_state(new_id, why, winner, order)
 
     names = dict(db.session.query(EpgSource.id, EpgSource.name).filter(
@@ -1193,8 +1240,12 @@ def _delete_source_rows(source_ids) -> None:
     by the other. Does not commit."""
     ids = list(source_ids)
     for model in (EPGEntry, EpgAlternateEntry, EpgSourceChannel, EpgChannelKey,
-                  EpgSourceSubscription, EpgSourceRefresh, EpgFinding):
+                  EpgSourceSubscription, EpgSourceRefresh, EpgFinding, EpgChannelStretch):
         db.session.execute(delete(model).where(model.source_id.in_(ids)))
+    db.session.execute(update(EpgChannelStretch)
+                       .where(EpgChannelStretch.after_source_id.in_(ids))
+                       .values(after_source_id=None)
+                       .execution_options(synchronize_session=False))
     db.session.execute(delete(EpgSourceAgreement).where(db.or_(
         EpgSourceAgreement.source_id.in_(ids), EpgSourceAgreement.other_source_id.in_(ids))))
     # A provider's list names it; the gap left in the positions is closed by the list's
@@ -1342,6 +1393,7 @@ def reresolve_channels(channel_ids, case_sensitive: bool, *,
     reasons: dict[int, str] = {}
     demotions: dict[int, list[int]] = {}
     promotions: dict[int, list[int]] = {}
+    leaving: dict[int | None, list[int]] = {}
     orphaned: list[int] = []
     for r in rows:
         if r.id not in decided:
@@ -1353,12 +1405,14 @@ def reresolve_channels(channel_ids, case_sensitive: bool, *,
         reasons[r.id] = why
         if r.epg_source_id is not None:
             demotions.setdefault(r.epg_source_id, []).append(r.id)
+        leaving.setdefault(new, []).append(r.id)
         if new is not None:
             promotions.setdefault(new, []).append(r.id)
         else:
             orphaned.append(r.id)
-    for sid, ids in demotions.items():
-        demote(ids, sid)
+    # Out before in: the old first source's rows and those of the sources that continued it.
+    for new, ids in leaving.items():
+        demote_others(ids, new)
     for sid, ids in promotions.items():
         promote(ids, sid)
     if orphaned:
@@ -1367,6 +1421,9 @@ def reresolve_channels(channel_ids, case_sensitive: bool, *,
     names.update(db.session.query(EpgSource.id, EpgSource.name).filter(
         EpgSource.id.in_(list(promotions) + list(demotions))))
     apply_winners(changes, names, reasons)
+    # Every channel asked about, not only the ones whose first source moved: a change of
+    # order changes which sources continue a guide whose start stays where it was (§14.4).
+    place_stretches([r.id for r in rows], case_sensitive)
 
     @retry_on_locked()
     def _recount_and_commit():
@@ -1484,6 +1541,10 @@ def retire_expired_listings(source_id: int, case_sensitive: bool,
             if k in just_now:
                 new.add(ch_id)
     outcome = reresolve_channels(dark, case_sensitive) if dark else {}
+    # A channel whose guide this source continued has nothing left from it either.
+    filled = stretch_channel_ids(source_id)
+    if filled:
+        place_stretches(filled, case_sensitive, now)
 
     # Everything this source has left dark since its last good refresh: the channels still
     # pointing at it with nothing to show, and the ones a call like this one left with no
@@ -1531,6 +1592,7 @@ def delete_url_source(source_id: int, case_sensitive: bool) -> SourceRemoval | N
     name = source.name
     affected = [cid for (cid,) in db.session.query(Channel.id)
                 .filter(Channel.epg_source_id == source_id)]
+    filled = stretch_channel_ids(source_id)
 
     @retry_on_locked()
     def _delete_and_commit():
@@ -1545,6 +1607,8 @@ def delete_url_source(source_id: int, case_sensitive: bool) -> SourceRemoval | N
     outcome = reresolve_channels(affected, case_sensitive,
                                  previous={cid: source_id for cid in affected},
                                  source_names={source_id: name})
+    # The channels it continued: a source behind it may reach past the end now.
+    place_stretches(filled, case_sensitive)
     return _removal_result(affected, outcome)
 
 
@@ -1577,6 +1641,7 @@ def stop_using_source(account_id: int, source_id: int, case_sensitive: bool, *,
         raise NeedsOwnOrder(own_order_sentence(account_id))
     affected = [cid for (cid,) in db.session.query(Channel.id).filter(
         Channel.account_id == account_id, Channel.epg_source_id == source_id)]
+    filled = stretch_channel_ids(source_id, account_id)
     mine = select(Channel.id).where(Channel.account_id == account_id)
 
     @retry_on_locked()
@@ -1592,6 +1657,9 @@ def stop_using_source(account_id: int, source_id: int, case_sensitive: bool, *,
         for model in (EPGEntry, EpgAlternateEntry):
             db.session.execute(delete(model).where(_of_source(model, source_id),
                                                    model.channel_id.in_(mine)))
+        db.session.execute(delete(EpgChannelStretch).where(
+            EpgChannelStretch.source_id == source_id,
+            EpgChannelStretch.channel_id.in_(mine)))
         db.session.execute(update(Channel).where(
             Channel.account_id == account_id, Channel.epg_source_id == source_id)
             .values(epg_source_id=None).execution_options(synchronize_session=False))
@@ -1602,6 +1670,7 @@ def stop_using_source(account_id: int, source_id: int, case_sensitive: bool, *,
     _unsubscribe_and_commit()
     outcome = reresolve_channels(affected, case_sensitive,
                                  previous={cid: source_id for cid in affected})
+    place_stretches(filled, case_sensitive)
     return _removal_result(affected, outcome)
 
 
@@ -1804,8 +1873,8 @@ def borrowable_sources(account_id: int, case_sensitive: bool) -> list[dict]:
 
 
 def _held_listings(source_id: int, case_sensitive: bool,
-                   variants: dict[str, dict[str, int]]) -> dict[str, tuple[int, type]]:
-    """{file id: (channel id, table model)} - for each id of the source's file, one visible
+                   variants: dict[str, dict[str, int]]) -> dict[str, int]:
+    """{file id: channel id} - for each id of the source's file, one visible
     channel on an account reading it that holds the source's listings for it now. Any one
     will do: the importer maps every channel whose key reads that id onto the same programs
     (§7.1), so their rows are identical. Keyed on the id read (file_id_for() over
@@ -1814,15 +1883,15 @@ def _held_listings(source_id: int, case_sensitive: bool,
     readers = subscriber_ids(source_id)
     if not readers:
         return {}
-    holding: dict[int, type] = {}
+    # In either table: a donor whose guide the source continues holds it in both (§14).
+    holding: set[int] = set()
     for model in (EPGEntry, EpgAlternateEntry):
-        for (cid,) in db.session.query(model.channel_id).filter(
-                model.source_id == source_id).distinct():
-            holding.setdefault(cid, model)
+        holding.update(cid for (cid,) in db.session.query(model.channel_id).filter(
+            model.source_id == source_id).distinct())
     if not holding:
         return {}
     user = {ch: k for (ch, _sid), k in key_answers([source_id]).items()}
-    out: dict[str, tuple[int, type]] = {}
+    out: dict[str, int] = {}
     for cid, provider_id in (db.session.query(Channel.id, Channel.epg_channel_id)
                              .filter(Channel.account_id.in_(readers),
                                      Channel.hidden.is_(False)).order_by(Channel.id)):
@@ -1831,7 +1900,7 @@ def _held_listings(source_id: int, case_sensitive: bool,
         k = channel_key(provider_id, user.get(cid))
         fid = file_id_for(k, variants.get(norm_key(k, case_sensitive), {})) if k else None
         if fid is not None:
-            out.setdefault(fid, (cid, holding[cid]))
+            out.setdefault(fid, cid)
     return out
 
 
@@ -1944,21 +2013,21 @@ def copy_held_listings(account_id: int, source_id: int,
         covered += 1
         fid = file_id_for(k, variants.get(nk, {}))
         donor = donors.get(fid)
-        if donor is not None and donor[0] != cid:
-            pairs.append((cid, *donor))
+        if donor is not None and donor != cid:
+            pairs.append((cid, donor))
 
     for pairs_batch in chunked(pairs, _COPY_CHUNK):
         @retry_on_locked()
         def _copy_and_commit(batch=pairs_batch):
-            targets = [t for t, _d, _m in batch]
+            targets = [t for t, _d in batch]
             for model in (EPGEntry, EpgAlternateEntry):
                 db.session.execute(delete(model).where(_of_source(model, source_id),
                                                        model.channel_id.in_(targets)))
             for model in (EPGEntry, EpgAlternateEntry):
-                _copy_listings([(t, d) for t, d, m in batch if m is model], source_id, model)
+                _copy_listings(batch, source_id, model)
             db.session.commit()
         _copy_and_commit()
-    return covered, [t for t, _d, _m in pairs]
+    return covered, [t for t, _d in pairs]
 
 
 def reresolve_account(account_id: int, case_sensitive: bool) -> dict[int, int | None]:
@@ -2497,7 +2566,9 @@ def provider_release_preview(provider_id: int) -> dict:
     unread = sum(1 for sid in sources if not subscriber_ids(sid))
     guided = (db.session.query(func.count(Channel.id)).filter(
         Channel.epg_source_id.in_(sources)).scalar() or 0) if sources else 0
-    return {'sources': len(sources), 'unread': unread, 'guided': guided}
+    extended = sum(extended_counts(sources).values())
+    return {'sources': len(sources), 'unread': unread, 'guided': guided,
+            'extended': extended}
 
 
 def provider_lists_view(provider_ids, tz=None, now: datetime | None = None) -> dict[int, list[dict]]:
@@ -2518,6 +2589,7 @@ def provider_lists_view(provider_ids, tz=None, now: datetime | None = None) -> d
     guided: dict[int, int] = dict(db.session.query(Channel.epg_source_id, func.count(Channel.id))
                                   .filter(Channel.epg_source_id.in_(list(sources) or [-1]))
                                   .group_by(Channel.epg_source_id))
+    extended = extended_counts(sources)
     out: dict[int, list[dict]] = {pid: [] for pid in ids}
     for e in entries:
         if e.entry == PROVIDER_ORDER_OWN_GUIDE:
@@ -2536,6 +2608,7 @@ def provider_lists_view(provider_ids, tz=None, now: datetime | None = None) -> d
             'last_success_at': s.last_success_at,
             'status_badge': badge, 'status_label': label, 'last_error': s.last_error,
             'readers': readers.get(s.id, 0), 'guided': guided.get(s.id, 0),
+            'extended': extended.get(s.id, 0),
         })
     return out
 
@@ -2703,18 +2776,27 @@ class AccountReach(NamedTuple):
     """An account's guide reach from the sources that guide its channels: `first` and `last`
     are the shortest and longest of their typical days, `most` the day at least half of the
     account's guided channels reach, each counted at its source's typical day - the one date
-    a list row has room for."""
+    a list row has room for. A channel whose guide a later source continues (§14) is counted
+    at the later of the two sources' days."""
     first: date
     last: date
     most: date
 
 
-def account_reach(active: dict, days: dict) -> AccountReach | None:
+def account_reach(active: dict, days: dict, filled: dict | None = None) -> AccountReach | None:
     """AccountReach for one account - `active` is {source_id: channels guided from it here},
-    `days` {source_id: Reach.day}. A source the account reads that guides none of its
-    channels says nothing about its guide."""
-    found = sorted((days[sid], n) for sid, n in active.items()
-                   if n and days.get(sid) is not None)
+    `days` {source_id: Reach.day}, `filled` {(first source, last filling source): channels}
+    for the ones whose guide is continued (filled_counts_by_accounts()). A source the
+    account reads that guides none of its channels says nothing about its guide."""
+    plain = dict(active)
+    found = []
+    for (first, last), n in (filled or {}).items():
+        reached = [days[s] for s in (first, last) if days.get(s) is not None]
+        if n and reached and first in plain:
+            plain[first] -= n
+            found.append((max(reached), n))
+    found = sorted(found + [(days[sid], n) for sid, n in plain.items()
+                            if n > 0 and days.get(sid) is not None])
     if not found:
         return None
     total, seen, most = sum(n for _d, n in found), 0, found[-1][0]
@@ -2730,11 +2812,13 @@ def accounts_reach(account_ids, tz) -> dict[int, AccountReach]:
     """{account_id: account_reach()} for a list page: two grouped queries whatever the
     account count, plus source_reach()'s reads for a source with no directory."""
     active = active_counts_by_accounts(account_ids)
-    reach = source_reach({sid for counts in active.values() for sid in counts}, tz)
+    filled = filled_counts_by_accounts(account_ids)
+    reach = source_reach({sid for counts in active.values() for sid in counts}
+                         | {last for pairs in filled.values() for _first, last in pairs}, tz)
     days = {sid: r.day for sid, r in reach.items()}
     out = {}
     for aid, counts in active.items():
-        span = account_reach(counts, days)
+        span = account_reach(counts, days, filled.get(aid))
         if span is not None:
             out[aid] = span
     return out
@@ -2850,6 +2934,7 @@ def account_sources_view(account_id: int, schedule: dict | None = None, tz=None,
     placed = set(placed_for_account(account_id))
     own_guide = own_guide_ids([account_id]).get(account_id)
     active_here = active_counts_by_account(account_id)
+    extends_here = extends_counts(account_id)
     readers: dict[int, list[ForeignReader]] = {}
     owned = [s.id for s in [sub.source for sub in subs] + idle
              if s.owner_account_id == account_id]
@@ -2884,6 +2969,8 @@ def account_sources_view(account_id: int, schedule: dict | None = None, tz=None,
             'status_badge': badge, 'status_label': label, 'last_error': s.last_error,
             'entry_count': s.entry_count or 0, 'channel_count': s.channel_count or 0,
             'active_here': active_here.get(s.id, 0),
+            # Channels whose guide it continues past the end of an earlier source (§14.6).
+            'extends_here': extends_here.get(s.id, 0),
             'ran_out_note': RAN_OUT_NOTES.get(ran_out.get(s.id)),
             'reach': source_reach_view(reach.get(s.id), now, tz),
             'reach_day': reach[s.id].day if s.id in reach else None,
@@ -2891,6 +2978,29 @@ def account_sources_view(account_id: int, schedule: dict | None = None, tz=None,
                         for fr in readers.get(s.id, [])],
         })
     return rows
+
+
+def stretch_note(outcome: str, after_name: str | None) -> str | None:
+    """Why a source after the first does not continue a channel's guide, for the channel
+    page. None for one that does: the page says where its part starts instead."""
+    other = f"{after_name}'s" if after_name else "the earlier source's"
+    if outcome == EPG_STRETCH_FILLS:
+        return None
+    if outcome == EPG_STRETCH_NOTHING_PAST_END:
+        return 'Reaches no further than the guide already does.'
+    if outcome == EPG_STRETCH_UNRELATED:
+        return f'Its listings do not match {other}, so it is not used to continue the guide.'
+    if outcome == EPG_STRETCH_NO_OVERLAP:
+        return (f'Too few listings overlap {other} to tell whether they match, so it is not '
+                'used to continue the guide.')
+    if outcome == EPG_STRETCH_NO_SCHEDULE:
+        return 'Lists one program all day, so it is not used to continue a full schedule.'
+    if outcome == EPG_STRETCH_WAITING:
+        return 'Its listings for this channel arrive at its next refresh.'
+    if outcome == EPG_STRETCH_SHARED_ID:
+        return ('Channels with different names share this id, so it is not used to continue '
+                'the guide.')
+    raise ValueError(f'unknown EPG stretch outcome {outcome!r}')
 
 
 def _pending_keys(channel_id: int, sources: dict[int, EpgSource]) -> dict[int, str]:
@@ -2919,9 +3029,11 @@ def _pending_keys(channel_id: int, sources: dict[int, EpgSource]) -> dict[int, s
 
 
 def channel_guide_view(channel: Channel, case_sensitive: bool) -> dict:
-    """The channel page's Guide section (DESIGN-epg-sources.md §9.3): the active source and
-    why, then one row per source the channel's account subscribes to. A fixed number of
-    queries per page, whatever the source count.
+    """The channel page's Guide section (DESIGN-epg-sources.md §9.3, §14.6): the source the
+    guide starts with and why, the sources that continue it (`chain`, each with where its
+    part ends), then one row per source the channel's account subscribes to, saying what
+    each does past the end of the one before. A fixed number of queries per page, whatever
+    the source count.
 
     The "why" is recomputed from the directory with the same resolve_active_source() the
     import used, rather than stored. When it disagrees with the stored winner - a source not
@@ -2947,14 +3059,27 @@ def channel_guide_view(channel: Channel, case_sensitive: bool) -> dict:
                                               coverage)
     active = by_id.get(channel.epg_source_id) if channel.epg_source_id else None
     others = [sid for sid in source_ids if sid != channel.epg_source_id]
-    comparable = bool(active and others and db.session.query(
-        select(EpgAlternateEntry.id).where(EpgAlternateEntry.source_id.in_(others),
-                                           EpgAlternateEntry.channel_id == channel.id)
-        .exists()).scalar())
+    comparable = bool(active and others and any(db.session.query(
+        select(model.id).where(of_sources(model, others), model.channel_id == channel.id)
+        .exists()).scalar() for model in (EpgAlternateEntry, EPGEntry)))
+    stretches = {r.source_id: r for r in EpgChannelStretch.query.filter_by(
+        channel_id=channel.id).order_by(EpgChannelStretch.position)}
+    # Where each source's part of the guide runs, read from the listings held (§14.4).
+    part = {sid: (lo, hi) for sid, lo, hi in db.session.query(
+        EPGEntry.source_id, func.min(EPGEntry.start_time), func.max(EPGEntry.stop_time))
+        .filter(EPGEntry.channel_id == channel.id).group_by(EPGEntry.source_id)}
+    chain = []
+    if active is not None and not channel.hidden:
+        chain = [{'name': by_id[sid].name, 'until': part[sid][1]}
+                 for sid in [active.id] + [x for x, r in stretches.items()
+                                           if r.outcome == EPG_STRETCH_FILLS]
+                 if sid in part and sid in by_id]
     rows = []
     for sid in source_ids + [s for s in by_id if s not in source_ids]:
         s = by_id[sid]
         d = directory.get(sid) or coverage.get(sid)
+        stretch = stretches.get(sid) if not channel.hidden else None
+        after = by_id.get(stretch.after_source_id) if stretch is not None else None
         user_key, origin = keys.get(sid, (None, None))
         ignored_id = (user_key.provider_id if ignores(channel.epg_channel_id, user_key)
                       else None)
@@ -2981,6 +3106,12 @@ def channel_guide_view(channel: Channel, case_sensitive: bool) -> dict:
             'refreshed': sid not in no_directory,
             'active': sid == channel.epg_source_id,
             'override': sid == channel.epg_source_override_id,
+            # What it does for the guide past the end of the source before it (§14.6).
+            'stretch': stretch.outcome if stretch is not None else None,
+            'stretch_from': (part[sid][0] if stretch is not None and sid in part
+                             and stretch.outcome == EPG_STRETCH_FILLS else None),
+            'stretch_note': (stretch_note(stretch.outcome, after.name if after else None)
+                             if stretch is not None else None),
         })
     override = None
     if channel.epg_source_override_id:
@@ -2992,7 +3123,7 @@ def channel_guide_view(channel: Channel, case_sensitive: bool) -> dict:
     return {
         'active': active, 'reason': why if computed == channel.epg_source_id else None,
         'hidden': channel.hidden, 'rows': rows, 'override': override,
-        'comparable': comparable,
+        'comparable': comparable, 'chain': chain,
     }
 
 
@@ -3579,6 +3710,8 @@ CMP_UNRELATED = 'unrelated'         # fewer than half the active listings have a
 CMP_NO_OVERLAP = 'no-overlap'       # no stretch of time both list, from now on
 COMPARE_VERDICTS = (CMP_IDENTICAL, CMP_DESCRIPTIONS, CMP_MOSTLY, CMP_SHIFTED, CMP_UNRELATED,
                     CMP_NO_OVERLAP)
+#: The verdicts that say two sources list the same channel's schedule (§14.3's "agree").
+CMP_AGREEING = frozenset({CMP_IDENTICAL, CMP_DESCRIPTIONS, CMP_MOSTLY, CMP_SHIFTED})
 
 ROW_SAME = 'same'
 ROW_MOVED = 'moved'
@@ -3818,9 +3951,10 @@ _LISTING_COLUMNS = ('title', 'sub_title', 'description', 'start_time', 'stop_tim
 
 
 def channel_source_comparisons(channel: Channel, now: datetime | None = None):
-    """(active listings, [SourceComparison]) for one channel, from now on: its guide
-    against every other source its account reads that holds listings for it, in priority
-    order. Three queries whatever the listing or source count, and nothing written.
+    """(the first source's listings, [SourceComparison]) for one channel, from now on: the
+    source its guide starts with against every other source its account reads that holds
+    listings for it, in priority order. Four queries whatever the listing or source count,
+    and nothing written.
 
     The alternates are kept only for a channel with an active source (§4), so a channel
     with none has nothing to compare."""
@@ -3831,24 +3965,615 @@ def channel_source_comparisons(channel: Channel, now: datetime | None = None):
     def listing(r):
         return Listing(r.title, r.sub_title, r.description, r.start_time, r.stop_time)
 
-    active = [listing(r) for r in db.session.query(
-        *(getattr(EPGEntry, c) for c in _LISTING_COLUMNS)).filter(
-        EPGEntry.channel_id == channel.id, EPGEntry.stop_time > now)
-        .order_by(EPGEntry.start_time)]
     order = [sid for sid in subscriptions_for([channel.account_id]).get(channel.account_id, [])
              if sid != channel.epg_source_id]
+    # By source over both tables: a source that continues the guide (§14) holds its later
+    # listings in epg_entries and its earlier ones in the alternates.
     held: dict[int, list[Listing]] = {}
-    if order:
-        for r in db.session.query(EpgAlternateEntry.source_id,
-                                  *(getattr(EpgAlternateEntry, c) for c in _LISTING_COLUMNS)
-                                  ).filter(EpgAlternateEntry.source_id.in_(order),
-                                           EpgAlternateEntry.channel_id == channel.id,
-                                           EpgAlternateEntry.stop_time > now
-                                           ).order_by(EpgAlternateEntry.start_time):
+    for model in (EPGEntry, EpgAlternateEntry):
+        for r in db.session.query(model.source_id,
+                                  *(getattr(model, c) for c in _LISTING_COLUMNS)
+                                  ).filter(model.channel_id == channel.id,
+                                           of_sources(model, order + [channel.epg_source_id]),
+                                           model.stop_time > now):
             held.setdefault(r.source_id, []).append(listing(r))
+    for rows in held.values():
+        rows.sort(key=lambda x: x.start)
+    active = held.pop(channel.epg_source_id, [])
     if not held:
         return active, []
     sources = {s.id: s for s in EpgSource.query.filter(EpgSource.id.in_(list(held)))}
     return active, [SourceComparison(sources[sid], max(x.stop for x in held[sid]),
                                      compare_listings(active, held[sid]))
                     for sid in order if sid in held]
+
+
+# ── Filling a guide past the end of its first source (DESIGN-epg-sources.md §14,
+#    dev/changelog/1722) ─────────────────────────────────────────────────────
+#
+# Channel.epg_source_id is the source a channel's guide STARTS with. Each later source in
+# the account's order may continue it: its listings starting at or after the last stop of
+# the stretch before go to epg_entries, the rest stay in the alternates. place_stretches()
+# is the one function that decides this and puts every row where it says, and every path
+# that moves or copies listings ends in it (tests/test_epg_fill.py holds the list).
+
+#: A recorded `fills` or `unrelated` is replaced only by a comparison over at least this
+#: many of the earlier source's listings, and a first judgment over fewer is `no_overlap`
+#: (§14.3). Judged over its first n listings, a pair of sources got a different answer than
+#: over all of them on 5.4% of 2,153 channels at 2, 2.0% at 6 and 1.5% at 10.
+FILL_MIN_JUDGED = 6
+
+#: Channels placed per commit.
+_PLACE_CHUNK = 100
+
+
+class Span(NamedTuple):
+    """What one source holds for one channel, over both tables."""
+    last_start: datetime
+    last_stop: datetime
+
+
+class Stretch(NamedTuple):
+    """The decision for one source after a channel's first."""
+    source_id: int
+    position: int
+    outcome: str                # EPG_STRETCH_*
+    after: int | None           # the source of the stretch it was judged against
+    seam: datetime | None       # EPG_STRETCH_FILLS: its listings starting at or after this
+    #                             are the guide's; None with fills = all of them
+
+
+def decide_stretches(first: int, later, covers: dict, spans: dict, flagged, stored: dict,
+                     listings: dict) -> list[Stretch]:
+    """Which of `later` (the account's other sources, in its order) continue a channel's
+    guide past `first`, and why not for the rest (§14.3, §14.4). Pure.
+
+    `covers` {source_id: Coverage} for the sources that cover the channel; `spans`
+    {source_id: Span} for the ones holding listings; `flagged` the sources through which the
+    channel reads an id unrelated channels share; `stored` {source_id: (outcome, after)} as
+    last decided; `listings` {source_id: [Listing] from now on, by start}.
+
+    A source is judged against the source of the stretch before it, and a refused one is
+    passed over: the next is judged against the same stretch. The checks run cheapest
+    first, and each names its outcome."""
+    out: list[Stretch] = []
+    prev = first
+    end = spans[first].last_stop if first in spans else None
+    for sid in later:
+        if sid == first or sid not in covers:
+            continue
+        span = spans.get(sid)
+        if sid in flagged or prev in flagged:
+            outcome = EPG_STRETCH_SHARED_ID
+        elif span is None:
+            outcome = EPG_STRETCH_WAITING
+        elif end is not None and span.last_start < end:
+            outcome = EPG_STRETCH_NOTHING_PAST_END
+        elif (prev in covers and covers[prev].real_schedule
+              and not covers[sid].real_schedule):
+            outcome = EPG_STRETCH_NO_SCHEDULE
+        else:
+            cmp = compare_listings(listings.get(prev, ()), listings.get(sid, ()))
+            kept = stored.get(sid)
+            if cmp.compared < FILL_MIN_JUDGED:
+                judged = None
+            elif cmp.verdict in CMP_AGREEING:
+                judged = EPG_STRETCH_FILLS
+            elif cmp.verdict == CMP_UNRELATED:
+                judged = EPG_STRETCH_UNRELATED
+            elif cmp.verdict == CMP_NO_OVERLAP:
+                judged = None
+            else:
+                # A verdict this does not know is never read as agreement.
+                raise ValueError(f'unknown comparison verdict {cmp.verdict!r}')
+            if judged is not None:
+                outcome = judged
+            elif (kept is not None and kept[1] == prev
+                  and kept[0] in (EPG_STRETCH_FILLS, EPG_STRETCH_UNRELATED)):
+                outcome = kept[0]
+            else:
+                outcome = EPG_STRETCH_NO_OVERLAP
+        out.append(Stretch(sid, len(out) + 1, outcome, prev,
+                           end if outcome == EPG_STRETCH_FILLS else None))
+        if outcome == EPG_STRETCH_FILLS:
+            end = span.last_stop if end is None else max(end, span.last_stop)
+            prev = sid
+    return out
+
+
+class _Held(NamedTuple):
+    """One source's rows for one channel in one table."""
+    first_start: datetime
+    last_start: datetime
+    last_stop: datetime
+    count: int
+    titles: int
+
+
+def _held_by_table(channel_ids) -> tuple[dict, dict]:
+    """({channel_id: {source_id: _Held}} in epg_entries, the same in the alternates). Two
+    grouped statements per chunk, each reaching the channels' own rows by a channel index."""
+    out: tuple[dict, dict] = ({}, {})
+    for chunk in _chunks(channel_ids):
+        for held, model in zip(out, (EPGEntry, EpgAlternateEntry)):
+            for cid, sid, lo, hi, stop, n, titles in (
+                    db.session.query(model.channel_id, model.source_id,
+                                     func.min(model.start_time), func.max(model.start_time),
+                                     func.max(model.stop_time), func.count(model.id),
+                                     func.count(func.distinct(model.title)))
+                    .filter(model.channel_id.in_(chunk))
+                    .group_by(model.channel_id, model.source_id)):
+                held.setdefault(cid, {})[sid] = _Held(lo, hi, stop, n, titles)
+    return out
+
+
+def _future_listings(channel_ids, now: datetime) -> dict[int, dict[int, list]]:
+    """{channel_id: {source_id: [Listing] from now on, by start}} over both tables. Titles
+    and times only: they are all a verdict is made from."""
+    out: dict[int, dict[int, list]] = {}
+    for chunk in _chunks(channel_ids):
+        for model in (EPGEntry, EpgAlternateEntry):
+            for cid, sid, title, start, stop in db.session.query(
+                    model.channel_id, model.source_id, model.title, model.start_time,
+                    model.stop_time).filter(model.channel_id.in_(chunk),
+                                            model.stop_time > now):
+                out.setdefault(cid, {}).setdefault(sid, []).append(
+                    Listing(title, None, None, start, stop))
+    for by_source in out.values():
+        for rows in by_source.values():
+            rows.sort(key=lambda x: x.start)
+    return out
+
+
+def _shared_id_flags(account_ids, case_sensitive: bool) -> dict[tuple[int, int], set[str]]:
+    """{(account_id, source_id): folded ids} the EPG check last found shared by channels
+    whose names disagree (find_shared_ids(), stored as findings). Read from the stored
+    finding, never judged here: the name comparison costs half a second an account, and a
+    key write places one channel at a time."""
+    out: dict[tuple[int, int], set[str]] = {}
+    account_ids = list(account_ids)
+    if not account_ids:
+        return out
+    for aid, sid, subject in db.session.query(
+            EpgFinding.account_id, EpgFinding.source_id, EpgFinding.subject).filter(
+            EpgFinding.account_id.in_(account_ids),
+            EpgFinding.kind == EPG_FINDING_SHARED_ID, EpgFinding.subject.isnot(None)):
+        out.setdefault((aid, sid), set()).add(norm_key(subject, case_sensitive))
+    return out
+
+
+class _Placement(NamedTuple):
+    """Where one channel's listings belong, and what has to change to get there."""
+    channel_id: int
+    first: int | None
+    stretches: list             # [Stretch], as decided
+    stored: dict                # {source_id: (position, outcome, after, updated_at)}
+    moves: list                 # [(source_id, into the guide?, starting_from, starting_before)]
+
+
+def _plan_moves(first: int, stretches, in_guide: dict, kept: dict) -> list:
+    """The moves that put one channel's rows where the decision says, from what it holds in
+    each table ({source_id: _Held}): the first source's all in epg_entries, a filling source's from its seam on, everything else in the alternates.
+    Only moves a row needs are planned, so a channel already in place costs nothing."""
+    fills = {s.source_id: s.seam for s in stretches if s.outcome == EPG_STRETCH_FILLS}
+    moves = []
+    for sid, held in kept.items():
+        if sid == first or (sid in fills and fills[sid] is None):
+            moves.append((sid, True, None, None))
+        elif sid in fills and held.last_start >= fills[sid]:
+            moves.append((sid, True, fills[sid], None))
+    for sid, held in in_guide.items():
+        if sid == first:
+            continue
+        if sid not in fills:
+            moves.append((sid, False, None, None))
+        elif fills[sid] is not None and held.first_start < fills[sid]:
+            moves.append((sid, False, None, fills[sid]))
+    return moves
+
+
+class _PlanContext(NamedTuple):
+    """What a placement reads once for all its channels, however many chunks it plans in."""
+    order: dict                 # {account_id: [source ids]}
+    keys: dict                  # key_answers()
+    flags: dict                 # _shared_id_flags()
+    directory: dict | None      # directory_coverage(); None when the caller has the coverage
+    unrefreshed: set
+
+
+def _plan_context(guided, case_sensitive: bool, with_directory: bool) -> _PlanContext:
+    order = subscriptions_for({r.account_id for r in guided})
+    candidates = {sid for sids in order.values() for sid in sids}
+    candidates |= {r.epg_source_id for r in guided}
+    keys = key_answers(candidates, [r.id for r in guided] if len(guided) <= _CHUNK else None)
+    flags = _shared_id_flags(order, case_sensitive)
+    if not with_directory or not guided:
+        return _PlanContext(order, keys, flags, None, set())
+    return _PlanContext(order, keys, flags, directory_coverage(candidates, case_sensitive),
+                        sources_without_directory(candidates))
+
+
+def _is_guided(r) -> bool:
+    return r.epg_source_id is not None and not r.hidden
+
+
+def _plan_stretches(rows, case_sensitive: bool, now: datetime, coverage_of=None,
+                    ctx: _PlanContext | None = None) -> list[_Placement]:
+    """Decide every channel in `rows` (id, account_id, epg_channel_id, hidden,
+    epg_source_id) from what the database holds. Reads only.
+
+    `coverage_of` {channel_id: {source_id: Coverage}} is passed by a caller that already
+    has one channel's coverage (a key write); otherwise it is read from the directory, with
+    held rows standing in for a source that has none yet (held_coverage()'s rule). `ctx` is
+    the caller's _plan_context() when it plans in chunks, so the directory is read once."""
+    guided = [r for r in rows if _is_guided(r)]
+    if ctx is None:
+        ctx = _plan_context(guided, case_sensitive, coverage_of is None)
+    order, keys, flags, directory, unrefreshed = ctx
+    in_guide, kept = _held_by_table([r.id for r in guided])
+    stored: dict[int, dict] = {}
+    for chunk in _chunks([r.id for r in rows]):
+        for cid, sid, pos, outcome, after, at in db.session.query(
+                EpgChannelStretch.channel_id, EpgChannelStretch.source_id,
+                EpgChannelStretch.position, EpgChannelStretch.outcome,
+                EpgChannelStretch.after_source_id, EpgChannelStretch.updated_at).filter(
+                EpgChannelStretch.channel_id.in_(chunk)):
+            stored.setdefault(cid, {})[sid] = (pos, outcome, after, at)
+
+    def held_span(cid, sid):
+        a, b = in_guide.get(cid, {}).get(sid), kept.get(cid, {}).get(sid)
+        if a is None and b is None:
+            return None
+        return Span(max(x.last_start for x in (a, b) if x), max(x.last_stop for x in (a, b) if x))
+
+    facts = {}
+    for r in guided:
+        mine = [r.epg_source_id] + [s for s in order.get(r.account_id, [])
+                                    if s != r.epg_source_id]
+        covers: dict[int, Coverage] = {}
+        flagged = set()
+        for sid in mine:
+            k = channel_key(r.epg_channel_id, keys.get((r.id, sid)))
+            nk = norm_key(k, case_sensitive) if k else None
+            if nk and nk in flags.get((r.account_id, sid), ()):
+                flagged.add(sid)
+            if coverage_of is not None:
+                continue
+            hit = directory.get(sid, {}).get(nk) if nk else None
+            if hit is None and (sid in unrefreshed or sid == r.epg_source_id):
+                # No directory yet, or the stored first source's row has been retired: what
+                # is held is the evidence there is (held_coverage()).
+                held = [x for x in (in_guide.get(r.id, {}).get(sid),
+                                    kept.get(r.id, {}).get(sid)) if x]
+                if held:
+                    hit = Coverage(sum(x.count for x in held), max(x.titles for x in held))
+            if hit is not None:
+                covers[sid] = hit
+        if coverage_of is not None:
+            covers = dict(coverage_of.get(r.id, {}))
+        spans = {sid: sp for sid in mine if (sp := held_span(r.id, sid)) is not None}
+        facts[r.id] = (mine, covers, spans, flagged)
+
+    # Listings are read only for a channel where some later source lists past the first's
+    # end, which the grouped read above already says.
+    def may_fill(cid):
+        mine, covers, spans, _flagged = facts[cid]
+        end = spans[mine[0]].last_stop if mine[0] in spans else None
+        return any(s in covers and s in spans and (end is None or spans[s].last_start >= end)
+                   for s in mine[1:])
+
+    listings = _future_listings([cid for cid in facts if may_fill(cid)], now)
+
+    out = []
+    for r in rows:
+        was = stored.get(r.id, {})
+        if r.id not in facts:
+            out.append(_Placement(r.id, None, [], was, []))
+            continue
+        mine, covers, spans, flagged = facts[r.id]
+        decided = decide_stretches(mine[0], mine[1:], covers, spans, flagged,
+                                   {sid: (o, after) for sid, (_p, o, after, _at) in was.items()},
+                                   listings.get(r.id, {}))
+        out.append(_Placement(r.id, mine[0], decided, was,
+                              _plan_moves(mine[0], decided, in_guide.get(r.id, {}),
+                                          kept.get(r.id, {}))))
+        time_mod.sleep(0)   # yield the GIL to request threads between channels
+    return out
+
+
+def _fill_event(p: _Placement, names: dict) -> dict | None:
+    """The CHANNEL_EPG_FILL_CHANGED row for a channel whose filling sources changed, or
+    None. A seam that only moved writes nothing (§14.6)."""
+    def name(sid):
+        return names.get(sid, f'source {sid}')
+    old = [sid for sid, (_pos, outcome, _after, _at) in
+           sorted(p.stored.items(), key=lambda x: x[1][0]) if outcome == EPG_STRETCH_FILLS]
+    new = [s.source_id for s in p.stretches if s.outcome == EPG_STRETCH_FILLS]
+    if old == new or p.first is None:
+        return None
+    if new:
+        detail = (f'Guide now continues from {join_labels([name(s) for s in new])} past the '
+                  f'end of {name(p.first)}')
+        if old:
+            detail += f' (was {join_labels([name(s) for s in old])})'
+    else:
+        detail = (f'Guide no longer continues from {join_labels([name(s) for s in old])} '
+                  f'past the end of {name(p.first)}')
+    return {'channel_id': p.channel_id, 'event_type': CHANNEL_EPG_FILL_CHANGED,
+            'detail': detail,
+            'extra_data': json.dumps({'first': p.first, 'fills': new, 'previous': old})}
+
+
+def _apply_placements(placements, names: dict, now: datetime) -> tuple[int, int]:
+    """Put the rows where the plan says, rewrite the stretch rows that changed and log the
+    channels whose filling sources changed. Does not commit. Returns (listings moved into
+    the guide, listings moved out). Every statement names its own rows, so run twice it
+    moves nothing the second time."""
+    moved_in = moved_out = 0
+    whole: dict[tuple[int, bool], list[int]] = {}
+    for p in placements:
+        for sid, into, starting_from, starting_before in p.moves:
+            src, dst = ((EpgAlternateEntry, EPGEntry) if into
+                        else (EPGEntry, EpgAlternateEntry))
+            if starting_from is None and starting_before is None:
+                whole.setdefault((sid, into), []).append(p.channel_id)
+                continue
+            n = _move_rows([p.channel_id], sid, src, dst, starting_from=starting_from,
+                           starting_before=starting_before)
+            moved_in, moved_out = moved_in + (n if into else 0), moved_out + (0 if into else n)
+    for (sid, into), ids in whole.items():
+        src, dst = (EpgAlternateEntry, EPGEntry) if into else (EPGEntry, EpgAlternateEntry)
+        n = _move_rows(ids, sid, src, dst)
+        moved_in, moved_out = moved_in + (n if into else 0), moved_out + (0 if into else n)
+
+    events = []
+    for p in placements:
+        want = _wanted(p)
+        if want == _stored(p):
+            continue
+        db.session.execute(delete(EpgChannelStretch).where(
+            EpgChannelStretch.channel_id == p.channel_id))
+        if want:
+            db.session.bulk_insert_mappings(EpgChannelStretch, [
+                {'channel_id': p.channel_id, 'source_id': sid, 'position': pos,
+                 'outcome': outcome, 'after_source_id': after,
+                 # When the outcome last changed: a row that only changed place keeps its time.
+                 'updated_at': (p.stored[sid][3] if sid in p.stored
+                                and p.stored[sid][1] == outcome else now)}
+                for sid, (pos, outcome, after) in want.items()])
+        event = _fill_event(p, names)
+        if event:
+            events.append(event)
+    if events:
+        db.session.bulk_insert_mappings(ChannelEvent, events)
+    return moved_in, moved_out
+
+
+def _wanted(p: _Placement) -> dict:
+    return {s.source_id: (s.position, s.outcome, s.after) for s in p.stretches}
+
+
+def _stored(p: _Placement) -> dict:
+    return {sid: row[:3] for sid, row in p.stored.items()}
+
+
+class _LazyNames:
+    """{source_id: name}, read the first time an event needs it: most placements change
+    no channel's filling sources, and a key write places one channel at a time."""
+
+    def __init__(self):
+        self._names = None
+
+    def get(self, sid, default=None):
+        if self._names is None:
+            self._names = dict(db.session.query(EpgSource.id, EpgSource.name))
+        return self._names.get(sid, default)
+
+
+def _take_write_lock() -> None:
+    """Open the write transaction before the reads a placement decides from. A statement
+    that changes no row still takes SQLite's write lock, and under pysqlite a SELECT alone
+    opens no transaction, so without it the reads would not be part of the unit."""
+    db.session.execute(update(EpgChannelStretch).where(EpgChannelStretch.id == -1)
+                       .values(position=EpgChannelStretch.position)
+                       .execution_options(synchronize_session=False))
+
+
+class Placed(NamedTuple):
+    """What place_stretches() did."""
+    channels: int       # channels whose stretch rows or listings changed
+    moved_in: int       # listings moved into epg_entries
+    moved_out: int      # ... and out of it
+
+
+def _channel_rows(channel_ids):
+    rows = []
+    for chunk in _chunks(channel_ids):
+        rows += db.session.query(Channel.id, Channel.account_id, Channel.epg_channel_id,
+                                 Channel.hidden, Channel.epg_source_id).filter(
+            Channel.id.in_(chunk)).all()
+    return rows
+
+
+def place_stretches(channel_ids, case_sensitive: bool,
+                    now: datetime | None = None) -> Placed:
+    """Put every listing these channels hold where §14 says it belongs, and record what was
+    decided for each source after the first. The first source's rows all go to epg_entries;
+    a later source that agrees with the stretch before it (decide_stretches()) contributes
+    the programs starting at or after that stretch's last stop; every other row stays in
+    the alternates. A channel with no first source keeps no stretch rows.
+
+    A function of the rows held and the stored first source, so it can be run again from
+    the top at any time and ends in the same rows: where a seam falls is read each time and
+    never stored, and a move interrupted by a restart is finished by the next call. Each
+    batch of channels is read, decided and moved in one write transaction. Every
+    path that moves or copies listings ends here for the channels it touched; one that did
+    not would leave a filling source's whole listing beside the first source's, every
+    program doubled. Nothing is fetched. Commits, a chunk of channels at a time."""
+    now = now or datetime.utcnow()
+    rows = _channel_rows(list(dict.fromkeys(channel_ids)))
+    # Only a channel with a guide, or with stretch rows to take away, has anything to place:
+    # an import hands over every channel of its accounts, most of which have no guide.
+    stale = {cid for chunk in _chunks([r.id for r in rows if not _is_guided(r)])
+             for (cid,) in db.session.query(EpgChannelStretch.channel_id).filter(
+                 EpgChannelStretch.channel_id.in_(chunk)).distinct()}
+    rows = [r for r in rows if _is_guided(r) or r.id in stale]
+    ctx = _plan_context([r for r in rows if _is_guided(r)], case_sensitive, True)
+    changed = moved_in = moved_out = 0
+    names = _LazyNames()
+    for batch in chunked(rows, _PLACE_CHUNK):
+        @retry_on_locked()
+        def _place_and_commit(batch=batch):
+            # Read, decide and move in one write transaction: a plan read before another
+            # writer's commit and applied after it (an import finishing in between) would
+            # put a filling source's listings beside the ones that import just wrote.
+            _take_write_lock()
+            fresh = _channel_rows([r.id for r in batch])
+            placements = [p for p in _plan_stretches(fresh, case_sensitive, now, ctx=ctx)
+                          if p.moves or _wanted(p) != _stored(p)]
+            done = _apply_placements(placements, names, now)
+            db.session.commit()
+            return (*done, len(placements))
+        n_in, n_out, n = _place_and_commit()
+        moved_in, moved_out, changed = moved_in + n_in, moved_out + n_out, changed + n
+    return Placed(changed, moved_in, moved_out)
+
+
+def place_channel_now(channel: Channel, case_sensitive: bool, coverage: dict | None = None,
+                      now: datetime | None = None) -> None:
+    """place_stretches() for one channel inside the caller's own unit: the writers that do
+    not commit (set_channel_key(), set_source_override()) call it after their own moves, so
+    the key or override and the placement land in one commit. `coverage` is the channel's
+    {source_id: Coverage} when the caller has it. Does not commit."""
+    now = now or datetime.utcnow()
+    db.session.flush()
+    row = db.session.query(Channel.id, Channel.account_id, Channel.epg_channel_id,
+                           Channel.hidden, Channel.epg_source_id).filter(
+        Channel.id == channel.id).one()
+    if coverage is None and row.epg_source_id is not None and not row.hidden:
+        order = subscriptions_for([row.account_id]).get(row.account_id, [])
+        sources = list(dict.fromkeys([row.epg_source_id] + order))
+        _keys, _wanted, directory = _channel_directory(channel, sources, case_sensitive)
+        coverage = _channel_coverage(channel, sources, directory)
+        if row.epg_source_id not in coverage:
+            held = held_coverage([row.epg_source_id], [row.id])[row.epg_source_id]
+            if row.id in held:
+                coverage[row.epg_source_id] = held[row.id]
+    placements = _plan_stretches([row], case_sensitive, now,
+                                 coverage_of={row.id: coverage or {}})
+    _apply_placements(placements, _LazyNames(), now)
+
+
+def stretch_channel_ids(source_id: int, account_id: int | None = None) -> list[int]:
+    """The channels (of one account, when given) with a stretch row on this source: the
+    ones whose guide it continues, or was judged for. What a path that takes the source
+    away, or changes what it covers, owes a placement beyond the channels it starts."""
+    q = db.session.query(EpgChannelStretch.channel_id).filter(
+        EpgChannelStretch.source_id == source_id)
+    if account_id is not None:
+        q = q.filter(EpgChannelStretch.channel_id.in_(
+            select(Channel.id).where(Channel.account_id == account_id)))
+    return [cid for (cid,) in q]
+
+
+def make_room_for_first(source_id: int, new_ends: dict[int, datetime]) -> int:
+    """Before an import writes a first source's new listings: move out of epg_entries the
+    later sources' listings that start before where the new file ends for each channel
+    (`new_ends` {channel_id: the file's last stop for it}), so the hours the file grew by
+    never hold two sources' programs while the import runs. place_stretches() at the end of
+    the import puts back whatever still belongs. Returns the listings moved. Commits, a
+    chunk of channels at a time."""
+    moved = 0
+    firsts = [cid for chunk in _chunks(new_ends) for (cid,) in db.session.query(
+        Channel.id).filter(Channel.id.in_(chunk), Channel.epg_source_id == source_id)]
+    for chunk in chunked(firsts, _PLACE_CHUNK):
+        @retry_on_locked()
+        def _move_and_commit(chunk=chunk):
+            _take_write_lock()
+            early = [(cid, sid) for cid, sid, lo in db.session.query(
+                EPGEntry.channel_id, EPGEntry.source_id, func.min(EPGEntry.start_time)).filter(
+                EPGEntry.channel_id.in_(chunk), (EPGEntry.source_id + 0) != source_id)
+                .group_by(EPGEntry.channel_id, EPGEntry.source_id) if lo < new_ends[cid]]
+            n = sum(_move_rows([cid], sid, EPGEntry, EpgAlternateEntry,
+                               starting_before=new_ends[cid]) for cid, sid in early)
+            db.session.commit()
+            return n
+        moved += _move_and_commit()
+    return moved
+
+
+def filling_sources(channel_ids) -> dict[int, list[int]]:
+    """{channel_id: [the sources continuing its guide, in order]} for the channels that
+    have any."""
+    out: dict[int, list[int]] = {}
+    for chunk in _chunks(channel_ids):
+        for cid, sid in db.session.query(
+                EpgChannelStretch.channel_id, EpgChannelStretch.source_id).filter(
+                EpgChannelStretch.channel_id.in_(chunk),
+                EpgChannelStretch.outcome == EPG_STRETCH_FILLS).order_by(
+                EpgChannelStretch.channel_id, EpgChannelStretch.position):
+            out.setdefault(cid, []).append(sid)
+    return out
+
+
+def account_filling_sources(account_id: int) -> dict[int, list[int]]:
+    """filling_sources() for every channel of one account. One query."""
+    out: dict[int, list[int]] = {}
+    for cid, sid in db.session.query(
+            EpgChannelStretch.channel_id, EpgChannelStretch.source_id).join(
+            Channel, Channel.id == EpgChannelStretch.channel_id).filter(
+            Channel.account_id == account_id,
+            EpgChannelStretch.outcome == EPG_STRETCH_FILLS).order_by(
+            EpgChannelStretch.channel_id, EpgChannelStretch.position):
+        out.setdefault(cid, []).append(sid)
+    return out
+
+
+def filled_counts_by_accounts(account_ids) -> dict[int, dict[tuple[int, int], int]]:
+    """{account_id: {(first source, last filling source): channels}} over the channels
+    whose guide a later source continues. One grouped query."""
+    account_ids = list(account_ids)
+    out: dict[int, dict] = {}
+    if not account_ids:
+        return out
+    later = EpgChannelStretch.__table__.alias('later')
+    last = ~select(later.c.id).where(
+        later.c.channel_id == EpgChannelStretch.channel_id,
+        later.c.outcome == EPG_STRETCH_FILLS,
+        later.c.position > EpgChannelStretch.position).exists()
+    for aid, first, sid, n in db.session.query(
+            Channel.account_id, Channel.epg_source_id, EpgChannelStretch.source_id,
+            func.count(EpgChannelStretch.id)).join(
+            Channel, Channel.id == EpgChannelStretch.channel_id).filter(
+            Channel.account_id.in_(account_ids), Channel.epg_source_id.isnot(None),
+            EpgChannelStretch.outcome == EPG_STRETCH_FILLS, last).group_by(
+            Channel.account_id, Channel.epg_source_id, EpgChannelStretch.source_id):
+        out.setdefault(aid, {})[(first, sid)] = n
+    return out
+
+
+def filling_source_ids() -> set[int]:
+    """Every source that continues some channel's guide. One query on the stretch index."""
+    return {sid for (sid,) in db.session.query(EpgChannelStretch.source_id).filter(
+        EpgChannelStretch.outcome == EPG_STRETCH_FILLS).distinct()}
+
+
+def extended_counts(source_ids) -> dict[int, int]:
+    """{source_id: channels, on any account, whose guide it continues}. One grouped query on
+    the stretch index."""
+    source_ids = list(source_ids)
+    if not source_ids:
+        return {}
+    return dict(db.session.query(EpgChannelStretch.source_id, func.count(EpgChannelStretch.id))
+                .filter(EpgChannelStretch.source_id.in_(source_ids),
+                        EpgChannelStretch.outcome == EPG_STRETCH_FILLS)
+                .group_by(EpgChannelStretch.source_id))
+
+
+def extends_counts(account_id: int) -> dict[int, int]:
+    """{source_id: channels of this account whose guide it continues}. One grouped query."""
+    return dict(db.session.query(EpgChannelStretch.source_id, func.count(EpgChannelStretch.id))
+                .join(Channel, Channel.id == EpgChannelStretch.channel_id)
+                .filter(Channel.account_id == account_id,
+                        EpgChannelStretch.outcome == EPG_STRETCH_FILLS)
+                .group_by(EpgChannelStretch.source_id))

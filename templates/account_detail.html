@@ -690,7 +690,7 @@
       <p class="card-note">This account reads no EPG source, so no guide data is imported for its channels. Add source takes an XMLTV URL or another account's guide.</p>
       {% else %}
       {% if epg_sources | selectattr('subscribed') | list | length > 1 %}
-      <p class="card-note">When more than one source has listings for a channel, its guide comes from the first one in this order that has a full schedule for it - a source listing one program all day gives way to one with a schedule. A channel's own page can pick a different source for that channel.</p>
+      <p class="card-note">When more than one source has listings for a channel, its guide starts with the first one in this order that has a full schedule for it - a source listing one program all day gives way to one with a schedule. Where that source's listings end and a later one runs further with matching listings, the guide continues from the later one. A channel's own page can pick a different source for that channel, and says where each part of its guide comes from.</p>
       {% endif %}
       {# Cards below 900px of room: its seven columns need about 820px, and the card column is
          619px in a 961px window (dev/docs/BUGS.md 2026-11-24 @ 08:50 PM). #}
@@ -700,7 +700,7 @@
             <th><span class="tip-plain" data-tip="Reaches.&#10;The last day at least half of this source's channels have listings for, counted over every channel in its guide. Point at a date for the full count by day.">Reaches</span></th>
             <th class="num">Entries</th>
             <th class="num"><span class="tip-plain" data-tip="Channels covered.&#10;Channels reading this source that it has at least one listing for in the import window.">Covered</span></th>
-            <th class="num"><span class="tip-plain" data-tip="Guide from here.&#10;Channels on this account whose guide listings come from this source right now.">Guide from here</span></th>
+            <th class="num"><span class="tip-plain" data-tip="Guide from here.&#10;Channels on this account whose guide starts with this source right now. Where it says extends, it also continues that many channels' guides past the end of an earlier source.">Guide from here</span></th>
             <th></th></tr></thead>
           <tbody>
           {% set n_read = epg_sources | selectattr('subscribed') | list | length %}
@@ -729,7 +729,8 @@
               {% else %}<span class="text-faint">Nothing ahead</span>{% endif %}</td>
             <td data-label="Entries" class="num">{% if s.entry_count %}{{ '{:,}'.format(s.entry_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</td>
             <td data-label="Covered" class="num">{% if s.channel_count %}{{ '{:,}'.format(s.channel_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</td>
-            <td data-label="Guide from here" class="num">{% if s.active_here %}{{ '{:,}'.format(s.active_here) }}{% else %}<span class="text-faint">0</span>{% endif %}</td>
+            <td data-label="Guide from here" class="num">{% if s.active_here %}{{ '{:,}'.format(s.active_here) }}{% else %}<span class="text-faint">0</span>{% endif %}
+              {% if s.extends_here %}<div class="text-faint small">extends {{ '{:,}'.format(s.extends_here) }} more</div>{% endif %}</td>
             <td class="num">
               <span class="menu-wrap">
                 {%- set readers_attr %}{% for r in s.readers %}{{ r.name }} ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}{% endset %}
@@ -760,14 +761,14 @@
                   {% endif %}
                   <div class="sep"></div>
                   <button class="menu-item danger" data-act="source-delete" data-source-id="{{ s.id }}"
-                          data-source-name="{{ s.name }}" data-active-here="{{ s.active_here }}"
+                          data-source-name="{{ s.name }}" data-active-here="{{ s.active_here }}" data-extends-here="{{ s.extends_here }}"
                           data-readers="{{ readers_attr }}">Delete</button>
                   {% else %}
                   {% if s.provider_owned %}
                   <button class="menu-item" data-act="source-refresh" data-source-id="{{ s.id }}"{% if s.refreshing or not s.enabled %} disabled{% endif %}>Refresh now</button>
                   {% endif %}
                   <button class="menu-item" data-act="source-stop" data-source-id="{{ s.id }}"
-                          data-source-name="{{ s.name }}" data-active-here="{{ s.active_here }}"
+                          data-source-name="{{ s.name }}" data-active-here="{{ s.active_here }}" data-extends-here="{{ s.extends_here }}"
                           {% if not s.owned %}data-owner-name="{{ s.owner_name }}"{% endif %}
                           {% if s.provider_owned %}data-provider-owned="1"{% endif %}
                           data-readers="{{ readers_attr }}"

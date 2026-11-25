@@ -69,7 +69,7 @@
 <div class="card">
   <div class="card-head"><h2>Against {{ active_source.name }}</h2></div>
   <div class="card-body">
-    <p class="card-note">The guide this channel shows today{% if active_until %}, listed until {{ active_until }}{% endif %}.</p>
+    <p class="card-note">The source this channel's guide starts with{% if active_until %}, listed until {{ active_until }}{% endif %}. A source below may continue the guide past that; the channel's page says which.</p>
     <div class="gc-sources">
       {% for s in sources %}
       <div class="gc-source">

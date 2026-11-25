@@ -104,7 +104,7 @@
                 <button class="menu-item" data-act="prov-epg-give" data-source-id="{{ e.id }}" data-source-name="{{ e.name }}" data-account-id="{{ a.id }}" data-account="{{ a.name }}">Move to {{ a.name }} only</button>
                 {% endfor %}
                 <div class="sep"></div>
-                <button class="menu-item danger" data-act="prov-epg-delete" data-source-id="{{ e.id }}" data-source-name="{{ e.name }}" data-guided="{{ e.guided }}" data-readers="{{ e.readers }}">Delete</button>
+                <button class="menu-item danger" data-act="prov-epg-delete" data-source-id="{{ e.id }}" data-source-name="{{ e.name }}" data-guided="{{ e.guided }}" data-extended="{{ e.extended }}" data-readers="{{ e.readers }}">Delete</button>
                 {% endif %}
               </div>
             </span>

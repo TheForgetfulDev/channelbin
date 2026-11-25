@@ -63,7 +63,7 @@ from sqlalchemy import and_, case, delete, func, null, or_, not_, select, update
 
 from . import admission, db, duplicate_streams
 from .database import (Account, Channel, ChannelEvent, ChannelGroupMember, ChannelHideRule,
-                       EPGEntry, EpgAlternateEntry, CHANNEL_HIDE_OVERRIDE_CHANGED, HIDE_TARGETS,
+                       EPGEntry, EpgAlternateEntry, EpgChannelStretch, CHANNEL_HIDE_OVERRIDE_CHANGED, HIDE_TARGETS,
                        HIDE_TARGET_CATEGORY_EXACT, HIDE_TARGET_CATEGORY_GLOB,
                        HIDE_TARGET_NAME_GLOB)
 from .db_utils import retry_on_locked
@@ -420,6 +420,9 @@ def purge_hidden_epg(scope_terms=()) -> int:
     # source (DESIGN-epg-sources.md §11). The next import re-resolves it once un-hidden.
     db.session.execute(
         delete(EpgAlternateEntry).where(EpgAlternateEntry.channel_id.in_(hidden_ids))
+        .execution_options(synchronize_session=False))
+    db.session.execute(
+        delete(EpgChannelStretch).where(EpgChannelStretch.channel_id.in_(hidden_ids))
         .execution_options(synchronize_session=False))
     db.session.execute(
         update(Channel).where(Channel.id.in_(hidden_ids), Channel.epg_source_id.isnot(None))

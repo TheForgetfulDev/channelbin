@@ -48,9 +48,10 @@ from .database import (
 from .db_utils import chunked, current_wal_size_bytes, retry_on_locked
 from .epg_sources import (
     DISTINCT_TITLE_CAP, UPCOMING_TITLES, DirectoryRow, key_answers,
-    apply_winners, case_sensitive_matching, channel_key, demote,
+    apply_winners, case_sensitive_matching, channel_key, demote_others,
     directory_coverage, drop_alternates,
-    ensure_provider_source, file_id_for, held_coverage, holding_rows, norm_key, promote,
+    ensure_provider_source, file_id_for, held_coverage, holding_rows, make_room_for_first,
+    norm_key, place_stretches, promote,
     retire_expired_listings,
     provider_xmltv_url, prune_refresh_history, refresh_source_counts, resolve_row,
     sources_refreshed_by_sync,
@@ -3804,24 +3805,38 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
     # channel with two sources' listings in epg_entries at once. A channel that lost its
     # last source keeps what it has: this source's in-window rows go in the delete below.
     touched_sources = {source_id}
-    by_old: dict[int, list[int]] = {}
     by_new: dict[int, list[int]] = {}
     for ch_id, (old, new) in changes.items():
         if new is None:
             continue
         if old is not None:
-            by_old.setdefault(old, []).append(ch_id)
+            touched_sources.add(old)
         by_new.setdefault(new, []).append(ch_id)
-    for sid, ids in by_old.items():
-        demote(ids, sid)
-        touched_sources.add(sid)
+    # Out before in: the old first source's rows and those of the sources that continued
+    # its guide (§14) leave epg_entries before the new first source's arrive, so a restart
+    # between the two leaves a short guide, never two sources' programs side by side.
     for sid, ids in by_new.items():
+        demote_others(ids, sid)
         promote(ids, sid)
         touched_sources.add(sid)
     if changes:
         names = dict(db.session.query(EpgSource.id, EpgSource.name).filter(
             EpgSource.id.in_({s for pair in changes.values() for s in pair if s})))
         apply_winners(changes, names, reasons)
+
+    # Where this source starts a guide other sources continue (§14), their listings inside
+    # the stretch the new file reaches go back to the alternates before a row is written,
+    # so the hours the file grew by never show two sources' programs while the import runs.
+    new_ends = {}
+    file_ends = {r.xml_id: r.horizon_until for r in (count.directory or [])
+                 if r.horizon_until is not None}
+    for fid, ids in feed_map.items():
+        if fid in file_ends:
+            new_ends.update((cid, file_ends[fid]) for cid in ids
+                            if winners.get(cid) == source_id)
+    if new_ends:
+        make_room_for_first(source_id, new_ends)
+    placeable = [c.id for c in channels if not c.hidden]
 
     # Delete scope = this source's rows in the window, both tables (§8.2). No channel join:
     # a channel hidden since the last refresh has its rows cleared by the same statement.
@@ -3901,6 +3916,8 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
                     # so anything still buffered would be reported as imported without
                     # ever having been inserted.
                     _flush()
+                    # What did land is placed, so a cancel leaves one timeline (§14.4).
+                    place_stretches(placeable, case_sensitive)
                     raise SyncCancelled(
                         f'the import of EPG source "{source_name}" had already cleared its '
                         f'previous listings, so it holds only the {synced} entries imported '
@@ -3927,6 +3944,15 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
     orphaned = [ch for ch, (old, new) in changes.items() if new is None and old is not None]
     if orphaned:
         drop_alternates(orphaned)
+
+    # Every row is in the table its channel's first source says. Now each later source's
+    # listings past the end of the stretch before it join the guide (§14), and the ones a
+    # longer first source has overtaken leave it.
+    placed = place_stretches(placeable, case_sensitive)
+    if placed.channels:
+        log.info('EPG source %d (%s): %d channel(s) placed, %d listing(s) into the guide '
+                 'from a later source and %d out', source_id, source_name, placed.channels,
+                 placed.moved_in, placed.moved_out)
 
     @retry_on_locked()
     def _refresh_counts_and_commit():

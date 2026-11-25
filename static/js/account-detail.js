@@ -637,10 +637,15 @@
   // Sentence one says what happens; sentence two what it costs, counted from the row.
   function confirmSourceRemoval(el, { title, verb, url, what }) {
     const n = Number(el.dataset.activeHere || 0);
+    const more = Number(el.dataset.extendsHere || 0);
     let cost = n
-      ? `${nf(n)} channel${n === 1 ? ' on this account gets its' : 's on this account get their'} ` +
-        'guide from it now. Each switches to the next source that covers it, or has no guide.'
-      : 'No channel on this account gets its guide from it right now.';
+      ? `${nf(n)} channel${n === 1 ? "'s guide on this account starts" : "s' guides on this account start"} ` +
+        'with it now. Each switches to the next source that covers it, or has no guide.'
+      : "No channel's guide on this account starts with it right now.";
+    if (more) {
+      cost += ` It also continues ${nf(more)} channel${more === 1 ? "'s guide" : "s' guides"} past the end of ` +
+        'an earlier source. Each of those ends sooner, unless another source runs further.';
+    }
     if (el.dataset.readers && verb === 'Delete source') {
       cost += ` Other accounts read it too, and lose it: ${escHtml(el.dataset.readers)}. ` +
         'Each of those channels switches to its next source, or has no guide.';
