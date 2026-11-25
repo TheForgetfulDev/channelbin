@@ -450,12 +450,16 @@
               <div{% if h.queue %} class="text-faint"{% endif %}>{% if h.queue %}<span class="small">Last time: </span>{% endif %}<span class="badge {{ h.check.badge }} tip-plain" data-tip="{{ h.check.tip }}">{{ h.check.label }}</span>{% if h.fastest %} <span class="badge b-auto tip-plain" data-tip="Fastest.&#10;The quickest answer of the hosts on this account that answered at their last check.">Fastest</span>{% endif %}</div>
               <div class="small">{{ h.check.line }}</div>
               <div class="text-faint small">{{ 'looked up' if h.check.from_lookup else 'checked' }} {{ h.check.at | local_time }}{% if h.checks %} &middot; answered {{ h.answered }} of {{ h.checks }} check{{ 's' if h.checks != 1 }}{% endif %}{% if h.still_resolves_at %} &middot; still resolves at {{ h.still_resolves_at | local_time }}{% endif %}</div>
+              {% elif h.lookup and h.set_aside %}
+              <span class="text-faint tip-plain" data-tip="Not checked since.&#10;The last check couldn't look the name up, but a lookup since then found it. Check now connects to it and asks for an answer.">Not checked since</span>
+              <div class="text-faint small">resolves{% if h.lookup.at %}, looked up {{ h.lookup.at | local_time }}{% endif %}{% if h.checks %} &middot; answered {{ h.answered }} of {{ h.checks }} check{{ 's' if h.checks != 1 }}{% endif %}</div>
               {% elif h.lookup %}
               <span class="text-faint tip-plain" data-tip="Not tested yet.&#10;The scheduled check only looks the name up. Check now connects to it and asks for an answer.">Not tested yet</span>
               <div class="text-faint small">{% if h.lookup.ok %}resolves{% else %}doesn't resolve: {{ h.lookup.error }}{% endif %}{% if h.lookup.at %}, looked up {{ h.lookup.at | local_time }}{% endif %}</div>
-              {% else %}
+              {% elif not h.skipped_at %}
               <span class="text-faint">Not checked yet</span>
-              {% endif %}</td>
+              {% endif %}
+              {% if h.skipped_at and not h.queue %}<div class="text-faint small tip-plain" data-tip="Not checked.&#10;Something was streaming from this host when its turn came, so it was left alone. A stream that keeps reconnecting holds its seat too, so the verdict above is still the last one that asked the host.">Not checked at {{ h.skipped_at | local_time }}: a stream was using it.</div>{% endif %}</td>
             <td class="num">
               <span class="menu-wrap">
                 <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ h.host }}">{{ icon('more') }}</button>

@@ -61,7 +61,6 @@ The probe job (`check_hosts()`) is DNS only and never rolls: a probe that rolled
 an account off a host still serving a running recording over a resolver hiccup.
 """
 import logging
-import socket
 import threading
 import time
 from collections import Counter
@@ -196,10 +195,9 @@ def normalize_host(raw: str) -> str:
     text = text.split('/', 1)[0].split('?', 1)[0].rsplit('@', 1)[-1].strip().lower()
     if not text:
         raise ValueError('Enter a host name, like a2.skyline.example or a2.skyline.example:8080.')
-    name, _, port = text.rpartition(':')
-    if not name:
-        name, port = text, ''
-    if port and not port.isdecimal():
+    from .host_checks import split_host
+    name, port = split_host(text)
+    if port is None and ':' in name:
         raise ValueError(f'"{raw.strip()}" is not a host name. The part after the colon must be a port number.')
     if any(ch.isspace() for ch in name) or '@' in name or not all(
             c.isalnum() or c in '.-_[]' for c in name):
@@ -405,11 +403,24 @@ def list_playlist_rows(account_id: int, host: Optional[str], pair: Optional[tupl
         return changes
 
     had_logins = bool(logins_for_account(account_id)) if pair else True
+    active_before = _active_host_name(account_id) if host else None
     changes = _list_and_commit()
+    if host and _active_host_name(account_id) != active_before:
+        # The active host is now another name (a renamed row, or the role handed on); its
+        # warning follows. Only then, or a read warning comes back unread (dev/changelog/1732).
+        from .host_checks import reassess_active
+        reassess_active(account_id)
     if not had_logins:
         from . import connection_limits as connlim
         connlim.fold_account_pool(account_id)
     return changes
+
+
+def _active_host_name(account_id: int) -> Optional[str]:
+    from .database import AccountHost
+    row = (db.session.query(AccountHost.host)
+           .filter_by(account_id=account_id, is_active=True, enabled=True).first())
+    return row[0] if row else None
 
 
 def _is_sync_listed(login) -> bool:
@@ -620,13 +631,18 @@ def remove_host(account_id: int, host_id: int) -> str:
                                           AccountHost.id != host_id).count()
         if row.is_active and others:
             raise ValueError(f'{row.host} is the active host. Make another host active first.')
-        name = row.host
+        name, was_active = row.host, row.is_active
         db.session.delete(row)
         db.session.commit()
-        return name
+        return name, was_active
 
-    name = _remove_and_commit()
+    name, was_active = _remove_and_commit()
     _clear_rolled_alert(account_id)
+    if was_active:
+        # The last (active) host can go; its warning must not stay naming it. Only then: a
+        # standby's removal would bring a read warning back unread (dev/changelog/1732).
+        from .host_checks import reassess_active
+        reassess_active(account_id)
     log.info('Account %d: host %s removed from its list', account_id, name)
     return name
 
@@ -690,7 +706,9 @@ def set_host_enabled(account_id: int, host_id: int, enabled: bool) -> dict:
 
     out = _switch_and_commit()
     _clear_rolled_alert(account_id)
-    if out['moved'] or not enabled:
+    # Only when the active role moved or the active host itself went off: re-asking over a
+    # standby host's switch would bring a read warning back unread (dev/changelog/1732).
+    if out['moved'] or (not enabled and out['host'] == out['active']):
         from .host_checks import reassess_active
         reassess_active(account_id)
     log.info('Account %d: host %s turned %s%s', account_id, out['host'],
@@ -992,30 +1010,11 @@ def _log_recording_roll(recording_id: int, old: Optional[str], new: str, channel
 
 def resolve_host(host: str, timeout: float = RESOLVE_TIMEOUT_SECONDS) -> tuple[bool, Optional[str]]:
     """(resolved, error text). A DNS lookup and nothing else - no connection is opened, so
-    this costs the provider nothing and cannot take a seat. Run on a helper thread because
-    getaddrinfo has no timeout; past `timeout` the lookup is abandoned and reported as such."""
-    name, _, port = host.rpartition(':')
-    if not name or not port.isdecimal():
-        name = host
-    result: dict = {}
-
-    def _lookup():
-        try:
-            socket.getaddrinfo(name, None)
-            result['ok'] = True
-        except socket.gaierror as exc:
-            result['error'] = exc.strerror or str(exc)
-        except OSError as exc:
-            result['error'] = str(exc)
-
-    worker = threading.Thread(target=_lookup, name=f'resolve-{name}', daemon=True)
-    worker.start()
-    worker.join(timeout)
-    if worker.is_alive():
-        return False, f'no answer from the resolver within {timeout:.0f}s'
-    if result.get('ok'):
-        return True, None
-    return False, result.get('error') or 'did not resolve'
+    this costs the provider nothing and cannot take a seat. The lookup is
+    host_checks.lookup(), abandoned past `timeout`."""
+    from .host_checks import lookup, split_host
+    infos, error = lookup(split_host(host)[0], None, timeout)
+    return (True, None) if infos is not None else (False, error)
 
 
 def _stamp_resolve_verdicts(verdicts: dict, trigger: str = 'roll',

@@ -954,17 +954,19 @@ STREAM_CHECK_OPEN = (STREAM_CHECK_PENDING_SYNC, STREAM_CHECK_WAITING, STREAM_CHE
 # What one check of a listed host found (app/host_checks.py, dev/changelog/1674). A full check
 # looks the name up, connects to the stream port and sends one plain request with no login in
 # it; a lookup-only check (the scheduled default) does the first step only. RESOLVES is a
-# lookup's success; every other value is a full check's verdict except UNRESOLVED, which both
-# can give. Only ANSWERS counts as up.
+# lookup's success; IN_USE is a full check that was skipped because a stream was using the host
+# (no verdict at all - the previous one stands, dev/changelog/1730); every other value is
+# a full check's verdict except UNRESOLVED, which both can give. Only ANSWERS counts as up.
 HOST_CHECK_ANSWERS      = 'ANSWERS'
 HOST_CHECK_SERVER_ERROR = 'SERVER_ERROR'
 HOST_CHECK_REFUSED      = 'REFUSED'
 HOST_CHECK_NO_ANSWER    = 'NO_ANSWER'
 HOST_CHECK_UNRESOLVED   = 'UNRESOLVED'
 HOST_CHECK_RESOLVES     = 'RESOLVES'
+HOST_CHECK_IN_USE       = 'IN_USE'
 HOST_CHECK_STATUSES = (
     HOST_CHECK_ANSWERS, HOST_CHECK_SERVER_ERROR, HOST_CHECK_REFUSED, HOST_CHECK_NO_ANSWER,
-    HOST_CHECK_UNRESOLVED, HOST_CHECK_RESOLVES,
+    HOST_CHECK_UNRESOLVED, HOST_CHECK_RESOLVES, HOST_CHECK_IN_USE,
 )
 # HostCheck.kind. Not HOST_CHECK_-prefixed, so the status family above stays statuses only.
 HOST_PROBE_LOOKUP = 'lookup'
@@ -2309,8 +2311,10 @@ class HostCheck(db.Model):
     port        = db.Column(db.Integer)
     #: What went wrong, in the resolver's or the socket's words; NULL when it answered.
     error       = db.Column(db.String(255))
-    #: A recording or other stream was using this host when its turn came, so it was counted
-    #: as answering and not touched (principle 2: a check never risks a working capture).
+    #: A recording or other stream was using this host when its turn came, so it was not
+    #: touched (principle 2: a check never risks a working capture). Such a row is no verdict:
+    #: the reads skip it and the previous check stands. Rows before dev/changelog/1730
+    #: carry status ANSWERS with this set; later ones carry HOST_CHECK_IN_USE.
     in_use      = db.Column(db.Boolean, nullable=False, default=False,
                             server_default=db.text('0'))
     #: Who asked: 'scheduled', or 'manual' for Check now / Check all / Check all hosts.
