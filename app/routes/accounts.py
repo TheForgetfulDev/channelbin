@@ -38,7 +38,8 @@ from ..db_utils import chunked, retry_on_locked
 from ..epg_scorecard import finding_text, recheck_soon, stored_findings
 from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, directory_row_summary,
                            case_sensitive_matching,
-                           accept_name_matches, account_reach, account_sources_view,
+                           accept_name_matches, account_reach, account_sources_view, filled_counts_by_accounts, place_stretches,
+                           stretch_channel_ids,
                            accounts_reach, reach_words,
                            add_url_source, borrowable_sources, clean_url_source_fields,
                            delete_sources_for_account, delete_url_source,
@@ -511,7 +512,8 @@ def _account_detail_payload(account, cfg, stats):
     # From the card's own rows, so the Content card's date and the sources it is made of
     # cannot disagree.
     span = account_reach({s['id']: s['active_here'] for s in sources},
-                         {s['id']: s['reach_day'] for s in sources})
+                         {s['id']: s['reach_day'] for s in sources},
+                         filled_counts_by_accounts([account.id]).get(account.id))
     # What the EPG check found this account could improve, as lines under each source
     # (dev/changelog/1718). Stored by the check rather than worked out here: the shared-id
     # half alone cost 0.5 s a page load on prod (dev/changelog/1716).
@@ -929,6 +931,12 @@ def _delete_account_and_jobs(account_id):
     # from others, which are recounted once it has gone.
     readers = foreign_readers(owned_source_ids, account_id)
     guided_elsewhere = foreign_guided_channels(owned_source_ids, account_id)
+    # Other accounts' channels whose guide one of these sources continues: a source behind
+    # it may reach past the end once it is gone (epg_sources.place_stretches()).
+    mine = {cid for (cid,) in db.session.query(Channel.id).filter(
+        Channel.account_id == account_id)} if owned_source_ids else set()
+    filled_elsewhere = sorted({cid for sid in owned_source_ids
+                               for cid in stretch_channel_ids(sid)} - mine)
     read_elsewhere = [sid for (sid,) in db.session.query(EpgSourceSubscription.source_id)
                       .join(EpgSource, EpgSource.id == EpgSourceSubscription.source_id)
                       .filter(EpgSourceSubscription.account_id == account_id,
@@ -1028,6 +1036,8 @@ def _delete_account_and_jobs(account_id):
     outcome = (reresolve_channels(list(guided_elsewhere), _case_sensitive(),
                                   previous=guided_elsewhere, source_names=source_names)
                if guided_elsewhere else {})
+    if filled_elsewhere:
+        place_stretches(filled_elsewhere, _case_sensitive())
     for sid in owned_source_ids:
         report_source_removed(sid, source_names[sid],
                               f'with its account "{name}"' if name else 'with its account',

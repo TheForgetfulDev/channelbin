@@ -50,7 +50,7 @@ from .database import (
     detach_recording_references,
 )
 from .db_utils import retry_on_locked
-from .epg_sources import latest_listing_start
+from .epg_sources import filling_source_ids, filling_sources, latest_listing_start
 from .fmt_utils import counted, iso_seconds_or_none
 from .program_titles import title_key
 
@@ -588,7 +588,8 @@ def _aborted_by_group_change(row: _Row, lib_by_id) -> bool:
 
 @dataclass
 class _Reach:
-    by_source: dict          # {source id winning a channel: latest listing start or None}
+    # {source id starting or continuing a channel's guide: latest listing start or None}
+    by_source: dict
     guide_wide: datetime | None
 
 
@@ -599,20 +600,24 @@ def _guide_reach() -> _Reach:
     "guide reaches" asks where most channels end instead (epg_sources.source_reach())."""
     winning = [sid for (sid,) in db.session.query(Channel.epg_source_id).filter(
         Channel.epg_source_id.isnot(None)).distinct()]
-    by_source = {sid: latest_listing_start(sid) for sid in winning}
+    # And per source that continues one past its first source's end
+    # (epg_sources.place_stretches()): a match is seen through its own channel's sources
+    # (_reach_inputs()), so a short first source is short for every channel nothing continues.
+    by_source = {sid: latest_listing_start(sid) for sid in set(winning) | filling_source_ids()}
     guide_wide = db.session.query(func.max(EPGEntry.start_time)).scalar()
     return _Reach(by_source=by_source, guide_wide=guide_wide)
 
 
 def _rule_sources(rows, member_channels, channel_source) -> list:
     """[[source ids]] - one entry per ledger match, the sources that match can be seen
-    through: a channel match its channel's source, a group match any of its members'."""
+    through: a channel match its channel's sources (the one its guide starts with and the
+    ones that continue it), a group match any of its members'."""
     out = []
     for row in rows:
         if row.group_id is not None and member_channels.get(row.group_id):
-            sids = {channel_source.get(c) for c in member_channels[row.group_id]}
+            sids = {s for c in member_channels[row.group_id] for s in channel_source.get(c, ())}
         else:
-            sids = {channel_source.get(row.channel_id)}
+            sids = set(channel_source.get(row.channel_id, ()))
         sids.discard(None)
         if sids:
             out.append(sorted(sids))
@@ -663,8 +668,11 @@ def _reach_inputs(rule_ids):
         channel_ids.update(cids)
     channel_source = {}
     if channel_ids:
-        channel_source = dict(db.session.query(Channel.id, Channel.epg_source_id).filter(
-            Channel.id.in_(sorted(channel_ids))))
+        filled = filling_sources(sorted(channel_ids))
+        channel_source = {cid: [first] + filled.get(cid, [])
+                          for cid, first in db.session.query(
+                              Channel.id, Channel.epg_source_id).filter(
+                              Channel.id.in_(sorted(channel_ids)))}
     return by_rule, member_channels, channel_source
 
 

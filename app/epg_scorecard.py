@@ -37,17 +37,16 @@ from .database import (Account, Channel, EPGEntry, EpgAlternateEntry, EpgFinding
                        EPG_FINDING_SHARED_ID, EPG_STATUS_FAILED, EPG_STATUS_OK,
                        EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED)
 from .db_utils import chunked, retry_on_locked
-from .epg_sources import (CMP_DESCRIPTIONS, CMP_IDENTICAL, CMP_MOSTLY, CMP_NO_OVERLAP,
-                          CMP_SHIFTED, CMP_UNRELATED, MATCH_DISAGREE, MATCH_NEW,
+from .epg_sources import (CMP_AGREEING, CMP_NO_OVERLAP, CMP_UNRELATED, MATCH_DISAGREE, MATCH_NEW,
                           REAL_SCHEDULE_MIN_TITLES, Listing,
-                          Reach, channel_key, compare_listings, file_id_for, key_answers,
+                          Reach, account_filling_sources, channel_key, compare_listings, file_id_for, key_answers,
                           norm_key, of_sources, reach_from_horizons, sources_without_directory)
 from .fmt_utils import counted, iso_or_none, plural
 
 log = logging.getLogger(__name__)
 
 #: Verdicts that say two sources list the same channel's schedule (§14.3's "agree").
-AGREEING = frozenset({CMP_IDENTICAL, CMP_DESCRIPTIONS, CMP_MOSTLY, CMP_SHIFTED})
+AGREEING = CMP_AGREEING
 
 #: A difference in the share of described listings smaller than this is not a reason to
 #: prefer one source (percentage points).
@@ -139,6 +138,9 @@ class ChannelScore(NamedTuple):
     verdicts: dict          # {(earlier, later): CMP_*}
     pinned: bool            # the user chose this channel's source (epg_source_override_id)
     why: str | None         # the RULE_* that set `current` aside, when another source is best
+    filled: tuple = ()      # the sources continuing its guide past `current`'s end, in order
+    # Its guide, continued, runs through the day `best` does: reach is no reason to change.
+    reach_met: bool = False
 
 
 #: The rules of best_source(), in the order it applies them: the one that set a source aside.
@@ -326,9 +328,9 @@ def choose_source(sources: list, verdicts: dict, names: dict, day_of) -> Choice:
 
 def account_scorecard(account_id: int, tz, case_sensitive: bool,
                       day_of=None, with_channels: bool = False) -> AccountScorecard:
-    """The scorecard for one account. Seven queries whatever the channel or source count
+    """The scorecard for one account. Eight queries whatever the channel or source count
     (subscriptions, sources, channels, key answers, directories, refresh history and, with
-    `with_channels` or more than one source, the stored agreements). `day_of(horizon)` is
+    more than one source, the stored agreements and the sources continuing each guide). `day_of(horizon)` is
     the display text of a horizon's last local day, for the per-channel reasons."""
     subs = (db.session.query(EpgSourceSubscription.source_id, EpgSourceSubscription.priority)
             .filter(EpgSourceSubscription.account_id == account_id)
@@ -350,14 +352,21 @@ def account_scorecard(account_id: int, tz, case_sensitive: bool,
     verdicts = _stored_verdicts(account_id, order) if len(order) > 1 else {}
     no_directory = sources_without_directory(order)
 
+    # A guide a later source continues runs as far as the furthest of its sources
+    # (epg_sources.place_stretches()).
+    filled = account_filling_sources(account_id) if len(order) > 1 else {}
     guides = Counter(c[2] for c in channels if c[2] is not None)
     # Horizons are counted by value: channels share a few hundred of them, and turning each
     # into a local day is what costs (0.5 s per call over account 2's 29,000 channels).
     guided_horizons = Counter()
+    guide_end: dict[int, datetime] = {}
     for cid, _pid, current, _name, _pin in channels:
-        for cs in per_channel.get(cid, ()):
-            if cs.source_id == current and cs.horizon_until is not None:
-                guided_horizons[cs.horizon_until] += 1
+        mine = {current, *filled.get(cid, ())}
+        ends = [cs.horizon_until for cs in per_channel.get(cid, ())
+                if cs.source_id in mine and cs.horizon_until is not None]
+        if ends and current is not None:
+            guide_end[cid] = max(ends)
+            guided_horizons[guide_end[cid]] += 1
     scores = []
     for sid, priority in subs:
         tally = Counter()
@@ -413,10 +422,15 @@ def account_scorecard(account_id: int, tz, case_sensitive: bool,
             v = verdicts.get(cid, {})
             choice = choose_source(found, v, names, day_of)
             current = by_id[cid][2]
-            channel_scores.append(ChannelScore(cid, by_id[cid][3], current, choice.best,
-                                               choice.reasons, found, v,
-                                               by_id[cid][4] is not None,
-                                               choice.dropped.get(current)))
+            best_end = next((cs.horizon_until for cs in found
+                             if cs.source_id == choice.best), None)
+            channel_scores.append(ChannelScore(
+                cid, by_id[cid][3], current, choice.best, choice.reasons, found, v,
+                by_id[cid][4] is not None, choice.dropped.get(current),
+                tuple(filled.get(cid, ())),
+                bool(best_end is not None and cid in guide_end
+                     and (guide_end[cid] >= best_end
+                          or day_of(guide_end[cid]) == day_of(best_end)))))
         channel_scores.sort(key=lambda c: ((c.name or '').lower(), c.channel_id))
     return AccountScorecard(account_id, scores, reach_from_horizons(guided_horizons.items(), tz),
                             channel_scores)
@@ -520,7 +534,7 @@ def scorecard_json(card: AccountScorecard, names: dict | None = None) -> dict:
                             'last_trouble': iso_or_none(s.reliability.last_trouble)}
         sources.append(d)
     channels = [{'channel_id': c.channel_id, 'name': c.name, 'current': c.current,
-                 'best': c.best, 'reasons': c.reasons,
+                 'best': c.best, 'reasons': c.reasons, 'filled': list(c.filled),
                  'sources': [{**cs._asdict(), 'horizon_until': iso_or_none(cs.horizon_until),
                               'described_pct': cs.share('described')} for cs in c.sources],
                  'verdicts': [{'source_id': a, 'other_source_id': b, 'verdict': v}
@@ -592,7 +606,8 @@ def account_findings(card: AccountScorecard, proposals: dict, shared) -> list[Fi
       the review page's "only channels with no guide today" view lists;
     - a shared id: the channels whose names say it is not theirs (find_shared_ids());
     - better source: channels another source serves better than their own (choose_source()),
-      left out where the user picked the source, or only the account's order separates them;
+      left out where the user picked the source, where only the account's order separates
+      them, or where reach is the reason and the guide already continues that far;
     - adds nothing: a source with a directory that no channel has only here, that serves no
       channel best, that no channel is pinned to, and whose names would guide no channel
       that lacks one."""
@@ -619,6 +634,9 @@ def account_findings(card: AccountScorecard, proposals: dict, shared) -> list[Fi
     for c in card.channels:
         if (c.pinned or c.current is None or c.best == c.current or c.why in (None, RULE_ORDER)
                 or all(cs.source_id != c.current for cs in c.sources)):
+            continue
+        if c.why == RULE_REACH and c.reach_met:
+            # Its guide already continues that far from a later source.
             continue
         b = better.setdefault(c.best, {'count': 0, 'why': Counter(), 'from': Counter()})
         b['count'] += 1
@@ -900,6 +918,36 @@ def _clear_unread(account_ids) -> None:
     _clear_and_commit()
 
 
+def _shared_id_subjects() -> dict[int, set]:
+    """{account_id: {(source_id, shared id)}} as the findings stand."""
+    out: dict[int, set] = {}
+    for aid, sid, subject in db.session.query(
+            EpgFinding.account_id, EpgFinding.source_id, EpgFinding.subject).filter(
+            EpgFinding.kind == EPG_FINDING_SHARED_ID):
+        out.setdefault(aid, set()).add((sid, subject))
+    db.session.rollback()
+    return out
+
+
+def _place_where_flags_moved(before: dict, after: dict) -> None:
+    """A guide is not continued through an id unrelated channels share
+    (epg_sources.decide_stretches()), and that reads the stored finding. So an account whose
+    shared ids changed has its guided channels placed again (dev/changelog/1722)."""
+    from .config import load_config
+    from .epg_sources import case_sensitive_matching, place_stretches
+    moved = [aid for aid in set(before) | set(after) if before.get(aid) != after.get(aid)]
+    if not moved:
+        return
+    cs = case_sensitive_matching(load_config())
+    for aid in moved:
+        ids = [cid for (cid,) in db.session.query(Channel.id).filter(
+            Channel.account_id == aid, Channel.hidden.is_(False),
+            Channel.epg_source_id.isnot(None))]
+        placed = place_stretches(ids, cs)
+        log.info('EPG source check: shared ids changed on account %d, %d channel(s) placed '
+                 'again', aid, placed.channels)
+
+
 def run_check(now: datetime | None = None) -> str:
     """One run over every account that reads an EPG source: the agreement of its sources,
     then its findings, stored. Takes a KIND_EPG_CHECK ticket; a refusal queues the next try.
@@ -923,7 +971,9 @@ def run_check(now: datetime | None = None) -> str:
         db.session.rollback()
         _clear_unread(list(orders))
         judged = sum(check_account(aid, order, now) for aid, order in orders.items())
+        flagged_before = _shared_id_subjects()
         found = check_findings(orders, now)
+        _place_where_flags_moved(flagged_before, _shared_id_subjects())
         note = (f'EPG source check: {counted(judged, "channel and source pair")} compared and '
                 f'{counted(found, "finding")} stored over {counted(len(orders), "account")} '
                 f'in {time_mod.monotonic() - started:.1f} s.')

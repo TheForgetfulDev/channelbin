@@ -51,6 +51,8 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from typing import NamedTuple
 
+from sqlalchemy import select, union_all
+
 from . import admission, db
 from .channel_groups import collapse_schedules
 from .database import (EPGEntry, EpgAlternateEntry, EpgScan, EpgScanLink, EpgScanSchedule,
@@ -233,34 +235,30 @@ def _read_units(now, titles):
     hashed as its rows pass and closed when the next unit starts. Also the row count."""
     finished: dict = {}
     n = 0
-    for model in (EPGEntry, EpgAlternateEntry):
-        q = (db.session.query(model.channel_id, model.source_id, model.title, model.sub_title,
-                              model.description, model.category, model.rating,
-                              model.start_time, model.stop_time)
-             .filter(model.stop_time > now)
-             .order_by(model.channel_id, model.source_id, model.start_time, model.stop_time,
-                       model.title)
-             .yield_per(_BATCH))
-        key = None
-        unit = None
-        for cid, sid, title, sub, desc, cat, rating, start, stop in q:
-            if (cid, sid) != key:
-                if unit is not None:
-                    finished[key] = unit.finish()
-                key = (cid, sid)
-                # A (channel, source) in both tables cannot happen - the import moves rows
-                # between them - but if it did, the two halves would be hashed apart, so
-                # the second is folded into the first rather than overwriting it.
-                unit = _Unit() if key not in finished else None
-                if unit is None:
-                    log.warning('EPG similarity scan: channel %s source %s has rows in both '
-                                'listings tables; the second table\'s are skipped', cid, sid)
-            if unit is None:
-                continue
-            unit.add(title, sub, desc, cat, rating, start, stop, titles)
-            n += 1
-        if unit is not None:
-            finished[key] = unit.finish()
+    # One stream over both tables: a source that continues a channel's guide past its first
+    # source's end holds its later listings in epg_entries and its earlier ones in the
+    # alternates (epg_sources.place_stretches()), and the two halves are one schedule.
+    halves = [select(model.channel_id, model.source_id, model.title, model.sub_title,
+                     model.description, model.category, model.rating, model.start_time,
+                     model.stop_time).where(model.stop_time > now)
+              for model in (EPGEntry, EpgAlternateEntry)]
+    both = union_all(*halves).subquery('listings')
+    rows = db.session.execute(
+        select(both).order_by(both.c.channel_id, both.c.source_id, both.c.start_time,
+                              both.c.stop_time, both.c.title)
+        .execution_options(yield_per=_BATCH))
+    key = None
+    unit = None
+    for cid, sid, title, sub, desc, cat, rating, start, stop in rows:
+        if (cid, sid) != key:
+            if unit is not None:
+                finished[key] = unit.finish()
+            key = (cid, sid)
+            unit = _Unit()
+        unit.add(title, sub, desc, cat, rating, start, stop, titles)
+        n += 1
+    if unit is not None:
+        finished[key] = unit.finish()
     return finished, n
 
 

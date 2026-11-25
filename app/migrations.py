@@ -4068,6 +4068,28 @@ def _m147_epg_findings(conn, cur):
     conn.commit()
 
 
+def _m149_epg_channel_stretches(conn, cur):
+    """What each later source does for a channel's guide past its first source's end
+    (epg_sources.place_stretches(), dev/changelog/1722). No backfill: the rows, and the
+    listings they move into the guide, arrive with each source's next import. Re-runnable
+    from the top, IF NOT EXISTS throughout."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS epg_channel_stretches (
+            id INTEGER NOT NULL PRIMARY KEY,
+            channel_id INTEGER NOT NULL REFERENCES channels (id),
+            source_id INTEGER NOT NULL REFERENCES epg_sources (id),
+            position INTEGER NOT NULL,
+            after_source_id INTEGER REFERENCES epg_sources (id),
+            outcome VARCHAR(20) NOT NULL,
+            updated_at DATETIME NOT NULL,
+            CONSTRAINT uq_epg_channel_stretch UNIQUE (channel_id, source_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_epg_channel_stretches_source
+            ON epg_channel_stretches (source_id, outcome);
+    """)
+    conn.commit()
+
+
 #: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
 #: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
 #: time; the rebuild test holds a migrated table equal to a fresh build.
@@ -4940,6 +4962,8 @@ SCHEMA_MIGRATIONS = [
      _m147_epg_findings),
     (148, 'epg_sources.owner_provider_id + is_account_guide, provider_epg_order, '
           'accounts.epg_order_mode: EPG sources at the provider level', _m148_provider_epg),
+    (149, 'epg_channel_stretches: a guide continued past the end of its first source',
+     _m149_epg_channel_stretches),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

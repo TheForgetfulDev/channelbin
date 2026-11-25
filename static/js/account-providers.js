@@ -174,10 +174,12 @@
           if (!el) return;
           const keep = body.querySelector('#prov-keep').checked;
           const g = pre.guided || 0;
+          const x = pre.extended || 0;
           el.textContent = keep
             ? 'Each goes to the first account reading it, and every account keeps reading it, so no guide changes.' +
               (pre.unread ? ` ${pre.unread} that no account reads ${pre.unread === 1 ? 'is' : 'are'} deleted.` : '')
-            : `They are deleted. ${g ? `${g.toLocaleString()} channel${g === 1 ? ' takes its' : 's take their'} guide from them now, and each switches to its next source or has no guide.` : 'No channel takes its guide from them now.'}`;
+            : `They are deleted. ${g ? `${g.toLocaleString()} channel${g === 1 ? "'s guide starts" : "s' guides start"} with them now, and each switches to its next source or has no guide.` : "No channel's guide starts with them now."}` +
+              (x ? ` They also continue ${x.toLocaleString()} channel${x === 1 ? "'s guide" : "s' guides"} past the end of an earlier source, and each of those ends sooner.` : '');
         };
         const keepBox = body.querySelector('#prov-keep');
         if (keepBox) { keepBox.addEventListener('change', note); note(); }
@@ -267,11 +269,13 @@
 
   function confirmEpgDelete(card, el) {
     const g = Number(el.dataset.guided || 0);
+    const x = Number(el.dataset.extended || 0);
     confirmModal({
       title: 'Delete EPG source',
       message: `Delete ${el.dataset.sourceName} and every listing it imported, for every account on ${card.dataset.name}?`,
-      consequence: g ? `${g.toLocaleString()} channel${g === 1 ? ' takes its' : 's take their'} guide from it now. ` +
-        'Each switches to its next source, or has no guide.' : 'No channel takes its guide from it right now.',
+      consequence: (g ? `${g.toLocaleString()} channel${g === 1 ? "'s guide starts" : "s' guides start"} with it now. ` +
+        'Each switches to its next source, or has no guide.' : "No channel's guide starts with it right now.") +
+        (x ? ` It also continues ${x.toLocaleString()} channel${x === 1 ? "'s guide" : "s' guides"} past the end of an earlier source, and each of those ends sooner.` : ''),
       confirmLabel: 'Delete source',
       danger: true,
     }).then((ok) => {

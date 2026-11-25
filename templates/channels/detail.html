@@ -971,6 +971,7 @@
       <p class="card-note">
         {% if gs.hidden %}Hidden channels have no guide data imported from any source.
         {% elif gs.active %}Listings come from <strong>{{ gs.active.name }}</strong>{% if gs.reason in gs_reasons %}: {{ gs_reasons[gs.reason] }}{% endif %}.
+          {% if gs.chain | length > 1 %}Its listings end {{ gs.chain[0].until | local_time }}, and the guide continues from {% for c in gs.chain[1:] %}<strong>{{ c.name }}</strong> until {{ c.until | local_time }}{{ ', then ' if not loop.last }}{% endfor %}.{% endif %}
         {% elif gs.rows %}No source this account reads has listings for this channel right now.
         {% else %}This account reads no EPG source, so no guide data is imported for it.
         {% endif %}
@@ -992,7 +993,7 @@
           <tbody>
           {% for r in gs.rows %}
           <tr>
-            <td data-label="Source">{{ r.name }}{% if r.active %} {{ m.status_badge('b-done', 'Active') }}{% endif %}{% if r.override %} {{ m.status_badge('b-sched', 'Your override') }}{% endif %}
+            <td data-label="Source">{{ r.name }}{% if r.active %} {{ m.status_badge('b-done', 'Active') }}{% elif r.stretch_from %} {{ m.status_badge('b-done', 'Continues') }}{% endif %}{% if r.override %} {{ m.status_badge('b-sched', 'Your override') }}{% endif %}
               <div class="text-faint small">{{ r.kind }}{% if not r.subscribed %} - no longer read by this account{% endif %}</div>
               {% if not gs.hidden and (r.override or (r.subscribed and r.covers)) %}<div class="gs-key-actions">
                 {% if r.override %}<button type="button" class="btn btn-sm" data-act="epg-override" data-source-id="">Clear override</button>
@@ -1013,7 +1014,9 @@
             <td data-label="Listings">
               {% if not r.covers %}<span class="text-faint">{% if r.ran_out %}ran out {{ r.horizon_until | local_time }}, and this source has not refreshed since{% else %}{{ 'none' if r.refreshed else 'no successful refresh yet' }}{% endif %}</span>
               {% else %}{{ r.summary }}{% if r.sole_title is not none %}: <em>{{ r.sole_title or '(untitled)' }}</em>{% endif %}
-              {% endif %}{% if r.covers and not r.refreshed %}<div class="text-faint small">already held; this source has no successful refresh yet</div>{% endif %}</td>
+              {% endif %}{% if r.covers and not r.refreshed %}<div class="text-faint small">already held; this source has no successful refresh yet</div>{% endif %}
+              {% if r.stretch_from %}<div class="small">Continues the guide from {{ r.stretch_from | local_time }}.</div>
+              {% elif r.stretch_note %}<div class="text-faint small">{{ r.stretch_note }}</div>{% endif %}</td>
             <td data-label="Until">{% if r.covers and r.horizon_until %}{{ r.horizon_until | local_time }}{% else %}<span class="text-faint">-</span>{% endif %}</td>
           </tr>
           {% endfor %}

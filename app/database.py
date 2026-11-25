@@ -402,6 +402,10 @@ CHANNEL_EPG_KEY_CHANGED = 'CHANNEL_EPG_KEY_CHANGED'
 # written only by app/epg_sources.py::set_source_override). extra_data carries source_id and
 # previous; detail says where the guide comes from after it (dev/changelog/1107).
 CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED = 'CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED'
+# Which sources continue this channel's guide past the end of its first one changed
+# (epg_sources.place_stretches(), dev/changelog/1722). The first source changing is
+# CHANNEL_EPG_SOURCE_CHANGED; a seam that only moved with a refresh writes nothing.
+CHANNEL_EPG_FILL_CHANGED = 'CHANNEL_EPG_FILL_CHANGED'
 
 # ── Channel group event type constants ────────────────────────────────────────
 #
@@ -602,6 +606,7 @@ EVENT_LABELS = {
     CHANNEL_EPG_SOURCE_CHANGED: 'Guide source changed',
     CHANNEL_EPG_KEY_CHANGED: 'Guide id changed',
     CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED: 'Guide source chosen by hand',
+    CHANNEL_EPG_FILL_CHANGED: 'Guide continued from another source',
     # Group events
     GROUP_MEMBER_PARTICIPATION: 'Participation changed',
     CHANNEL_GROUP_FORMAT_MISMATCH: 'Format mismatch',
@@ -2779,6 +2784,8 @@ class Channel(db.Model):
     epg_alternate_entries = db.relationship('EpgAlternateEntry', lazy=True,
                                             cascade='all, delete-orphan')
     epg_keys = db.relationship('EpgChannelKey', lazy=True, cascade='all, delete-orphan')
+    epg_stretches = db.relationship('EpgChannelStretch', lazy=True,
+                                    cascade='all, delete-orphan')
     epg_agreements = db.relationship('EpgSourceAgreement', lazy=True,
                                      cascade='all, delete-orphan')
 
@@ -3419,10 +3426,11 @@ class EpgSourceChannel(db.Model):
 
 
 class EpgAlternateEntry(db.Model):
-    """Listings from a source that is NOT the channel's active one (DESIGN-epg-sources.md
-    §4). Same columns as EPGEntry by design, so a change of winner is an INSERT ... SELECT;
-    no search index, no chan_prog, no guide reader. Read only by the source/channel pages
-    and the comparison view."""
+    """Listings that are not part of a channel's guide (DESIGN-epg-sources.md §4, §14): a
+    source that neither starts nor continues it, and the listings of one that continues it
+    from before its seam. Same columns as EPGEntry by design, so a move is an INSERT ...
+    SELECT; no search index, no chan_prog, no guide reader. Read by the source/channel
+    pages, the comparison view and the checks that judge one source against another."""
     __tablename__ = 'epg_alternate_entries'
 
     id          = db.Column(db.Integer, primary_key=True)
@@ -3519,6 +3527,44 @@ class EpgSourceAgreement(db.Model):
     __table_args__ = (
         db.UniqueConstraint('channel_id', 'source_id', 'other_source_id',
                             name='uq_epg_source_agreement'),
+    )
+
+
+# What the resolver decided for a source after a channel's first one (DESIGN-epg-sources.md
+# §14.5, dev/changelog/1722). Every branch over an outcome names all seven.
+EPG_STRETCH_FILLS            = 'fills'             # continues the guide past the stretch before it
+EPG_STRETCH_NOTHING_PAST_END = 'nothing_past_end'  # lists nothing starting after the guide ends
+EPG_STRETCH_UNRELATED        = 'unrelated'         # its listings are not the earlier source's schedule
+EPG_STRETCH_NO_OVERLAP       = 'no_overlap'        # too little listed by both to judge
+EPG_STRETCH_NO_SCHEDULE      = 'no_schedule'       # one program all day, behind a real schedule
+EPG_STRETCH_WAITING          = 'waiting'           # covers the channel; its listings are not here yet
+EPG_STRETCH_SHARED_ID        = 'shared_id'         # the channel reads an id unrelated channels share
+EPG_STRETCH_OUTCOMES = (EPG_STRETCH_FILLS, EPG_STRETCH_NOTHING_PAST_END, EPG_STRETCH_UNRELATED,
+                        EPG_STRETCH_NO_OVERLAP, EPG_STRETCH_NO_SCHEDULE, EPG_STRETCH_WAITING,
+                        EPG_STRETCH_SHARED_ID)
+
+
+class EpgChannelStretch(db.Model):
+    """What the resolver decided for each source after a channel's first one that covers the
+    channel (DESIGN-epg-sources.md §14.5): whether it continues the guide, or why not. The
+    first source is Channel.epg_source_id and has no row. Derived, written only by
+    epg_sources.place_stretches(), never the user's. Where a seam falls is not stored: it is
+    read from the listings held each time. A deleted channel or source, a stopped
+    subscription and a hidden channel take their rows."""
+    __tablename__ = 'epg_channel_stretches'
+
+    id         = db.Column(db.Integer, primary_key=True)
+    channel_id = db.Column(db.Integer, db.ForeignKey('channels.id'), nullable=False)
+    source_id  = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
+    position   = db.Column(db.Integer, nullable=False)      # 1 = the first source after the first
+    # The source of the stretch it was judged against: the one it continues, or would have.
+    after_source_id = db.Column(db.Integer, db.ForeignKey('epg_sources.id'))
+    outcome    = db.Column(db.String(20), nullable=False)   # EPG_STRETCH_*
+    updated_at = db.Column(db.DateTime, nullable=False)     # when the outcome last changed
+
+    __table_args__ = (
+        db.UniqueConstraint('channel_id', 'source_id', name='uq_epg_channel_stretch'),
+        db.Index('ix_epg_channel_stretches_source', 'source_id', 'outcome'),
     )
 
 
