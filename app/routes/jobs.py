@@ -802,7 +802,9 @@ def _build_job_list():
                 'schedule_description': ('deferred behind an account sync or a channel test run'
                                          if is_retry else
                                          f'every {hours} hour{"s" if hours != 1 else ""}'),
-                'edit_url': f'/accounts/{src.owner_account_id}' if src else None,
+                'edit_url': ((f'/accounts/{src.owner_account_id}' if src.owner_account_id
+                              else f'/accounts#provider-{src.owner_provider_id}')
+                             if src else None),
                 'run_url': None if is_retry else f'/api/jobs/{job.id}/run-now',
                 'skip_url': None,
                 'overlap': 'green',

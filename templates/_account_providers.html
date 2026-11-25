@@ -2,9 +2,11 @@
    dev/changelog/1170). `providers` is routes/providers.py::providers_section(): None with
    fewer than two accounts, so a one-account user sees nothing at all. The writes are
    account-providers.js -> /api/providers*, through app/account_links.py. #}
+{% import '_macros.html' as m %}
 {% macro section(providers) -%}
 {% if providers %}
-<section class="prov" id="acct-providers" data-choices="{{ providers.choices | tojson | forceescape }}">
+<section class="prov" id="acct-providers" data-choices="{{ providers.choices | tojson | forceescape }}"
+         data-source-hours="{{ providers.source_hours | tojson | forceescape }}">
   <div class="prov-top">
     <h2>Providers</h2>
     <button class="btn btn-sm" data-act="prov-add"
@@ -69,6 +71,48 @@
         {% if p.addable %}
         <button class="btn btn-sm prov-add-acct" data-act="prov-add-account">+ Add account to this provider</button>
         {% endif %}
+        {# Its EPG list (DESIGN-epg-sources.md §15.3, §15.4): the "Provider's EPG" place each
+           account's own guide fills, and the guides added once for every account on it. An
+           account following it reads these first, in this order. #}
+        <div class="prov-epg" id="provider-{{ p.id }}-epg">
+          <h3>EPG order</h3>
+          <p class="card-note">Accounts on {{ p.name }} that follow this order read these guides first, in this order, then their own. A guide added here is read by every account on {{ p.name }}.</p>
+          {% set n_epg = p.epg | length %}
+          {% for e in p.epg %}
+          <div class="prov-acct">
+            <span class="prov-name">{% if n_epg > 1 %}<span class="text-faint">{{ loop.index }}.</span> {% endif %}{{ e.name }}</span>
+            {% if e.slot %}
+            <span class="prov-meta">each account's own guide</span>
+            {% else %}
+            <span class="prov-meta">XMLTV URL &middot; every {{ e.refresh_interval_hours }}h &middot; read by {{ e.readers }} account{{ '' if e.readers == 1 else 's' }}{% if e.guided %} &middot; guide for {{ '{:,}'.format(e.guided) }} channel{{ '' if e.guided == 1 else 's' }}{% endif %}{% if not e.enabled %} &middot; turned off{% endif %}</span>
+            {% if e.refreshing %}<span class="badge b-running"><span class="pulse"></span>Refreshing</span>
+            {% else %}{{ m.status_badge(e.status_badge, e.status_label) }}{% endif %}
+            {% endif %}
+            {% if n_epg > 1 or not e.slot %}
+            <span class="menu-wrap prov-end">
+              <button class="btn btn-sm btn-icon" data-menu data-sheet aria-label="Actions for {{ e.name }}">{{ icon('more') }}</button>
+              <div class="menu">
+                {% if n_epg > 1 %}
+                <button class="menu-item" data-act="prov-epg-move" data-entry-id="{{ e.entry_id }}" data-direction="up"{% if loop.first %} disabled{% endif %}
+                        data-tip="Every account following this order has its channels' guides re-decided from listings already here.">Move up</button>
+                <button class="menu-item" data-act="prov-epg-move" data-entry-id="{{ e.entry_id }}" data-direction="down"{% if loop.last %} disabled{% endif %}>Move down</button>
+                {% endif %}
+                {% if not e.slot %}
+                <button class="menu-item" data-act="prov-epg-refresh" data-source-id="{{ e.id }}"{% if e.refreshing or not e.enabled %} disabled{% endif %}>Refresh now</button>
+                <button class="menu-item" data-act="prov-epg-edit" data-source-id="{{ e.id }}">Edit&hellip;</button>
+                {% for a in p.members %}
+                <button class="menu-item" data-act="prov-epg-give" data-source-id="{{ e.id }}" data-source-name="{{ e.name }}" data-account-id="{{ a.id }}" data-account="{{ a.name }}">Move to {{ a.name }} only</button>
+                {% endfor %}
+                <div class="sep"></div>
+                <button class="menu-item danger" data-act="prov-epg-delete" data-source-id="{{ e.id }}" data-source-name="{{ e.name }}" data-guided="{{ e.guided }}" data-readers="{{ e.readers }}">Delete</button>
+                {% endif %}
+              </div>
+            </span>
+            {% endif %}
+          </div>
+          {% endfor %}
+          <button class="btn btn-sm prov-add-acct" data-act="prov-epg-add">+ Add EPG source</button>
+        </div>
       </div>
     </div>
     {% endfor %}

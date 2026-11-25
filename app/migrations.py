@@ -154,6 +154,7 @@ _BF_DEFAULT_HIDE_RULES = 'm098.default_hide_rules'
 #: Discharged by channel_hiding.backfill_rule_account_counts() from create_app(): the counts
 #: are refresh_rule_stats(), which is ORM code a step cannot call.
 _BF_HIDE_RULE_ACCOUNT_COUNTS = 'm143.hide_rule_account_counts'
+_BF_PROVIDER_EPG_ORDER = 'm148.provider_epg_order'
 
 
 def _register_backfill(conn, cur, name: str):
@@ -2536,12 +2537,17 @@ def _m072_epg_sources(conn, cur):
     left NULL and counted in the log if they somehow do. A fresh database never runs this:
     create_all() builds the tables and there is nothing to backfill.
     """
+    # Dead on every real database (create_all() builds the table first) and held to the model
+    # by MigrationCreateTableParityTests, so it carries the owner columns step 148's rebuild
+    # gave the table rather than an ADD COLUMN could.
     cur.execute('''
         CREATE TABLE IF NOT EXISTS epg_sources (
             id                     INTEGER PRIMARY KEY,
             kind                   VARCHAR(16) NOT NULL,
             name                   VARCHAR(255) NOT NULL,
-            owner_account_id       INTEGER NOT NULL REFERENCES accounts(id),
+            owner_account_id       INTEGER REFERENCES accounts(id),
+            owner_provider_id      INTEGER REFERENCES providers(id),
+            is_account_guide       BOOLEAN DEFAULT 0 NOT NULL,
             url                    VARCHAR(2048),
             refresh_interval_hours INTEGER,
             enabled                BOOLEAN DEFAULT 1 NOT NULL,
@@ -4062,6 +4068,130 @@ def _m147_epg_findings(conn, cur):
     conn.commit()
 
 
+#: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
+#: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
+#: time; the rebuild test holds a migrated table equal to a fresh build.
+_EPG_SOURCES_148_DDL = (
+    'CREATE TABLE epg_sources_owner_new (\n'
+    '\tid INTEGER NOT NULL, \n'
+    '\tkind VARCHAR(16) NOT NULL, \n'
+    '\tname VARCHAR(255) NOT NULL, \n'
+    '\towner_account_id INTEGER, \n'
+    '\turl VARCHAR(2048), \n'
+    '\trefresh_interval_hours INTEGER, \n'
+    '\tenabled BOOLEAN DEFAULT 1 NOT NULL, \n'
+    '\tlast_refresh_at DATETIME, \n'
+    '\tlast_success_at DATETIME, \n'
+    '\trefresh_started_at DATETIME, \n'
+    '\tlast_status VARCHAR(16), \n'
+    '\tlast_error TEXT, \n'
+    '\tentry_count INTEGER DEFAULT 0 NOT NULL, \n'
+    '\tchannel_count INTEGER DEFAULT 0 NOT NULL, \n'
+    '\tactive_channel_count INTEGER DEFAULT 0 NOT NULL, \n'
+    '\tcreated_at DATETIME, \n'
+    '\tupdated_at DATETIME, \n'
+    '\towner_provider_id INTEGER, \n'
+    '\tis_account_guide BOOLEAN DEFAULT 0 NOT NULL, \n'
+    '\tPRIMARY KEY (id), \n'
+    '\tCONSTRAINT ck_epg_sources_one_owner CHECK '
+    '((owner_account_id IS NULL) != (owner_provider_id IS NULL)), \n'
+    '\tFOREIGN KEY(owner_account_id) REFERENCES accounts (id), \n'
+    '\tFOREIGN KEY(owner_provider_id) REFERENCES providers (id)\n'
+    ')'
+)
+
+
+def _m148_provider_epg(conn, cur):
+    """EPG sources at the provider level (DESIGN-epg-sources.md §15, dev/changelog/1721): a
+    source may be owned by a provider instead of an account, a provider has an ordered list
+    with one "Provider's EPG" slot, and an account on a provider follows that list or keeps
+    its own order.
+
+    epg_sources is rebuilt (SQLite cannot drop a NOT NULL in place) with the documented
+    copy/drop/rename, inside one transaction. The backfill is ledger-gated and changes no
+    channel's guide: every provider gets the list [Provider's EPG]; an M3U account's
+    lowest-numbered owned url source becomes its own guide (the one m072 or the account form
+    made); an account on a provider follows when following would leave its subscriptions
+    exactly as they are, and otherwise keeps its own order. Re-runnable from the top: each
+    write is skipped where its answer is already stored."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(epg_sources)').fetchall()}
+    if not cols:
+        return
+    acct_cols = {r[1] for r in cur.execute('PRAGMA table_info(accounts)').fetchall()}
+    changed = 'owner_provider_id' not in cols or 'epg_order_mode' not in acct_cols
+    if changed:
+        _register_backfill(conn, cur, _BF_PROVIDER_EPG_ORDER)
+    if 'owner_provider_id' not in cols:
+        copied, carried = _rebuild_table(conn, cur, 'epg_sources', _EPG_SOURCES_148_DDL,
+                                         'epg_sources_owner_new')
+        conn.commit()
+        log.info('Rebuilt epg_sources so a provider can own a source (%d row(s), %d index(es) '
+                 'carried over)', copied, carried)
+    if 'epg_order_mode' not in acct_cols:
+        cur.execute('ALTER TABLE accounts ADD COLUMN epg_order_mode VARCHAR(8)')
+    cur.executescript("""
+        CREATE INDEX IF NOT EXISTS ix_epg_sources_owner_provider_id
+            ON epg_sources (owner_provider_id);
+        CREATE TABLE IF NOT EXISTS provider_epg_order (
+            id INTEGER NOT NULL,
+            provider_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            entry VARCHAR(16) NOT NULL,
+            source_id INTEGER,
+            PRIMARY KEY (id),
+            CONSTRAINT uq_provider_epg_order_position UNIQUE (provider_id, position),
+            CONSTRAINT uq_provider_epg_order_source UNIQUE (source_id),
+            FOREIGN KEY(provider_id) REFERENCES providers (id),
+            FOREIGN KEY(source_id) REFERENCES epg_sources (id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_provider_epg_order_own_guide
+            ON provider_epg_order (provider_id) WHERE entry = 'own_guide';
+    """)
+    conn.commit()
+    if not _backfill_needed(cur, _BF_PROVIDER_EPG_ORDER, changed):
+        return
+    _backfill_provider_epg(conn, cur)
+    _finish_backfill(conn, cur, _BF_PROVIDER_EPG_ORDER)
+
+
+def _backfill_provider_epg(conn, cur):
+    """Step 148's backfill. Every write is a recompute guarded by "not stored yet", so a
+    retry after a partial run redoes nothing it already did."""
+    providers = [r[0] for r in cur.execute('SELECT id FROM providers').fetchall()]
+    for pid in providers:
+        cur.execute("INSERT INTO provider_epg_order (provider_id, position, entry, source_id) "
+                    "SELECT ?, 1, 'own_guide', NULL WHERE NOT EXISTS "
+                    "(SELECT 1 FROM provider_epg_order WHERE provider_id = ?)", (pid, pid))
+    cur.execute("""
+        UPDATE epg_sources SET is_account_guide = 1 WHERE id IN (
+            SELECT MIN(s.id) FROM epg_sources s JOIN accounts a ON a.id = s.owner_account_id
+            WHERE s.kind = 'url' AND a.account_type != 'xtream'
+              AND NOT EXISTS (SELECT 1 FROM epg_sources m
+                              WHERE m.owner_account_id = a.id AND m.is_account_guide = 1)
+            GROUP BY a.id)
+    """)
+    modes = {'follow': 0, 'own': 0}
+    for aid, kind in cur.execute(
+            'SELECT id, account_type FROM accounts WHERE provider_id IS NOT NULL '
+            'AND epg_order_mode IS NULL').fetchall():
+        if kind == 'xtream':
+            own = cur.execute("SELECT MIN(id) FROM epg_sources WHERE owner_account_id = ? "
+                              "AND kind = 'provider'", (aid,)).fetchone()[0]
+        else:
+            own = cur.execute('SELECT MIN(id) FROM epg_sources WHERE owner_account_id = ? '
+                              'AND is_account_guide = 1', (aid,)).fetchone()[0]
+        present = [r[0] for r in cur.execute(
+            'SELECT source_id FROM epg_source_subscriptions WHERE account_id = ? '
+            'ORDER BY priority', (aid,)).fetchall()]
+        following = present if own is None else [own] + [s for s in present if s != own]
+        mode = 'follow' if following == present else 'own'
+        modes[mode] += 1
+        cur.execute('UPDATE accounts SET epg_order_mode = ? WHERE id = ?', (mode, aid))
+    conn.commit()
+    log.info('Backfill: %d provider EPG list(s); %d account(s) follow their provider\'s order, '
+             '%d keep their own', len(providers), modes['follow'], modes['own'])
+
+
 def _m135_rule_sports_sessions(conn, cur):
     """auto_rules.sports_sessions: whether a rule about a league counts its practice, qualifying and
     shootouts among its games (app/auto_rules_sports.py, dev/changelog/1633). No backfill: before this a
@@ -4808,6 +4938,8 @@ SCHEMA_MIGRATIONS = [
           'the EPG source scorecard', _m146_epg_scorecard),
     (147, 'epg_findings + case-folded EPG id indexes: the EPG findings check',
      _m147_epg_findings),
+    (148, 'epg_sources.owner_provider_id + is_account_guide, provider_epg_order, '
+          'accounts.epg_order_mode: EPG sources at the provider level', _m148_provider_epg),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

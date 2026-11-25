@@ -2125,6 +2125,51 @@ class EpgSourceOverrideWriteBypassTests(unittest.TestCase):
             + '\n'.join(offenders))
 
 
+class EpgOrderWriteBypassTests(unittest.TestCase):
+    """`Account.epg_order_mode` is the user's answer to "does this account follow its
+    provider's EPG order" (DESIGN-epg-sources.md §15.3), and `provider_epg_order` is the
+    provider's list. One writer each, in app/epg_sources.py (dev/changelog/1721): the mode
+    through set_epg_order_mode(), which logs what moved it, and the list nowhere else, so a
+    following account's subscriptions are always written from it by apply_provider_order().
+
+    The scan: an assignment or keyword naming the column, and any construction of the list's
+    row or statement on its model outside app/epg_sources.py. app/ only; migrations exempt
+    (step 148's backfill). Escape hatch: `# epg-order-write-ok: <reason>`."""
+
+    _MARKER = 'epg-order-write-ok'
+    _MODE = re.compile(r'\bepg_order_mode\s*=(?!=)')
+    _LIST = re.compile(r'\bProviderEpgOrder\s*\(|\b(?:delete|update|insert)\(\s*ProviderEpgOrder\b')
+
+    def _offenders(self, pattern, allowed):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            rel = _rel(path)
+            if rel == 'app/migrations.py':
+                continue
+            raw_lines = _read(path).splitlines()
+            code_lines = _mask_comments_and_strings(_read(path)).splitlines()
+            for i, line in enumerate(code_lines):
+                if not pattern.search(line) or _marked_at(raw_lines, i, self._MARKER):
+                    continue
+                if allowed(rel, ConfigReadBypassTests._enclosing_def(code_lines, i)):
+                    continue
+                offenders.append(f'{rel}:{i + 1}: {raw_lines[i].strip()}')
+        return offenders
+
+    def test_the_order_mode_has_one_writer(self):
+        offenders = self._offenders(
+            self._MODE, lambda rel, fn: (rel, fn) == ('app/epg_sources.py', 'set_epg_order_mode')
+            or rel == 'app/database.py')
+        self.assertEqual(offenders, [], 'Account.epg_order_mode written outside '
+                         'epg_sources.set_epg_order_mode():\n' + '\n'.join(offenders))
+
+    def test_the_provider_list_is_written_in_epg_sources_only(self):
+        offenders = self._offenders(
+            self._LIST, lambda rel, fn: rel in ('app/epg_sources.py', 'app/database.py'))
+        self.assertEqual(offenders, [], 'provider_epg_order written outside '
+                         'app/epg_sources.py:\n' + '\n'.join(offenders))
+
+
 class GuideListingsWriteBypassTests(unittest.TestCase):
     """`ChannelGroup.guide_listings_channel_id` is the user's answer to "whose guide data
     do I trust for this group" - the participation-switch rule applied to a group's

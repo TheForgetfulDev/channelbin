@@ -4230,6 +4230,10 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .prov-logins { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
 .prov-pool { font-size: var(--fs-md); color: var(--text-muted); margin-top: 6px; }
 .prov-add-acct { margin-top: 10px; }
+/* The provider's EPG list (DESIGN-epg-sources.md §15.4, dev/changelog/1721). */
+.prov-epg { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
+.prov-epg h3 { font-size: var(--fs-md); font-weight: 700; margin: 0 0 2px; }
+.prov-end { margin-left: auto; }
 @media (max-width: 960px) {
   .prov-logins { margin-left: 0; flex-basis: 100%; }
 }

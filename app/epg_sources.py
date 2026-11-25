@@ -27,7 +27,9 @@ from . import db
 from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_KEY_CHANGED,
                        CHANNEL_EPG_SOURCE_CHANGED, CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED, EPGEntry, EpgAlternateEntry, EpgChannelKey,
                        EpgFinding, EpgSource, EpgSourceAgreement, EpgSourceChannel, EpgSourceRefresh,
-                       EpgSourceSubscription, EPG_KEY_ACCEPTED,
+                       EpgSourceSubscription, EPG_KEY_ACCEPTED, EPG_ORDER_FOLLOW, EPG_ORDER_MODES,
+                       EPG_ORDER_OWN, PROVIDER_ORDER_OWN_GUIDE, PROVIDER_ORDER_SOURCE, Provider,
+                       ProviderEpgOrder,
                        EPG_KEY_IGNORED, EPG_REFRESH_HISTORY_LIMIT, EPG_KEY_ORIGIN_MANUAL, EPG_KEY_ORIGIN_NAME_MATCH, EPG_KEY_REJECTED,
                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, EPG_STATUS_FAILED, EPG_STATUS_OK,
                        EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED)
@@ -268,6 +270,9 @@ def ensure_provider_source(account: Account) -> EpgSource:
     db.session.flush()
     db.session.add(EpgSourceSubscription(source_id=source.id, account_id=account.id,
                                          priority=_next_priority(account.id)))
+    db.session.flush()
+    # On a provider whose order it follows, its own guide belongs in the slot (§15.3).
+    apply_provider_order(account.id)
     return source
 
 
@@ -1192,6 +1197,9 @@ def _delete_source_rows(source_ids) -> None:
         db.session.execute(delete(model).where(model.source_id.in_(ids)))
     db.session.execute(delete(EpgSourceAgreement).where(db.or_(
         EpgSourceAgreement.source_id.in_(ids), EpgSourceAgreement.other_source_id.in_(ids))))
+    # A provider's list names it; the gap left in the positions is closed by the list's
+    # next write (_renumber_list()).
+    db.session.execute(delete(ProviderEpgOrder).where(ProviderEpgOrder.source_id.in_(ids)))
 
 
 # ── Managing sources from the account page (DESIGN-epg-sources.md §9.2) ────────
@@ -1239,11 +1247,15 @@ def clean_url_source_fields(data: dict, account_name: str) -> tuple[list[str], d
                     'enabled': bool(enabled)}
 
 
-def add_url_source(account: Account, fields: dict) -> EpgSource:
+def add_url_source(account: Account, fields: dict, *, account_guide: bool = False) -> EpgSource:
     """A new url source owned by `account`, subscribed last in its priority order
     (move_source() reorders it). Does not commit. Its directory is empty until its
-    first refresh, so the caller starts one (accounts.start_source_refresh)."""
-    source = EpgSource(kind=EPG_SOURCE_URL, owner_account_id=account.id, **fields)
+    first refresh, so the caller starts one (accounts.start_source_refresh).
+
+    `account_guide` marks it as an M3U account's own guide (§15.3): the add-account form's
+    EPG URL, which fills the slot when the account is on a provider."""
+    source = EpgSource(kind=EPG_SOURCE_URL, owner_account_id=account.id,
+                       is_account_guide=account_guide, **fields)
     db.session.add(source)
     db.session.flush()
     db.session.add(EpgSourceSubscription(source_id=source.id, account_id=account.id,
@@ -1544,24 +1556,34 @@ def _disable_if_unread(source_id: int) -> None:
         source.enabled = False
 
 
-def stop_using_source(account_id: int, source_id: int,
-                      case_sensitive: bool) -> SourceRemoval | None:
+def stop_using_source(account_id: int, source_id: int, case_sensitive: bool, *,
+                      own_order_ok: bool = False) -> SourceRemoval | None:
     """The account stops reading a source it subscribes to (§3: "no subscription for
     ignoring the result"). Its listings for this account's channels go - the next import
     would not write them anyway - and each channel it was the guide for moves to its next
     source. When nobody reads the source any more it is also disabled, so the fetch is
     skipped too (§3: "enabled = 0 for skipping the fetch"). The source, its directory and
-    the users' keys into it are kept, so Use again restores it. None if not subscribed."""
+    the users' keys into it are kept, so Use again restores it. None if not subscribed.
+
+    On an account following its provider's order, stopping a source the provider's list
+    placed gives the account its own order (§15.3): refused with NeedsOwnOrder unless the
+    caller says the user confirmed that (`own_order_ok`)."""
     sub = EpgSourceSubscription.query.filter_by(account_id=account_id,
                                                 source_id=source_id).first()
     if sub is None:
         return None
+    goes_own = source_id in placed_for_account(account_id)
+    if goes_own and not own_order_ok:
+        raise NeedsOwnOrder(own_order_sentence(account_id))
     affected = [cid for (cid,) in db.session.query(Channel.id).filter(
         Channel.account_id == account_id, Channel.epg_source_id == source_id)]
     mine = select(Channel.id).where(Channel.account_id == account_id)
 
     @retry_on_locked()
     def _unsubscribe_and_commit():
+        if goes_own:
+            set_epg_order_mode(db.session.get(Account, account_id), EPG_ORDER_OWN,
+                               'stopped using a source its provider placed')
         db.session.execute(delete(EpgSourceSubscription).where(
             EpgSourceSubscription.account_id == account_id,
             EpgSourceSubscription.source_id == source_id))
@@ -1586,14 +1608,19 @@ def stop_using_source(account_id: int, source_id: int,
 def use_source_again(account_id: int, source_id: int) -> bool:
     """Undo stop_using_source: subscribe at the end of the account's priority order and
     enable the source. Does not commit. Its listings come back at its next refresh. False
-    when already subscribed."""
+    when already subscribed.
+
+    A source the account does not own (its provider's, §15.2) is switched on only when
+    nobody reads it - off because unread - never when its owner turned it off by hand and
+    other accounts still read it."""
     if EpgSourceSubscription.query.filter_by(account_id=account_id,
                                              source_id=source_id).first() is not None:
         return False
     source = db.session.get(EpgSource, source_id)
     if source is None:
         return False
-    source.enabled = True
+    if source.owner_account_id == account_id or not subscriber_ids(source_id):
+        source.enabled = True
     db.session.add(EpgSourceSubscription(source_id=source_id, account_id=account_id,
                                          priority=_next_priority(account_id)))
     return True
@@ -1603,17 +1630,23 @@ class Reorder(NamedTuple):
     """What moving a source in an account's priority order did."""
     moved: bool      # False: already first (or last), nothing changed
     switched: int    # channels whose guide now comes from a different source
+    went_own: bool = False   # the move gave the account its own order (§15.3)
 
 
 def move_source(account_id: int, source_id: int, step: int,
-                case_sensitive: bool) -> Reorder | None:
+                case_sensitive: bool, *, own_order_ok: bool = False) -> Reorder | None:
     """Move a source one place up (`step` -1) or down (+1) in the account's priority order
     (§5.2), then re-decide every visible channel's winner and move the listings (§5.4) -
     from rows already held, since every source the account reads keeps its listings for
     these channels in one table or the other. Priorities are renumbered 1..n, closing the
-    gaps Stop using leaves. None when the account does not read the source. Commits."""
+    gaps Stop using leaves. None when the account does not read the source. Commits.
+
+    On an account following its provider's order, a move that changes what the provider's
+    list placed - including putting one of the account's own sources above it - gives the
+    account its own order (§15.3): refused with NeedsOwnOrder unless `own_order_ok`."""
     if step not in (-1, 1):
         raise ValueError(f'step must be -1 or 1, not {step!r}')
+    placed = placed_for_account(account_id)
 
     @retry_on_locked()
     def _reorder_and_commit():
@@ -1621,11 +1654,19 @@ def move_source(account_id: int, source_id: int, step: int,
                 .order_by(EpgSourceSubscription.priority).all())
         ids = [s.source_id for s in subs]
         if source_id not in ids:
-            return None
+            return None, False
         i = ids.index(source_id)
         j = i + step
         if not 0 <= j < len(subs):
-            return False
+            return False, False
+        trial = list(ids)
+        trial[i], trial[j] = trial[j], trial[i]
+        went_own = bool(placed) and not still_following(placed, trial)
+        if went_own and not own_order_ok:
+            raise NeedsOwnOrder(own_order_sentence(account_id))
+        if went_own:
+            set_epg_order_mode(db.session.get(Account, account_id), EPG_ORDER_OWN,
+                               'moved a source its provider placed')
         subs[i], subs[j] = subs[j], subs[i]
         # uq_epg_sub_account_priority is checked row by row, so the new numbers are reached
         # through negative ones nobody holds.
@@ -1635,16 +1676,14 @@ def move_source(account_id: int, source_id: int, step: int,
         for n, sub in enumerate(subs, 1):
             sub.priority = n
         db.session.commit()
-        return True
+        return True, went_own
 
-    moved = _reorder_and_commit()
+    moved, went_own = _reorder_and_commit()
     if moved is None:
         return None
     if not moved:
         return Reorder(False, 0)
-    visible = [cid for (cid,) in db.session.query(Channel.id).filter(
-        Channel.account_id == account_id, Channel.hidden.is_(False))]
-    return Reorder(True, len(reresolve_channels(visible, case_sensitive)))
+    return Reorder(True, len(reresolve_account(account_id, case_sensitive)), went_own)
 
 
 # ── Another account's source (DESIGN-epg-sources.md §3, dev/changelog/1106) ────
@@ -1712,9 +1751,19 @@ def borrowable_sources(account_id: int, case_sensitive: bool) -> list[dict]:
     directories exactly as an import resolves, with the source appended last in priority
     as subscribe_to_source() appends it. A source with no directory (never refreshed
     successfully) has unknown numbers (None), not zero. Five queries, plus held_coverage()'s for a source
-    this account reads that has no directory yet."""
+    this account reads that has no directory yet.
+
+    Another provider's source is offered like another account's (§15.2). This account's own
+    provider's sources are not: they come with following its order, or Use again on their
+    row (account_sources_view() lists them)."""
     order = subscriptions_for([account_id])[account_id]
-    cands = [s for s in EpgSource.query.filter(EpgSource.owner_account_id != account_id)
+    account = db.session.get(Account, account_id)
+    mine = account.provider_id if account is not None else None
+    others = db.or_(EpgSource.owner_account_id != account_id,
+                    and_(EpgSource.owner_account_id.is_(None),
+                         EpgSource.owner_provider_id != mine) if mine is not None
+                    else EpgSource.owner_account_id.is_(None))
+    cands = [s for s in EpgSource.query.filter(others)
              .order_by(EpgSource.owner_account_id, EpgSource.id) if s.id not in order]
     if not cands:
         return []
@@ -1748,7 +1797,7 @@ def borrowable_sources(account_id: int, case_sensitive: bool) -> list[dict]:
         out.append({'id': s.id, 'name': s.name, 'kind': KIND_LABELS.get(s.kind, s.kind),
                     'is_url': s.kind == EPG_SOURCE_URL, 'enabled': bool(s.enabled),
                     'owner_id': s.owner_account_id,
-                    'owner_name': s.owner.name if s.owner else None,
+                    'owner_name': owner_label(s),
                     'last_success_at': s.last_success_at,
                     'covers': covers, 'fills': fills, 'switches': switches})
     return out
@@ -1795,10 +1844,14 @@ def _copy_listings(pairs, source_id: int, model) -> None:
                           for t, d in pairs]).subquery('m')
     cols = [mapping.c.target if c == 'channel_id' else getattr(model, c)
             for c in _ENTRY_COLUMNS]
+    # The donor ids are named in the WHERE as well as the join: given only the join, SQLite
+    # read the source's whole run of rows once per chunk (1.2 s a chunk, 3 minutes to give
+    # one provider guide to two accounts on prod's data, dev/changelog/1721).
+    donors = sorted({d for _t, d in pairs})
     db.session.execute(insert(EpgAlternateEntry).from_select(
         [getattr(EpgAlternateEntry, c) for c in _ENTRY_COLUMNS],
         select(*cols).join(mapping, model.channel_id == mapping.c.donor)
-        .where(_of_source(model, source_id))))
+        .where(_of_source(model, source_id), model.channel_id.in_(donors))))
 
 
 class Borrowed(NamedTuple):
@@ -1843,8 +1896,6 @@ def subscribe_to_source(account_id: int, source_id: int,
                                              source_id=source_id).first() is not None:
         return None
     name, refreshed = source.name, has_directory(source_id)
-    variants = folded_variants(source_id, case_sensitive)
-    donors = _held_listings(source_id, case_sensitive, variants)
 
     @retry_on_locked()
     def _subscribe_and_commit():
@@ -1858,6 +1909,29 @@ def subscribe_to_source(account_id: int, source_id: int,
         return turned_on
 
     turned_on = _subscribe_and_commit()
+    covered, copied = copy_held_listings(account_id, source_id, case_sensitive)
+    outcome = reresolve_channels(copied, case_sensitive, source_names={source_id: name})
+
+    @retry_on_locked()
+    def _recount_and_commit():
+        refresh_source_counts(source_id)
+        db.session.commit()
+
+    _recount_and_commit()
+    guided = sum(1 for new in outcome.values() if new == source_id)
+    return Borrowed(refreshed, covered, len(copied), guided, turned_on)
+
+
+def copy_held_listings(account_id: int, source_id: int,
+                       case_sensitive: bool) -> tuple[int, list[int]]:
+    """For an account that has just started reading a source: copy into the alternates what
+    the database already holds of it for each of the account's visible channels - the rule
+    set_channel_key() follows (dev/changelog/1102). A channel on another reader whose key
+    into the source reads the same id holds exactly what the next import would write. A
+    covered key no reader carries waits for the source's next refresh. Returns (channels
+    the source covers, channels copied); the caller re-resolves. Commits, in chunks."""
+    variants = folded_variants(source_id, case_sensitive)
+    donors = _held_listings(source_id, case_sensitive, variants)
     coverage = directory_coverage([source_id], case_sensitive)[source_id]
     user = {ch: k for (ch, _sid), k in key_answers([source_id]).items()}
     covered, pairs = 0, []
@@ -1869,8 +1943,9 @@ def subscribe_to_source(account_id: int, source_id: int,
             continue
         covered += 1
         fid = file_id_for(k, variants.get(nk, {}))
-        if fid in donors:
-            pairs.append((cid, *donors[fid]))
+        donor = donors.get(fid)
+        if donor is not None and donor[0] != cid:
+            pairs.append((cid, *donor))
 
     for pairs_batch in chunked(pairs, _COPY_CHUNK):
         @retry_on_locked()
@@ -1883,19 +1958,599 @@ def subscribe_to_source(account_id: int, source_id: int,
                 _copy_listings([(t, d) for t, d, m in batch if m is model], source_id, model)
             db.session.commit()
         _copy_and_commit()
+    return covered, [t for t, _d, _m in pairs]
 
-    outcome = reresolve_channels([t for t, _d, _m in pairs], case_sensitive,
-                                 source_names={source_id: name})
+
+def reresolve_account(account_id: int, case_sensitive: bool) -> dict[int, int | None]:
+    """reresolve_channels() over every visible channel of one account - what a change to its
+    order owes. Commits."""
+    visible = [cid for (cid,) in db.session.query(Channel.id).filter(
+        Channel.account_id == account_id, Channel.hidden.is_(False))]
+    return reresolve_channels(visible, case_sensitive)
+
+
+# ── Provider-level sources (DESIGN-epg-sources.md §15, dev/changelog/1721) ─────
+#
+# A provider may own url sources, and has an ordered list in which one entry is a slot,
+# "Provider's EPG", that each account's own guide fills. epg_source_subscriptions stays the
+# one thing every resolver reads: a following account's rows are written from the provider's
+# list by apply_provider_order(), so no resolver, import or page learns a second place to
+# look. Account.epg_order_mode is the user's answer and has one writer, set_epg_order_mode();
+# provider_epg_order is written here and nowhere else.
+
+class NeedsOwnOrder(Exception):
+    """The action would give a following account its own order, and the user has not been
+    told. The message is the sentence the confirmation shows (§15.3)."""
+
+
+def owner_label(source: EpgSource) -> str | None:
+    """The name of the account or provider that owns a source."""
+    if source.owner_provider_id is not None:
+        return source.owner_provider.name if source.owner_provider else None
+    return source.owner.name if source.owner else None
+
+
+def own_guide_ids(account_ids) -> dict[int, int]:
+    """{account_id: source_id} of each account's own guide (§15.3): its provider-kind source,
+    else the url source marked is_account_guide. Accounts with neither are absent. One
+    query."""
+    ids = list(account_ids)
+    if not ids:
+        return {}
+    out: dict[int, int] = {}
+    marked: dict[int, int] = {}
+    for sid, aid, kind in (db.session.query(EpgSource.id, EpgSource.owner_account_id,
+                                            EpgSource.kind)
+                           .filter(EpgSource.owner_account_id.in_(ids),
+                                   db.or_(EpgSource.kind == EPG_SOURCE_PROVIDER,
+                                          EpgSource.is_account_guide.is_(True)))
+                           .order_by(EpgSource.id)):
+        if kind == EPG_SOURCE_PROVIDER:
+            out.setdefault(aid, sid)
+        else:
+            marked.setdefault(aid, sid)
+    for aid, sid in marked.items():
+        out.setdefault(aid, sid)
+    return out
+
+
+def provider_list(provider_id: int) -> list[ProviderEpgOrder]:
+    return (ProviderEpgOrder.query.filter_by(provider_id=provider_id)
+            .order_by(ProviderEpgOrder.position).all())
+
+
+def placed_by_provider(entries, own_guide: int | None) -> list[int]:
+    """The source ids a provider's list places for one account, in order: each source, and
+    the slot as the account's own guide, left out when it has none. Pure."""
+    out: list[int] = []
+    for e in entries:
+        sid = own_guide if e.entry == PROVIDER_ORDER_OWN_GUIDE else e.source_id
+        if sid is not None and sid not in out:
+            out.append(sid)
+    return out
+
+
+def follow_order(placed: list[int], present: list[int]) -> list[int]:
+    """A following account's subscriptions: what the provider's list placed, then the
+    account's other sources in the order it already has them (§15.3). Pure."""
+    return placed + [s for s in present if s not in placed]
+
+
+def still_following(placed: list[int], order: list[int]) -> bool:
+    """Whether an account order keeps what the provider placed first and in its order, with
+    only the account's own sources after it. Pure."""
+    return order[:len(placed)] == placed
+
+
+def follows(account: Account | None) -> bool:
+    return (account is not None and account.provider_id is not None
+            and account.epg_order_mode == EPG_ORDER_FOLLOW)
+
+
+def placed_for_account(account_id: int) -> list[int]:
+    """What the account's provider's list places for it, or [] when it does not follow one."""
+    account = db.session.get(Account, account_id)
+    if not follows(account):
+        return []
+    return placed_by_provider(provider_list(account.provider_id),
+                              own_guide_ids([account_id]).get(account_id))
+
+
+def own_order_sentence(account_id: int) -> str:
+    account = db.session.get(Account, account_id)
+    provider = (db.session.get(Provider, account.provider_id)
+                if account is not None and account.provider_id else None)
+    who = account.name if account is not None else 'this account'
+    whose = f"{provider.name}'s" if provider is not None else "its provider's"
+    return f'This gives {who} its own EPG order; it will stop following {whose}.'
+
+
+def set_epg_order_mode(account: Account, mode: str | None, why: str) -> bool:
+    """The one writer of Account.epg_order_mode (§15.3): the user's answer, moved only by a
+    user action and named in the log with what did it. NULL means the account is on no
+    provider. Does not commit. Returns True when it changed."""
+    if mode is not None and mode not in EPG_ORDER_MODES:
+        raise ValueError(f'unknown EPG order mode {mode!r}')
+    if account.epg_order_mode == mode:
+        return False
+    old = account.epg_order_mode
+    account.epg_order_mode = mode
+    log.info('Account %d (%s): EPG order %s -> %s (%s)', account.id, account.name, old, mode, why)
+    return True
+
+
+def _write_order(account_id: int, order: list[int]) -> list[int]:
+    """Make the account's subscriptions `order`, priority 1..n, subscribing to any source in
+    it the account does not read yet. A subscription `order` leaves out keeps its place after
+    it - nothing is unsubscribed here. A source nobody read (switched off by
+    _disable_if_unread()) is switched back on. Returns the source ids newly subscribed. Does
+    not commit."""
+    subs = (EpgSourceSubscription.query.filter_by(account_id=account_id)
+            .order_by(EpgSourceSubscription.priority).all())
+    by_sid = {s.source_id: s for s in subs}
+    full = list(dict.fromkeys(order)) + [s.source_id for s in subs if s.source_id not in order]
+    if full == [s.source_id for s in subs]:
+        return []
+    added = [sid for sid in full if sid not in by_sid]
+    for sid in added:
+        src = db.session.get(EpgSource, sid)
+        if src is not None and not src.enabled and not subscriber_ids(sid):
+            src.enabled = True
+    # uq_epg_sub_account_priority is checked row by row: reach the new numbers through
+    # negative ones nobody holds, as move_source() does.
+    for n, sub in enumerate(subs, 1):
+        sub.priority = -n
+    for k, sid in enumerate(added, len(subs) + 1):
+        sub = EpgSourceSubscription(source_id=sid, account_id=account_id, priority=-k)
+        db.session.add(sub)
+        by_sid[sid] = sub
+    db.session.flush()
+    for n, sid in enumerate(full, 1):
+        by_sid[sid].priority = n
+    db.session.flush()
+    return added
+
+
+def apply_provider_order(account_id: int) -> list[int]:
+    """Write a following account's subscriptions from its provider's list (§15.3): the
+    list in order with the slot as the account's own guide, then its other sources in the
+    order it had them. A no-op for an account that does not follow a provider. Returns the
+    source ids newly subscribed, whose held listings the caller copies after the commit
+    (copy_held_listings()) before re-resolving. Does not commit."""
+    account = db.session.get(Account, account_id)
+    if not follows(account):
+        return []
+    placed = placed_by_provider(provider_list(account.provider_id),
+                                own_guide_ids([account_id]).get(account_id))
+    present = subscriptions_for([account_id])[account_id]
+    return _write_order(account_id, follow_order(placed, present))
+
+
+def _append_to_own_order(account_id: int, source_id: int) -> list[int]:
+    """A source the provider gained goes at the end of an own-order account's list (§15.3).
+    Does not commit."""
+    present = subscriptions_for([account_id])[account_id]
+    if source_id in present:
+        return []
+    return _write_order(account_id, present + [source_id])
+
+
+def ensure_provider_list(provider_id: int) -> None:
+    """Every provider's list holds the slot (§15.3); a provider created after migration 148
+    gets [Provider's EPG] here. Does not commit."""
+    if ProviderEpgOrder.query.filter_by(provider_id=provider_id).first() is None:
+        db.session.add(ProviderEpgOrder(provider_id=provider_id, position=1,
+                                        entry=PROVIDER_ORDER_OWN_GUIDE))
+        db.session.flush()
+
+
+def _renumber_list(entries: list[ProviderEpgOrder]) -> None:
+    """Positions 1..n in the given order, through negatives (uq_provider_epg_order_position
+    is checked row by row). Does not commit."""
+    for n, e in enumerate(entries, 1):
+        e.position = -n
+    db.session.flush()
+    for n, e in enumerate(entries, 1):
+        e.position = n
+    db.session.flush()
+
+
+def _list_append(provider_id: int, source_id: int) -> None:
+    ensure_provider_list(provider_id)
+    top = db.session.query(func.max(ProviderEpgOrder.position)).filter(
+        ProviderEpgOrder.provider_id == provider_id).scalar() or 0
+    db.session.add(ProviderEpgOrder(provider_id=provider_id, position=top + 1,
+                                    entry=PROVIDER_ORDER_SOURCE, source_id=source_id))
+    db.session.flush()
+
+
+def provider_account_ids(provider_id: int) -> list[int]:
+    return [aid for (aid,) in db.session.query(Account.id).filter(
+        Account.provider_id == provider_id).order_by(Account.id)]
+
+
+def _give_to_provider_accounts(provider_id: int, source_id: int) -> dict[int, list[int]]:
+    """Every account on the provider reads a source its list just gained: a following account
+    through its list, an own-order one at the end of its own (§15.3). Returns {account_id:
+    sources newly subscribed}. Does not commit."""
+    out = {}
+    for aid in provider_account_ids(provider_id):
+        account = db.session.get(Account, aid)
+        out[aid] = (apply_provider_order(aid) if follows(account)
+                    else _append_to_own_order(aid, source_id))
+    return out
+
+
+def settle_accounts(added: dict[int, list[int]], case_sensitive: bool,
+                    moved: dict[int, set[int]] | None = None) -> int:
+    """After an order change has committed: copy what the database holds for each source an
+    account newly reads, then re-decide each account's channels from rows held (§5.4).
+    Returns how many channels' guide changed source. Commits.
+
+    `moved` ({account_id: source ids}) says the change only joined or moved those sources in
+    an account's order, the others keeping their order among themselves. Then only a channel
+    holding one of their listings can change winner - a channel switches only to a source it
+    holds rows of, or away from one it holds - so only those are re-decided: on prod's
+    largest account a few thousand channels, where a whole-account re-resolve is 28,000. An
+    account absent from `moved` (or `moved` None) is re-decided whole."""
+    switched = 0
+    for aid, sources in added.items():
+        for sid in sources:
+            copy_held_listings(aid, sid, case_sensitive)
+        if moved is None or aid not in moved:
+            switched += len(reresolve_account(aid, case_sensitive))
+        else:
+            ids = sorted({cid for sid in moved[aid] for cid in _holding_channels(aid, sid)})
+            switched += len(reresolve_channels(ids, case_sensitive))
+        for sid in sources:
+            @retry_on_locked()
+            def _recount_and_commit(sid=sid):
+                refresh_source_counts(sid)
+                db.session.commit()
+            _recount_and_commit()
+    return switched
+
+
+def _holding_channels(account_id: int, source_id: int) -> list[int]:
+    """The account's visible channels holding any of the source's listings, in either
+    table. A statement over the whole source, so it walks the source index rather than
+    going through _of_source() (whose channel-index plan suits a statement naming a few
+    channels)."""
+    out: set[int] = set()
+    for model in (EPGEntry, EpgAlternateEntry):
+        out.update(cid for (cid,) in db.session.query(model.channel_id).join(
+            Channel, Channel.id == model.channel_id).filter(
+            model.source_id == source_id, Channel.account_id == account_id,
+            Channel.hidden.is_(False)).distinct())
+    return sorted(out)
+
+
+def clean_provider_source_fields(data: dict, provider_name: str) -> tuple[list[str], dict]:
+    """clean_url_source_fields() for a provider's source, which has no account sync to ride
+    and so must refresh on an interval of its own (§15.2)."""
+    errors, fields = clean_url_source_fields(data, provider_name)
+    if not errors and not fields['refresh_interval_hours']:
+        errors.append("Choose how often to refresh it: a provider's source has no account "
+                      'sync to refresh with.')
+    return errors, fields
+
+
+def add_provider_source(provider_id: int, fields: dict) -> tuple[EpgSource, dict[int, list[int]]]:
+    """A new url source owned by the provider, last on its list and read by every account on
+    it (§15.2, §15.3). Nothing is held for it yet, so nothing needs re-resolving until its
+    first import, which the caller starts. Returns (source, {account_id: newly subscribed}).
+    Does not commit."""
+    source = EpgSource(kind=EPG_SOURCE_URL, owner_provider_id=provider_id, **fields)
+    db.session.add(source)
+    db.session.flush()
+    _list_append(provider_id, source.id)
+    return source, _give_to_provider_accounts(provider_id, source.id)
+
+
+class ProviderMove(NamedTuple):
+    """What moving a source between an account and its provider did."""
+    readers: int     # accounts reading it now
+    switched: int    # channels whose guide changed source
+
+
+def move_source_to_provider(source_id: int, provider_id: int, interval: int | None,
+                            case_sensitive: bool) -> ProviderMove:
+    """An account's url source becomes its provider's (§15.4, "Move to Strong"): ownership
+    changes, the list gains it at the end and every account on the provider reads it.
+    Nothing is fetched: the other accounts get what the database already holds for it. A
+    source that refreshed with its account's sync takes `interval` (§15.2). The caller has
+    checked the source is a url source owned by an account on this provider, and not that
+    account's own guide. Commits."""
+    @retry_on_locked()
+    def _move_and_commit():
+        src = db.session.get(EpgSource, source_id)
+        src.owner_account_id = None
+        src.owner_provider_id = provider_id
+        src.is_account_guide = False
+        if not src.refresh_interval_hours:
+            src.refresh_interval_hours = interval
+        db.session.flush()
+        _list_append(provider_id, source_id)
+        added = _give_to_provider_accounts(provider_id, source_id)
+        db.session.commit()
+        return added
+
+    added = _move_and_commit()
+    switched = settle_accounts(added, case_sensitive,
+                               moved={aid: {source_id} for aid in added})
+    return ProviderMove(len(subscriber_ids(source_id)), switched)
+
+
+def move_source_to_account(source_id: int, account_id: int,
+                           case_sensitive: bool) -> SourceRemoval:
+    """A provider's source becomes one account's alone (§15.3, the other way to take it off
+    the list): ownership changes, it leaves the list, and every other account reading it
+    stops - their listings from it go and their channels re-resolve. Its interval is kept.
+    The caller has checked the account is on the provider. Returns what the other accounts'
+    channels lost. Commits."""
+    @retry_on_locked()
+    def _move_and_commit():
+        src = db.session.get(EpgSource, source_id)
+        pid = src.owner_provider_id
+        src.owner_provider_id = None
+        src.owner_account_id = account_id
+        db.session.execute(delete(ProviderEpgOrder).where(ProviderEpgOrder.source_id == source_id))
+        db.session.flush()
+        if pid is not None:
+            _renumber_list(provider_list(pid))
+        present = subscriptions_for([account_id])[account_id]
+        added = [] if source_id in present else _write_order(account_id, present + [source_id])
+        added += apply_provider_order(account_id)
+        db.session.commit()
+        return added
+
+    added = _move_and_commit()
+    # Copied before the others stop: their rows are what it copies.
+    settle_accounts({account_id: added}, case_sensitive)
+    affected, switched = 0, 0
+    for aid in subscriber_ids(source_id):
+        if aid == account_id:
+            continue
+        done = stop_using_source(aid, source_id, case_sensitive, own_order_ok=True)
+        if done is not None:
+            affected += done.affected
+            switched += done.switched
+    return SourceRemoval(affected, switched, affected - switched)
+
+
+def move_provider_entry(provider_id: int, entry_id: int, step: int,
+                        case_sensitive: bool) -> Reorder | None:
+    """Move one entry of the provider's list up (-1) or down (+1) (§15.3, "Changing the
+    provider's list"): every following account's subscriptions are rewritten at once and
+    its channels re-resolved from rows held. Own-order accounts are untouched. None when the
+    entry is not on this provider's list. Commits."""
+    if step not in (-1, 1):
+        raise ValueError(f'step must be -1 or 1, not {step!r}')
 
     @retry_on_locked()
-    def _recount_and_commit():
-        refresh_source_counts(source_id)
+    def _move_and_commit():
+        entries = provider_list(provider_id)
+        ids = [e.id for e in entries]
+        if entry_id not in ids:
+            return None
+        i = ids.index(entry_id)
+        j = i + step
+        if not 0 <= j < len(entries):
+            return False
+        swapped = (entries[i], entries[j])
+        entries[i], entries[j] = entries[j], entries[i]
+        _renumber_list(entries)
+        following = [aid for aid in provider_account_ids(provider_id)
+                     if follows(db.session.get(Account, aid))]
+        guides = own_guide_ids(following)
+        added, moved = {}, {}
+        for aid in following:
+            added[aid] = apply_provider_order(aid)
+            # Only the two entries traded places; the slot is each account's own guide.
+            moved[aid] = {guides.get(aid) if e.entry == PROVIDER_ORDER_OWN_GUIDE else e.source_id
+                          for e in swapped} - {None}
+        db.session.commit()
+        return added, moved
+
+    result = _move_and_commit()
+    if result is None:
+        return None
+    if result is False:
+        return Reorder(False, 0)
+    added, moved = result
+    return Reorder(True, settle_accounts(added, case_sensitive, moved))
+
+
+def follow_provider_again(account_id: int, case_sensitive: bool) -> int:
+    """"Follow <provider>'s order again" (§15.3): the order mode back to follow and the
+    provider's list re-applied, re-subscribing to any of its sources the account had dropped,
+    its own sources after. Returns how many channels' guide changed source. Commits."""
+    @retry_on_locked()
+    def _follow_and_commit():
+        account = db.session.get(Account, account_id)
+        set_epg_order_mode(account, EPG_ORDER_FOLLOW, "chose to follow its provider's order again")
+        ensure_provider_list(account.provider_id)
+        added = apply_provider_order(account_id)
+        db.session.commit()
+        return added
+
+    return settle_accounts({account_id: _follow_and_commit()}, case_sensitive)
+
+
+def set_account_guide(account_id: int, source_id: int, case_sensitive: bool) -> int:
+    """Make one of an M3U account's own url sources its own guide (§15.3), the one that
+    fills the provider's slot; the mark leaves whichever source held it. On a following
+    account the slot moves with it. The caller has checked the source is a url source the
+    account owns. Returns how many channels changed source. Commits."""
+    @retry_on_locked()
+    def _mark_and_commit():
+        for src in EpgSource.query.filter_by(owner_account_id=account_id).all():
+            src.is_account_guide = src.id == source_id
+        db.session.flush()
+        added = apply_provider_order(account_id)
+        db.session.commit()
+        return added
+
+    added = _mark_and_commit()
+    return settle_accounts({account_id: added}, case_sensitive) if placed_for_account(account_id) else 0
+
+
+class ProviderChange(NamedTuple):
+    """What an account joining or leaving a provider did to its guide."""
+    switched: int    # channels whose guide changed source (joining)
+    removed: SourceRemoval | None   # what leaving the old provider's sources cost
+
+
+def provider_changed(account_id: int, old_provider_id: int | None,
+                     new_provider_id: int | None, case_sensitive: bool) -> ProviderChange:
+    """The EPG half of an account moving between providers (§15.5), after the move itself
+    has committed (account_links.set_account_provider()). Leaving: the account stops using
+    the old provider's sources - their listings for its channels go and the channels
+    re-resolve from rows held - and its own sources are untouched. Joining: it follows the
+    new provider's order. Commits."""
+    removed = None
+    if old_provider_id is not None and old_provider_id != new_provider_id:
+        theirs = [sid for (sid,) in db.session.query(EpgSourceSubscription.source_id)
+                  .join(EpgSource, EpgSource.id == EpgSourceSubscription.source_id)
+                  .filter(EpgSourceSubscription.account_id == account_id,
+                          EpgSource.owner_provider_id == old_provider_id)]
+        affected = switched = 0
+        for sid in theirs:
+            done = stop_using_source(account_id, sid, case_sensitive, own_order_ok=True)
+            if done is not None:
+                affected += done.affected
+                switched += done.switched
+        removed = SourceRemoval(affected, switched, affected - switched)
+    switched = 0
+    if new_provider_id is not None and old_provider_id != new_provider_id:
+        @retry_on_locked()
+        def _join_and_commit():
+            account = db.session.get(Account, account_id)
+            set_epg_order_mode(account, EPG_ORDER_FOLLOW, 'joined a provider')
+            ensure_provider_list(new_provider_id)
+            added = apply_provider_order(account_id)
+            db.session.commit()
+            return added
+        switched = settle_accounts({account_id: _join_and_commit()}, case_sensitive)
+    elif new_provider_id is None:
+        @retry_on_locked()
+        def _leave_and_commit():
+            set_epg_order_mode(db.session.get(Account, account_id), None, 'left its provider')
+            db.session.commit()
+        _leave_and_commit()
+    return ProviderChange(switched, removed)
+
+
+class ProviderRelease(NamedTuple):
+    """What deleting a provider did with its sources (§15.5)."""
+    handed: list      # [(source name, account name)] kept for the accounts reading them
+    deleted: list     # [source id] deleted with the provider
+    removed: SourceRemoval
+
+
+def release_provider_sources(provider_id: int, keep: bool,
+                             case_sensitive: bool) -> ProviderRelease:
+    """Before a provider is deleted (§15.5, §17 Q3). Kept, each source is handed to the
+    lowest-numbered account still reading it with every subscription kept, so no guide
+    changes; turned off, the sources are deleted and their channels re-resolve. Either way a
+    source no account reads is deleted, and the provider's list goes. The caller removes the
+    deleted sources' scheduler jobs and alerts. Commits."""
+    sources = EpgSource.query.filter_by(owner_provider_id=provider_id).order_by(EpgSource.id).all()
+    plan = [(s.id, s.name, sorted(subscriber_ids(s.id))) for s in sources]
+    handed, deleted = [], []
+    affected = switched = 0
+    for sid, name, readers in plan:
+        if keep and readers:
+            @retry_on_locked()
+            def _hand_and_commit(sid=sid, to=readers[0]):
+                src = db.session.get(EpgSource, sid)
+                src.owner_provider_id = None
+                src.owner_account_id = to
+                db.session.commit()
+            _hand_and_commit()
+            account = db.session.get(Account, readers[0])
+            handed.append((name, account.name if account else f'account {readers[0]}'))
+        else:
+            done = delete_url_source(sid, case_sensitive)
+            deleted.append(sid)
+            if done is not None:
+                affected += done.affected
+                switched += done.switched
+
+    @retry_on_locked()
+    def _drop_list_and_commit():
+        db.session.execute(delete(ProviderEpgOrder).where(
+            ProviderEpgOrder.provider_id == provider_id))
+        for account in Account.query.filter(Account.provider_id == provider_id).all():
+            set_epg_order_mode(account, None, 'its provider was deleted')
         db.session.commit()
 
-    _recount_and_commit()
-    guided = sum(1 for new in outcome.values() if new == source_id)
-    return Borrowed(refreshed, covered, len(pairs), guided, turned_on)
+    _drop_list_and_commit()
+    return ProviderRelease(handed, deleted, SourceRemoval(affected, switched, affected - switched))
 
+
+def provider_release_preview(provider_id: int) -> dict:
+    """What the delete dialog counts (§15.5): the provider's sources, how many no account
+    reads, and the channels whose guide comes from them now."""
+    sources = [sid for (sid,) in db.session.query(EpgSource.id).filter(
+        EpgSource.owner_provider_id == provider_id)]
+    unread = sum(1 for sid in sources if not subscriber_ids(sid))
+    guided = (db.session.query(func.count(Channel.id)).filter(
+        Channel.epg_source_id.in_(sources)).scalar() or 0) if sources else 0
+    return {'sources': len(sources), 'unread': unread, 'guided': guided}
+
+
+def provider_lists_view(provider_ids, tz=None, now: datetime | None = None) -> dict[int, list[dict]]:
+    """{provider_id: [entry, ...]} for the Providers section's cards (§15.4): each provider's
+    list in order, the slot and each source with its status, interval and readers. A fixed
+    number of queries whatever the count of providers or sources."""
+    from .url_utils import mask_url_path
+    ids = list(provider_ids)
+    if not ids:
+        return {}
+    entries = (ProviderEpgOrder.query.filter(ProviderEpgOrder.provider_id.in_(ids))
+               .order_by(ProviderEpgOrder.provider_id, ProviderEpgOrder.position).all())
+    sources = {s.id: s for s in EpgSource.query.filter(EpgSource.owner_provider_id.in_(ids))}
+    readers: dict[int, int] = dict(db.session.query(
+        EpgSourceSubscription.source_id, func.count(EpgSourceSubscription.id))
+        .filter(EpgSourceSubscription.source_id.in_(list(sources) or [-1]))
+        .group_by(EpgSourceSubscription.source_id))
+    guided: dict[int, int] = dict(db.session.query(Channel.epg_source_id, func.count(Channel.id))
+                                  .filter(Channel.epg_source_id.in_(list(sources) or [-1]))
+                                  .group_by(Channel.epg_source_id))
+    out: dict[int, list[dict]] = {pid: [] for pid in ids}
+    for e in entries:
+        if e.entry == PROVIDER_ORDER_OWN_GUIDE:
+            out[e.provider_id].append({'entry_id': e.id, 'slot': True,
+                                       'name': "Provider's EPG"})
+            continue
+        s = sources.get(e.source_id)
+        if s is None:
+            continue
+        badge, label = STATUS_DISPLAY.get(s.last_status, STATUS_DISPLAY[None])
+        out[e.provider_id].append({
+            'entry_id': e.id, 'slot': False, 'id': s.id, 'name': s.name,
+            'url': mask_url_path(s.url), 'enabled': bool(s.enabled),
+            'refresh_interval_hours': s.refresh_interval_hours,
+            'refreshing': s.refresh_started_at is not None,
+            'last_success_at': s.last_success_at,
+            'status_badge': badge, 'status_label': label, 'last_error': s.last_error,
+            'readers': readers.get(s.id, 0), 'guided': guided.get(s.id, 0),
+        })
+    return out
+
+
+
+def account_order_view(account: Account) -> dict | None:
+    """The Sources card's order line (§15.3, §15.4) for an account on a provider: the
+    provider's id and name and whether the account follows its order. None on no provider."""
+    if account.provider_id is None:
+        return None
+    provider = db.session.get(Provider, account.provider_id)
+    if provider is None:
+        return None
+    return {'provider_id': provider.id, 'provider_name': provider.name,
+            'follows': follows(account)}
 
 # ── What the account and channel pages show ─────────────────────────────────
 
@@ -2182,10 +2837,18 @@ def account_sources_view(account_id: int, schedule: dict | None = None, tz=None,
     subs = (EpgSourceSubscription.query.filter_by(account_id=account_id)
             .order_by(EpgSourceSubscription.priority).all())
     subscribed = {sub.source_id for sub in subs}
-    idle = EpgSource.query.filter(EpgSource.owner_account_id == account_id)
+    account = db.session.get(Account, account_id)
+    provider_id = account.provider_id if account is not None else None
+    # Its own sources and its provider's (§15.4) it has stopped using, so Use again has a row.
+    mine = (db.or_(EpgSource.owner_account_id == account_id,
+                   EpgSource.owner_provider_id == provider_id) if provider_id is not None
+            else EpgSource.owner_account_id == account_id)
+    idle = EpgSource.query.filter(mine)
     if subscribed:
         idle = idle.filter(EpgSource.id.notin_(subscribed))
     idle = idle.order_by(EpgSource.id).all()
+    placed = set(placed_for_account(account_id))
+    own_guide = own_guide_ids([account_id]).get(account_id)
     active_here = active_counts_by_account(account_id)
     readers: dict[int, list[ForeignReader]] = {}
     owned = [s.id for s in [sub.source for sub in subs] + idle
@@ -2208,7 +2871,12 @@ def account_sources_view(account_id: int, schedule: dict | None = None, tz=None,
             'kind': KIND_LABELS.get(s.kind, s.kind), 'is_url': s.kind == EPG_SOURCE_URL,
             'url': mask_url_path(s.url) if s.kind == EPG_SOURCE_URL else None,
             'owned': s.owner_account_id == account_id,
-            'owner_id': s.owner_account_id, 'owner_name': s.owner.name if s.owner else None,
+            'owner_id': s.owner_account_id, 'owner_name': owner_label(s),
+            'owner_provider_id': s.owner_provider_id,
+            # The provider's own source (§15.2), and whether the provider's list placed this
+            # row on a following account - what moving it would change (§15.3).
+            'provider_owned': provider_id is not None and s.owner_provider_id == provider_id,
+            'placed': s.id in placed, 'own_guide': s.id == own_guide,
             'enabled': s.enabled, 'refresh_interval_hours': s.refresh_interval_hours,
             'refreshing': s.refresh_started_at is not None,
             'next_refresh_at': when.get('next'), 'retry_at': when.get('retry'),
@@ -2297,7 +2965,8 @@ def channel_guide_view(channel: Channel, case_sensitive: bool) -> dict:
             'subscribed': sid in source_ids,
             'key': wanted.get(sid), 'key_origin': origin if user_key else 'provider',
             'user_key': user_key, 'ignored_id': ignored_id, 'key_pending': pending.get(sid),
-            'owner_id': s.owner_account_id, 'owner_name': s.owner.name if s.owner else None,
+            'owner_id': s.owner_account_id, 'owner_name': owner_label(s),
+            'owner_provider_id': s.owner_provider_id,
             'covers': sid in coverage,
             'entry_count': d.entry_count if d else 0,
             'distinct_titles': d.distinct_titles if d else 0,

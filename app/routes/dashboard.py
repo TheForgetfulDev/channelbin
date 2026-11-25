@@ -895,8 +895,11 @@ def _activity_status_dict():
             continue
         bg_tasks.append({'kind': BG_KIND_EPG_SOURCE_REFRESH,
                          'label': 'EPG source refresh', 'detail': f'Refreshing {src.name}',
-                         'href': url_for('accounts.account_detail',
-                                         account_id=src.owner_account_id)})
+                         'href': (url_for('accounts.account_detail',
+                                          account_id=src.owner_account_id)
+                                  if src.owner_account_id is not None
+                                  else url_for('accounts.accounts_list')
+                                  + f'#provider-{src.owner_provider_id}')})
         dashboard_bg_tasks.append(bg_tasks[-1])
 
     # The three post-capture phases - already counted via `live` on the Dashboard's own

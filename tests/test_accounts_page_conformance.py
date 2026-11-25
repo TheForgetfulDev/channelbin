@@ -118,6 +118,20 @@ class AccountPageTests(unittest.TestCase):
                       + r'</span>.*?</div>', details_html, re.S)
         return m.group(0) if m else ''
 
+    def test_the_epg_sources_table_turns_to_cards_in_a_narrow_column(self):
+        """dev/docs/BUGS.md 2026-11-24 @ 08:50 PM. The Sources card's seven columns need about
+        820px and the card column is 619px at 961px, so the table scrolled sideways. The width
+        is the browser suite's 961px check; this holds the opt-in that answers it."""
+        acc = _account('Sources', 'OK')
+        from tests.support.seed import make_epg_source
+        make_epg_source(acc)
+        db.session.commit()
+        html = self._get(acc)
+        table = re.search(r'<div class="card-body" id="acct-sources-body">.*?<table class="([^"]*)"',
+                          html, re.S)
+        self.assertIsNotNone(table)
+        self.assertIn('cards-under-900', table.group(1).split())
+
     # ── The primary action: exactly two copies, and named per status ─────────
 
     def test_status_action_is_rendered_exactly_twice(self):

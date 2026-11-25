@@ -46,8 +46,13 @@ def make_epg_source(account, kind=None, url=None, name=None, priority=None):
     src = EpgSource.query.filter_by(owner_account_id=account.id, kind=kind).first()
     if src is not None:
         return src
+    # An M3U account's first url source is its own guide, as the account form makes it
+    # (DESIGN-epg-sources.md §15.3).
+    guide = (kind == EPG_SOURCE_URL and account.account_type != 'xtream'
+             and EpgSource.query.filter_by(owner_account_id=account.id,
+                                           is_account_guide=True).first() is None)
     src = EpgSource(kind=kind, owner_account_id=account.id,
-                    name=name or f'{account.name} {kind}',
+                    name=name or f'{account.name} {kind}', is_account_guide=guide,
                     url=(url or account.epg_url) if kind == EPG_SOURCE_URL else None)
     db.session.add(src)
     db.session.flush()

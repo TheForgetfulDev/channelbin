@@ -1883,6 +1883,16 @@ def _drop_shares_off_provider(account, provider_id: Optional[int]) -> list:
     return dropped
 
 
+def _case_sensitive(case_sensitive: Optional[bool]) -> bool:
+    # duplicated from app/routes/accounts.py::_case_sensitive - app/ modules do not import
+    # route modules; both are case_sensitive_matching() over the one config reader.
+    if case_sensitive is not None:
+        return case_sensitive
+    from .config import load_config
+    from .epg_sources import case_sensitive_matching
+    return case_sensitive_matching(load_config())
+
+
 def _refold_duplicates() -> None:
     """Recompute the duplicate fold inside the caller's commit unit. An account joining or
     leaving a provider changes the key of every channel on it, and a human made the change,
@@ -1892,12 +1902,25 @@ def _refold_duplicates() -> None:
     duplicate_streams.recompute()
 
 
-def create_provider(name: str, account_ids: Iterable[int]):
+def create_provider(name: str, account_ids: Iterable[int],
+                    case_sensitive: Optional[bool] = None):
+    """create_provider_full() without its EPG report: (provider, dropped)."""
+    provider, dropped, _changes = create_provider_full(name, account_ids, case_sensitive)
+    return provider, dropped
+
+
+def create_provider_full(name: str, account_ids: Iterable[int],
+                         case_sensitive: Optional[bool] = None):
     """Create a provider and put `account_ids` on it, in one unit. An account already on
     another provider moves, dropping the shares it held there. Returns (provider, {account_id:
-    [dropped login names]}). Raises ValueError for a bad or taken name or an unknown
-    account."""
+    [dropped login names]}, {account_id: epg_sources.ProviderChange}). Raises ValueError for
+    a bad or taken name or an unknown account.
+
+    The provider starts with the EPG list [Provider's EPG], and each account then follows it
+    (DESIGN-epg-sources.md §15.5) - after the commit, since that re-resolves channels and
+    commits on its own."""
     from .database import Account, Provider
+    from .epg_sources import ensure_provider_list, provider_changed
     name = normalize_provider_name(name)
     ids = list(dict.fromkeys(int(a) for a in account_ids))
 
@@ -1907,10 +1930,12 @@ def create_provider(name: str, account_ids: Iterable[int]):
         accounts = Account.query.filter(Account.id.in_(ids)).all() if ids else []
         if len(accounts) != len(ids):
             raise ValueError('One of the chosen accounts no longer exists.')
+        before = {a.id: a.provider_id for a in accounts}
         now = datetime.utcnow()
         provider = Provider(name=name, created_at=now, updated_at=now)
         db.session.add(provider)
         db.session.flush()
+        ensure_provider_list(provider.id)
         # Every account is put on the provider BEFORE any share is judged: two accounts
         # that kept a share through their old provider's deletion and are now re-created
         # together must keep it, and judging the first while the second is still on none
@@ -1926,11 +1951,17 @@ def create_provider(name: str, account_ids: Iterable[int]):
         if accounts:
             _refold_duplicates()
         db.session.commit()
-        return provider, dropped
+        return provider, dropped, before
 
-    provider, dropped = _create_and_commit()
+    provider, dropped, before = _create_and_commit()
     log.info('Provider "%s" created with accounts %s', provider.name, ids)
-    return provider, dropped
+    changes = {}
+    if ids:
+        cs = _case_sensitive(case_sensitive)
+        for account_id in ids:
+            changes[account_id] = provider_changed(account_id, before.get(account_id),
+                                                   provider.id, cs)
+    return provider, dropped, changes
 
 
 def rename_provider(provider_id: int, name: str):
@@ -1955,14 +1986,31 @@ def rename_provider(provider_id: int, name: str):
     return provider
 
 
-def delete_provider(provider_id: int) -> tuple[str, int]:
+def delete_provider(provider_id: int, keep_sources: bool = True,
+                    case_sensitive: Optional[bool] = None) -> tuple[str, int]:
+    """delete_provider_full() without its EPG report. Returns (name, accounts unlinked)."""
+    name, count, _release = delete_provider_full(provider_id, keep_sources, case_sensitive)
+    return name, count
+
+
+def delete_provider_full(provider_id: int, keep_sources: bool,
+                         case_sensitive: Optional[bool] = None):
     """Delete a provider: its accounts go back to being on none. Their hosts and logins are
     left alone, and a login two of them share stays shared (design §3.2) - the seat is one
     real seat whatever the label says, and the account page keeps naming the share. The
     share is judged again at the next provider change of either account: re-creating the
     provider with both keeps it, putting one of them on a provider without the other drops
-    it. Returns (name, accounts unlinked). Raises LookupError."""
+    it. Returns (name, accounts unlinked, epg_sources.ProviderRelease). Raises LookupError.
+
+    Its EPG sources go first (DESIGN-epg-sources.md §15.5): kept, each is handed to the
+    lowest-numbered account reading it so no guide changes; not kept, they are deleted and
+    their channels re-resolved. The caller removes a deleted source's jobs and alerts."""
     from .database import Account, Provider
+    from .epg_sources import release_provider_sources
+    if db.session.get(Provider, provider_id) is None:
+        raise LookupError('Provider not found.')
+    release = release_provider_sources(provider_id, keep_sources,
+                                       _case_sensitive(case_sensitive))
 
     @retry_on_locked()
     def _delete_and_commit():
@@ -1980,16 +2028,29 @@ def delete_provider(provider_id: int) -> tuple[str, int]:
         return name, len(accounts)
 
     name, count = _delete_and_commit()
-    log.info('Provider "%s" deleted; %d accounts unlinked', name, count)
-    return name, count
+    log.info('Provider "%s" deleted; %d accounts unlinked; EPG sources handed over %s, '
+             'deleted %s', name, count, release.handed, release.deleted)
+    return name, count, release
 
 
-def set_account_provider(account_id: int, provider_id: Optional[int]) -> list:
+def set_account_provider(account_id: int, provider_id: Optional[int],
+                         case_sensitive: Optional[bool] = None) -> list:
+    """move_account_provider() without its EPG report: the names of the logins let go."""
+    return move_account_provider(account_id, provider_id, case_sensitive)[0]
+
+
+def move_account_provider(account_id: int, provider_id: Optional[int],
+                          case_sensitive: Optional[bool] = None):
     """Put the account on `provider_id`, or on none. Leaving, joining or moving drops the
     account's hold on any login shared with an account that is not on the new provider
-    (design §3.2). Returns the names of the logins it let go. Raises LookupError for an
-    unknown account or provider."""
+    (design §3.2). Returns (names of the logins it let go, epg_sources.ProviderChange or
+    None when nothing moved). Raises LookupError for an unknown account or provider.
+
+    Then the EPG half (DESIGN-epg-sources.md §15.5), after the commit since it re-resolves
+    channels and commits on its own: leaving stops using the old provider's sources,
+    joining follows the new provider's order."""
     from .database import Account, Provider
+    from .epg_sources import provider_changed
 
     @retry_on_locked()
     def _set_and_commit():
@@ -1998,19 +2059,23 @@ def set_account_provider(account_id: int, provider_id: Optional[int]) -> list:
             raise LookupError('Account not found.')
         if provider_id is not None and db.session.get(Provider, provider_id) is None:
             raise LookupError('Provider not found.')
-        if account.provider_id == provider_id:
-            return []
+        old = account.provider_id
+        if old == provider_id:
+            return [], old, False
         account.provider_id = provider_id
         db.session.flush()
         dropped = _drop_shares_off_provider(account, provider_id)
         _refold_duplicates()
         db.session.commit()
-        return dropped
+        return dropped, old, True
 
-    dropped = _set_and_commit()
+    dropped, old, moved = _set_and_commit()
+    if not moved:
+        return dropped, None
     log.info('Account %d: provider set to %s%s', account_id, provider_id,
              f' (stopped sharing {", ".join(dropped)})' if dropped else '')
-    return dropped
+    change = provider_changed(account_id, old, provider_id, _case_sensitive(case_sensitive))
+    return dropped, change
 
 
 def share_login(login_id: int, account_id: int):

@@ -280,8 +280,10 @@ def refreshing_epg_sources(db_path):
     conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
     try:
         rows = conn.execute(
-            "SELECT s.name FROM epg_sources s JOIN accounts a ON a.id = s.owner_account_id "
-            "WHERE s.refresh_started_at IS NOT NULL AND a.status != 'SYNCING' "
+            # LEFT JOIN: a provider's source has no owning account (dev/changelog/1721).
+            "SELECT s.name FROM epg_sources s LEFT JOIN accounts a ON a.id = s.owner_account_id "
+            "WHERE s.refresh_started_at IS NOT NULL "
+            "AND (a.id IS NULL OR a.status != 'SYNCING') "
             "ORDER BY s.name").fetchall()
     except sqlite3.DatabaseError as e:
         return [], f'cannot read {db_path} ({e}), assuming idle'

@@ -2125,6 +2125,11 @@ class Account(db.Model):
     #: dev/changelog/1170): "these accounts reach the same backend". NULL = on none, which is
     #: every account until the user says otherwise. Written only by app/account_links.py.
     provider_id       = db.Column(db.Integer, db.ForeignKey('providers.id'))
+    #: On a provider, whether this account's EPG source order is the provider's (EPG_ORDER_FOLLOW)
+    #: or its own (EPG_ORDER_OWN); NULL while it is on none (DESIGN-epg-sources.md §15.3). The
+    #: user's answer: written only by epg_sources.set_epg_order_mode(), and once set no sync,
+    #: sweep or migration moves it (dev/changelog/1721).
+    epg_order_mode    = db.Column(db.String(8))
     #: Created by "Try it with example channels" (app/examples.py, dev/changelog/1281) and
     #: nothing else: Delete the examples deletes exactly the accounts carrying it. Never set
     #: on an account the user added, and never derived from the name or the URL.
@@ -3273,17 +3278,32 @@ EPG_KEY_REJECTED = 'rejected'
 # there. Once the provider's id changes, the row stops counting (dev/changelog/1716).
 EPG_KEY_IGNORED = 'ignored'
 
+# Account.epg_order_mode (DESIGN-epg-sources.md §15.3).
+EPG_ORDER_FOLLOW = 'follow'   # the provider's list first, the account's own sources after
+EPG_ORDER_OWN    = 'own'      # the account's subscriptions are the user's, as on no provider
+EPG_ORDER_MODES = (EPG_ORDER_FOLLOW, EPG_ORDER_OWN)
+
+# ProviderEpgOrder.entry.
+PROVIDER_ORDER_OWN_GUIDE = 'own_guide'   # the slot: each account's own guide fills it
+PROVIDER_ORDER_SOURCE    = 'source'      # one of the provider's own url sources
+
 
 class EpgSource(db.Model):
-    """One XMLTV feed. Owned by the account that refreshes it and whose deletion takes it;
-    read by every account subscribed to it (DESIGN-epg-sources.md §3)."""
+    """One XMLTV feed, owned by exactly one account or one provider and read by every account
+    subscribed to it (DESIGN-epg-sources.md §3, §15.2). An account-owned source is refreshed
+    with that account and deleted with it; a provider-owned one is a url source on an interval
+    of its own that survives any one account. Read the owner through
+    epg_sources.owner_label() / owned_by_account(), never one column alone."""
     __tablename__ = 'epg_sources'
+    __table_args__ = (
+        db.CheckConstraint('(owner_account_id IS NULL) != (owner_provider_id IS NULL)',
+                           name='ck_epg_sources_one_owner'),
+    )
 
     id               = db.Column(db.Integer, primary_key=True)
     kind             = db.Column(db.String(16), nullable=False)          # EPG_SOURCE_KINDS
     name             = db.Column(db.String(255), nullable=False)
-    owner_account_id = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False,
-                                 index=True)
+    owner_account_id = db.Column(db.Integer, db.ForeignKey('accounts.id'), index=True)
     # EPG_SOURCE_URL only. Account-owned and secret in full: render through mask_url_path().
     url              = db.Column(db.String(2048))
     # NULL = refreshes inside the owner account's sync (DESIGN-epg-sources.md §8.1).
@@ -3305,8 +3325,36 @@ class EpgSource(db.Model):
                                      server_default=db.text('0'))
     created_at       = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at       = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Set instead of owner_account_id for a source the provider owns (§15.2). url kind only.
+    owner_provider_id = db.Column(db.Integer, db.ForeignKey('providers.id'), index=True)
+    # An M3U account's own guide: the url source that fills its provider's "Provider's EPG"
+    # slot, at most one per account (§15.3). The user's to move between the account's url
+    # sources; an Xtream account's own guide is its provider-kind source and needs no mark.
+    is_account_guide = db.Column(db.Boolean, nullable=False, default=False,
+                                 server_default=db.text('0'))
 
     owner = db.relationship('Account', foreign_keys=[owner_account_id], lazy='joined')
+    owner_provider = db.relationship('Provider', foreign_keys=[owner_provider_id], lazy='joined')
+
+
+class ProviderEpgOrder(db.Model):
+    """A provider's ordered EPG list (DESIGN-epg-sources.md §15.3): its own url sources and
+    one slot, PROVIDER_ORDER_OWN_GUIDE, that each account's own guide fills. A following
+    account's subscriptions are written from it by epg_sources.apply_provider_order(); no
+    resolver reads it. Written only by app/epg_sources.py (dev/changelog/1721)."""
+    __tablename__ = 'provider_epg_order'
+    __table_args__ = (
+        db.UniqueConstraint('provider_id', 'position', name='uq_provider_epg_order_position'),
+        db.UniqueConstraint('source_id', name='uq_provider_epg_order_source'),
+        db.Index('uq_provider_epg_order_own_guide', 'provider_id', unique=True,
+                 sqlite_where=db.text("entry = 'own_guide'")),
+    )
+
+    id          = db.Column(db.Integer, primary_key=True)
+    provider_id = db.Column(db.Integer, db.ForeignKey('providers.id'), nullable=False)
+    position    = db.Column(db.Integer, nullable=False)
+    entry       = db.Column(db.String(16), nullable=False)    # PROVIDER_ORDER_*
+    source_id   = db.Column(db.Integer, db.ForeignKey('epg_sources.id'))   # NULL for the slot
 
 
 class EpgSourceSubscription(db.Model):
