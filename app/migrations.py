@@ -4090,9 +4090,20 @@ def _m149_epg_channel_stretches(conn, cur):
     conn.commit()
 
 
+def _m150_epg_source_expiry(conn, cur):
+    """epg_sources.expires_on: the day a paid guide's subscription ends (dev/changelog/1724).
+    No backfill: nobody has given one yet. Re-runnable from the top: the ADD COLUMN asks
+    PRAGMA table_info first."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(epg_sources)').fetchall()}
+    if cols and 'expires_on' not in cols:
+        cur.execute('ALTER TABLE epg_sources ADD COLUMN expires_on DATE')
+    conn.commit()
+
+
 #: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
 #: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
-#: time; the rebuild test holds a migrated table equal to a fresh build.
+#: time; the rebuild test holds step 148's output to this text, and the column list after
+#: the later steps that add to the table to a fresh build's.
 _EPG_SOURCES_148_DDL = (
     'CREATE TABLE epg_sources_owner_new (\n'
     '\tid INTEGER NOT NULL, \n'
@@ -4964,6 +4975,7 @@ SCHEMA_MIGRATIONS = [
           'accounts.epg_order_mode: EPG sources at the provider level', _m148_provider_epg),
     (149, 'epg_channel_stretches: a guide continued past the end of its first source',
      _m149_epg_channel_stretches),
+    (150, 'epg_sources.expires_on: an expiration date on an EPG source', _m150_epg_source_expiry),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

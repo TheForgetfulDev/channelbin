@@ -78,6 +78,9 @@ RECURRING_META = {
     'host_resolve_check': ('Stream Host Check', '/settings?q=hosts',
                            'Checks each account\'s stream hosts: a lookup only, or the '
                            'full check if Settings says so.'),
+    'epg_source_expiry': ('EPG Source Expiry Check', '/accounts',
+                          'Says when an EPG source you gave an expiration date is about to '
+                          'expire, or has.'),
     'auto_rule_sweep': ('Auto-record Rules', '/rules',
                         'Schedules what your auto-record rules match.'),
     'sports_worker': ('Sports Schedules', '/sports',
@@ -111,7 +114,7 @@ RECURRING_META = {
 # set rather than a runtime threshold because none of these has history to measure.
 PROBE_JOBS = frozenset({
     'hc_window_dispatch', 'hc_window_close', 'storage_dirs_check', 'host_resolve_check',
-    'account_stats_fold',
+    'account_stats_fold', 'epg_source_expiry',
 })
 
 # How far ahead the Dashboard timeline looks (static/js/dashboard.js reads it from the

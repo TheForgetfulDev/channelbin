@@ -512,6 +512,13 @@
           (provider ? '' : `<option value=""${s.refresh_interval_hours ? '' : ' selected'}>With this account's sync</option>`) +
           `${hours}</select>`,
       }) +
+      fieldRow({
+        // "A week" is epg_sources.EXPIRY_NOTICE_DAYS (dev/changelog/1724).
+        label: 'Expires on',
+        meta: 'Optional. The day a paid guide\'s subscription ends: you get a heads-up a week ' +
+          'before and an alert on the day. Nothing stops using it by itself.',
+        control: `<input type="date" id="src-expires" value="${escHtml(s.expires_on || '')}">`,
+      }) +
       (editing ? fieldRow({
         label: 'On',
         meta: 'Turned off, the source keeps its listings and is not fetched again.',
@@ -534,6 +541,7 @@
               url,
               name: $m('#src-name').value,
               refresh_interval_hours: $m('#src-hours').value,
+              expires_on: $m('#src-expires').value,
               enabled: editing ? $m('#src-on').checked : true,
             };
             const target = provider ? `/api/providers/${provider.id}/epg-sources`

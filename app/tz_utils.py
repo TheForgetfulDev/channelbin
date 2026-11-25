@@ -236,6 +236,12 @@ def date_label(day, now: datetime, tz: ZoneInfo) -> str:
         return 'Yesterday'
     if day.year == today.year:
         return day.strftime('%a %b ') + str(day.day)
+    return full_date_label(day)
+
+
+def full_date_label(day) -> str:
+    """'Dec 31, 2026': a calendar date in full, for text that is read later than it is
+    written (an alert body), where 'Tomorrow' would go stale."""
     return day.strftime('%b ') + f'{day.day}, {day.year}'
 
 

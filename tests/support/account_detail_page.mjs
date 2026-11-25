@@ -35,6 +35,7 @@ for (const s of ['never', 'syncing', 'done']) {
     scores: JSON.parse(read(`${s}.scores.json`)),
     ordered: read(`${s}.ordered.html`),
     preview: JSON.parse(read(`${s}.preview.json`)),
+    settings: JSON.parse(read(`${s}.settings.json`)),
   };
 }
 const JS = ['util.js', 'account-modal.js', 'account-actions.js', 'account-detail.js', 'account-stats.js']
@@ -83,6 +84,7 @@ function boot(which, start, { serve = start, scoresStatus = 200 } = {}) {
       if (server.previewStatus) return respond(server.previewStatus, { error: 'Preview broke.' });
       return respond(200, server.preview || st.preview);
     }
+    if (url.pathname === `/api/accounts/${id}/epg-sources/${META.second}`) return respond(200, st.settings);
     if (url.pathname === '/api/nav-status') return respond(200, st.nav);
     if (url.pathname === `/api/accounts/${id}/syncs`) return respond(200, st.syncs);
     if (url.pathname === `/api/accounts/${id}/epg-scorecard`) {
@@ -414,6 +416,35 @@ await record('move_preview', async (start) => {
     served: STATES.done.preview.lines, posts: ownPosts, second: META.second, brokenItems,
     brokenPosts: c.posts.slice(ownPosts.length)
       .map((x) => ({ path: x.path, body: JSON.parse(x.body || '{}') })),
+  };
+});
+
+// The Edit source dialog shows the expiration date the server holds and sends back what the
+// field says, a cleared field as '' (dev/changelog/1724).
+await record('source_expiry', async (start) => {
+  const c = start('ordered', 'done');
+  await c.settle();
+  const field = () => c.document.querySelector('.modal-panel #src-expires');
+  const save = () => {
+    const btns = c.document.querySelectorAll('.modal-panel .modal-foot .btn');
+    btns[btns.length - 1].click();
+  };
+  const edit = () => c.click(c.$(`[data-act="source-edit"][data-source-id="${META.second}"]`));
+  edit();
+  await c.settle();
+  const shown = field() ? { type: field().type, value: field().value } : null;
+  field().value = '2027-02-01';
+  save();
+  await c.settle();
+  edit();
+  await c.settle();
+  field().value = '';
+  save();
+  await c.settle();
+  return {
+    errors: c.errors, shown,
+    bodies: c.posts.map((x) => ({ path: x.path, body: JSON.parse(x.body || '{}') })),
+    second: META.second,
   };
 });
 

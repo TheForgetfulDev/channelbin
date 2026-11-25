@@ -63,8 +63,8 @@ def providers_section(accounts) -> dict | None:
     counts = connlim.login_pool_counts(holders)
     from ..epg_sources import provider_lists_view
     from ..tz_utils import format_local, get_display_tz, is_24h
-    lists = provider_lists_view([p.id for p in providers])
     tz, h24 = get_display_tz(), is_24h()
+    lists = provider_lists_view([p.id for p in providers], tz=tz)
     for entries in lists.values():
         for e in entries:
             if e.get('last_success_at'):
@@ -503,6 +503,8 @@ def add_provider_epg_source_api(provider_id):
         return source.id
 
     source_id = _add_and_commit()
+    from ..accounts import update_source_expiry_alerts
+    update_source_expiry_alerts(source_id)
     app_obj = current_app._get_current_object()
     from ..epg_scorecard import recheck_soon
     from ..scheduler import schedule_epg_source_refresh
@@ -526,7 +528,8 @@ def provider_epg_source_settings_api(provider_id, source_id):
     return jsonify({'success': True, 'source': {
         'id': source.id, 'name': source.name, 'url': source.url or '',
         'refresh_interval_hours': source.refresh_interval_hours or '',
-        'enabled': bool(source.enabled)}})
+        'enabled': bool(source.enabled),
+        'expires_on': source.expires_on.isoformat() if source.expires_on else ''}})
 
 
 @providers_bp.route('/api/providers/<int:provider_id>/epg-sources/<int:source_id>',
@@ -535,7 +538,8 @@ def save_provider_epg_source_api(provider_id, source_id):
     provider, source, err = _provider_source_or_404(provider_id, source_id)
     if err:
         return err
-    from ..accounts import start_source_refresh, update_source_stale_alert
+    from ..accounts import (start_source_refresh, update_source_expiry_alerts,
+                            update_source_stale_alert)
     from ..epg_sources import clean_provider_source_fields, update_url_source
     errors, fields = clean_provider_source_fields(request.get_json(silent=True) or {},
                                                   provider.name)
@@ -550,6 +554,7 @@ def save_provider_epg_source_api(provider_id, source_id):
 
     url_changed = _save_and_commit()
     update_source_stale_alert(source_id)
+    update_source_expiry_alerts(source_id)
     app_obj = current_app._get_current_object()
     from ..scheduler import schedule_epg_source_refresh
     message = f'Saved "{fields["name"]}".'

@@ -20,7 +20,7 @@ import traceback
 import zlib
 import defusedxml.ElementTree as ET
 from defusedxml.common import DefusedXmlException
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from typing import NamedTuple
 
@@ -47,9 +47,9 @@ from .database import (
 )
 from .db_utils import chunked, current_wal_size_bytes, retry_on_locked
 from .epg_sources import (
-    DISTINCT_TITLE_CAP, UPCOMING_TITLES, DirectoryRow, key_answers,
+    DISTINCT_TITLE_CAP, EXPIRY_PASSED, EXPIRY_SOON, UPCOMING_TITLES, DirectoryRow, key_answers,
     apply_winners, case_sensitive_matching, channel_key, demote_others,
-    directory_coverage, drop_alternates,
+    directory_coverage, drop_alternates, expiry_state, owner_label,
     ensure_provider_source, file_id_for, held_coverage, holding_rows, make_room_for_first,
     norm_key, place_stretches, promote,
     retire_expired_listings,
@@ -58,7 +58,8 @@ from .epg_sources import (
     subscriber_ids, subscriptions_for, sources_without_directory, write_directory,
 )
 from .fmt_utils import fmt_bytes, plural
-from .tz_utils import format_local, parse_epoch_utc, to_naive_utc
+from .tz_utils import (format_local, full_date_label, get_display_tz, is_24h, parse_epoch_utc,
+                       to_local, to_naive_utc)
 from .url_utils import mask_account_urls_in_text, mask_creds, mask_creds_in_text, mask_url_path
 
 log = logging.getLogger(__name__)
@@ -2162,7 +2163,8 @@ def _classify_alert_body(note: str | None, added: int, why_it_matters: str,
 
 
 def _raise_or_resolve_standing_alert(alert_type: str, source: str, active: bool,
-                                     title: str = '', body: str = '') -> None:
+                                     title: str = '', body: str = '', *,
+                                     resurface: bool = True) -> None:
     """The shared shape behind every SYNC_* degradation alert (DESIGN-sync-resilience.md
     §3): while `active`, raise or refresh a WARN alert for (alert_type, source) rather than
     stacking one per sync; once the condition clears, auto-dismiss the standing one. Mirrors
@@ -2171,6 +2173,10 @@ def _raise_or_resolve_standing_alert(alert_type: str, source: str, active: bool,
 
     Canonical home for this pattern - the EPG_SOURCE_* alerts and SYNC_FEED_SHRUNK need the
     identical shape; reuse this instead of another copy.
+
+    `resurface=False` is for a caller that re-asks on a clock rather than on a new
+    observation (the hourly expiry check): a standing row keeps its time and read state and
+    only takes the new wording, or it would come back unread every hour.
     """
     from .alerts import create_alert, mark_cleared
 
@@ -2187,8 +2193,9 @@ def _raise_or_resolve_standing_alert(alert_type: str, source: str, active: bool,
             for a in existing:
                 a.title = title[:255]
                 a.body = body
-                a.created_at = datetime.utcnow()
-                a.read_at = None
+                if resurface:
+                    a.created_at = datetime.utcnow()
+                    a.read_at = None
         else:
             mark_cleared(existing)
         db.session.commit()
@@ -3061,7 +3068,8 @@ def _set_refreshing(source_id: int, on: bool) -> None:
 
 #: Every standing alert a source can hold, by the key suffix it is raised under.
 _SOURCE_ALERTS = (('EPG_SOURCE_FETCH_FAILED', 'fetch'), ('EPG_SOURCE_COLLAPSE_REFUSED', 'collapse'),
-                  ('EPG_SOURCE_IMPORT_TRUNCATED', 'truncated'), ('EPG_SOURCE_STALE', 'stale'))
+                  ('EPG_SOURCE_IMPORT_TRUNCATED', 'truncated'), ('EPG_SOURCE_STALE', 'stale'),
+                  ('EPG_SOURCE_EXPIRING', 'expiring'), ('EPG_SOURCE_EXPIRED', 'expired'))
 
 
 def start_source_refresh(app, source_id: int) -> tuple[bool, str]:
@@ -3146,6 +3154,69 @@ def update_source_stale_alert(source_id: int) -> None:
     _raise_or_resolve_standing_alert(
         'EPG_SOURCE_STALE', source=f'epg-source:{source_id}:stale', active=active,
         title=f'EPG source "{source.name}" is stale', body=body)
+
+
+def update_source_expiry_alerts(source_id: int, today: date | None = None, *, tz=None,
+                                h24: bool | None = None) -> None:
+    """Raise or clear EPG_SOURCE_EXPIRING and EPG_SOURCE_EXPIRED for one source against its
+    expiration date (epg_sources.expiry_state()). At most one of the two stands; a source
+    turned off holds neither, since turning it off is the answer to the date. Called after
+    a save and by the hourly check_source_expiries(); a deleted source's are cleared by
+    resolve_source_alerts(). `today`, `tz` and `h24` are read once by a caller doing many."""
+    source = db.session.get(EpgSource, source_id)
+    if source is None:
+        return
+    if tz is None:
+        tz, h24 = get_display_tz(), is_24h()
+    if today is None:
+        today = to_local(datetime.utcnow(), tz).date()
+    state = expiry_state(source.expires_on, today) if source.enabled else None
+    name, key = source.name, f'epg-source:{source_id}'
+    when = full_date_label(source.expires_on) if source.expires_on else ''
+    owner = owner_label(source)
+    where = f'"{name}" ({owner})' if owner else f'"{name}"'
+    soon_body = expired_body = ''
+    if state == EXPIRY_SOON:
+        soon_body = (f'EPG source {where} expires on {when}, the date you gave it. Once it is '
+                     "renewed, move the date on in the source's Edit dialog. This alert "
+                     'clears itself then, or if the source is turned off or deleted.')
+    elif state == EXPIRY_PASSED:
+        last = (f'Its last good refresh was {format_local(source.last_success_at, tz=tz, h24=h24)}.'
+                if source.last_success_at else 'It has not had a good refresh yet.')
+        expired_body = (f'EPG source {where} expired on {when}, the date you gave it. It is '
+                        'still in use: ChannelBin goes on refreshing it and keeps the listings '
+                        f'it already has, and a refresh may now fail. {last} Once it is renewed, '
+                        "move the date on in the source's Edit dialog; to stop using it, turn it "
+                        'off or delete it. This alert clears itself when you do.')
+    _raise_or_resolve_standing_alert(
+        'EPG_SOURCE_EXPIRING', source=f'{key}:expiring', active=state == EXPIRY_SOON,
+        title=f'EPG source "{name}" expires {when}', body=soon_body, resurface=False)
+    _raise_or_resolve_standing_alert(
+        'EPG_SOURCE_EXPIRED', source=f'{key}:expired', active=state == EXPIRY_PASSED,
+        title=f'EPG source "{name}" expired {when}', body=expired_body, resurface=False)
+
+
+def check_source_expiries() -> int:
+    """The hourly pass over every source with an expiration date, and every one still
+    holding an expiry alert (a date taken off by something other than a save). Returns how
+    many sources it looked at. A handful of rows and no bulk work, so it takes no admission
+    ticket."""
+    held = {int(src.split(':')[1]) for (src,) in db.session.query(Alert.source).filter(
+        Alert.alert_type.in_(('EPG_SOURCE_EXPIRING', 'EPG_SOURCE_EXPIRED')),
+        Alert.dismissed_at.is_(None), Alert.source.like('epg-source:%'))}
+    dated = {sid for (sid,) in db.session.query(EpgSource.id).filter(
+        EpgSource.expires_on.isnot(None))}
+    existing = dated | {sid for (sid,) in db.session.query(EpgSource.id).filter(
+        EpgSource.id.in_(list(held) or [-1]))}
+    tz, h24 = get_display_tz(), is_24h()
+    today = to_local(datetime.utcnow(), tz).date()
+    ids = sorted(dated | held)
+    for sid in ids:
+        if sid in existing:
+            update_source_expiry_alerts(sid, today, tz=tz, h24=h24)
+        else:
+            resolve_source_alerts(sid)
+    return len(ids)
 
 
 def resolve_source_alerts(source_id: int) -> None:
