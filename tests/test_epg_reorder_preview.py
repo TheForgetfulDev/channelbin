@@ -11,7 +11,8 @@ so a difference here is the preview judging a second way.
   - ProviderOrderTests: a provider list move, Follow again, and joining a provider - with a
     source the account does not read yet read through the donor its copy would use.
   - LinesTests: the sentences say what the comparison can stand behind, never that the
-    programs change.
+    programs change; a program named another way and a placeholder are counted
+    (dev/changelog/1725).
   - RouteTests: the preview routes answer and write nothing.
 
 No network: every feed is a local byte string (CLAUDE.md §Testing).
@@ -30,7 +31,7 @@ from app import db  # noqa: E402
 from app import account_links as links  # noqa: E402
 from app import epg_sources as es  # noqa: E402
 from app.accounts import import_source  # noqa: E402
-from app.database import (Channel, EPGEntry, EpgAlternateEntry, EpgChannelStretch,  # noqa: E402
+from app.database import (Account, Channel, EPGEntry, EpgAlternateEntry, EpgChannelStretch,  # noqa: E402
                           EpgSource, EpgSourceSubscription, ProviderEpgOrder)
 from tests.support import seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
@@ -172,6 +173,32 @@ class AccountOrderTests(_OneAccount):
         self.assertEqual(p.unaligned, 1, 'c2 lines up nowhere')
         self.assertEqual((p.described_before, p.described_after), (20, 0))
         self.assertEqual((p.episodes_before, p.episodes_after), (0, 10))
+
+    def test_a_program_named_another_way_and_a_placeholder_are_counted(self):
+        """dev/changelog/1725: c7's External guide names five programs another way and
+        lists the channel's own name in one slot."""
+        seed.make_channel(db.session.get(Account, self.acct_id), name='UK: TALKSPORT',
+                          epg_channel_id='c7.test')
+        db.session.commit()
+        ext_c7 = ([(x[0], x[1], x[2], f'The {x[3]} Special', None, None)
+                   for x in _slots('c7.test', 0, 4, 'Seven')]
+                  + [('c7.test', 60 + 5 * 30, 30, 'talkSPORT', None, None)]
+                  + _slots('c7.test', 6, 9, 'Seven'))
+        self._import(self.src_id, _slots('c1.test', 0, 9, 'Show', desc=True)
+                     + _slots('c2.test', 0, 9, 'Show', desc=True)
+                     + _slots('c3.test', 0, 9, 'Solo', desc=True)
+                     + _slots('c6.test', 0, 9, 'Long', desc=True)
+                     + _slots('c7.test', 0, 9, 'Seven', desc=True))
+        self._import(self.ext_id, _slots('c1.test', 0, 19, 'Show', sub=True)
+                     + _slots('c2.test', 0, 9, 'Other')
+                     + _slots('c6.test', 0, 119, 'Long') + ext_c7)
+        p = es.preview_orders(es.move_trial(self.acct_id, self.ext_id, -1).trials, False)
+        self.assertEqual((p.same, p.renamed, p.different), (29, 5, 10))
+        self.assertEqual((p.placeholder_before, p.placeholder_after, p.only_before), (0, 1, 1))
+        text = ' '.join(es.preview_lines(p, {self.src_id: 'Guide', self.ext_id: 'External'}))
+        self.assertIn('29 listings are the same program (5 of them named differently)', text)
+        self.assertIn("0 listings from the source used now and 1 from the new one are only the "
+                      "channel's name, not a program", text)
 
     def test_a_preview_writes_nothing(self):
         before = self._fingerprint()
@@ -331,8 +358,8 @@ class LinesTests(unittest.TestCase):
         text = ' '.join(es.preview_lines(p, {1: 'Guide', 2: 'Full'}))
         self.assertIn('3 channels would start their guide with a different source: 3 from '
                       'Guide to Full.', text)
-        self.assertIn('10 have a different title in the same slot (some of those are the same '
-                      'program named differently)', text)
+        self.assertIn('10 have a different title in the same slot (some of those may still be '
+                      'one program named two ways)', text)
         self.assertIn('100% have a description now and 25% would after', text)
         self.assertNotIn('different program', text)
         self.assertNotIn('end sooner', text, 'reach is only a warning')

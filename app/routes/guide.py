@@ -24,6 +24,7 @@ from ..channel_groups import (effective_score, rank_members, member_channels,
                               serving_member, blocked_account_ids_now,
                               DEFAULT_FAILING_STREAK_THRESHOLD)
 from ..epg_sources import (Listing, listing_agreement, keys_read, case_sensitive_matching,
+                           placeholder_names,
                            AGREE_DOUBLED, AGREE_PAST, AGREE_REFERENCE, COMPARE_VERDICTS)
 from .. import channel_hiding
 from ..channel_search import mark_labels
@@ -413,10 +414,14 @@ def _schedules_payload(group, row, ref_entries, lead_channel_id, cell, entries_b
                 'recording_enabled': recording_on.get(ch.id, False)}
 
     verdict_order = {v: i for i, v in enumerate(COMPARE_VERDICTS)}
+    # Every member is the group's one channel, so any of their names, or the group's, as a
+    # title is that channel's name standing in for a program.
+    placeholders = placeholder_names([group.name] + [ch.name for ch in members])
     rows = []
     for s in member_schedules(members, reads, entries_by_channel, cs):
         entries = entries_by_channel.get(s.channels[0].id, [])
-        cmp, agreements, lacking = listing_agreement(ref, [listing(e) for e in entries], now)
+        cmp, agreements, lacking = listing_agreement(ref, [listing(e) for e in entries], now,
+                                                     placeholders=placeholders)
         programs = []
         for e, a in zip(entries, agreements):
             p = cell(e)
@@ -425,6 +430,7 @@ def _schedules_payload(group, row, ref_entries, lead_channel_id, cell, entries_b
             p['on_schedule'] = True
             p['agreement'] = a.kind
             p['gap'] = a.gap
+            p['renamed'] = a.renamed
             p['partner'] = ({'title': a.partner.title, 'start_time': iso_seconds_or_none(a.partner.start),
                              'stop_time': iso_seconds_or_none(a.partner.stop)} if a.partner else None)
             programs.append(p)
@@ -442,6 +448,7 @@ def _schedules_payload(group, row, ref_entries, lead_channel_id, cell, entries_b
             'counts': {'compared': cmp.compared, 'same': cmp.same, 'moved': cmp.moved,
                        'different': cmp.different, 'only_guide': cmp.only_active,
                        'only_here': cmp.only_other, 'doubled': cmp.doubled_other,
+                       'renamed': cmp.renamed, 'placeholder': cmp.placeholder_other,
                        'largest_move_min': (int(cmp.largest_move.total_seconds() // 60)
                                             if cmp.largest_move else None)},
             'ends': iso_seconds_or_none(max((e.stop_time for e in entries), default=None)),
