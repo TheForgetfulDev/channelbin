@@ -71,6 +71,11 @@ class _Leagues:
 
     def game(self, league, hours, n, field=False):
         start = self.now + timedelta(hours=hours)
+        if field and (start.hour, start.minute) == (0, 0):
+            # A field event at 00:00 is TheSportsDB's no-time placeholder and has no window
+            # (sports_feed.event_window), so a run in the wrong minute would drop it
+            # (dev/docs/BUGS.md 2026-11-25).
+            start += timedelta(minutes=1)
         ev = SportsEvent(tsdb_id=70000 + n, league_id=league.id, name=f'Grand Prix {n}',
                          home_team_id=0 if field else 101, away_team_id=0 if field else 102,
                          home_name=None if field else 'Ironvale Bears',

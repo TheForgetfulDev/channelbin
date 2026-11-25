@@ -107,6 +107,14 @@ class PipPicturesScenario(CaptureCase):
         return [p.message for p in OutputFeedPlay.query.filter_by(kind=FEED_PLAY_PICTURE)
                 .order_by(OutputFeedPlay.id).all()]
 
+    def lines_once_back(self) -> list:
+        """The lines, once the last one says the small picture is back. The reaper writes that
+        line on its next turn after the picture is live again, so a read made the moment
+        `small.live` turns true can come before it (dev/docs/BUGS.md 2026-11-25)."""
+        self.wait_for(lambda: (said := self.lines()) and 'is back' in said[-1], 10,
+                      lambda: f'the "is back" line, have {self.lines()}')
+        return self.lines()
+
     def simple(self):
         big, small = self.guide(self.channel('cove-tv', 0)), self.guide(self.channel('reed-tv', 0))
         row_id = self.make({'kind': PIP_SOURCE_CHANNEL, 'ref': big.id}, {'kind': PIP_SOURCE_CHANNEL, 'ref': small.id})
@@ -134,7 +142,7 @@ class PipPicturesScenario(CaptureCase):
         at_back = play.combined.frames.at
         self.wait_for(lambda: play.combined.frames.at > at_back, 30, 'its frames to be shown again')
         self.assertBigNeverStopped(tv, play, since, combiner)
-        said = self.lines()
+        said = self.lines_once_back()
         self.assertEqual(len(said), 2, said)
         self.assertIn('stopped', said[0])
         self.assertIn('is back', said[1])
@@ -172,7 +180,7 @@ class PipPicturesScenario(CaptureCase):
         db.session.remove()
         self.assertEqual(Alert.query.filter_by(alert_type='VIEWER_PREEMPTED').count(), 0,
                          'the TV kept a picture, so nothing is raised')
-        said = self.lines()
+        said = self.lines_once_back()
         self.assertIn('paused for a recording', said[0])
         self.assertIn('is back', said[-1])
 
