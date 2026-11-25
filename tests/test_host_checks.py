@@ -39,7 +39,8 @@ from app import host_checks as hc  # noqa: E402
 from app.alerts import ACCOUNT_HOST_ANSWER_CHANGED, ACCOUNT_HOST_NOT_ANSWERING  # noqa: E402
 from app.config import load_config  # noqa: E402
 from app.database import (  # noqa: E402
-    AccountHost, Alert, HostCheck, HOST_CHECK_ANSWERS, HOST_CHECK_NO_ANSWER, HOST_CHECK_REFUSED,
+    AccountHost, Alert, HostCheck, HOST_CHECK_ANSWERS, HOST_CHECK_IN_USE, HOST_CHECK_NO_ANSWER,
+    HOST_CHECK_REFUSED,
     HOST_CHECK_RESOLVES, HOST_CHECK_SERVER_ERROR, HOST_CHECK_UNRESOLVED, HOST_PROBE_FULL,
     HOST_PROBE_LOOKUP,
 )
@@ -167,14 +168,14 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(r['status'], HOST_CHECK_NO_ANSWER)
 
     def test_a_name_that_does_not_resolve_tries_nothing_else(self):
-        with mock.patch.object(hc, '_lookup', return_value=(None, 'Name or service not known')):
+        with mock.patch.object(hc, 'lookup', return_value=(None, 'Name or service not known')):
             r = hc.probe('gone.example')
         self.assertEqual(r['status'], HOST_CHECK_UNRESOLVED)
         self.assertEqual(r['error'], 'Name or service not known')
         self.assertIsNone(r['connect_ms'])
 
     def test_the_port_comes_from_the_host_or_the_scheme(self):
-        with mock.patch.object(hc, '_lookup', return_value=(None, 'x')):
+        with mock.patch.object(hc, 'lookup', return_value=(None, 'x')):
             self.assertEqual(hc.probe('a.example')['port'], 80)
             self.assertEqual(hc.probe('a.example', 'https')['port'], 443)
             self.assertEqual(hc.probe('a.example:8080')['port'], 8080)
@@ -287,7 +288,7 @@ class CheckOneTests(_Case):
             row = hc.check_one('a1.skyline.example', hc.TRIGGER_MANUAL)
         probe.assert_not_called()
         self.assertTrue(row.in_use)
-        self.assertEqual(row.status, HOST_CHECK_ANSWERS)
+        self.assertEqual(row.status, HOST_CHECK_IN_USE)
         self.assertIn('wasn\'t touched', hc.describe(row)['line'])
 
     def test_streaming_hosts_is_the_active_host_of_an_account_holding_a_seat(self):
@@ -364,7 +365,8 @@ class VerdictTests(_Case):
 
     def test_every_status_has_words_and_an_unknown_one_raises(self):
         for status in (HOST_CHECK_ANSWERS, HOST_CHECK_SERVER_ERROR, HOST_CHECK_REFUSED,
-                       HOST_CHECK_NO_ANSWER, HOST_CHECK_UNRESOLVED, HOST_CHECK_RESOLVES):
+                       HOST_CHECK_NO_ANSWER, HOST_CHECK_UNRESOLVED, HOST_CHECK_RESOLVES,
+                       HOST_CHECK_IN_USE):
             words = hc.describe(HostCheck(host='x', status=status, port=80, http_status=502,
                                           answer_ms=5, error='e'))
             self.assertTrue(words['label'] and words['badge'], status)
@@ -521,6 +523,278 @@ class PageTests(_Case):
         r = self.client.post('/api/settings/field', json={'path': 'hosts.check_spacing_seconds', 'value': 3})
         self.assertEqual(r.status_code, 400)
         self.assertIn('at least 10', r.get_json()['error'])
+
+
+class OneLookupTests(unittest.TestCase):
+    """The hosts code has one DNS lookup and one name[:port] split (dev/changelog/1729)."""
+
+    def test_resolve_host_is_the_shared_lookup_with_the_port_split_off(self):
+        calls = []
+
+        def fake(name, port=None, timeout=None):
+            calls.append((name, port, timeout))
+            return None, 'Name or service not known'
+
+        with mock.patch.object(hc, 'lookup', side_effect=fake):
+            self.assertEqual(links.resolve_host('a2.skyline.example:8080', timeout=3),
+                             (False, 'Name or service not known'))
+        self.assertEqual(calls, [('a2.skyline.example', None, 3)])
+
+    def test_a_hung_lookup_reads_the_same_from_both(self):
+        gate = threading.Event()
+        with mock.patch('app.host_checks.socket.getaddrinfo', lambda *a, **k: gate.wait(5)):
+            _, from_resolve = links.resolve_host('slow.example', timeout=0.05)
+            _, from_check = hc.lookup('slow.example', 80, 0.05)
+        gate.set()
+        self.assertEqual(from_resolve, from_check)
+        self.assertEqual(from_check, 'no answer from the resolver within 0 seconds')
+
+    def test_normalize_host_splits_through_split_host(self):
+        with mock.patch.object(hc, 'split_host', wraps=hc.split_host) as split:
+            self.assertEqual(links.normalize_host('A2.Skyline.Example:8080'), 'a2.skyline.example:8080')
+        split.assert_called_once_with('a2.skyline.example:8080')
+        with self.assertRaises(ValueError):
+            links.normalize_host('a2.skyline.example:http')
+
+
+class InUseTests(_Case):
+    """A check skipped because a stream was using the host is no verdict
+    (dev/docs/BUGS.md 2026-11-25, dev/changelog/1730)."""
+
+    def _in_use(self, host):
+        with mock.patch.object(hc, 'streaming_hosts', return_value={host}), \
+                mock.patch.object(hc, 'probe') as probe:
+            row = hc.check_one(host, hc.TRIGGER_MANUAL)
+        probe.assert_not_called()
+        return row
+
+    def _refused(self, host):
+        result = {'status': HOST_CHECK_REFUSED, 'lookup_ms': 5, 'connect_ms': None,
+                  'answer_ms': None, 'http_status': None, 'port': 80,
+                  'error': 'nothing is taking connections on port 80 (connection refused)'}
+        with mock.patch.object(hc, 'streaming_hosts', return_value=set()), \
+                mock.patch.object(hc, 'probe', return_value=result):
+            return hc.check_one(host, hc.TRIGGER_MANUAL)
+
+    def test_a_skipped_check_leaves_the_last_verdict_and_the_warning_standing(self):
+        self._refused('a1.skyline.example')
+        self.assertEqual(len(self._alerts(ACCOUNT_HOST_NOT_ANSWERING, self.accs[0])), 1)
+        db.session.query(HostCheck).update({HostCheck.checked_at: datetime.utcnow() - timedelta(hours=1)})
+        db.session.commit()
+        self._in_use('a1.skyline.example')
+        latest = hc.latest_for_hosts(['a1.skyline.example'])['a1.skyline.example']
+        self.assertEqual(hc.effective(latest).status, HOST_CHECK_REFUSED)
+        self.assertEqual((latest['answered'], latest['checks']), (0, 1),
+                         'a skipped check is not counted as a check, let alone an answer')
+        self.assertEqual(len(self._alerts(ACCOUNT_HOST_NOT_ANSWERING, self.accs[0])), 1,
+                         'the warning a stream cannot disprove stands')
+        self.assertEqual(hc.not_answering_accounts(self.accs),
+                         {a: 'a1.skyline.example' for a in self.accs})
+
+    def test_an_older_answers_row_marked_in_use_is_skipped_too(self):
+        self._full('a2.skyline.example', HOST_CHECK_NO_ANSWER, minutes_ago=90, error='e')
+        self._full('a2.skyline.example', HOST_CHECK_ANSWERS, minutes_ago=30, in_use=True)
+        latest = hc.latest_for_hosts(['a2.skyline.example'])['a2.skyline.example']
+        self.assertEqual(hc.effective(latest).status, HOST_CHECK_NO_ANSWER)
+        self.assertEqual(hc.rank(['a2.skyline.example']), {'a2.skyline.example': 2})
+
+    def test_the_card_keeps_the_verdict_and_says_the_check_was_skipped(self):
+        self._full('a1.skyline.example', HOST_CHECK_REFUSED, port=80)
+        self._in_use('a1.skyline.example')
+        html = self.client.get(f'/accounts/{self.accs[0]}').get_data(as_text=True)
+        row = html.split('data-section="hosts"')[1].split('<code>a1.skyline.example</code>')[1].split('</tr>')[0]
+        self.assertIn('>Refused<', row)
+        self.assertIn('a stream was using it', row)
+        self.assertNotIn('>Answers<', row)
+
+
+class SetAsideTests(_Case):
+    """A newer resolving lookup sets aside a full check that could not look the name up
+    (dev/docs/BUGS.md 2026-11-25, dev/changelog/1731)."""
+
+    def _unresolved(self, host):
+        result = {'status': HOST_CHECK_UNRESOLVED, 'lookup_ms': None, 'connect_ms': None,
+                  'answer_ms': None, 'http_status': None, 'port': 80,
+                  'error': 'Temporary failure in name resolution'}
+        with mock.patch.object(hc, 'streaming_hosts', return_value=set()), \
+                mock.patch.object(hc, 'probe', return_value=result):
+            return hc.check_one(host, hc.TRIGGER_MANUAL)
+
+    def _age(self):
+        for row in HostCheck.query.all():
+            row.checked_at -= timedelta(hours=1)
+        db.session.commit()
+
+    def test_the_host_reads_as_untested_not_as_down(self):
+        self._unresolved('a1.skyline.example')
+        self._age()
+        hc.record_lookups({'a1.skyline.example': (True, None, 12)}, hc.TRIGGER_SCHEDULED)
+        latest = hc.latest_for_hosts(['a1.skyline.example'])['a1.skyline.example']
+        self.assertIsNone(hc.effective(latest))
+        self.assertTrue(hc.resolved_since(latest))
+        self.assertEqual(hc.not_answering_accounts(self.accs), {})
+        self.assertEqual(hc.rank(['a1.skyline.example']), {'a1.skyline.example': 1})
+
+    def test_a_resolving_lookup_takes_the_active_hosts_warning_down(self):
+        self._unresolved('a1.skyline.example')
+        self.assertEqual(len(self._alerts(ACCOUNT_HOST_NOT_ANSWERING, self.accs[0])), 1)
+        self._age()
+        hc.record_lookups({'a1.skyline.example': (True, None, 12)}, hc.TRIGGER_SCHEDULED)
+        for acc_id in self.accs:
+            self.assertEqual(self._alerts(ACCOUNT_HOST_NOT_ANSWERING, acc_id), [])
+
+    def test_a_resolving_lookup_does_not_bring_another_warning_back_unread(self):
+        self._full('a1.skyline.example', HOST_CHECK_REFUSED, port=80)
+        hc.reassess_active(self.accs[0])
+        alert = self._alerts(ACCOUNT_HOST_NOT_ANSWERING, self.accs[0])[0]
+        alert.read_at = datetime.utcnow()
+        db.session.commit()
+        hc.record_lookups({'a1.skyline.example': (True, None, 12)}, hc.TRIGGER_SCHEDULED)
+        db.session.expire_all()
+        still = self._alerts(ACCOUNT_HOST_NOT_ANSWERING, self.accs[0])
+        self.assertEqual(len(still), 1)
+        self.assertIsNotNone(still[0].read_at)
+
+    def test_a_standby_host_back_after_a_set_aside_check_says_it_answers_again(self):
+        self._unresolved('a3.skyline.example')
+        self._age()
+        hc.record_lookups({'a3.skyline.example': (True, None, 12)}, hc.TRIGGER_SCHEDULED)
+        self._age()
+        result = {'status': HOST_CHECK_ANSWERS, 'lookup_ms': 5, 'connect_ms': 6, 'answer_ms': 7,
+                  'http_status': 200, 'port': 80, 'error': None}
+        with mock.patch.object(hc, 'streaming_hosts', return_value=set()), \
+                mock.patch.object(hc, 'probe', return_value=result):
+            hc.check_one('a3.skyline.example', hc.TRIGGER_MANUAL)
+        changed = self._alerts(ACCOUNT_HOST_ANSWER_CHANGED, self.accs[0])
+        self.assertEqual(len(changed), 1)
+        self.assertIn('answers again', changed[0].title)
+
+    def test_the_card_says_not_checked_since_never_a_green_resolves(self):
+        self._unresolved('a1.skyline.example')
+        self._age()
+        hc.record_lookups({'a1.skyline.example': (True, None, 12)}, hc.TRIGGER_SCHEDULED)
+        html = self.client.get(f'/accounts/{self.accs[0]}').get_data(as_text=True)
+        row = html.split('data-section="hosts"')[1].split('<code>a1.skyline.example</code>')[1].split('</tr>')[0]
+        self.assertIn('Not checked since', row)
+        self.assertIn('answered 0 of 1 check', row)
+        self.assertNotIn('Not tested yet', row)
+        self.assertNotIn('Doesn\'t resolve', row)
+        self.assertNotIn('>Resolves<', row)
+
+
+class WarningFollowsTheHostTests(_Case):
+    """The active-host warning goes when the host it names does
+    (dev/docs/BUGS.md 2026-11-25, dev/changelog/1732)."""
+
+    def _warn(self, host='a1.skyline.example'):
+        self._full(host, HOST_CHECK_REFUSED, port=80)
+        for acc_id in self.accs:
+            hc.reassess_active(acc_id)
+        self.assertEqual(len(self._alerts(ACCOUNT_HOST_NOT_ANSWERING, self.accs[1])), 1)
+
+    def test_removing_the_last_host_takes_its_warning(self):
+        acc = self.accs[1]
+        a1 = AccountHost.query.filter_by(account_id=acc, host='a1.skyline.example').one()
+        a2 = AccountHost.query.filter_by(account_id=acc, host='a2.skyline.example').one()
+        a1.from_playlist = False
+        db.session.commit()
+        links.set_active_host(acc, a2.id)
+        links.remove_host(acc, a1.id)
+        self._full('a2.skyline.example', HOST_CHECK_REFUSED, port=80)
+        hc.reassess_active(acc)
+        self.assertEqual(len(self._alerts(ACCOUNT_HOST_NOT_ANSWERING, acc)), 1)
+        links.remove_host(acc, a2.id)
+        self.assertEqual(AccountHost.query.filter_by(account_id=acc).count(), 0)
+        self.assertEqual(self._alerts(ACCOUNT_HOST_NOT_ANSWERING, acc), [])
+
+    def test_a_sync_that_renames_the_active_host_reassesses_its_warning(self):
+        acc = self.accs[1]
+        links.list_playlist_rows(acc, 'a1.skyline.example', None)
+        self._warn()
+        changes = links.list_playlist_rows(acc, 'a9.skyline.example', None)
+        self.assertEqual([c['what'] for c in changes], [links.PLAYLIST_HOST])
+        self.assertEqual(self._alerts(ACCOUNT_HOST_NOT_ANSWERING, acc), [],
+                         'the active row now names a9, which nothing has found down')
+
+    def _read_warning(self, acc):
+        alert = self._alerts(ACCOUNT_HOST_NOT_ANSWERING, acc)[0]
+        alert.read_at = datetime.utcnow()
+        db.session.commit()
+        return alert.id
+
+    def _still_read(self, acc, alert_id):
+        db.session.expire_all()
+        open_ = self._alerts(ACCOUNT_HOST_NOT_ANSWERING, acc)
+        self.assertEqual([a.id for a in open_], [alert_id])
+        self.assertIsNotNone(open_[0].read_at, 'a read warning came back unread')
+
+    def test_editing_a_standby_host_leaves_a_read_warning_read(self):
+        self._warn()
+        acc = self.accs[0]
+        alert_id = self._read_warning(acc)
+        a3 = AccountHost.query.filter_by(account_id=acc, host='a3.skyline.example').one()
+        links.set_host_enabled(acc, a3.id, False)
+        self._still_read(acc, alert_id)
+        links.remove_host(acc, a3.id)
+        self._still_read(acc, alert_id)
+
+    def test_a_sync_that_leaves_the_active_host_alone_leaves_a_read_warning_read(self):
+        acc = self.accs[0]
+        links.list_playlist_rows(acc, 'a1.skyline.example', None)
+        self._warn()
+        alert_id = self._read_warning(acc)
+        a2 = AccountHost.query.filter_by(account_id=acc, host='a2.skyline.example').one()
+        links.set_active_host(acc, a2.id)
+        self._full('a2.skyline.example', HOST_CHECK_REFUSED, minutes_ago=1, port=80)
+        hc.reassess_active(acc)
+        alert_id = self._read_warning(acc)
+        changes = links.list_playlist_rows(acc, 'a8.skyline.example', None)
+        self.assertEqual([c['what'] for c in changes], [links.PLAYLIST_HOST],
+                         'the standby playlist row a1 was renamed')
+        self._still_read(acc, alert_id)
+
+    def test_deleting_the_account_clears_its_standing_alerts_and_no_one_elses(self):
+        from app.alerts import create_alert
+        from app.routes.accounts import _delete_account_and_jobs
+        self._warn()
+        create_alert(ACCOUNT_HOST_ANSWER_CHANGED, title='x', source=f'account:{self.accs[1]}:host-answer')
+        deleted, _ = _delete_account_and_jobs(self.accs[1])
+        self.assertTrue(deleted)
+        db.session.expire_all()
+        left = Alert.query.filter(Alert.source.like(f'account:{self.accs[1]}:%'),
+                                  Alert.dismissed_at.is_(None)).all()
+        self.assertEqual(left, [])
+        self.assertEqual(len(self._alerts(ACCOUNT_HOST_NOT_ANSWERING, self.accs[0])), 1,
+                         'the other account still uses a1')
+
+
+class StandbySchemeTests(_Case):
+    """A standby host is checked on the scheme the account's streams use
+    (dev/docs/BUGS.md 2026-11-25, dev/changelog/1733)."""
+
+    def _https(self, acc_id):
+        from app.database import Channel
+        for ch in Channel.query.filter_by(account_id=acc_id).all():
+            ch.stream_url = ch.stream_url.replace('http://', 'https://')
+        db.session.commit()
+
+    def test_a_standby_host_on_an_https_account_is_checked_on_https(self):
+        self._https(self.accs[0])
+        self.assertEqual(hc.scheme_for('a3.skyline.example'), 'https')
+        self.assertEqual(hc.scheme_for('a1.skyline.example'), 'https')
+
+    def test_a_standby_host_on_an_http_account_stays_http(self):
+        self.assertEqual(hc.scheme_for('a3.skyline.example'), 'http')
+
+    def test_a_host_with_its_own_urls_goes_by_them(self):
+        self._https(self.accs[0])
+        from app.database import Channel
+        ch = Channel.query.filter_by(account_id=self.accs[0]).first()
+        seed.make_channel(db.session.get(type(ch.account), self.accs[0]), stream_id=2, name='radio')
+        radio = Channel.query.filter_by(account_id=self.accs[0], name='radio').one()
+        radio.stream_url = 'http://a3.skyline.example/radio'
+        db.session.commit()
+        self.assertEqual(hc.scheme_for('a3.skyline.example'), 'http')
 
 
 if __name__ == '__main__':

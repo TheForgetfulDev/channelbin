@@ -505,7 +505,7 @@ class ProbeTests(_Case):
     def test_a_lookup_that_hangs_is_reported_not_waited_for(self):
         import threading
         gate = threading.Event()
-        with mock.patch('app.account_links.socket.getaddrinfo', lambda *a, **k: gate.wait(5)):
+        with mock.patch('app.host_checks.socket.getaddrinfo', lambda *a, **k: gate.wait(5)):
             ok, error = links.resolve_host('slow.example', timeout=0.05)
         gate.set()
         self.assertFalse(ok)

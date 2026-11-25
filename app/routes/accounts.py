@@ -27,7 +27,8 @@ from ..account_stats import WINDOWS, today_local, windowed_stats
 from ..channel_groups import clear_guide_listings_pins_on, report_orphaned_guide_groups
 from ..channel_search import GROUP_ANY, OTHER_NEW, OTHER_REMOVED
 from ..config import load_config, config_default
-from ..database import (Account, AccountBlock, AccountLogin, AccountStatDay, Channel, Login,
+from ..alerts import mark_cleared
+from ..database import (Account, AccountBlock, Alert, AccountLogin, AccountStatDay, Channel, Login,
                         AccountSyncLog, ChannelGroupMember, ChannelTest, EpgSource,
                         EpgSourceSubscription, SportsMatch,
                         EPG_FINDING_ADDS_NOTHING, EPG_FINDING_BETTER_SOURCE, EPG_FINDING_NAME_MATCHES,
@@ -294,7 +295,7 @@ def host_views(account_id):
     for row in rows:
         info = latest.get(row.host) or {}
         verdict = host_checks.effective(info)
-        full, lookup = info.get('full'), info.get('lookup')
+        full, lookup, skipped = info.get('full'), info.get('lookup'), info.get('skipped')
         if lookup is not None:
             lookup_view = {'ok': lookup.status == HOST_CHECK_RESOLVES, 'at': lookup.checked_at,
                            'error': lookup.error}
@@ -326,6 +327,13 @@ def host_views(account_id):
                                   and lookup is not None and lookup.status == HOST_CHECK_RESOLVES
                                   and lookup.checked_at > full.checked_at else None),
             'lookup': lookup_view,
+            # A "Doesn't resolve" full check a newer resolving lookup set aside
+            # (dev/changelog/1731): untested again, but not "Not tested yet".
+            'set_aside': host_checks.resolved_since(info),
+            # The newest check skipped because a stream was using the host, when nothing
+            # asked it since (dev/changelog/1730); the verdict above is still the last one.
+            'skipped_at': (skipped.checked_at if skipped is not None and (
+                full is None or skipped.checked_at > full.checked_at) else None),
             'answered': info.get('answered', 0),
             'checks': info.get('checks', 0),
             'queue': queue,
@@ -1033,6 +1041,10 @@ def _delete_account_and_jobs(account_id):
         # Nor are its EPG sources, which may hold hundreds of thousands of rows across two
         # tables and are bulk-deleted rather than cascaded (DESIGN-epg-sources.md §9.5).
         delete_sources_for_account(account_id)
+        # Its standing alerts describe an account that no longer exists; account ids are
+        # never re-issued, so every `account:<id>:` source is this account's (dev/changelog/1732).
+        mark_cleared(Alert.query.filter(Alert.source.like(f'account:{account_id}:%'),
+                                        Alert.dismissed_at.is_(None)).all())
         # A group pinned to one of these channels goes back to automatic, and says why.
         clear_guide_listings_pins_on(channel_ids)
         # Not cascaded either, and channel ids are re-issued (DESIGN-sports-data.md 9): a

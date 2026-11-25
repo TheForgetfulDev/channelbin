@@ -24,9 +24,10 @@ Every check, scheduled or asked for, goes through ONE line and one worker thread
   the rate;
 - a host NAME is checked once per run even when two accounts list it;
 - no host gets a full check twice inside `REPEAT_FLOOR`, by hand or not;
-- a host a stream is using right now is not touched: it is recorded as answering, with
-  `in_use` set, because the stream already proves it and a check must never risk a working
-  capture.
+- a host a stream is using right now is not touched, because a check must never risk a
+  working capture. The skip is recorded (`HOST_CHECK_IN_USE`, `in_use` set) but it is no
+  verdict: a stream stuck reconnecting to a dead host holds its seat too, so the host's
+  previous verdict stands and the warning is left as it was (dev/changelog/1730).
 
 The scheduled run stays a lookup only unless `hosts.scheduled_check` is `full`; Check now,
 Check all and Check all hosts are always the full check. The line lives in memory: a restart
@@ -55,9 +56,9 @@ from typing import Iterable, Optional
 from sqlalchemy import func
 
 from . import db
-from .database import (HOST_CHECK_ANSWERS, HOST_CHECK_NO_ANSWER, HOST_CHECK_REFUSED,
-                       HOST_CHECK_RESOLVES, HOST_CHECK_SERVER_ERROR, HOST_CHECK_UNRESOLVED,
-                       HOST_PROBE_FULL, HOST_PROBE_LOOKUP, HostCheck)
+from .database import (HOST_CHECK_ANSWERS, HOST_CHECK_IN_USE, HOST_CHECK_NO_ANSWER,
+                       HOST_CHECK_REFUSED, HOST_CHECK_RESOLVES, HOST_CHECK_SERVER_ERROR,
+                       HOST_CHECK_UNRESOLVED, HOST_PROBE_FULL, HOST_PROBE_LOOKUP, HostCheck)
 from .db_utils import chunked, retry_on_locked
 
 log = logging.getLogger(__name__)
@@ -86,7 +87,8 @@ _HTTP_STATUS = re.compile(rb'^HTTP/\d(?:\.\d)?\s+(\d{3})')
 # ── The probe: network only, no database ────────────────────────────────────────────────
 
 def split_host(host: str) -> tuple:
-    """('name', port or None) from `name[:port]`."""
+    """('name', port or None) from `name[:port]` - the one split of a stored host for the
+    hosts code (account_links.normalize_host() and resolve_host() call it too)."""
     name, sep, port = host.rpartition(':')
     if sep and name and port.isdecimal():
         return name, int(port)
@@ -97,9 +99,10 @@ def _ms(start: float) -> int:
     return max(0, round((time.perf_counter() - start) * 1000))
 
 
-def _lookup(name: str, port: int, timeout: float):
-    """(addrinfo list, None) or (None, error text). getaddrinfo has no timeout, so it runs on
-    a helper thread that is abandoned past `timeout`."""
+def lookup(name: str, port: Optional[int] = None, timeout: float = LOOKUP_TIMEOUT_SECONDS):
+    """(addrinfo list, None) or (None, error text) - the one DNS lookup of the hosts code,
+    for the full check and for account_links.resolve_host(). getaddrinfo has no timeout, so
+    it runs on a helper thread that is abandoned past `timeout`."""
     result: dict = {}
 
     def run():
@@ -134,7 +137,7 @@ def probe(host: str, scheme: str = 'http', *, user_agent: str = 'VLC/3.0.18 LibV
            'http_status': None, 'port': port, 'error': None}
 
     start = time.perf_counter()
-    infos, error = _lookup(name, port, lookup_timeout)
+    infos, error = lookup(name, port, lookup_timeout)
     if infos is None:
         out.update(status=HOST_CHECK_UNRESOLVED, error=error[:255])
         return out
@@ -229,27 +232,32 @@ def probe(host: str, scheme: str = 'http', *, user_agent: str = 'VLC/3.0.18 LibV
 # ── What the database says ──────────────────────────────────────────────────────────────
 
 def latest_for_hosts(hosts: Iterable[str], now: Optional[datetime] = None) -> dict:
-    """{host: {'full': HostCheck|None, 'lookup': HostCheck|None, 'answered': n, 'checks': n}}
-    for every host given, in three queries however many there are. `checks` and `answered`
-    count the full checks inside KEEP_DAYS; a check that found the host in use counts as
-    answered, which it was."""
+    """{host: {'full': HostCheck|None, 'lookup': HostCheck|None, 'skipped': HostCheck|None,
+    'answered': n, 'checks': n}} for every host given, in four queries however many there
+    are. `full` is the newest full check that asked the host; `skipped` the newest one left
+    out because a stream was using it (`in_use`, whatever its status - rows before
+    dev/changelog/1730 said ANSWERS). `checks` and `answered` count the full checks inside
+    KEEP_DAYS that asked the host; a skipped one is neither."""
     names = sorted({h for h in hosts if h})
-    out = {h: {'full': None, 'lookup': None, 'answered': 0, 'checks': 0} for h in names}
+    out = {h: {'full': None, 'lookup': None, 'skipped': None, 'answered': 0, 'checks': 0}
+           for h in names}
     if not names:
         return out
     now = now or datetime.utcnow()
     since = now - timedelta(days=KEEP_DAYS)
-    for kind, key in ((HOST_PROBE_FULL, 'full'), (HOST_PROBE_LOOKUP, 'lookup')):
+    for kind, in_use, key in ((HOST_PROBE_FULL, False, 'full'), (HOST_PROBE_FULL, True, 'skipped'),
+                              (HOST_PROBE_LOOKUP, False, 'lookup')):
         for part in chunked(names, 400):
             newest = (db.session.query(func.max(HostCheck.id))
-                      .filter(HostCheck.host.in_(part), HostCheck.kind == kind)
+                      .filter(HostCheck.host.in_(part), HostCheck.kind == kind,
+                              HostCheck.in_use.is_(in_use))
                       .group_by(HostCheck.host))
             for row in HostCheck.query.filter(HostCheck.id.in_(newest)).all():
                 out[row.host][key] = row
     for part in chunked(names, 400):
         rows = (db.session.query(HostCheck.host, HostCheck.status, func.count(HostCheck.id))
                 .filter(HostCheck.host.in_(part), HostCheck.kind == HOST_PROBE_FULL,
-                        HostCheck.checked_at >= since)
+                        HostCheck.in_use.is_(False), HostCheck.checked_at >= since)
                 .group_by(HostCheck.host, HostCheck.status).all())
         for host, status, n in rows:
             out[host]['checks'] += n
@@ -260,15 +268,30 @@ def latest_for_hosts(hosts: Iterable[str], now: Optional[datetime] = None) -> di
 
 def effective(latest: Optional[dict]):
     """The verdict a host's row shows: its newest full check, unless a lookup since then
-    found the name gone. A lookup that still resolves never overrides a full check's verdict
-    - resolving was never the question."""
+    found the name gone. A lookup that still resolves does not override a full check's
+    verdict - resolving was never the question - except a full check that could not look the
+    name up: that verdict was only about the lookup, so a newer lookup that resolves sets it
+    aside and the host reads as untested (None) until a full check asks it again
+    (dev/changelog/1731)."""
     if not latest:
         return None
     full, lookup = latest.get('full'), latest.get('lookup')
     if lookup is not None and lookup.status == HOST_CHECK_UNRESOLVED and (
             full is None or lookup.checked_at > full.checked_at):
         return lookup
+    if resolved_since(latest):
+        return None
     return full
+
+
+def resolved_since(latest: Optional[dict]) -> bool:
+    """True when the newest full check found the name gone and a newer lookup resolves it:
+    effective() then gives no verdict, and the card says "Not checked since"."""
+    if not latest:
+        return False
+    full, lookup = latest.get('full'), latest.get('lookup')
+    return (full is not None and full.status == HOST_CHECK_UNRESOLVED and lookup is not None
+            and lookup.status == HOST_CHECK_RESOLVES and lookup.checked_at > full.checked_at)
 
 
 def is_answering(check) -> Optional[bool]:
@@ -279,7 +302,7 @@ def is_answering(check) -> Optional[bool]:
         return True
     if check.status in NOT_ANSWERING:
         return False
-    if check.status == HOST_CHECK_RESOLVES:
+    if check.status in (HOST_CHECK_RESOLVES, HOST_CHECK_IN_USE):
         return None
     raise ValueError(f'unknown host check status {check.status!r}')
 
@@ -314,12 +337,13 @@ def describe(check) -> dict:
         code = f' (HTTP {check.http_status})' if check.http_status else ''
         steps.append(f'Answer: {check.answer_ms} ms for the server to answer a plain request '
                      f'with no login in it{code}.')
+    if s == HOST_CHECK_IN_USE or check.in_use:
+        return {'label': 'Not checked', 'badge': 'b-abort',
+                'line': 'A stream was using it, so it wasn\'t touched.',
+                'tip': 'Not checked\nSomething was streaming from this host when its turn came, '
+                       'so it was left alone. A stream that keeps reconnecting holds its seat '
+                       'too, so this says nothing about whether the host answers.'}
     if s == HOST_CHECK_ANSWERS:
-        if check.in_use:
-            return {'label': 'Answers', 'badge': 'b-done',
-                    'line': 'A stream was using it, so it wasn\'t touched.',
-                    'tip': 'Answers\nSomething was streaming from this host when its turn came, '
-                           'so it was counted as answering and left alone.'}
         return {'label': 'Answers', 'badge': 'b-done', 'line': timings,
                 'tip': 'Answers\n' + '\n'.join(steps + [
                     'Any answer counts, whatever its code, except a server error (5xx).'])}
@@ -366,6 +390,30 @@ def record_lookups(verdicts: dict, trigger: str) -> None:
         db.session.commit()
 
     _write_and_commit()
+    _reassess_set_aside([h for h, (ok, _, _) in verdicts.items() if ok])
+
+
+def _reassess_set_aside(hosts: list) -> None:
+    """A resolving lookup that set aside a "Doesn't resolve" full check on an active host
+    takes that host's warning down (dev/changelog/1731). Only those: re-asking every active
+    host would bring a standing warning back unread at every scheduled lookup."""
+    from .database import AccountHost
+    if not hosts:
+        return
+    try:
+        latest = latest_for_hosts(hosts)
+        set_aside = [h for h in hosts if resolved_since(latest.get(h))]
+        if not set_aside:
+            return
+        accounts = {a for (a,) in db.session.query(AccountHost.account_id)
+                    .filter(AccountHost.host.in_(set_aside), AccountHost.is_active.is_(True),
+                            AccountHost.enabled.is_(True)).all()}
+    except Exception:
+        # Never raises: a swap reaches here through its lookups, before it moves anything.
+        log.exception('Host check: could not reassess hosts a lookup found again')
+        return
+    for account_id in sorted(accounts):
+        reassess_active(account_id)
 
 
 def _write_full(host: str, result: dict, trigger: str, in_use: bool) -> HostCheck:
@@ -414,19 +462,38 @@ def streaming_hosts() -> set:
 
 
 def scheme_for(host: str) -> str:
-    """'https' when the stream URLs on this host are https, else 'http'. One indexed query
-    over the channels of the accounts that list it."""
+    """'https' or 'http': the scheme of the stream URLs on this host, else - a standby host,
+    whose URLs were all rewritten onto the active one - of those on the active host of an
+    account listing it, the scheme render_host() would keep if it became active
+    (dev/changelog/1733). A few indexed queries over the channels of those accounts."""
     from .database import AccountHost, Channel
     account_ids = [a for (a,) in db.session.query(AccountHost.account_id)
                    .filter(AccountHost.host == host).all()]
     if not account_ids:
         return 'http'
-    escaped = host.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
-    hit = (db.session.query(Channel.id)
-           .filter(Channel.account_id.in_(account_ids),
-                   Channel.stream_url.like(f'https://{escaped}/%', escape='\\'))
-           .limit(1).first())
-    return 'https' if hit else 'http'
+
+    def first_scheme(name):
+        escaped = name.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        for scheme in ('https', 'http'):
+            hit = (db.session.query(Channel.id)
+                   .filter(Channel.account_id.in_(account_ids),
+                           Channel.stream_url.like(f'{scheme}://{escaped}/%', escape='\\'))
+                   .limit(1).first())
+            if hit:
+                return scheme
+        return None
+
+    own = first_scheme(host)
+    if own:
+        return own
+    actives = sorted({h for (h,) in db.session.query(AccountHost.host)
+                      .filter(AccountHost.account_id.in_(account_ids),
+                              AccountHost.is_active.is_(True), AccountHost.host != host).all()})
+    for active in actives:
+        found = first_scheme(active)
+        if found:
+            return found
+    return 'http'
 
 
 def spacing_seconds(cfg: dict) -> float:
@@ -444,23 +511,27 @@ def check_one(host: str, trigger: str) -> HostCheck:
     from .config import load_config
     from . import account_links
     cfg = load_config()
-    prev = latest_for_hosts([host]).get(host)
-    was = is_answering(effective(prev))
+    prev = latest_for_hosts([host]).get(host) or {}
+    # The last verdict that asked the host: a full check a later lookup set aside still says
+    # what the host did, so a standby host coming back after it says "answers again".
+    was = is_answering(effective(prev) or prev.get('full'))
     if host in streaming_hosts():
+        # No verdict: the previous one stands and nothing is reported (dev/changelog/1730).
         port = split_host(host)[1]
-        row = _write_full(host, {'status': HOST_CHECK_ANSWERS, 'port': port}, trigger, True)
-        log.info('Host check: %s is in use by a stream, so it was not touched', host)
-    else:
-        result = probe(host, scheme_for(host),
-                       user_agent=_request_headers(cfg).get('User-Agent', 'VLC/3.0.18 LibVLC/3.0.18'))
-        row = _write_full(host, result, trigger, False)
-        account_links.stamp_lookup(host, result['status'] != HOST_CHECK_UNRESOLVED,
-                                   result['error'] if result['status'] == HOST_CHECK_UNRESOLVED else None)
-        log.log(logging.INFO if result['status'] == HOST_CHECK_ANSWERS else logging.WARNING,
-                'Host check: %s %s (lookup %s ms, connect %s ms, answer %s ms%s)%s', host,
-                result['status'], result['lookup_ms'], result['connect_ms'], result['answer_ms'],
-                f', HTTP {result["http_status"]}' if result['http_status'] else '',
-                f': {result["error"]}' if result['error'] else '')
+        row = _write_full(host, {'status': HOST_CHECK_IN_USE, 'port': port}, trigger, True)
+        log.info('Host check: %s is in use by a stream, so it was not touched and its last '
+                 'verdict stands', host)
+        return row
+    result = probe(host, scheme_for(host),
+                   user_agent=_request_headers(cfg).get('User-Agent', 'VLC/3.0.18 LibVLC/3.0.18'))
+    row = _write_full(host, result, trigger, False)
+    account_links.stamp_lookup(host, result['status'] != HOST_CHECK_UNRESOLVED,
+                               result['error'] if result['status'] == HOST_CHECK_UNRESOLVED else None)
+    log.log(logging.INFO if result['status'] == HOST_CHECK_ANSWERS else logging.WARNING,
+            'Host check: %s %s (lookup %s ms, connect %s ms, answer %s ms%s)%s', host,
+            result['status'], result['lookup_ms'], result['connect_ms'], result['answer_ms'],
+            f', HTTP {result["http_status"]}' if result['http_status'] else '',
+            f': {result["error"]}' if result['error'] else '')
     _report(host, was, row)
     return row
 
