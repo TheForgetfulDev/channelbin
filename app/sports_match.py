@@ -445,14 +445,15 @@ class Row:
         return title_key(self.title), title_key(self.sub_title)
 
 
-def _filler():
+def _filler(model=EPGEntry):
     """A listing that only repeats its channel's name: same title, no sub-title, no description. Some
     guide sources fill every hour of an event channel this way, in 2-hour blocks, so the block at the
     game's start read as its live airing and the blocks after it as replays (dev/changelog/1470). It
-    says no more than the name does, so such a channel is read by its name (6.8)."""
-    return and_(db.func.lower(db.func.trim(EPGEntry.title)) == db.func.lower(db.func.trim(Channel.name)),
-                db.func.coalesce(db.func.trim(EPGEntry.sub_title), '') == '',
-                db.func.coalesce(db.func.trim(EPGEntry.description), '') == '')
+    says no more than the name does, so such a channel is read by its name (6.8). `model` is the
+    listings table, EPGEntry or EpgAlternateEntry, whose columns are the same by design."""
+    return and_(db.func.lower(db.func.trim(model.title)) == db.func.lower(db.func.trim(Channel.name)),
+                db.func.coalesce(db.func.trim(model.sub_title), '') == '',
+                db.func.coalesce(db.func.trim(model.description), '') == '')
 
 
 def _offered():
@@ -468,22 +469,27 @@ def _offered():
     return (db.type_coerce(Channel.hidden, db.Integer) + 0).is_(0)
 
 
-def _candidate_rows(lt: LeagueText, lo: datetime, hi: datetime) -> list:
+def _candidate_rows(lt: LeagueText, lo: datetime, hi: datetime, model=EPGEntry, scope=()) -> list:
     """The league's rows in [lo, hi): any whose title or sub-title carries one of its terms, or on a
     channel in one of its categories, never a filler row and never on a hidden channel. LIKE only
-    narrows; the whole-word check is in Python. The start_time index bounds the scan."""
+    narrows; the whole-word check is in Python. The start_time index bounds the scan of the guide.
+
+    `model` and `scope` are for source_games(), which reads one source's listings for one account's
+    channels from either table, so its dry run reads rows by this one rule and no second spelling
+    of it. A run reads the guide, EPGEntry, whole."""
     conds = []
     for needle in lt.needles:
-        conds += [EPGEntry.title.ilike(f'%{needle}%'), EPGEntry.sub_title.ilike(f'%{needle}%')]
+        conds += [model.title.ilike(f'%{needle}%'), model.sub_title.ilike(f'%{needle}%')]
     if lt.categories:
         conds.append(Channel.category_name.in_(list(lt.categories)))
     if not conds:
         return []
-    q = (db.session.query(EPGEntry.channel_id, Channel.category_name, EPGEntry.title, EPGEntry.sub_title,
-                          EPGEntry.start_time, EPGEntry.stop_time, EPGEntry.is_live,
-                          db.func.substr(EPGEntry.description, 1, OPENING_CHARS))
-         .join(Channel, Channel.id == EPGEntry.channel_id)
-         .filter(EPGEntry.start_time >= lo, EPGEntry.start_time < hi, or_(*conds), ~_filler(), _offered()))
+    q = (db.session.query(model.channel_id, Channel.category_name, model.title, model.sub_title,
+                          model.start_time, model.stop_time, model.is_live,
+                          db.func.substr(model.description, 1, OPENING_CHARS))
+         .join(Channel, Channel.id == model.channel_id)
+         .filter(model.start_time >= lo, model.start_time < hi, or_(*conds), ~_filler(model), _offered(),
+                 *scope))
     out = []
     for channel_id, category, title, sub_title, start, stop, is_live, opening in q.all():
         row = Row(channel_id, category, title, sub_title, start, stop, bool(is_live) or _marked_live(title))
@@ -1572,6 +1578,13 @@ def _events_in_range(league_id: int, lo: datetime, hi: datetime) -> list:
             (SportsEvent.start_at.is_(None) & SportsEvent.local_date.between(lo.date(), hi.date())))).all()
 
 
+def _rejected_anchors(events: list) -> set:
+    """The anchors (_anchor_key) of the guide rows a person marked a wrong match for these events."""
+    return {(m.event_id, m.channel_id, m.program_start_time, m.title_key) for m in SportsMatch.query.filter(
+        SportsMatch.event_id.in_([e.id for e in events]), SportsMatch.kind == SPORTS_MATCH_KIND_GUIDE,
+        SportsMatch.rejected_at.isnot(None)).all()}
+
+
 def match_league(league_id: int, now: datetime, pause: float = PAUSE_SECONDS, clock=None,
                  last_run: datetime = None, skip_rules=None) -> dict:
     """Match one league's events that the guide can still hold, then the event channels whose names
@@ -1612,9 +1625,7 @@ def match_league(league_id: int, now: datetime, pause: float = PAUSE_SECONDS, cl
     if spans:
         rows = _candidate_rows(lt, min(s[0] for s in spans), max(s[1] for s in spans))
     if events:
-        rejected = {(m.event_id, m.channel_id, m.program_start_time, m.title_key) for m in SportsMatch.query.filter(
-            SportsMatch.event_id.in_([e.id for e in events]), SportsMatch.kind == SPORTS_MATCH_KIND_GUIDE,
-            SportsMatch.rejected_at.isnot(None)).all()}
+        rejected = _rejected_anchors(events)
         hits = _identify_matchups(lt, matchups, rows)
         for event in matchups:
             results[event.id] = _judge_matchup(event, lt, hits.get(event.id, []), trusted, now, clock, rejected)
@@ -1747,6 +1758,123 @@ def _queue_rule_checks(league_ids: list):
 def _clock():
     tz, h24 = get_display_tz(), is_24h()
     return lambda dt: format_local(dt, 'clock', tz=tz, h24=h24)
+
+
+# ---------------------------------------------------------------------------
+# Each EPG source on its own: which followed games it would match (dev/changelog/1726)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Listed:
+    """One followed game as one source lists it: the channels, and whether any is a live airing."""
+    channels: set
+    live: bool
+
+
+@dataclass
+class SourceGames:
+    #: {event id: its local day (sports_data.game_day())} for every followed game still to come
+    #: the guide could hold.
+    followed: dict
+    #: {source id: {event id: Listed}} for the followed games each source lists.
+    listed: dict
+
+
+def _followed_teams() -> dict:
+    """{league id: {followed team id, 0 for the whole league}}."""
+    from .database import SportsFollow
+    out = defaultdict(set)
+    for league_id, team in db.session.query(SportsFollow.league_id, SportsFollow.team_tsdb_id):
+        out[league_id].add(team)
+    return out
+
+
+def source_games(account_id: int, source_ids, now: datetime, skip_rules=None) -> SourceGames:
+    """Which followed games still to come each source would match for this account's channels,
+    judged by the matcher's own steps over that source's listings alone: the first source's and
+    a continuing one's from the guide, the rest from the alternates, both through
+    _candidate_rows(). A dry run that writes nothing, so no run's matches change.
+
+    Every event a run would judge is judged, followed or not, since a listing goes to the nearest
+    game of its pair (_identify_matchups); only followed games still to come are counted. A listing
+    a person marked a wrong match is not counted. Channels read by their names are not a source's,
+    and are name_games()'s. Costs one query per league, source and table: 6.7 s for prod's account 5
+    and its three sources over six followed leagues, nearly all of it the queries."""
+    from .database import EpgAlternateEntry
+    from .sports_data import game_day, is_followed, still_ahead
+    source_ids = list(source_ids)
+    out = SourceGames({}, {sid: {} for sid in source_ids})
+    follows = _followed_teams()
+    if not follows or not source_ids:
+        return out
+    ends = [db.session.query(db.func.max(EPGEntry.start_time)).scalar(),
+            db.session.query(db.func.max(EpgAlternateEntry.start_time))
+            .filter(EpgAlternateEntry.source_id.in_(source_ids)).scalar()]
+    guide_end = max([e for e in ends if e is not None] + [now])
+    leagues = SportsLeague.query.all()
+    categories = SportsLeagueCategory.query.all()
+    skip_rules = skip_rules or sports_skips.SkipRules()
+    clock, tz = _clock(), get_display_tz()
+    for league in leagues:
+        teams = follows.get(league.id)
+        if not teams:
+            continue
+        events = _events_in_range(league.id, now - LOOKBACK, guide_end + WINDOW)
+        ahead = {e.id: game_day(e, tz) for e in events if is_followed(e, teams) and still_ahead(e, now, tz)}
+        if not ahead:
+            continue
+        out.followed.update(ahead)
+        lt = _league_text(league, [o for o in leagues if o.id != league.id], categories, skip_rules)
+        _load_teams(lt, events)
+        trusted = league_trusted(league)
+        matchups = [e for e in events if e.home_team_id or e.away_team_id]
+        fields = [e for e in events if not (e.home_team_id or e.away_team_id)]
+        spans = [(_anchor(e) - WINDOW, _anchor(e) + WINDOW) for e in matchups] + [_band(e) for e in fields]
+        lo, hi = min(s[0] for s in spans), max(s[1] for s in spans)
+        rejected = _rejected_anchors(events)
+        for sid in source_ids:
+            rows = []
+            for model in (EPGEntry, EpgAlternateEntry):
+                # The source compared plainly, never through epg_sources.of_sources(): with no
+                # channel named, the guide's source index bounded by stop_time reads the least.
+                # A row starting at or after `lo` stops after it, so the bound drops nothing.
+                rows += _candidate_rows(lt, lo, hi, model, (Channel.account_id == account_id,
+                                                            model.source_id == sid, model.stop_time > lo))
+            hits = _identify_matchups(lt, matchups, rows)
+            found = {e.id: _judge_matchup(e, lt, hits.get(e.id, []), trusted, now, clock, rejected)[0]
+                     for e in matchups}
+            for event_id, judged in _judge_field_events(lt, fields, rows, trusted, now, rejected).items():
+                found[event_id] = judged[0]
+            for event_id in ahead:
+                kept = [f for f in found.get(event_id, ()) if not f.rejected]
+                if kept:
+                    out.listed[sid][event_id] = Listed({f.row.channel_id for f in kept},
+                                                       any(f.airing == SPORTS_AIRING_FIRST for f in kept))
+        db.session.rollback()   # no read transaction held between leagues
+    return out
+
+
+def name_games(account_id: int, now: datetime) -> dict:
+    """{event id: {channel ids}} for the followed games still to come that this account's
+    channels name, as the last run stored them: not gone, not marked a wrong match, on a channel
+    not hidden. A name is read only where the guide has nothing real at the game's time
+    (_drop_listed), so it belongs to no one source. Two queries."""
+    from .sports_data import is_followed, still_ahead
+    follows = _followed_teams()
+    if not follows:
+        return {}
+    tz = get_display_tz()
+    out = defaultdict(set)
+    rows = (db.session.query(SportsMatch.channel_id, SportsEvent)
+            .join(SportsEvent, SportsEvent.id == SportsMatch.event_id)
+            .join(Channel, Channel.id == SportsMatch.channel_id)
+            .filter(Channel.account_id == account_id, SportsMatch.kind == SPORTS_MATCH_KIND_CHANNEL_NAME,
+                    SportsMatch.gone_since.is_(None), SportsMatch.rejected_at.is_(None), _offered(),
+                    SportsEvent.league_id.in_(list(follows))))
+    for channel_id, event in rows:
+        if is_followed(event, follows[event.league_id]) and still_ahead(event, now, tz):
+            out[event.id].add(channel_id)
+    return dict(out)
 
 
 def run_needed() -> bool:

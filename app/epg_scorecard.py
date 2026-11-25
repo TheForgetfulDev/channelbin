@@ -14,7 +14,8 @@ account 5's three sources on prod), so it runs in the background after an import
 
 The same check stores each account's findings (dev/changelog/1718): name matches waiting,
 an id unrelated channels share, a source serving channels better than their own, a source
-adding nothing. Shown on pages, never raised as alerts.
+adding nothing. Shown on pages, never raised as alerts. Then which followed sports games
+each source would match, by the sports matcher's own judge (dev/changelog/1726).
 
 Nothing here writes a channel's guide. "Best here" is a suggestion with its reasons; acting
 on it is the user's, through set_source_override()."""
@@ -31,7 +32,7 @@ from sqlalchemy import delete, select
 
 from . import admission, db
 from .database import (Account, Channel, EPGEntry, EpgAlternateEntry, EpgFinding, EpgSource,
-                       EpgSourceAgreement, EpgSourceChannel, EpgSourceRefresh,
+                       EpgSourceAgreement, EpgSourceGames, EpgSourceChannel, EpgSourceRefresh,
                        EpgSourceSubscription, EPG_FINDING_ADDS_NOTHING,
                        EPG_FINDING_BETTER_SOURCE, EPG_FINDING_NAME_MATCHES,
                        EPG_FINDING_SHARED_ID, EPG_STATUS_FAILED, EPG_STATUS_OK,
@@ -816,6 +817,180 @@ def check_findings(orders: dict, now: datetime) -> int:
     return stored
 
 
+# ── Followed sports games per source (dev/changelog/1726) ────────────────────
+# Which followed games each source would match, judged by the sports matcher on that source's
+# listings alone (sports_match.source_games()). Only for an account reading two or more
+# sources: with one, the answer is the matcher's own, which the sports pages already show, and
+# a single source is where it costs most (33 s for prod's account 2, one 1.8M-listing feed).
+
+class SourceGamesScore(NamedTuple):
+    source_id: int
+    through_day: date | None    # the source's typical reach day; None = reaches nothing ahead
+    followed: int               # followed games still to come through that day
+    listed: int                 # ... that it lists
+    listed_later: int           # games it lists after that day
+    live: int                   # of `listed`, the ones with a live airing
+    channels: int               # channels it lists `listed` on
+    only_here: int              # of `listed`, the ones no other source the account reads lists
+    event_ids: tuple            # every game it lists, `listed_later` included
+
+
+def score_source_games(games, reach_days: dict) -> list[SourceGamesScore]:
+    """One SourceGamesScore per source in `games.listed` - pure. `reach_days` {source_id:
+    the last local day it typically reaches}. Every number but `listed_later` and
+    `event_ids` is over the games through that day, so the card's one sentence is one
+    window; "only here" asks whether any other source lists the game at all."""
+    out = []
+    for sid, listed in games.listed.items():
+        through = reach_days.get(sid)
+        inside = {eid for eid, day in games.followed.items() if through is None or day <= through}
+        mine = {eid: g for eid, g in listed.items() if eid in inside}
+        others = set().union(*(set(o) for s, o in games.listed.items() if s != sid))
+        out.append(SourceGamesScore(
+            sid, through, len(inside), len(mine), len(set(listed) - inside),
+            sum(1 for g in mine.values() if g.live),
+            len(set().union(*(g.channels for g in mine.values()))),
+            len(set(mine) - others), tuple(sorted(listed))))
+    return out
+
+
+def _replace_source_games(account_id: int, scores, now: datetime) -> None:
+    """Replace an account's rows. An account or source deleted while the check ran gets none,
+    as with the findings."""
+    @retry_on_locked()
+    def _replace_and_commit():
+        db.session.execute(delete(EpgSourceGames).where(EpgSourceGames.account_id == account_id))
+        alive = {sid for (sid,) in db.session.query(EpgSource.id).filter(
+            EpgSource.id.in_({s.source_id for s in scores}))} if scores else set()
+        if db.session.get(Account, account_id) is None:
+            alive = set()
+        kept = [s for s in scores if s.source_id in alive]
+        if kept:
+            db.session.bulk_insert_mappings(EpgSourceGames, [
+                {**{k: v for k, v in s._asdict().items() if k != 'event_ids'},
+                 'account_id': account_id, 'event_ids': json.dumps(list(s.event_ids)),
+                 'counted_at': now}
+                for s in kept])
+        db.session.commit()
+    _replace_and_commit()
+
+
+def check_source_games(orders: dict, now: datetime) -> int:
+    """Count and store every account's followed games per source. `orders` {account_id:
+    [source_id]}. An account reading one source keeps no rows. The matcher's judging happens
+    before each account's one retry_on_locked write. Returns the accounts counted."""
+    from .epg_sources import source_reach
+    from .sports_match import source_games
+    from .tz_utils import get_display_tz
+    tz = get_display_tz()
+    counted_accounts = 0
+    for aid, order in orders.items():
+        if len(order) < 2:
+            _replace_source_games(aid, [], now)
+            continue
+        games = source_games(aid, order, now)
+        reach = {sid: r.day for sid, r in source_reach(order, tz).items()}
+        db.session.rollback()
+        scores = score_source_games(games, reach) if games.followed else []
+        _replace_source_games(aid, scores, now)
+        counted_accounts += bool(scores)
+    return counted_accounts
+
+
+def stored_source_games(account_id: int) -> list[tuple[SourceGamesScore, datetime]]:
+    """[(SourceGamesScore, counted_at)] for the sources the account still reads. Two queries."""
+    reads = {sid for (sid,) in db.session.query(EpgSourceSubscription.source_id).filter(
+        EpgSourceSubscription.account_id == account_id)}
+    out = []
+    for row in EpgSourceGames.query.filter(EpgSourceGames.account_id == account_id).order_by(
+            EpgSourceGames.id):
+        if row.source_id not in reads:
+            continue
+        try:
+            ids = tuple(json.loads(row.event_ids or '[]'))
+        except ValueError:
+            log.warning('EPG source games for account %d and source %d: unreadable event ids',
+                        account_id, row.source_id)
+            ids = ()
+        out.append((SourceGamesScore(row.source_id, row.through_day, row.followed, row.listed,
+                                     row.listed_later, row.live, row.channels, row.only_here,
+                                     ids), row.counted_at))
+    return out
+
+
+def sports_json(account_id: int, now: datetime) -> dict | None:
+    """The scorecard API's followed sports games, unformatted, for the EPG Manager: each
+    source's stored counts and listed game ids, and the games this account's channels name.
+    None when the check has stored none for the account."""
+    from .sports_match import name_games
+    games = stored_source_games(account_id)
+    if not games:
+        return None
+    listed = set().union(*(g.event_ids for g, _at in games))
+    named = name_games(account_id, now)
+    return {'sources': [{**g._asdict(), 'through_day': iso_or_none(g.through_day),
+                         'event_ids': list(g.event_ids), 'counted_at': iso_or_none(at)}
+                        for g, at in games],
+            'by_channel_name': {'games': len(named),
+                                'channels': len(set().union(*named.values())) if named else 0,
+                                'only_by_name': len(set(named) - listed),
+                                'event_ids': sorted(named)}}
+
+
+def followed_noun() -> tuple:
+    """(one, many) for the games followed: the sport's own word when every followed league
+    reads the same, `events` when they differ (app/sports_words.py)."""
+    from .database import SportsFollow, SportsLeague
+    from .sports_words import EVENT, noun
+    sports = {s for (s,) in db.session.query(SportsLeague.sport).filter(
+        SportsLeague.id.in_(select(SportsFollow.league_id)))}
+    words = {noun(s) for s in sports}
+    return words.pop() if len(words) == 1 else EVENT
+
+
+def games_text(s: SourceGamesScore, day_label, at_label: str, noun: tuple) -> tuple[str, str]:
+    """(line, tooltip) for one source's followed games on the Sources card. `day_label(day)`
+    is a day's display text; `at_label` when they were counted."""
+    one, many = noun
+    when = f'through {day_label(s.through_day)}' if s.through_day else 'still to come'
+    line = f'Lists {s.listed:,} of the {counted(s.followed, "followed " + one, "followed " + many)} {when}'
+    if s.channels:
+        line += f', on {counted(s.channels, "channel")}'
+    if s.only_here:
+        line += f', {s.only_here:,} only here'
+    tip = [f'Followed {many}, judged by the sports matcher on this guide\'s listings alone.']
+    if s.listed and not s.live:
+        tip.append('Every one of them is a replay; none airs live here.')
+    elif s.listed and s.live < s.listed:
+        tip.append(f'{s.live:,} of the {counted(s.listed, one, many)} {plural(s.live, "has", "have")} '
+                   'a live airing here; the rest only replays.')
+    elif s.listed:
+        tip.append('Every one of them has a live airing here.')
+    if s.only_here:
+        tip.append(f'{counted(s.only_here, one, many)} of them no other source on this account lists.')
+    if s.listed_later:
+        tip.append(f'It also lists {counted(s.listed_later, one, many)} after '
+                   f'{day_label(s.through_day)}, not counted above.')
+    tip.append(f'Counted {at_label}.')
+    return line + '.', '\n'.join(tip)
+
+
+def name_games_text(named: dict, listed_ids, noun: tuple) -> tuple[str, str] | None:
+    """(line, tooltip) for the followed games this account's channels name, or None when
+    none do. `named` is sports_match.name_games(); `listed_ids` every game a source lists."""
+    if not named:
+        return None
+    one, many = noun
+    channels = set().union(*named.values())
+    only = len(set(named) - set(listed_ids))
+    line = (f'Read from channel names: {counted(len(named), "followed " + one, "followed " + many)} '
+            f'on {counted(len(channels), "channel")}')
+    line += f', {only:,} that no guide here lists.' if only else ', every one also in a guide here.'
+    tip = ('A channel whose guide has nothing at a game\'s time is read by its name. These belong '
+           'to no one source, so they are counted apart from each source\'s line.')
+    return line, tip
+
+
 # ── The check that stores agreement ──────────────────────────────────────────
 
 def _held_listings(channel_ids, source_ids, now) -> dict[int, dict[int, list]]:
@@ -906,17 +1081,20 @@ def _clear_unguided(account_id: int) -> None:
 
 
 def _clear_unread(account_ids) -> None:
-    """An account that reads no source any more keeps no agreement and no finding."""
+    """An account that reads no source any more keeps no agreement, finding or game count."""
     @retry_on_locked()
     def _clear_and_commit():
         accounts = select(Channel.id)
         findings = delete(EpgFinding)
+        games = delete(EpgSourceGames)
         if account_ids:
             accounts = accounts.where(Channel.account_id.notin_(account_ids))
             findings = findings.where(EpgFinding.account_id.notin_(account_ids))
+            games = games.where(EpgSourceGames.account_id.notin_(account_ids))
         db.session.execute(delete(EpgSourceAgreement).where(
             EpgSourceAgreement.channel_id.in_(accounts)))
         db.session.execute(findings)
+        db.session.execute(games)
         db.session.commit()
     _clear_and_commit()
 
@@ -953,7 +1131,7 @@ def _place_where_flags_moved(before: dict, after: dict) -> None:
 
 def run_check(now: datetime | None = None) -> str:
     """One run over every account that reads an EPG source: the agreement of its sources,
-    then its findings, stored. Takes a KIND_EPG_CHECK ticket; a refusal queues the next try.
+    then its findings, then its followed sports games per source, stored. Takes a KIND_EPG_CHECK ticket; a refusal queues the next try.
     Returns a note for the log."""
     from .scheduler import queue_epg_check
     ticket = admission.try_start(admission.KIND_EPG_CHECK, 'EPG sources')
@@ -977,9 +1155,12 @@ def run_check(now: datetime | None = None) -> str:
         flagged_before = _shared_id_subjects()
         found = check_findings(orders, now)
         _place_where_flags_moved(flagged_before, _shared_id_subjects())
+        games_at = time_mod.monotonic()
+        games = check_source_games(orders, now)
         note = (f'EPG source check: {counted(judged, "channel and source pair")} compared and '
                 f'{counted(found, "finding")} stored over {counted(len(orders), "account")} '
-                f'in {time_mod.monotonic() - started:.1f} s.')
+                f'in {time_mod.monotonic() - started:.1f} s; followed sports games counted per '
+                f'source on {counted(games, "account")} in {time_mod.monotonic() - games_at:.1f} s.')
         log.info(note)
         return note
     finally:

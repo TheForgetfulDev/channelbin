@@ -4100,6 +4100,30 @@ def _m150_epg_source_expiry(conn, cur):
     conn.commit()
 
 
+def _m151_epg_source_games(conn, cur):
+    """epg_source_games: which followed sports games each EPG source would match
+    (app/epg_scorecard.py, dev/changelog/1726). No backfill: the rows arrive with the EPG
+    check after the next import. Re-runnable from the top, IF NOT EXISTS throughout."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS epg_source_games (
+            id INTEGER NOT NULL PRIMARY KEY,
+            account_id INTEGER NOT NULL REFERENCES accounts (id),
+            source_id INTEGER NOT NULL REFERENCES epg_sources (id),
+            through_day DATE,
+            followed INTEGER NOT NULL,
+            listed INTEGER NOT NULL,
+            listed_later INTEGER NOT NULL,
+            live INTEGER NOT NULL,
+            channels INTEGER NOT NULL,
+            only_here INTEGER NOT NULL,
+            event_ids TEXT NOT NULL,
+            counted_at DATETIME NOT NULL,
+            CONSTRAINT uq_epg_source_games UNIQUE (account_id, source_id)
+        );
+    """)
+    conn.commit()
+
+
 #: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
 #: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
 #: time; the rebuild test holds step 148's output to this text, and the column list after
@@ -4976,6 +5000,8 @@ SCHEMA_MIGRATIONS = [
     (149, 'epg_channel_stretches: a guide continued past the end of its first source',
      _m149_epg_channel_stretches),
     (150, 'epg_sources.expires_on: an expiration date on an EPG source', _m150_epg_source_expiry),
+    (151, 'epg_source_games: which followed sports games each EPG source would match',
+     _m151_epg_source_games),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

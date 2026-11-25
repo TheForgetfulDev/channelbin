@@ -35,7 +35,8 @@ from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_FILL_CHANGED,
                        EPG_STRETCH_NO_SCHEDULE, EPG_STRETCH_SHARED_ID,
                        EPG_STRETCH_UNRELATED, EPG_STRETCH_WAITING,
                        CHANNEL_EPG_SOURCE_CHANGED, CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED, EPGEntry, EpgAlternateEntry, EpgChannelKey,
-                       EpgFinding, EpgSource, EpgSourceAgreement, EpgSourceChannel, EpgSourceRefresh,
+                       EpgFinding, EpgSource, EpgSourceAgreement, EpgSourceChannel, EpgSourceGames,
+                       EpgSourceRefresh,
                        EpgSourceSubscription, EPG_KEY_ACCEPTED, EPG_ORDER_FOLLOW, EPG_ORDER_MODES,
                        EPG_ORDER_OWN, PROVIDER_ORDER_OWN_GUIDE, PROVIDER_ORDER_SOURCE, Provider,
                        ProviderEpgOrder,
@@ -1234,16 +1235,18 @@ def delete_sources_for_account(account_id: int) -> None:
     db.session.execute(delete(EpgSourceSubscription)
                        .where(EpgSourceSubscription.account_id == account_id))
     db.session.execute(delete(EpgFinding).where(EpgFinding.account_id == account_id))
+    db.session.execute(delete(EpgSourceGames).where(EpgSourceGames.account_id == account_id))
 
 
 def _delete_source_rows(source_ids) -> None:
     """Every row keyed on these sources, short of the sources themselves: listings in both
     tables, directory, user keys, subscriptions, refresh history and agreements on either
-    side, findings. The one list both source deletes share, so a table added to one cannot be missed
+    side, findings, game counts. The one list both source deletes share, so a table added to one cannot be missed
     by the other. Does not commit."""
     ids = list(source_ids)
     for model in (EPGEntry, EpgAlternateEntry, EpgSourceChannel, EpgChannelKey,
-                  EpgSourceSubscription, EpgSourceRefresh, EpgFinding, EpgChannelStretch):
+                  EpgSourceSubscription, EpgSourceRefresh, EpgFinding, EpgChannelStretch,
+                  EpgSourceGames):
         db.session.execute(delete(model).where(model.source_id.in_(ids)))
     db.session.execute(update(EpgChannelStretch)
                        .where(EpgChannelStretch.after_source_id.in_(ids))
@@ -1705,6 +1708,8 @@ def stop_using_source(account_id: int, source_id: int, case_sensitive: bool, *,
             EpgSourceSubscription.source_id == source_id))
         db.session.execute(delete(EpgFinding).where(EpgFinding.account_id == account_id,
                                                     EpgFinding.source_id == source_id))
+        db.session.execute(delete(EpgSourceGames).where(EpgSourceGames.account_id == account_id,
+                                                        EpgSourceGames.source_id == source_id))
         for model in (EPGEntry, EpgAlternateEntry):
             db.session.execute(delete(model).where(_of_source(model, source_id),
                                                    model.channel_id.in_(mine)))
@@ -2937,10 +2942,11 @@ def reach_words(span, now: datetime, tz, with_days: bool = True) -> dict | None:
         else:
             text = (f'{date_label(first, now, tz)} - {date_label(last, now, tz)}'
                     + (f' (up to {ahead})' if ahead else ''))
-    return {'ran_out': ran_out, 'text': text, 'inline': _inline(text)}
+    return {'ran_out': ran_out, 'text': text, 'inline': inline_day(text)}
 
 
-def _inline(text: str) -> str:
+def inline_day(text: str) -> str:
+    """A date_label() for the middle of a sentence: `through tomorrow`, never `through Tomorrow`."""
     for word in _RELATIVE_DAYS:
         text = text.replace(word, word.lower())
     return text
@@ -2983,7 +2989,7 @@ def source_reach_view(reach: Reach | None, now: datetime, tz) -> dict | None:
     later = None
     if reach.later and reach.latest > reach.day:
         later = (f'{counted(reach.later, "channel")} {plural(reach.later, "runs", "run")} later, to '
-                 f'{_inline(date_label(reach.latest, now, tz))}')
+                 f'{inline_day(date_label(reach.latest, now, tz))}')
     return {'words': reach_words((reach.day, reach.day), now, tz), 'later': later,
             'tip': reach_breakdown(reach, now, tz)}
 

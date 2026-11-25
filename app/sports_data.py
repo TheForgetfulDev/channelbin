@@ -624,6 +624,31 @@ def _teams_without_a_game(league: SportsLeague, season: str, number: int, outcom
     return teams - {i for pair in covered.all() for i in pair if i}
 
 
+def _day_only(event) -> bool:
+    """A placeholder start, a race's 00:00 or no time at all: the event has only its day."""
+    return event.start_at is None or (not event_shape_is_matchup(event) and (event.start_at.hour, event.start_at.minute) == (0, 0))
+
+
+def still_ahead(event, now, tz) -> bool:
+    """Whether a game has yet to start. An event with only its day is still ahead for the whole
+    of that day in the display timezone."""
+    if _day_only(event):
+        return event.local_date >= to_local(now, tz).date()
+    return event.start_at >= now
+
+
+def game_day(event, tz):
+    """The local day a game is on: TheSportsDB's own date for an event with only its day, whose
+    00:00 UTC is the evening before in every US timezone."""
+    return event.local_date if _day_only(event) else to_local(event.start_at, tz).date()
+
+
+def is_followed(event, teams) -> bool:
+    """Whether a league's follows cover this game. `teams` is the league's followed team ids,
+    where 0 is the whole league."""
+    return 0 in teams or event.home_team_id in teams or event.away_team_id in teams
+
+
 def _teams_followed(league: SportsLeague):
     """The team ids a follow of this league covers, or None for the whole league."""
     ids = {t for (t,) in db.session.query(SportsFollow.team_tsdb_id).filter_by(league_id=league.id).all()}

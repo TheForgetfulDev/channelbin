@@ -36,13 +36,15 @@ from ..database import (Account, AccountBlock, AccountLogin, AccountStatDay, Cha
                         SYNC_LOG_IMPORTED, HOST_CHECK_ANSWERS, HOST_CHECK_RESOLVES,
                         HOST_PROBE_LOOKUP, detach_channel_references)
 from ..db_utils import chunked, retry_on_locked
-from ..epg_scorecard import finding_text, recheck_soon, stored_findings
+from ..epg_scorecard import (finding_text, followed_noun, games_text, name_games_text, recheck_soon,
+                             stored_findings, stored_source_games)
+from ..sports_match import name_games
 from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, comparison_title,
                            directory_row_summary,
                            case_sensitive_matching,
                            accept_name_matches, account_reach, account_sources_view, filled_counts_by_accounts, place_stretches,
                            stretch_channel_ids,
-                           accounts_reach, reach_words,
+                           accounts_reach, inline_day, reach_words,
                            add_url_source, borrowable_sources, clean_url_source_fields,
                            delete_sources_for_account, delete_url_source,
                            ensure_provider_source, foreign_guided_channels, foreign_readers, has_directory,
@@ -530,7 +532,25 @@ def _account_detail_payload(account, cfg, stats):
             'warn': f.kind == EPG_FINDING_SHARED_ID, 'link': finding_link(f, account.id)})
     for s in sources:
         s['findings'] = found_by_source.get(s['id'], [])
+    # Which followed sports games each source would match, stored by the same check
+    # (dev/changelog/1726), and the ones read from channel names, which belong to no source.
+    sports_games = None
+    games = stored_source_games(account.id)
+    if games:
+        noun = followed_noun()
+        listed_ids = set()
+        by_source = {}
+        for g, at in games:
+            line, tip = games_text(g, lambda day: inline_day(date_label(day, now, tz)),
+                                   format_local(at, 'monthday_time', tz=tz, h24=h24), noun)
+            by_source[g.source_id] = {'line': line, 'tip': tip}
+            listed_ids.update(g.event_ids)
+        for s in sources:
+            s['games'] = by_source.get(s['id'])
+        named = name_games_text(name_games(account.id, now), listed_ids, noun)
+        sports_games = {'line': named[0], 'tip': named[1]} if named else None
     return {
+        'sports_names': sports_games,
         'cur': stats['current'][account.id],
         'group_any': GROUP_ANY,
         'all_time_note': account_stats_view.ALL_TIME_NOTE,
@@ -2236,12 +2256,13 @@ def epg_scorecard_api(account_id):
     after the page because it costs 0.6 s on prod's two largest accounts, almost all of it
     reading each guide's whole directory. Without it, every number unformatted, with each
     channel two or more sources cover, the source that serves it best and the name matches
-    the review page would propose (another 2.9 s on account 5)."""
+    the review page would propose (another 2.9 s on account 5), and the followed sports
+    games each source lists, as the EPG check stored them (dev/changelog/1726)."""
     _account, err = _json_account(account_id)
     if err:
         return err
     from ..epg_scorecard import (account_scorecard, card_json, name_match_counts,
-                                 scorecard_json)
+                                 scorecard_json, sports_json)
     from ..epg_sources import last_local_day, to_local_date
     tz, now, cs = get_display_tz(), datetime.utcnow(), _case_sensitive()
     if request.args.get('view') == 'card':
@@ -2252,7 +2273,8 @@ def epg_scorecard_api(account_id):
     card = account_scorecard(account_id, tz, cs, with_channels=True,
                              day_of=lambda h: date_label(last_local_day(h, tz), now, tz))
     names = name_match_counts(account_id, [s.source_id for s in card.sources], cs)
-    return jsonify({'success': True, **scorecard_json(card, names)})
+    return jsonify({'success': True, **scorecard_json(card, names),
+                    'sports': sports_json(account_id, now)})
 
 
 def _borrowed_message(source, owner_name: str, done) -> str:
