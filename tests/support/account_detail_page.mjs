@@ -33,6 +33,8 @@ for (const s of ['never', 'syncing', 'done']) {
     nav: JSON.parse(read(`${s}.nav.json`)),
     syncs: JSON.parse(read(`${s}.syncs.json`)),
     scores: JSON.parse(read(`${s}.scores.json`)),
+    ordered: read(`${s}.ordered.html`),
+    preview: JSON.parse(read(`${s}.preview.json`)),
   };
 }
 const JS = ['util.js', 'account-modal.js', 'account-actions.js', 'account-detail.js', 'account-stats.js']
@@ -52,8 +54,9 @@ function boot(which, start, { serve = start, scoresStatus = 200 } = {}) {
 
   const id = META[which];
   const pagePath = `/accounts/${id}`;
-  const server = { state: serve, pageStatus: 200, postStatus: 200, scoresStatus };
+  const server = { state: serve, pageStatus: 200, postStatus: 200, scoresStatus, preview: null };
   const sent = [];
+  const previews = [];
   const posts = [];
   const respond = (status, payload, text) => Promise.resolve({
     ok: status >= 200 && status < 300,
@@ -74,6 +77,11 @@ function boot(which, start, { serve = start, scoresStatus = 200 } = {}) {
     if (url.pathname === pagePath) {
       const status = server.pageStatus;
       return respond(status, null, status === 200 ? st[which] : 'Internal Server Error');
+    }
+    if (url.pathname.endsWith('-preview')) {
+      previews.push(url.pathname + url.search);
+      if (server.previewStatus) return respond(server.previewStatus, { error: 'Preview broke.' });
+      return respond(200, server.preview || st.preview);
     }
     if (url.pathname === '/api/nav-status') return respond(200, st.nav);
     if (url.pathname === `/api/accounts/${id}/syncs`) return respond(200, st.syncs);
@@ -112,7 +120,7 @@ function boot(which, start, { serve = start, scoresStatus = 200 } = {}) {
   const $ = (s) => document.querySelector(s);
   const text = (s) => ($(s) ? $(s).textContent.replace(/\s+/g, ' ').trim() : null);
   const c = {
-    window, document, server, sent, posts, errors, navigations, warnings, observers, $,
+    window, document, server, sent, posts, previews, errors, navigations, warnings, observers, $,
     settle: () => new Promise((r) => setTimeout(r, 60)),
     poll: async () => { window.fetchNavStatus(); await c.settle(); },
     click: (el) => el.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true })),
@@ -358,6 +366,55 @@ await record('scores_failed', async (start) => {
   const c = start('busy', 'done', { scoresStatus: 500 });
   await c.settle();
   return { errors: c.errors, warnings: c.warnings, ...c.snap() };
+});
+
+/* ── Move up asks the server what it would change, and moves only on the OK ── */
+await record('move_preview', async (start) => {
+  const c = start('ordered', 'done');
+  await c.settle();
+  const dialog = () => {
+    const panels = c.document.querySelectorAll('.modal .modal-panel');
+    const p = panels[panels.length - 1];
+    if (!p) return null;
+    return {
+      title: p.querySelector('.modal-head') ? p.querySelector('.modal-head').textContent.trim() : null,
+      items: Array.from(p.querySelectorAll('.confirm-list li')).map((li) => li.textContent.trim()),
+      paras: Array.from(p.querySelectorAll('.modal-body p')).map((x) => x.textContent.trim()),
+      buttons: Array.from(p.querySelectorAll('.modal-foot .btn')),
+    };
+  };
+  const moveUp = () => c.click(c.$(`[data-act="source-move"][data-direction="up"][data-source-id="${META.second}"]`));
+  moveUp();
+  await c.settle();
+  const shown = dialog();
+  const asked = { previews: c.previews.slice(), posts: c.posts.length, title: shown && shown.title,
+    items: shown && shown.items, paras: shown && shown.paras };
+  shown.buttons[0].click();
+  await c.settle();
+  const cancelled = { posts: c.posts.length, open: Boolean(dialog()) };
+  c.server.preview = { ...STATES.done.preview, own_order: 'This gives Ordered its own EPG order.' };
+  moveUp();
+  await c.settle();
+  const own = dialog();
+  const ownParas = own.paras;
+  own.buttons[own.buttons.length - 1].click();
+  await c.settle();
+  const ownPosts = c.posts.map((x) => ({ path: x.path, body: JSON.parse(x.body || '{}') }));
+  // The preview itself fails: the dialog still opens, says so, and the move can go ahead.
+  c.server.preview = null;
+  c.server.previewStatus = 500;
+  moveUp();
+  await c.settle();
+  const broken = dialog();
+  const brokenItems = broken ? broken.items : null;
+  if (broken) broken.buttons[broken.buttons.length - 1].click();
+  await c.settle();
+  return {
+    errors: c.errors.filter((e) => !/Preview broke/.test(e)), asked, cancelled, ownParas,
+    served: STATES.done.preview.lines, posts: ownPosts, second: META.second, brokenItems,
+    brokenPosts: c.posts.slice(ownPosts.length)
+      .map((x) => ({ path: x.path, body: JSON.parse(x.body || '{}') })),
+  };
 });
 
 process.stdout.write(JSON.stringify(out), () => process.exit(0));

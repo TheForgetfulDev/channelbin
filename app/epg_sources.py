@@ -15,6 +15,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import math
 import re
 import time as time_mod
 import unicodedata
@@ -1695,6 +1696,21 @@ def use_source_again(account_id: int, source_id: int) -> bool:
     return True
 
 
+def moved_order(items: list, item, step: int) -> list | None:
+    """`items` with `item` one place up (`step` -1) or down (+1): the same list when it is
+    already first or last, None when it is not there. Pure; the move and its preview both
+    take their new order from here."""
+    if item not in items:
+        return None
+    i = items.index(item)
+    j = i + step
+    if not 0 <= j < len(items):
+        return list(items)
+    out = list(items)
+    out[i], out[j] = out[j], out[i]
+    return out
+
+
 class Reorder(NamedTuple):
     """What moving a source in an account's priority order did."""
     moved: bool      # False: already first (or last), nothing changed
@@ -1722,21 +1738,18 @@ def move_source(account_id: int, source_id: int, step: int,
         subs = (EpgSourceSubscription.query.filter_by(account_id=account_id)
                 .order_by(EpgSourceSubscription.priority).all())
         ids = [s.source_id for s in subs]
-        if source_id not in ids:
+        trial = moved_order(ids, source_id, step)
+        if trial is None:
             return None, False
-        i = ids.index(source_id)
-        j = i + step
-        if not 0 <= j < len(subs):
+        if trial == ids:
             return False, False
-        trial = list(ids)
-        trial[i], trial[j] = trial[j], trial[i]
         went_own = bool(placed) and not still_following(placed, trial)
         if went_own and not own_order_ok:
             raise NeedsOwnOrder(own_order_sentence(account_id))
         if went_own:
             set_epg_order_mode(db.session.get(Account, account_id), EPG_ORDER_OWN,
                                'moved a source its provider placed')
-        subs[i], subs[j] = subs[j], subs[i]
+        subs.sort(key=lambda s: trial.index(s.source_id))
         # uq_epg_sub_account_priority is checked row by row, so the new numbers are reached
         # through negative ones nobody holds.
         for n, sub in enumerate(subs, 1):
@@ -1991,14 +2004,11 @@ def subscribe_to_source(account_id: int, source_id: int,
     return Borrowed(refreshed, covered, len(copied), guided, turned_on)
 
 
-def copy_held_listings(account_id: int, source_id: int,
-                       case_sensitive: bool) -> tuple[int, list[int]]:
-    """For an account that has just started reading a source: copy into the alternates what
-    the database already holds of it for each of the account's visible channels - the rule
-    set_channel_key() follows (dev/changelog/1102). A channel on another reader whose key
-    into the source reads the same id holds exactly what the next import would write. A
-    covered key no reader carries waits for the source's next refresh. Returns (channels
-    the source covers, channels copied); the caller re-resolves. Commits, in chunks."""
+def copy_pairs(account_id: int, source_id: int,
+               case_sensitive: bool) -> tuple[int, list[tuple[int, int]]]:
+    """What copy_held_listings() would copy, without copying it: (channels of the account
+    the source covers, [(channel, donor channel whose rows it gets)]). Reads only; the
+    reorder preview (preview_orders()) reads the donors' rows in the target's place."""
     variants = folded_variants(source_id, case_sensitive)
     donors = _held_listings(source_id, case_sensitive, variants)
     coverage = directory_coverage([source_id], case_sensitive)[source_id]
@@ -2015,7 +2025,18 @@ def copy_held_listings(account_id: int, source_id: int,
         donor = donors.get(fid)
         if donor is not None and donor != cid:
             pairs.append((cid, donor))
+    return covered, pairs
 
+
+def copy_held_listings(account_id: int, source_id: int,
+                       case_sensitive: bool) -> tuple[int, list[int]]:
+    """For an account that has just started reading a source: copy into the alternates what
+    the database already holds of it for each of the account's visible channels - the rule
+    set_channel_key() follows (dev/changelog/1102). A channel on another reader whose key
+    into the source reads the same id holds exactly what the next import would write. A
+    covered key no reader carries waits for the source's next refresh. Returns (channels
+    the source covers, channels copied); the caller re-resolves. Commits, in chunks."""
+    covered, pairs = copy_pairs(account_id, source_id, case_sensitive)
     for pairs_batch in chunked(pairs, _COPY_CHUNK):
         @retry_on_locked()
         def _copy_and_commit(batch=pairs_batch):
@@ -2387,6 +2408,18 @@ def move_source_to_account(source_id: int, account_id: int,
     return SourceRemoval(affected, switched, affected - switched)
 
 
+def _traded(entries, new_ids: list) -> list:
+    """The entries whose place `new_ids` changes: the two a one-place move traded."""
+    return [e for i, e in enumerate(entries) if new_ids[i] != e.id]
+
+
+def _entry_sources(entries, own_guide: int | None) -> set[int]:
+    """The source ids these list entries stand for on one account: the slot is its own
+    guide, left out when it has none."""
+    return {own_guide if e.entry == PROVIDER_ORDER_OWN_GUIDE else e.source_id
+            for e in entries} - {None}
+
+
 def move_provider_entry(provider_id: int, entry_id: int, step: int,
                         case_sensitive: bool) -> Reorder | None:
     """Move one entry of the provider's list up (-1) or down (+1) (§15.3, "Changing the
@@ -2400,14 +2433,13 @@ def move_provider_entry(provider_id: int, entry_id: int, step: int,
     def _move_and_commit():
         entries = provider_list(provider_id)
         ids = [e.id for e in entries]
-        if entry_id not in ids:
+        new = moved_order(ids, entry_id, step)
+        if new is None:
             return None
-        i = ids.index(entry_id)
-        j = i + step
-        if not 0 <= j < len(entries):
+        if new == ids:
             return False
-        swapped = (entries[i], entries[j])
-        entries[i], entries[j] = entries[j], entries[i]
+        swapped = _traded(entries, new)
+        entries.sort(key=lambda e: new.index(e.id))
         _renumber_list(entries)
         following = [aid for aid in provider_account_ids(provider_id)
                      if follows(db.session.get(Account, aid))]
@@ -2415,9 +2447,7 @@ def move_provider_entry(provider_id: int, entry_id: int, step: int,
         added, moved = {}, {}
         for aid in following:
             added[aid] = apply_provider_order(aid)
-            # Only the two entries traded places; the slot is each account's own guide.
-            moved[aid] = {guides.get(aid) if e.entry == PROVIDER_ORDER_OWN_GUIDE else e.source_id
-                          for e in swapped} - {None}
+            moved[aid] = _entry_sources(swapped, guides.get(aid))
         db.session.commit()
         return added, moved
 
@@ -4149,6 +4179,7 @@ class _Placement(NamedTuple):
     stretches: list             # [Stretch], as decided
     stored: dict                # {source_id: (position, outcome, after, updated_at)}
     moves: list                 # [(source_id, into the guide?, starting_from, starting_before)]
+    end: datetime | None = None   # the last stop of the guide as decided, fills included
 
 
 def _plan_moves(first: int, stretches, in_guide: dict, kept: dict) -> list:
@@ -4198,19 +4229,25 @@ def _is_guided(r) -> bool:
 
 
 def _plan_stretches(rows, case_sensitive: bool, now: datetime, coverage_of=None,
-                    ctx: _PlanContext | None = None) -> list[_Placement]:
+                    ctx: _PlanContext | None = None, held_by_table=None,
+                    future_listings=None) -> list[_Placement]:
     """Decide every channel in `rows` (id, account_id, epg_channel_id, hidden,
     epg_source_id) from what the database holds. Reads only.
 
     `coverage_of` {channel_id: {source_id: Coverage}} is passed by a caller that already
     has one channel's coverage (a key write); otherwise it is read from the directory, with
     held rows standing in for a source that has none yet (held_coverage()'s rule). `ctx` is
-    the caller's _plan_context() when it plans in chunks, so the directory is read once."""
+    the caller's _plan_context() when it plans in chunks, so the directory is read once.
+    `held_by_table` and `future_listings` stand in for _held_by_table() and
+    _future_listings(): the reorder preview hands in what the rows would be after the
+    change (preview_orders()), so it decides with this function rather than a copy of it."""
+    held_by_table = held_by_table or _held_by_table
+    future_listings = future_listings or _future_listings
     guided = [r for r in rows if _is_guided(r)]
     if ctx is None:
         ctx = _plan_context(guided, case_sensitive, coverage_of is None)
     order, keys, flags, directory, unrefreshed = ctx
-    in_guide, kept = _held_by_table([r.id for r in guided])
+    in_guide, kept = held_by_table([r.id for r in guided])
     stored: dict[int, dict] = {}
     for chunk in _chunks([r.id for r in rows]):
         for cid, sid, pos, outcome, after, at in db.session.query(
@@ -4262,7 +4299,7 @@ def _plan_stretches(rows, case_sensitive: bool, now: datetime, coverage_of=None,
         return any(s in covers and s in spans and (end is None or spans[s].last_start >= end)
                    for s in mine[1:])
 
-    listings = _future_listings([cid for cid in facts if may_fill(cid)], now)
+    listings = future_listings([cid for cid in facts if may_fill(cid)], now)
 
     out = []
     for r in rows:
@@ -4274,9 +4311,13 @@ def _plan_stretches(rows, case_sensitive: bool, now: datetime, coverage_of=None,
         decided = decide_stretches(mine[0], mine[1:], covers, spans, flagged,
                                    {sid: (o, after) for sid, (_p, o, after, _at) in was.items()},
                                    listings.get(r.id, {}))
+        ends = [spans[s].last_stop for s in [mine[0]] + [x.source_id for x in decided
+                                                           if x.outcome == EPG_STRETCH_FILLS]
+                if s in spans]
         out.append(_Placement(r.id, mine[0], decided, was,
                               _plan_moves(mine[0], decided, in_guide.get(r.id, {}),
-                                          kept.get(r.id, {}))))
+                                          kept.get(r.id, {})),
+                              max(ends) if ends else None))
         time_mod.sleep(0)   # yield the GIL to request threads between channels
     return out
 
@@ -4577,3 +4618,463 @@ def extends_counts(account_id: int) -> dict[int, int]:
                 .filter(Channel.account_id == account_id,
                         EpgChannelStretch.outcome == EPG_STRETCH_FILLS)
                 .group_by(EpgChannelStretch.source_id))
+
+
+# ── Reorder preview (DESIGN-epg-sources.md §15.3, dev/changelog/1723) ──────────
+#
+# What an order change would do, worked out before it happens by the functions that do it:
+# resolve_row() for each channel's first source under the new order, with
+# reresolve_channels()' rule that a channel moves only to a source it holds rows of, then
+# _plan_stretches() for the sources continuing each guide. Nothing is written. A source the
+# change would start reading is read through copy_pairs(): each channel sees the rows its
+# donor holds, as the copy would give it. A source the change stops reading is left out.
+#
+# What it reports is what the data that comes first would be, not how far ahead a guide
+# reaches: since a later source continues a guide past the end of the one before (§14), an
+# order rarely changes reach, so a guide ending sooner is a warning shown when it happens.
+# A channel whose first source stays but whose continuing sources change is counted too, so
+# "no channel's guide would change" is said only when that is so.
+
+class Trial(NamedTuple):
+    """One account's side of an order change."""
+    account_id: int
+    order: list                     # the subscriptions the change leaves, in priority order
+    channels: list | None = None    # the channels the change re-decides; None = every visible one
+    refirst: set | None = None      # of those, the ones whose first source may change; None = all
+
+
+class OrderTrial(NamedTuple):
+    """An action's trials, and what the action would say before it runs."""
+    trials: list                    # [Trial]
+    own_order: str | None = None    # NeedsOwnOrder's sentence, when the action gives one
+    noop: bool = False              # already first or last: nothing to preview
+
+
+class OrderPreview(NamedTuple):
+    """What preview_orders() found. Listing counts compare, for each channel whose first
+    source changes, the old first source's listings from now on with the new one's, over
+    the hours both list (compare_listings())."""
+    accounts: int
+    changes: dict           # {(old first source, new first source): channels}, None = no guide
+    same: int               # listings both sources list as the same program
+    moved: int              # ... the same program at another time
+    different: int          # a different title in the same slot
+    only_before: int        # listed only by the old first source
+    only_after: int         # ... only by the new one
+    described_before: int   # of `same`, described by the old source
+    described_after: int
+    episodes_before: int    # of `same`, carrying an episode title in the old source
+    episodes_after: int
+    unaligned: int          # switched channels where fewer than half the listings pair up
+    refilled: int           # channels keeping their first source whose continuing sources change
+    shorter: int            # channels whose guide would end sooner
+    most_hours_shorter: int # ... by up to this many hours, rounded up
+
+    def _sum(self, keep) -> int:
+        return sum(n for (old, new), n in self.changes.items() if keep(old, new))
+
+    @property
+    def switched(self) -> int:
+        return self._sum(lambda old, new: old is not None and new is not None)
+
+    @property
+    def gained(self) -> int:
+        return self._sum(lambda old, new: old is None)
+
+    @property
+    def lost(self) -> int:
+        return self._sum(lambda old, new: new is None)
+
+
+_PREVIEW_COUNTS = ('same', 'moved', 'different', 'only_before', 'only_after',
+                   'described_before', 'described_after', 'episodes_before',
+                   'episodes_after', 'unaligned', 'refilled', 'shorter', 'most_hours_shorter')
+
+
+class _TrialRow(NamedTuple):
+    id: int
+    account_id: int
+    epg_channel_id: str | None
+    hidden: bool
+    epg_source_id: int | None
+
+
+class _ListEntry(NamedTuple):
+    """A provider list entry as placed_by_provider() reads it."""
+    id: int | None
+    entry: str
+    source_id: int | None
+
+
+#: The list of a provider with none yet: ensure_provider_list() would write the slot.
+_SLOT_ONLY = [_ListEntry(None, PROVIDER_ORDER_OWN_GUIDE, None)]
+
+
+def _merge_held(a, b):
+    """One source's _Held for one channel over both tables, as a copy into the alternates
+    would hold them."""
+    parts = [x for x in (a, b) if x is not None]
+    if not parts:
+        return None
+    return _Held(min(x.first_start for x in parts), max(x.last_start for x in parts),
+                 max(x.last_stop for x in parts), sum(x.count for x in parts),
+                 max(x.titles for x in parts))
+
+
+def _trial_held(raw, channel_ids, dropped, borrowed) -> tuple[dict, dict]:
+    """_held_by_table() as it would read after the change: the stopped sources' rows gone,
+    and each copied source's rows replaced by its donor's, in the alternates."""
+    in_guide, kept = {}, {}
+    for cid in channel_ids:
+        g = {s: h for s, h in raw[0].get(cid, {}).items() if s not in dropped}
+        k = {s: h for s, h in raw[1].get(cid, {}).items() if s not in dropped}
+        for sid, donor in borrowed.get(cid, {}).items():
+            g.pop(sid, None)
+            k.pop(sid, None)
+            merged = _merge_held(raw[0].get(donor, {}).get(sid), raw[1].get(donor, {}).get(sid))
+            if merged is not None:
+                k[sid] = merged
+        if g:
+            in_guide[cid] = g
+        if k:
+            kept[cid] = k
+    return in_guide, kept
+
+
+def _held_coverage_from(held, source_ids) -> dict[int, dict[int, Coverage]]:
+    """held_coverage() counted from _held_by_table()-shaped rows."""
+    out: dict[int, dict[int, Coverage]] = {sid: {} for sid in source_ids}
+    for table in held:
+        for cid, per in table.items():
+            for sid, h in per.items():
+                if sid not in out:
+                    continue
+                prev = out[sid].get(cid)
+                out[sid][cid] = (Coverage(h.count, h.titles) if prev is None else Coverage(
+                    prev.entry_count + h.count, max(prev.distinct_titles, h.titles)))
+    return out
+
+
+def _detailed_listings(pairs, now: datetime) -> dict[tuple[int, int], list]:
+    """{(channel_id, source_id): [Listing] from now on, by start} over both tables, with the
+    sub-title, for the pairs asked. `description` is only whether there is one ('y' or
+    None), so a large feed's text is not read to answer a yes or no."""
+    by_source: dict[int, set[int]] = {}
+    for cid, sid in pairs:
+        by_source.setdefault(sid, set()).add(cid)
+    out: dict[tuple[int, int], list] = {}
+    for sid, cids in by_source.items():
+        for chunk in _chunks(sorted(cids)):
+            for model in (EPGEntry, EpgAlternateEntry):
+                described = func.length(func.trim(func.coalesce(model.description, ''))) > 0
+                for cid, title, sub, has, start, stop in db.session.query(
+                        model.channel_id, model.title, model.sub_title, described,
+                        model.start_time, model.stop_time).filter(
+                        _of_source(model, sid), model.channel_id.in_(chunk),
+                        model.stop_time > now):
+                    out.setdefault((cid, sid), []).append(
+                        Listing(title, sub, 'y' if has else None, start, stop))
+    for rows in out.values():
+        rows.sort(key=lambda x: x.start)
+    return out
+
+
+def _preview_account(t: Trial, case_sensitive: bool, now: datetime,
+                     acc: Counter, changes: Counter) -> None:
+    aid = t.account_id
+    present = subscriptions_for([aid])[aid]
+    order = list(dict.fromkeys(t.order))
+    dropped = set(present) - set(order)
+    borrowed: dict[int, dict[int, int]] = {}
+    for sid in order:
+        if sid not in present:
+            _covered, pairs = copy_pairs(aid, sid, case_sensitive)
+            for target, donor in pairs:
+                borrowed.setdefault(target, {})[sid] = donor
+
+    q = db.session.query(Channel.id, Channel.account_id, Channel.epg_channel_id, Channel.hidden,
+                         Channel.epg_source_id, Channel.epg_source_override_id).filter(
+        Channel.account_id == aid, Channel.hidden.is_(False))
+    rows = (q.all() if t.channels is None
+            else [r for chunk in _chunks(sorted(set(t.channels))) for r in q.filter(
+                Channel.id.in_(chunk))])
+    if not rows:
+        return
+    ids = [r.id for r in rows]
+    donors = {d for per in borrowed.values() for d in per.values()}
+    raw = _held_by_table(sorted(set(ids) | donors))
+    held = _trial_held(raw, ids, dropped, borrowed)
+
+    candidates = set(order) | set(present) | {r.epg_source_override_id for r in rows
+                                              if r.epg_source_override_id}
+    keys = key_answers(candidates)
+    coverage = directory_coverage(candidates, case_sensitive)
+    unrefreshed = sources_without_directory(candidates)
+    held_cov = _held_coverage_from(held, unrefreshed) if unrefreshed else None
+
+    first: dict[int, int | None] = {}
+    for r in rows:
+        now_first = None if r.epg_source_id in dropped else r.epg_source_id
+        if t.refirst is not None and r.id not in t.refirst:
+            first[r.id] = now_first
+            continue
+        new, _why = resolve_row(r, order, keys, coverage, case_sensitive, held_cov)
+        if new is not None and not (new in held[0].get(r.id, {}) or new in held[1].get(r.id, {})):
+            new = now_first     # reresolve_channels(): never onto a source holding nothing here
+        first[r.id] = new
+
+    cache: dict[int, dict] = {}
+
+    def future(cids, when):
+        want = [c for c in cids if c not in cache]
+        if want:
+            got = _future_listings(sorted(set(want) | {d for c in want
+                                                       for d in borrowed.get(c, {}).values()}),
+                                   when)
+            for c in want:
+                mine = {s: v for s, v in got.get(c, {}).items() if s not in dropped}
+                for sid, donor in borrowed.get(c, {}).items():
+                    mine.pop(sid, None)
+                    if sid in got.get(donor, {}):
+                        mine[sid] = got[donor][sid]
+                cache[c] = mine
+        return {c: cache[c] for c in cids}
+
+    ctx = _PlanContext({aid: order}, keys, _shared_id_flags([aid], case_sensitive), coverage,
+                       unrefreshed)
+    trial_rows = [_TrialRow(r.id, aid, r.epg_channel_id, False, first[r.id]) for r in rows]
+    planned = {p.channel_id: p for p in _plan_stretches(
+        trial_rows, case_sensitive, now, ctx=ctx, held_by_table=lambda _ids: held,
+        future_listings=future)}
+    fills_now = filling_sources(ids)
+
+    switched = []
+    for r in rows:
+        old, new = r.epg_source_id, first[r.id]
+        p = planned.get(r.id)
+        if old != new:
+            changes[(old, new)] += 1
+            if old is not None and new is not None:
+                switched.append((r.id, old, new))
+        elif old is not None and p is not None and fills_now.get(r.id, []) != [
+                s.source_id for s in p.stretches if s.outcome == EPG_STRETCH_FILLS]:
+            acc['refilled'] += 1
+        before = max((h.last_stop for h in raw[0].get(r.id, {}).values()), default=None)
+        after = p.end if p is not None else None
+        if new is not None and before is not None and after is not None and after < before:
+            acc['shorter'] += 1
+            acc['most_hours_shorter'] = max(acc['most_hours_shorter'],
+                                            math.ceil((before - after).total_seconds() / 3600))
+
+    reads = {(cid, old) for cid, old, _new in switched}
+    reads |= {(borrowed.get(cid, {}).get(new, cid), new) for cid, _old, new in switched}
+    detail = _detailed_listings(reads, now)
+    for cid, old, new in switched:
+        cmp = compare_listings(detail.get((cid, old), []),
+                               detail.get((borrowed.get(cid, {}).get(new, cid), new), []))
+        acc['same'] += cmp.same
+        acc['moved'] += cmp.moved
+        acc['different'] += cmp.different
+        acc['only_before'] += cmp.only_active
+        acc['only_after'] += cmp.only_other
+        acc['described_before'] += cmp.described_active
+        acc['described_after'] += cmp.described_other
+        for row in cmp.rows:
+            if row.kind == ROW_SAME and row.counted:
+                acc['episodes_before'] += bool(row.active.sub_title)
+                acc['episodes_after'] += bool(row.other.sub_title)
+        if cmp.verdict == CMP_UNRELATED:
+            acc['unaligned'] += 1
+        time_mod.sleep(0)   # yield the GIL to request threads between channels
+
+
+def preview_orders(trials, case_sensitive: bool,
+                   now: datetime | None = None) -> OrderPreview:
+    """What these order changes would do to each channel's guide, without doing it. Reads
+    only. A channel's first source is decided as the change would decide it, its guide's
+    end with the sources that would continue it, and the old and new first source's
+    listings are compared for every channel whose first source changes."""
+    now = now or datetime.utcnow()
+    acc: Counter = Counter()
+    changes: Counter = Counter()
+    for t in trials:
+        _preview_account(t, case_sensitive, now, acc, changes)
+    return OrderPreview(len(trials), dict(changes), *(acc[f] for f in _PREVIEW_COUNTS))
+
+
+def _holders(account_id: int, source_ids) -> list[int]:
+    """The account's visible channels holding any of these sources' listings or starting
+    their guide with one: the only ones whose guide a move of those sources can change
+    (settle_accounts()' argument)."""
+    out = set()
+    for sid in source_ids:
+        out.update(_holding_channels(account_id, sid))
+    if source_ids:
+        out.update(cid for (cid,) in db.session.query(Channel.id).filter(
+            Channel.account_id == account_id, Channel.hidden.is_(False),
+            Channel.epg_source_id.in_(list(source_ids))))
+    return sorted(out)
+
+
+def move_trial(account_id: int, source_id: int, step: int) -> OrderTrial | None:
+    """move_source()'s change as a trial. None when the account does not read the source."""
+    present = subscriptions_for([account_id])[account_id]
+    new = moved_order(present, source_id, step)
+    if new is None:
+        return None
+    if new == present:
+        return OrderTrial([], noop=True)
+    placed = placed_for_account(account_id)
+    own = (own_order_sentence(account_id)
+           if placed and not still_following(placed, new) else None)
+    traded = {s for i, s in enumerate(present) if new[i] != s}
+    return OrderTrial([Trial(account_id, new, _holders(account_id, traded))], own)
+
+
+def stop_trial(account_id: int, source_id: int) -> OrderTrial | None:
+    """stop_using_source()'s change as a trial: the channels it starts are re-decided, the
+    ones it continues are placed again. None when the account does not read the source."""
+    present = subscriptions_for([account_id])[account_id]
+    if source_id not in present:
+        return None
+    affected = {cid for (cid,) in db.session.query(Channel.id).filter(
+        Channel.account_id == account_id, Channel.epg_source_id == source_id)}
+    filled = stretch_channel_ids(source_id, account_id)
+    own = (own_order_sentence(account_id) if source_id in placed_for_account(account_id)
+           else None)
+    return OrderTrial([Trial(account_id, [s for s in present if s != source_id],
+                             sorted(affected | set(filled)), affected)], own)
+
+
+def _following_order(account_id: int, entries, present: list) -> list:
+    return follow_order(placed_by_provider(entries, own_guide_ids([account_id]).get(account_id)),
+                        present)
+
+
+def follow_trial(account_id: int) -> OrderTrial | None:
+    """follow_provider_again()'s change as a trial. None when the account is on no
+    provider."""
+    account = db.session.get(Account, account_id)
+    if account is None or account.provider_id is None:
+        return None
+    present = subscriptions_for([account_id])[account_id]
+    order = _following_order(account_id, provider_list(account.provider_id) or _SLOT_ONLY,
+                             present)
+    return OrderTrial([Trial(account_id, order)])
+
+
+def provider_move_trial(provider_id: int, entry_id: int, step: int) -> OrderTrial | None:
+    """move_provider_entry()'s change as a trial over every account following the list.
+    None when the entry is not on it."""
+    entries = provider_list(provider_id)
+    ids = [e.id for e in entries]
+    new = moved_order(ids, entry_id, step)
+    if new is None:
+        return None
+    if new == ids:
+        return OrderTrial([], noop=True)
+    traded = _traded(entries, new)
+    reordered = sorted(entries, key=lambda e: new.index(e.id))
+    following = [aid for aid in provider_account_ids(provider_id)
+                 if follows(db.session.get(Account, aid))]
+    guides = own_guide_ids(following)
+    present = subscriptions_for(following)
+    # The channels move_provider_entry() re-decides: settle_accounts()' holders, no more.
+    return OrderTrial([Trial(aid, _following_order(aid, reordered, present[aid]),
+                             sorted({cid for sid in _entry_sources(traded, guides.get(aid))
+                                     for cid in _holding_channels(aid, sid)}))
+                       for aid in following])
+
+
+def join_trial(account_ids, provider_id: int | None) -> OrderTrial:
+    """provider_changed()'s change for accounts joining a provider, as a trial: each stops
+    using its old provider's sources and follows the new list. `provider_id` None is a
+    provider not created yet, whose list is the slot alone. An account already on the
+    provider changes nothing and is left out."""
+    trials = []
+    for aid in account_ids:
+        account = db.session.get(Account, aid)
+        if account is None or (provider_id is not None and account.provider_id == provider_id):
+            continue
+        present = subscriptions_for([aid])[aid]
+        if account.provider_id is not None:
+            theirs = {sid for (sid,) in db.session.query(EpgSource.id).filter(
+                EpgSource.owner_provider_id == account.provider_id)}
+            present = [s for s in present if s not in theirs]
+        entries = (provider_list(provider_id) if provider_id is not None else []) or _SLOT_ONLY
+        trials.append(Trial(aid, _following_order(aid, entries, present)))
+    return OrderTrial(trials)
+
+
+def _names(source_ids, names: dict) -> str:
+    return join_labels([names.get(s, f'source {s}') for s in source_ids])
+
+
+def preview_lines(p: OrderPreview, names: dict) -> list[str]:
+    """The preview in plain sentences, one per paragraph. `names` {source_id: name}. Says
+    what the comparison can stand behind: a different title in the same slot is not called
+    a different program, since two guides often name one program differently."""
+    if not p.changes and not p.refilled and not p.shorter:
+        return ["No channel's guide would change."]
+    lines = []
+    if p.switched:
+        moves = sorted(((n, old, new) for (old, new), n in p.changes.items()
+                        if old is not None and new is not None), key=lambda x: (-x[0], x[1], x[2]))
+        parts = [f'{n:,} from {_names([old], names)} to {_names([new], names)}'
+                 for n, old, new in moves[:3]]
+        if len(moves) > 3:
+            parts.append(f'{sum(n for n, _o, _n in moves[3:]):,} between other sources')
+        lines.append(f'{counted(p.switched, "channel")} would start '
+                     f'{plural(p.switched, "its", "their")} guide with a different source: '
+                     f'{join_labels(parts)}.')
+    if p.gained:
+        lines.append(f'{counted(p.gained, "channel")} with no guide now would get one.')
+    if p.lost:
+        lines.append(f'{counted(p.lost, "channel")} would have no guide.')
+    if p.switched:
+        judged = p.same + p.moved + p.different + p.only_before + p.only_after
+        if judged:
+            lines.append(
+                f'Over the hours both list for those channels, {counted(p.same, "listing")} '
+                f'{plural(p.same, "is", "are")} the same program, {p.moved:,} the same program at '
+                f'another time, and {p.different:,} {plural(p.different, "has", "have")} a '
+                f'different title in the same slot (some of those are the same program named '
+                f'differently). {p.only_before:,} {plural(p.only_before, "is", "are")} listed '
+                f'only by the source used now and {p.only_after:,} only by the new one.')
+        else:
+            lines.append('The two sources list no hours in common for those channels, so '
+                         'their listings could not be compared.')
+        if p.same:
+            lines.append(
+                f'Of the same programs, {_share(p.described_before, p.same)} have a '
+                f'description now and {_share(p.described_after, p.same)} would after; '
+                f'{_share(p.episodes_before, p.same)} have an episode title now and '
+                f'{_share(p.episodes_after, p.same)} would after.')
+        if p.unaligned:
+            lines.append(f'On {counted(p.unaligned, "channel")} fewer than half the listings '
+                         'line up between the two sources.')
+    if p.refilled:
+        lines.append(f'{counted(p.refilled, "channel")} would keep the source '
+                     f'{plural(p.refilled, "its guide starts", "their guides start")} with but '
+                     f'be continued past its end by different sources.')
+    if p.shorter:
+        whose = (f'{counted(p.shorter, "channel")}\'s guide' if p.shorter == 1
+                 else f'{p.shorter:,} channels\' guides')
+        lines.append(f'{whose} would end sooner, by up to '
+                     f'{counted(p.most_hours_shorter, "hour")}.')
+    return lines
+
+
+def preview_json(t: OrderTrial, case_sensitive: bool) -> dict:
+    """The API answer for one action's preview: the sentences, the counts behind them, and
+    the own-order sentence the action would need confirmed."""
+    if t.noop:
+        return {'success': True, 'noop': True, 'lines': [], 'own_order': None}
+    p = preview_orders(t.trials, case_sensitive)
+    ids = {s for pair in p.changes for s in pair if s is not None}
+    names = dict(db.session.query(EpgSource.id, EpgSource.name).filter(
+        EpgSource.id.in_(list(ids)))) if ids else {}
+    return {'success': True, 'noop': False, 'lines': preview_lines(p, names),
+            'own_order': t.own_order, 'accounts': p.accounts, 'switched': p.switched,
+            'gained': p.gained, 'lost': p.lost, 'refilled': p.refilled, 'shorter': p.shorter,
+            'counts': {f: getattr(p, f) for f in _PREVIEW_COUNTS}}

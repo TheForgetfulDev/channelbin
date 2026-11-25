@@ -223,6 +223,22 @@ def create_provider_api():
     return jsonify({'success': True, 'provider_id': provider.id, 'message': message})
 
 
+@providers_bp.route('/api/providers/join-preview')
+def provider_join_preview_api():
+    """What putting accounts on a provider would do to their guides (DESIGN-epg-sources.md
+    §15.5): `?account_ids=1,2`, and `provider_id` for an existing provider (none for one
+    being created). Reads only."""
+    try:
+        ids = [int(a) for a in (request.args.get('account_ids') or '').split(',') if a.strip()]
+        pid = request.args.get('provider_id', type=int)
+    except ValueError:
+        return jsonify({'error': 'account_ids must be account ids.'}), 400
+    if pid is not None and db.session.get(Provider, pid) is None:
+        return jsonify({'error': 'Provider not found.'}), 404
+    from ..epg_sources import join_trial, preview_json
+    return jsonify(preview_json(join_trial(ids, pid), _cs()))
+
+
 @providers_bp.route('/api/providers/<int:provider_id>/rename', methods=['POST'])
 def rename_provider_api(provider_id):
     data = request.get_json(silent=True) or {}
@@ -613,6 +629,23 @@ def give_provider_epg_source_api(provider_id, source_id):
     if done.affected:
         message += f' On the other accounts: {_removal_clause(done)}'
     return jsonify({'success': True, 'message': message})
+
+
+@providers_bp.route('/api/providers/<int:provider_id>/epg-order/<int:entry_id>/move-preview')
+def move_provider_epg_entry_preview_api(provider_id, entry_id):
+    """What moving one entry of the provider's list would do to the guides of the accounts
+    following it (?direction=up|down). Reads only."""
+    _provider, err = _provider_or_404(provider_id)
+    if err:
+        return err
+    direction = request.args.get('direction')
+    if direction not in ('up', 'down'):
+        return jsonify({'error': 'direction must be "up" or "down"'}), 400
+    from ..epg_sources import preview_json, provider_move_trial
+    trial = provider_move_trial(provider_id, entry_id, -1 if direction == 'up' else 1)
+    if trial is None:
+        return jsonify({'error': 'That entry is not on this provider\'s list.'}), 404
+    return jsonify(preview_json(trial, _cs()))
 
 
 @providers_bp.route('/api/providers/<int:provider_id>/epg-order/<int:entry_id>/move',

@@ -694,6 +694,30 @@ function showToast(message, { type = 'success', html = false, durationMs = 5000 
   _toastTimer = setTimeout(() => { t.className = 'toast'; }, durationMs);
 }
 
+// Take down a toast shown for work whose end is not a time, such as "working out what this
+// changes" ahead of the dialog that answers it.
+function hideToast() {
+  clearTimeout(_toastTimer);
+  const t = document.getElementById('app-toast');
+  if (t) t.className = 'toast';
+}
+
+// Ask the server what a change would do before the user confirms it (an EPG order change,
+// DESIGN-epg-sources.md §15.3): resolves to its answer ({lines, own_order, noop}). A preview
+// that fails never blocks the change it describes - it resolves to `failed` with a line
+// saying so, and the caller's dialog still offers the action. About 20 s on an account with
+// a few thousand guided channels (dev/changelog/1723), so the toast stays up until then.
+function previewChange(url) {
+  showToast('Working out what this changes...', { durationMs: 120000 });
+  return jsonFetch(url).then((p) => { hideToast(); return p; }).catch((e) => {
+    hideToast();
+    return {
+      failed: true, noop: false, own_order: null,
+      lines: [`Could not work out what this changes (${(e && e.message) || 'request failed'}).`],
+    };
+  });
+}
+
 // Render a message + clickable conflict-recording list into a modal error element.
 function showConflictError(elId, msg, conflicts, recDetailUrlBase) {
   const el = document.getElementById(elId);
