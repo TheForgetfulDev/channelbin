@@ -12,7 +12,9 @@ read here and never written here by anything a sync reaches (DESIGN-epg-sources.
 """
 from __future__ import annotations
 
+import bisect
 import difflib
+import functools
 import json
 import logging
 import math
@@ -3539,6 +3541,7 @@ _COUNTRY_TAG = re.compile(r'^\s*[A-Za-z]{2,3}(?:\s+[A-Za-z]{2})?\s*[:|]\s*'
 _SAME_NAME_RATIO = 0.8
 
 
+@functools.lru_cache(maxsize=65536)
 def name_core(name: str | None) -> str:
     """What a channel name says about WHICH channel it is, for comparing two names: the
     country tag, accents, marks and delivery words gone, and what is left run together
@@ -3807,6 +3810,11 @@ ROW_ONLY_OTHER = 'only-other'
 #: verdict, which would otherwise call two agreeing guides unrelated.
 ROW_DOUBLED_ACTIVE = 'doubled-active'
 ROW_DOUBLED_OTHER = 'doubled-other'
+#: A listing titled with the channel's own name and matching nothing on the other side: the
+#: source has no program there. Shown, and left out of the verdict, so its slot partner is
+#: "only in the other source" rather than a different program (dev/changelog/1725).
+ROW_PLACEHOLDER_ACTIVE = 'placeholder-active'
+ROW_PLACEHOLDER_OTHER = 'placeholder-other'
 
 
 class Listing(NamedTuple):
@@ -3826,6 +3834,9 @@ class CompareRow(NamedTuple):
     active: Listing | None
     other: Listing | None
     counted: bool       # judged: inside the stretch both sources list, and not doubled
+    #: ROW_SAME only: paired as one program under another name - one title the other plus
+    #: more words, or _another_name() - not on equal comparison titles.
+    renamed: bool = False
 
     @property
     def start(self) -> datetime:
@@ -3848,34 +3859,156 @@ class Comparison(NamedTuple):
     largest_move: timedelta | None   # other minus active, the largest in size
     doubled_active: int      # ROW_DOUBLED_ACTIVE rows
     doubled_other: int
+    renamed: int             # of `same`, the pairs judged one program under another name
+    placeholder_active: int  # ROW_PLACEHOLDER_ACTIVE rows
+    placeholder_other: int
 
 
+#: The accents NFKD splits off Latin, Greek and Cyrillic letters (`š`, `ț`, `ё`). Only this
+#: block: a kana voicing mark or an Indic vowel sign is part of the letter, and dropping one
+#: would make two different words equal.
+_ACCENTS = re.compile('[̀-ͯ]+')
+
+
+@functools.lru_cache(maxsize=65536)
 def comparison_title(title: str | None) -> str:
-    """A listing's title as the comparison matches it: §7.3's normalize_name() after
-    dropping the marks providers write into titles - the superscript tags (`ᴺᵉʷ`, `ᴸᶦᵛᵉ`,
-    `ᴿᴬᵂ`, 131,000 of them in the live guide) that one feed carries and another does not,
-    and a leading `Live:`, the other feeds' spelling of the same tag
-    (`U.S. Senate ᴸᶦᵛᵉ` / `Live: U.S. Senate`).
+    """A listing's title as the comparison matches it: the marks providers write into
+    titles dropped - the superscript tags (`ᴺᵉʷ`, `ᴸᶦᵛᵉ`, `ᴿᴬᵂ`, 131,000 of them in the live
+    guide) that one feed carries and another does not, and a leading `Live:`, the other
+    feeds' spelling of the same tag (`U.S. Senate ᴸᶦᵛᵉ` / `Live: U.S. Senate`) - then
+    casefolded, accents folded (`Ţ` / `ț`) and every run of punctuation, symbols and spaces
+    one space (`šéfe!` / `sefe`), keeping the letters, marks and digits of every script.
+
+    Measured on prod's 2026-11-25 copy (dev/changelog/1725): folding found 235 of 6,900
+    listings one account's two guides called different programs the same, and none of
+    20,006 pairs from unrelated channels. A title that folds to nothing (`⚽`) keeps its
+    §7.3 normalize_name() form, so two symbol-only titles are not equal by both being
+    empty.
 
     The marks are program_titles.strip_marks(), the one definition auto-record rules use
-    too (DESIGN-autoschedule.md §3.3). The separator folding is this comparison's own."""
-    return normalize_name(strip_marks(title))
+    too (DESIGN-autoschedule.md §3.3). The folding is this comparison's own."""
+    bare = strip_marks(title)
+    text = _ACCENTS.sub('', unicodedata.normalize('NFKD', bare).casefold())
+    text = ''.join(ch if unicodedata.category(ch)[0] in 'LMN' else ' ' for ch in text)
+    folded = unicodedata.normalize('NFC', ' '.join(text.split()))
+    return folded or normalize_name(bare)
+
+
+#: A word spelled two ways differs by at most this many letters (`проклятья` / `проклятия`,
+#: `Zvezdice` / `zvjezdice`), and only in words this long: `Bachelor` / `Bachelorette` is
+#: four apart, `Friends` / `Fiends` a one-word title (dev/changelog/1725).
+_SPELLING_EDITS = 2
+_SPELLING_MIN_LETTERS = 4
+_NUMBERS = re.compile(r'\d+')
 
 
 def _word_prefix(x: str, y: str) -> bool:
     return bool(x and y) and (x.startswith(y + ' ') or y.startswith(x + ' '))
 
 
-def _pair(a, b, used_a, used_b, window, match) -> list[tuple[int, int]]:
+def _edits_within(a: str, b: str, cap: int) -> bool:
+    """Whether `a` becomes `b` in at most `cap` single-letter insertions, deletions or
+    substitutions."""
+    if abs(len(a) - len(b)) > cap:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) > cap:
+            return False
+        prev = cur
+    return prev[-1] <= cap
+
+
+@functools.lru_cache(maxsize=65536)
+def _spelled_alike(x: str, y: str) -> bool:
+    """Whether two comparison titles are one spelled two ways: as many words, at least two,
+    fewer than half of them different, and each different word long and a letter or two
+    apart. A one-word title is never a misspelling of another, and neither is a number:
+    `Formula 1` / `Formula 2` and `episode 3` / `episode 4` stay apart."""
+    xw, yw = x.split(), y.split()
+    if len(xw) != len(yw) or len(xw) < 2 or _NUMBERS.findall(x) != _NUMBERS.findall(y):
+        return False
+    differ = [(p, q) for p, q in zip(xw, yw) if p != q]
+    return (0 < len(differ) <= len(xw) // 2
+            and all(min(len(p), len(q)) >= _SPELLING_MIN_LETTERS
+                    and _edits_within(p, q, _SPELLING_EDITS) for p, q in differ))
+
+
+class _Titles(NamedTuple):
+    """What the comparison reads of one listing's names, worked out once per listing."""
+    title: str
+    sub_title: str
+    words: frozenset
+
+
+def _titles(x: Listing) -> _Titles:
+    t = comparison_title(x.title)
+    return _Titles(t, comparison_title(x.sub_title) if x.sub_title else '', frozenset(t.split()))
+
+
+def _named_as(name: str, title: str) -> bool:
+    """An episode title standing for the other side's title: equal, or one the other plus
+    more words, and the shorter of the two at least two words."""
+    shorter = name if len(name) <= len(title) else title
+    return (len(shorter.split()) >= 2
+            and (name == title or _word_prefix(name, title)))
+
+
+def _another_name(x: _Titles, y: _Titles) -> bool:
+    """Whether two listings starting together are one program named two ways, past the
+    matching titles compare_listings() tries first. Each rule was measured on prod's
+    2026-11-25 copy, account 5's two guides, against the 6,900 pairs called different and
+    20,006 same-slot pairs from unrelated channels (dev/changelog/1725):
+
+    - one side's episode title is the other's title (`Aces` with episode `Primo Per Sempre`
+      / `Primo Per Sempre`): 29 pairs, none unrelated;
+    - every word of a title of two words or more is in the other (`Nové Město` / `Epreuve de
+      Nove Mesto`, `PARTIZAN - DUBAI` / `Košarka - Aba Liga: Partizan - Dubai`): 659, one;
+    - the same title spelled two ways (_spelled_alike()): 127, none.
+
+    A one-word title never stands for a longer one or an episode: `News` is in `BBC World
+    News` and `Football` in `Monday Night Football`, and in a slot two guides fill differently
+    that says nothing. That leaves `Weltcup` / `Ski alpin: Weltcup Kitzbühel Abfahrt` apart.
+    A 60% word overlap, which called `FOX SPORTS News` and `FOX 10 News at 4PM` one program
+    16 times, was left out, as was difflib's ratio, which joins `The Bachelor` / `The
+    Bachelorette`."""
+    if not x.title or not y.title:
+        return False
+    if x.sub_title and _named_as(x.sub_title, y.title):
+        return True
+    if y.sub_title and _named_as(y.sub_title, x.title):
+        return True
+    smaller, larger = (x.words, y.words) if len(x.words) <= len(y.words) else (y.words, x.words)
+    if len(smaller) >= 2 and smaller <= larger:
+        return True
+    return _spelled_alike(x.title, y.title)
+
+
+def placeholder_names(names) -> frozenset:
+    """The name_core()s of the channel names a comparison treats as placeholder titles: a
+    listing titled with its channel's own name (`talkSPORT` on `UK: TALKSPORT`) says the
+    source has no program there. Cores under three characters are left out, as
+    same_channel_name() leaves them out."""
+    return frozenset(c for c in (name_core(n) for n in names if n) if len(c) >= 3)
+
+
+def _pair(a, b, used_a, used_b, window, match, b_starts) -> list[tuple[int, int]]:
     """Closest-first pairing of unused listings starting within `window` of each other for
-    which match(i, j) holds."""
+    which match(i, j) holds. `b_starts` is [(start, j)] over `b`, sorted, so each listing
+    looks only at the other side's listings inside its window."""
     cands = []
+    keys = [s for s, _j in b_starts]
     for i, x in enumerate(a):
         if i in used_a:
             continue
-        for j, y in enumerate(b):
-            if j not in used_b and abs(y.start - x.start) <= window and match(i, j):
-                cands.append((abs(y.start - x.start), i, j))
+        lo = bisect.bisect_left(keys, x.start - window)
+        hi = bisect.bisect_right(keys, x.start + window)
+        for start, j in b_starts[lo:hi]:
+            if j not in used_b and match(i, j):
+                cands.append((abs(start - x.start), i, j))
     cands.sort()
     out = []
     for _gap, i, j in cands:
@@ -3886,46 +4019,71 @@ def _pair(a, b, used_a, used_b, window, match) -> list[tuple[int, int]]:
     return out
 
 
-def compare_listings(active, other) -> Comparison:
+def compare_listings(active, other, *, placeholders) -> Comparison:
     """Line up one channel's listings from two sources and name the difference, under the
     rule recorded in DESIGN-epg-sources.md §12 - the same program starts within five
     minutes under a matching title - with the title match widened by measurement on the
-    live guide (dev/changelog/1108): comparison_title() drops providers' superscript tags,
-    and a title that is the other plus more words (`Hot Bench` / `Hot Bench - Timesharing
-    Is Caring`) is the same program when the two start together. Pure; both lists are the
-    listings from now on.
+    live guide (dev/changelog/1108, 1725): comparison_title() drops providers' superscript
+    tags, accents and punctuation; a title that is the other plus more words (`Hot Bench` /
+    `Hot Bench - Timesharing Is Caring`) is the same program when the two start together;
+    and so is one named two ways (_another_name()). Pure; both lists are the listings from
+    now on.
 
-    Pairing runs closest first: matching titles within five minutes, then equal titles
-    within six hours (moved - a rain delay), then any two leftovers starting together (a
-    different program in the same slot). Only the stretch both sources list is judged, so a
-    source listing 20 hours is not called unrelated to one listing 72."""
+    `placeholders` is placeholder_names() of the channel or channels the listings are for,
+    required so that no caller judges without them: a listing titled with one of those
+    names that nothing pairs with by title is a placeholder, the source having nothing
+    there, never a different program.
+
+    Pairing runs closest first: matching titles within five minutes, then one program under
+    another name within five minutes, then equal titles within six hours (moved - a rain
+    delay), then any two leftovers starting together that are not placeholders (a different
+    program in the same slot). Only the stretch both sources list is judged, so a source
+    listing 20 hours is not called unrelated to one listing 72."""
     a, b = list(active), list(other)
-    at = [comparison_title(x.title) for x in a]
-    bt = [comparison_title(x.title) for x in b]
+    an, bn = [_titles(x) for x in a], [_titles(x) for x in b]
+    at, bt = [x.title for x in an], [x.title for x in bn]
+    b_starts = sorted((x.start, j) for j, x in enumerate(b))
     used_a: set[int] = set()
     used_b: set[int] = set()
-    same = _pair(a, b, used_a, used_b, SAME_START, lambda i, j: at[i] == bt[j])
-    same += _pair(a, b, used_a, used_b, SAME_START, lambda i, j: _word_prefix(at[i], bt[j]))
-    moved = _pair(a, b, used_a, used_b, MOVED_WITHIN, lambda i, j: at[i] == bt[j])
-    different = _pair(a, b, used_a, used_b, SAME_START, lambda i, j: True)
+    same = _pair(a, b, used_a, used_b, SAME_START, lambda i, j: at[i] == bt[j], b_starts)
+    renamed = _pair(a, b, used_a, used_b, SAME_START,
+                    lambda i, j: _word_prefix(at[i], bt[j]), b_starts)
+    renamed += _pair(a, b, used_a, used_b, SAME_START,
+                     lambda i, j: _another_name(an[i], bn[j]), b_starts)
+    moved = _pair(a, b, used_a, used_b, MOVED_WITHIN, lambda i, j: at[i] == bt[j], b_starts)
+    held_a = {i for i, x in enumerate(a)
+              if i not in used_a and placeholders and name_core(x.title) in placeholders}
+    held_b = {j for j, x in enumerate(b)
+              if j not in used_b and placeholders and name_core(x.title) in placeholders}
+    different = _pair(a, b, used_a | held_a, used_b | held_b, SAME_START, lambda i, j: True,
+                      b_starts)
+    used_a.update(i for i, _j in different)
+    used_b.update(j for _i, j in different)
     since = max(min(x.start for x in a), min(x.start for x in b)) if a and b else None
     until = min(max(x.stop for x in a), max(x.stop for x in b)) if a and b else None
 
     def inside(x):
         return until is not None and since < until and x.stop > since and x.start < until
 
-    paired_a = {a[i].start for i, _j in same + moved + different}
-    paired_b = {b[j].start for _i, j in same + moved + different}
+    pairs = same + renamed + moved + different
+    paired_a = {a[i].start for i, _j in pairs}
+    paired_b = {b[j].start for _i, j in pairs}
     rows = ([CompareRow(ROW_SAME, a[i], b[j], inside(a[i])) for i, j in same]
+            + [CompareRow(ROW_SAME, a[i], b[j], inside(a[i]), renamed=True)
+               for i, j in renamed]
             + [CompareRow(ROW_MOVED, a[i], b[j], inside(a[i])) for i, j in moved]
             + [CompareRow(ROW_DIFFERENT, a[i], b[j], inside(a[i]))
                for i, j in different])
     for i, x in enumerate(a):
-        if i not in used_a:
+        if i in held_a:
+            rows.append(CompareRow(ROW_PLACEHOLDER_ACTIVE, x, None, False))
+        elif i not in used_a:
             rows.append(CompareRow(ROW_DOUBLED_ACTIVE, x, None, False) if x.start in paired_a
                         else CompareRow(ROW_ONLY_ACTIVE, x, None, inside(x)))
     for j, x in enumerate(b):
-        if j not in used_b:
+        if j in held_b:
+            rows.append(CompareRow(ROW_PLACEHOLDER_OTHER, None, x, False))
+        elif j not in used_b:
             rows.append(CompareRow(ROW_DOUBLED_OTHER, None, x, False) if x.start in paired_b
                         else CompareRow(ROW_ONLY_OTHER, None, x, inside(x)))
     rows.sort(key=lambda r: (r.start, r.active is None))
@@ -3959,7 +4117,9 @@ def compare_listings(active, other) -> Comparison:
         described_other=sum(1 for r in same_rows if r.other.described),
         description_gaps=gaps, largest_move=max(moves, key=abs) if moves else None,
         doubled_active=sum(1 for r in rows if r.kind == ROW_DOUBLED_ACTIVE),
-        doubled_other=sum(1 for r in rows if r.kind == ROW_DOUBLED_OTHER))
+        doubled_other=sum(1 for r in rows if r.kind == ROW_DOUBLED_OTHER),
+        renamed=sum(1 for r in same_rows if r.renamed),
+        placeholder_active=len(held_a), placeholder_other=len(held_b))
 
 
 # How one listing stands against a reference schedule, for a display that draws both
@@ -3973,8 +4133,9 @@ AGREE_DOUBLED = 'doubled'           # a second listing at a moment already liste
 AGREE_OUTSIDE = 'outside'           # past the stretch both list, so not judged
 AGREE_PAST = 'past'                 # over before now; the comparison starts from now
 AGREE_REFERENCE = 'reference'       # a listing of the reference itself
+AGREE_PLACEHOLDER = 'placeholder'   # titled with the channel's own name: no program there
 AGREEMENTS = (AGREE_SAME, AGREE_MOVED, AGREE_DIFFERENT, AGREE_ONLY_HERE, AGREE_DOUBLED,
-              AGREE_OUTSIDE, AGREE_PAST, AGREE_REFERENCE)
+              AGREE_OUTSIDE, AGREE_PAST, AGREE_REFERENCE, AGREE_PLACEHOLDER)
 #: The side of a same-program pair that has the only description.
 GAP_REFERENCE = 'reference'
 GAP_OTHER = 'other'
@@ -3984,17 +4145,19 @@ class Agreement(NamedTuple):
     kind: str
     partner: Listing | None   # the reference's listing it was paired with (same/moved/different)
     gap: str | None           # GAP_* on a same pair described on one side only
+    renamed: bool = False     # a same pair named two ways (CompareRow.renamed)
 
 
-def listing_agreement(reference, other, now):
+def listing_agreement(reference, other, now, *, placeholders):
     """(Comparison, [Agreement] parallel to `other`, [reference Listing other lacks]) -
     `other` judged listing by listing against `reference`, both from now on, by
-    compare_listings(). The lacking ones are the reference's counted listings with no
+    compare_listings(), with `placeholders` the placeholder_names() of both channels. The
+    lacking ones are the reference's counted listings with no
     partner that overlap nothing `other` lists, so a display can outline them without
     drawing one over a real listing. Pure."""
     ref_live = [x for x in reference if x.stop > now]
     oth_live = [x for x in other if x.stop > now]
-    cmp = compare_listings(ref_live, oth_live)
+    cmp = compare_listings(ref_live, oth_live, placeholders=placeholders)
     by_other = {id(r.other): r for r in cmp.rows if r.other is not None}
     out = []
     for x in other:
@@ -4004,13 +4167,15 @@ def listing_agreement(reference, other, now):
         r = by_other[id(x)]
         if r.kind == ROW_DOUBLED_OTHER:
             out.append(Agreement(AGREE_DOUBLED, None, None))
+        elif r.kind == ROW_PLACEHOLDER_OTHER:
+            out.append(Agreement(AGREE_PLACEHOLDER, None, None))
         elif not r.counted:
             out.append(Agreement(AGREE_OUTSIDE, None, None))
         elif r.kind == ROW_SAME:
             gap = None
             if r.active.described != r.other.described:
                 gap = GAP_REFERENCE if r.active.described else GAP_OTHER
-            out.append(Agreement(AGREE_SAME, r.active, gap))
+            out.append(Agreement(AGREE_SAME, r.active, gap, r.renamed))
         elif r.kind == ROW_MOVED:
             out.append(Agreement(AGREE_MOVED, r.active, None))
         elif r.kind == ROW_DIFFERENT:
@@ -4067,8 +4232,10 @@ def channel_source_comparisons(channel: Channel, now: datetime | None = None):
     if not held:
         return active, []
     sources = {s.id: s for s in EpgSource.query.filter(EpgSource.id.in_(list(held)))}
+    placeholders = placeholder_names([channel.name])
     return active, [SourceComparison(sources[sid], max(x.stop for x in held[sid]),
-                                     compare_listings(active, held[sid]))
+                                     compare_listings(active, held[sid],
+                                                      placeholders=placeholders))
                     for sid in order if sid in held]
 
 
@@ -4108,14 +4275,15 @@ class Stretch(NamedTuple):
 
 
 def decide_stretches(first: int, later, covers: dict, spans: dict, flagged, stored: dict,
-                     listings: dict) -> list[Stretch]:
+                     listings: dict, placeholders) -> list[Stretch]:
     """Which of `later` (the account's other sources, in its order) continue a channel's
     guide past `first`, and why not for the rest (§14.3, §14.4). Pure.
 
     `covers` {source_id: Coverage} for the sources that cover the channel; `spans`
     {source_id: Span} for the ones holding listings; `flagged` the sources through which the
     channel reads an id unrelated channels share; `stored` {source_id: (outcome, after)} as
-    last decided; `listings` {source_id: [Listing] from now on, by start}.
+    last decided; `listings` {source_id: [Listing] from now on, by start}; `placeholders`
+    the channel's placeholder_names().
 
     A source is judged against the source of the stretch before it, and a refused one is
     passed over: the next is judged against the same stretch. The checks run cheapest
@@ -4137,7 +4305,8 @@ def decide_stretches(first: int, later, covers: dict, spans: dict, flagged, stor
               and not covers[sid].real_schedule):
             outcome = EPG_STRETCH_NO_SCHEDULE
         else:
-            cmp = compare_listings(listings.get(prev, ()), listings.get(sid, ()))
+            cmp = compare_listings(listings.get(prev, ()), listings.get(sid, ()),
+                                   placeholders=placeholders)
             kept = stored.get(sid)
             if cmp.compared < FILL_MIN_JUDGED:
                 judged = None
@@ -4192,17 +4361,18 @@ def _held_by_table(channel_ids) -> tuple[dict, dict]:
 
 
 def _future_listings(channel_ids, now: datetime) -> dict[int, dict[int, list]]:
-    """{channel_id: {source_id: [Listing] from now on, by start}} over both tables. Titles
-    and times only: they are all a verdict is made from."""
+    """{channel_id: {source_id: [Listing] from now on, by start}} over both tables. Titles,
+    episode titles and times: all a verdict is made from (compare_listings() pairs one
+    side's episode title with the other's title, dev/changelog/1725)."""
     out: dict[int, dict[int, list]] = {}
     for chunk in _chunks(channel_ids):
         for model in (EPGEntry, EpgAlternateEntry):
-            for cid, sid, title, start, stop in db.session.query(
-                    model.channel_id, model.source_id, model.title, model.start_time,
-                    model.stop_time).filter(model.channel_id.in_(chunk),
-                                            model.stop_time > now):
+            for cid, sid, title, sub_title, start, stop in db.session.query(
+                    model.channel_id, model.source_id, model.title, model.sub_title,
+                    model.start_time, model.stop_time).filter(model.channel_id.in_(chunk),
+                                                              model.stop_time > now):
                 out.setdefault(cid, {}).setdefault(sid, []).append(
-                    Listing(title, None, None, start, stop))
+                    Listing(title, sub_title, None, start, stop))
     for by_source in out.values():
         for rows in by_source.values():
             rows.sort(key=lambda x: x.start)
@@ -4286,7 +4456,7 @@ def _plan_stretches(rows, case_sensitive: bool, now: datetime, coverage_of=None,
                     ctx: _PlanContext | None = None, held_by_table=None,
                     future_listings=None) -> list[_Placement]:
     """Decide every channel in `rows` (id, account_id, epg_channel_id, hidden,
-    epg_source_id) from what the database holds. Reads only.
+    epg_source_id, name) from what the database holds. Reads only.
 
     `coverage_of` {channel_id: {source_id: Coverage}} is passed by a caller that already
     has one channel's coverage (a key write); otherwise it is read from the directory, with
@@ -4364,7 +4534,7 @@ def _plan_stretches(rows, case_sensitive: bool, now: datetime, coverage_of=None,
         mine, covers, spans, flagged = facts[r.id]
         decided = decide_stretches(mine[0], mine[1:], covers, spans, flagged,
                                    {sid: (o, after) for sid, (_p, o, after, _at) in was.items()},
-                                   listings.get(r.id, {}))
+                                   listings.get(r.id, {}), placeholder_names([r.name]))
         ends = [spans[s].last_stop for s in [mine[0]] + [x.source_id for x in decided
                                                            if x.outcome == EPG_STRETCH_FILLS]
                 if s in spans]
@@ -4485,7 +4655,7 @@ def _channel_rows(channel_ids):
     rows = []
     for chunk in _chunks(channel_ids):
         rows += db.session.query(Channel.id, Channel.account_id, Channel.epg_channel_id,
-                                 Channel.hidden, Channel.epg_source_id).filter(
+                                 Channel.hidden, Channel.epg_source_id, Channel.name).filter(
             Channel.id.in_(chunk)).all()
     return rows
 
@@ -4543,7 +4713,7 @@ def place_channel_now(channel: Channel, case_sensitive: bool, coverage: dict | N
     now = now or datetime.utcnow()
     db.session.flush()
     row = db.session.query(Channel.id, Channel.account_id, Channel.epg_channel_id,
-                           Channel.hidden, Channel.epg_source_id).filter(
+                           Channel.hidden, Channel.epg_source_id, Channel.name).filter(
         Channel.id == channel.id).one()
     if coverage is None and row.epg_source_id is not None and not row.hidden:
         order = subscriptions_for([row.account_id]).get(row.account_id, [])
@@ -4723,6 +4893,9 @@ class OrderPreview(NamedTuple):
     refilled: int           # channels keeping their first source whose continuing sources change
     shorter: int            # channels whose guide would end sooner
     most_hours_shorter: int # ... by up to this many hours, rounded up
+    renamed: int            # of `same`, one program named two ways
+    placeholder_before: int # listings of the old first source titled with the channel's name
+    placeholder_after: int  # ... of the new one
 
     def _sum(self, keep) -> int:
         return sum(n for (old, new), n in self.changes.items() if keep(old, new))
@@ -4742,7 +4915,8 @@ class OrderPreview(NamedTuple):
 
 _PREVIEW_COUNTS = ('same', 'moved', 'different', 'only_before', 'only_after',
                    'described_before', 'described_after', 'episodes_before',
-                   'episodes_after', 'unaligned', 'refilled', 'shorter', 'most_hours_shorter')
+                   'episodes_after', 'unaligned', 'refilled', 'shorter', 'most_hours_shorter',
+                   'renamed', 'placeholder_before', 'placeholder_after')
 
 
 class _TrialRow(NamedTuple):
@@ -4751,6 +4925,7 @@ class _TrialRow(NamedTuple):
     epg_channel_id: str | None
     hidden: bool
     epg_source_id: int | None
+    name: str | None
 
 
 class _ListEntry(NamedTuple):
@@ -4847,7 +5022,8 @@ def _preview_account(t: Trial, case_sensitive: bool, now: datetime,
                 borrowed.setdefault(target, {})[sid] = donor
 
     q = db.session.query(Channel.id, Channel.account_id, Channel.epg_channel_id, Channel.hidden,
-                         Channel.epg_source_id, Channel.epg_source_override_id).filter(
+                         Channel.epg_source_id, Channel.epg_source_override_id,
+                         Channel.name).filter(
         Channel.account_id == aid, Channel.hidden.is_(False))
     rows = (q.all() if t.channels is None
             else [r for chunk in _chunks(sorted(set(t.channels))) for r in q.filter(
@@ -4896,7 +5072,8 @@ def _preview_account(t: Trial, case_sensitive: bool, now: datetime,
 
     ctx = _PlanContext({aid: order}, keys, _shared_id_flags([aid], case_sensitive), coverage,
                        unrefreshed)
-    trial_rows = [_TrialRow(r.id, aid, r.epg_channel_id, False, first[r.id]) for r in rows]
+    trial_rows = [_TrialRow(r.id, aid, r.epg_channel_id, False, first[r.id], r.name)
+                  for r in rows]
     planned = {p.channel_id: p for p in _plan_stretches(
         trial_rows, case_sensitive, now, ctx=ctx, held_by_table=lambda _ids: held,
         future_listings=future)}
@@ -4923,10 +5100,15 @@ def _preview_account(t: Trial, case_sensitive: bool, now: datetime,
     reads = {(cid, old) for cid, old, _new in switched}
     reads |= {(borrowed.get(cid, {}).get(new, cid), new) for cid, _old, new in switched}
     detail = _detailed_listings(reads, now)
+    name_of = {r.id: r.name for r in rows}
     for cid, old, new in switched:
         cmp = compare_listings(detail.get((cid, old), []),
-                               detail.get((borrowed.get(cid, {}).get(new, cid), new), []))
+                               detail.get((borrowed.get(cid, {}).get(new, cid), new), []),
+                               placeholders=placeholder_names([name_of[cid]]))
         acc['same'] += cmp.same
+        acc['renamed'] += cmp.renamed
+        acc['placeholder_before'] += cmp.placeholder_active
+        acc['placeholder_after'] += cmp.placeholder_other
         acc['moved'] += cmp.moved
         acc['different'] += cmp.different
         acc['only_before'] += cmp.only_active
@@ -5088,16 +5270,23 @@ def preview_lines(p: OrderPreview, names: dict) -> list[str]:
     if p.switched:
         judged = p.same + p.moved + p.different + p.only_before + p.only_after
         if judged:
+            renamed = f' ({p.renamed:,} of them named differently)' if p.renamed else ''
             lines.append(
                 f'Over the hours both list for those channels, {counted(p.same, "listing")} '
-                f'{plural(p.same, "is", "are")} the same program, {p.moved:,} the same program at '
-                f'another time, and {p.different:,} {plural(p.different, "has", "have")} a '
-                f'different title in the same slot (some of those are the same program named '
-                f'differently). {p.only_before:,} {plural(p.only_before, "is", "are")} listed '
-                f'only by the source used now and {p.only_after:,} only by the new one.')
+                f'{plural(p.same, "is", "are")} the same program{renamed}, {p.moved:,} the same '
+                f'program at another time, and {p.different:,} '
+                f'{plural(p.different, "has", "have")} a different title in the same slot (some '
+                f'of those may still be one program named two ways). {p.only_before:,} '
+                f'{plural(p.only_before, "is", "are")} listed only by the source used now and '
+                f'{p.only_after:,} only by the new one.')
         else:
             lines.append('The two sources list no hours in common for those channels, so '
                          'their listings could not be compared.')
+        if p.placeholder_before or p.placeholder_after:
+            lines.append(
+                f'{p.placeholder_before:,} {plural(p.placeholder_before, "listing", "listings")} '
+                f'from the source used now and {p.placeholder_after:,} from the new one are only '
+                f"the channel's name, not a program, so they are not counted above.")
         if p.same:
             lines.append(
                 f'Of the same programs, {_share(p.described_before, p.same)} have a '

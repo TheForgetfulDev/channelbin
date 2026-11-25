@@ -32,7 +32,7 @@ from ..db_utils import chunked, retry_on_locked
 from ..logo_cache import get_logo_cache_dir, resolve_logo_url
 from ..storage_dirs import manual_screenshot_paths
 from .. import fmt_utils
-from ..fmt_utils import counted
+from ..fmt_utils import counted, plural
 from ..health_score import set_manual_adjustment
 
 log = logging.getLogger(__name__)
@@ -1988,6 +1988,10 @@ def _comparison_summary(c, active_name: str, other_name: str, until_text: str) -
         out.append(f'{c.same:,} of {counted(c.compared, "program")} match.')
     else:
         raise ValueError(f'unknown comparison verdict {c.verdict!r}')
+    if c.renamed and c.verdict != CMP_NO_OVERLAP:
+        out.append(f'{counted(c.renamed, "program")} of those '
+                   f'{plural(c.renamed, "matches", "match")} under a different name: an '
+                   'episode title used as the title, extra words, or another spelling.')
     if c.moved:
         move = c.largest_move.total_seconds()
         out.append(f'{counted(c.moved, "program")} {"starts" if c.moved == 1 else "start"} '
@@ -2008,16 +2012,22 @@ def _comparison_summary(c, active_name: str, other_name: str, until_text: str) -
         if n:
             out.append(f'{name} lists this channel twice at {counted(n, "time")} - its file '
                        'gives two programs the same start time.')
+    for n, name in ((c.placeholder_active, active_name), (c.placeholder_other, other_name)):
+        if n:
+            out.append(f"{name} lists only the channel's name at {counted(n, 'time')}, not a "
+                       'program, so those are left out.')
     return out
 
 
 def _difference_text(row, active_name: str, other_name: str) -> str:
     from ..epg_sources import (ROW_DIFFERENT, ROW_DOUBLED_ACTIVE, ROW_DOUBLED_OTHER,
-                               ROW_MOVED, ROW_ONLY_ACTIVE, ROW_ONLY_OTHER, ROW_SAME)
+                               ROW_MOVED, ROW_ONLY_ACTIVE, ROW_ONLY_OTHER, ROW_PLACEHOLDER_ACTIVE,
+                               ROW_PLACEHOLDER_OTHER, ROW_SAME)
     if row.kind == ROW_SAME:
+        same = 'Same, named differently' if row.renamed else 'Same'
         if row.active.described != row.other.described:
-            return f'Same - only {active_name if row.active.described else other_name} describes it'
-        return 'Same'
+            return f'{same} - only {active_name if row.active.described else other_name} describes it'
+        return same
     if row.kind == ROW_MOVED:
         gap = (row.other.start - row.active.start).total_seconds()
         return (f'Starts {fmt_utils.fmt_duration(abs(gap))} '
@@ -2032,6 +2042,10 @@ def _difference_text(row, active_name: str, other_name: str) -> str:
         return f'Listed twice in {active_name}'
     if row.kind == ROW_DOUBLED_OTHER:
         return f'Listed twice in {other_name}'
+    if row.kind == ROW_PLACEHOLDER_ACTIVE:
+        return f"Only the channel's name in {active_name}"
+    if row.kind == ROW_PLACEHOLDER_OTHER:
+        return f"Only the channel's name in {other_name}"
     raise ValueError(f'unknown comparison row kind {row.kind!r}')
 
 
@@ -2041,8 +2055,10 @@ def channel_guide_compare(channel_id):
     (DESIGN-epg-sources.md §4, §12; dev/changelog/1108). Read-only. A fixed number of
     queries whatever the listing count: the rows are compared in Python."""
     from ..database import EpgSource
-    from ..epg_sources import (ROW_DOUBLED_ACTIVE, ROW_DOUBLED_OTHER, ROW_SAME,
-                               channel_source_comparisons)
+    from ..epg_sources import (ROW_DOUBLED_ACTIVE, ROW_DOUBLED_OTHER, ROW_PLACEHOLDER_ACTIVE,
+                               ROW_PLACEHOLDER_OTHER, ROW_SAME, channel_source_comparisons)
+    not_judged = (ROW_DOUBLED_ACTIVE, ROW_DOUBLED_OTHER, ROW_PLACEHOLDER_ACTIVE,
+                  ROW_PLACEHOLDER_OTHER)
     from ..tz_utils import format_local, get_display_tz, is_24h, to_local
     channel = db.session.get(Channel, channel_id)
     if channel is None:
@@ -2075,17 +2091,17 @@ def channel_guide_compare(channel_id):
     if chosen is not None:
         for row in chosen.comparison.rows:
             # A doubled row is the import listing a channel twice, which the summary names;
-            # it is not a difference between the two guides.
+            # it is not a difference between the two guides. A pair named two ways is.
             if diff_only and (row.kind in (ROW_DOUBLED_ACTIVE, ROW_DOUBLED_OTHER) or (
-                    row.kind == ROW_SAME and row.active.described == row.other.described)):
+                    row.kind == ROW_SAME and not row.renamed
+                    and row.active.described == row.other.described)):
                 continue
             label = to_local(row.start, tz).strftime('%A, %B %-d')
             if not days or days[-1]['label'] != label:
                 days.append({'label': label, 'rows': []})
             days[-1]['rows'].append({
                 'counted': row.counted,
-                'outside': (not row.counted
-                            and row.kind not in (ROW_DOUBLED_ACTIVE, ROW_DOUBLED_OTHER)),
+                'outside': not row.counted and row.kind not in not_judged,
                 'active': cell(row.active), 'other': cell(row.other),
                 'difference': _difference_text(row, active_name, chosen.source.name)})
     return render_template(

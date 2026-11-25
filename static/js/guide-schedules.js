@@ -20,6 +20,7 @@ const SCHED_VERDICTS = {
 const SCHED_AGREE = {
   SAME: 'same', MOVED: 'moved', DIFFERENT: 'different', ONLY_HERE: 'only-here',
   DOUBLED: 'doubled', OUTSIDE: 'outside', PAST: 'past', REFERENCE: 'reference',
+  PLACEHOLDER: 'placeholder',
 };
 const SCHED_GAP = { REFERENCE: 'reference', OTHER: 'other' };
 
@@ -156,8 +157,10 @@ function schedGapSentence(gap) {
 
 function schedAgreementLine(p) {
   switch (p.agreement) {
-    case SCHED_AGREE.SAME:
-      return p.gap ? `Same as the guide. ${schedGapSentence(p.gap)}` : 'Same as the guide.';
+    case SCHED_AGREE.SAME: {
+      const named = p.renamed ? ` The guide calls it "${p.partner.title}".` : '';
+      return `Same as the guide.${named}${p.gap ? ` ${schedGapSentence(p.gap)}` : ''}`;
+    }
     case SCHED_AGREE.MOVED: {
       const d = Math.round((schedDate(p.start_time) - schedDate(p.partner.start_time)) / 60000);
       return `Moved: the guide has it at ${schedDayTime(p.partner.start_time)}, ` +
@@ -171,6 +174,8 @@ function schedAgreementLine(p) {
       return 'Listed twice: this source gives two programs the same start time. Not counted in the verdict.';
     case SCHED_AGREE.OUTSIDE:
       return 'Not compared: past the end of what both schedules list.';
+    case SCHED_AGREE.PLACEHOLDER:
+      return 'Only the channel\'s name, not a program: this schedule has nothing here. Not counted in the verdict.';
     case SCHED_AGREE.PAST:
       return 'Already over. The comparison starts from now.';
     case SCHED_AGREE.REFERENCE: {
@@ -193,7 +198,9 @@ function schedCountsLine(s) {
   if (c.only_here) parts.push(`${c.only_here} only here`);
   if (c.only_guide) parts.push(`${c.only_guide} missing`);
   let line = `Of ${counted(c.compared, 'program')} compared: ${parts.join(', ')}.`;
+  if (c.renamed) line += ` ${c.renamed} of the same named differently.`;
   if (c.doubled) line += ` ${counted(c.doubled, 'listing')} doubled, not counted.`;
+  if (c.placeholder) line += ` ${counted(c.placeholder, 'listing')} only the channel's name, not counted.`;
   const gaps = { [SCHED_GAP.REFERENCE]: 0, [SCHED_GAP.OTHER]: 0 };
   s.programs.forEach(p => { if (p.gap) gaps[p.gap] += 1; });
   if (gaps[SCHED_GAP.REFERENCE]) line += ` ${gaps[SCHED_GAP.REFERENCE]} described only in the guide.`;
@@ -389,6 +396,7 @@ function schedLegendHtml() {
     ['sched-ghost', 'Missing here'],
     ['sched-tinted sched-k-doubled', 'Listed twice'],
     ['sched-k-outside', 'Not compared'],
+    ['sched-k-placeholder', 'Only the channel\'s name'],
     [`sched-sw-gap sched-gap-${SCHED_GAP.REFERENCE}`, SCHED_GAP_WORDS[SCHED_GAP.REFERENCE]],
     [`sched-sw-gap sched-gap-${SCHED_GAP.OTHER}`, SCHED_GAP_WORDS[SCHED_GAP.OTHER]],
   ];

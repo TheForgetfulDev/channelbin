@@ -1779,6 +1779,15 @@
 /* Not judged (already over, or past what both schedules list): drawn, but quieter. */
 .sched-k-past, .sched-k-outside { opacity: .55; }
 
+/* Only the channel's own name, no program (dev/changelog/1725): striped like the band
+   where a schedule has nothing, since that is what it says. */
+.sched-grid .guide-program.sched-k-placeholder,
+.sched-sw.sched-k-placeholder {
+  background: repeating-linear-gradient(135deg, var(--bg2) 0 6px, var(--bg1) 6px 12px);
+  border: 1px dashed var(--border);
+}
+.sched-grid .guide-program.sched-k-placeholder .guide-program-title { color: var(--text-faint); }
+
 /* A program the guide has and this schedule does not: its outline only. */
 .sched-grid .guide-program.sched-ghost {
   background: transparent;

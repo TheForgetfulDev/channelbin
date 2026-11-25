@@ -37,7 +37,8 @@ from ..database import (Account, AccountBlock, AccountLogin, AccountStatDay, Cha
                         HOST_PROBE_LOOKUP, detach_channel_references)
 from ..db_utils import chunked, retry_on_locked
 from ..epg_scorecard import finding_text, recheck_soon, stored_findings
-from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, directory_row_summary,
+from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, comparison_title,
+                           directory_row_summary,
                            case_sensitive_matching,
                            accept_name_matches, account_reach, account_sources_view, filled_counts_by_accounts, place_stretches,
                            stretch_channel_ids,
@@ -2403,8 +2404,8 @@ def epg_source_review(source_id):
                'current': _file_row_view(item.current, tz, h24) if item.current else None}
         row['same_listings'] = bool(
             row['current'] and row['file']['upcoming']
-            and [u['title'] for u in row['file']['upcoming']]
-            == [u['title'] for u in row['current']['upcoming']])
+            and [comparison_title(u['title']) for u in row['file']['upcoming']]
+            == [comparison_title(u['title']) for u in row['current']['upcoming']])
         rows.append(row)
 
     owner = _review_owner(source, only_account)

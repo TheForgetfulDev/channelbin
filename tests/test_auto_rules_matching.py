@@ -57,7 +57,7 @@ from app.database import (Alert, AutoRule, Channel, ChannelGroup,  # noqa: E402
                           M3uAccount, RECORDING_RULE_SCHEDULED, RULE_MATCH_SCHEDULED,
                           Recording, RecordingEvent, RecordingProfile, RuleMatch)
 from app.epg_sources import (CMP_IDENTICAL, ROW_DIFFERENT, Listing,  # noqa: E402
-                             compare_listings, comparison_title, normalize_name)
+                             compare_listings, comparison_title)
 from app.program_titles import strip_marks, title_key  # noqa: E402
 
 _REAL_DATETIME = datetime
@@ -168,14 +168,24 @@ class TitleNormalizationTests(unittest.TestCase):
 
 
 class ComparisonTitleAdoptsHelperTests(unittest.TestCase):
-    """comparison_title() keeps its separator folding but takes its mark definition from
-    program_titles (§3.3) - one definition, never a second copy."""
+    """comparison_title() keeps its own folding (accents and punctuation, dev/changelog/1725)
+    but takes its mark definition from program_titles (§3.3) - one definition, never a
+    second copy."""
 
-    def test_it_is_the_helper_then_the_separator_folding(self):
-        for raw in ('U.S. Senate ᴸᶦᵛᵉ', 'Live: U.S. Senate', 'US| A&E: Live PD',
-                    'Hot Bench - Timesharing Is Caring', 'スーパー日々', None):
+    def test_it_is_the_helper_then_the_folding(self):
+        for raw, want in (('U.S. Senate ᴸᶦᵛᵉ', 'u s senate'), ('Live: U.S. Senate', 'u s senate'),
+                          ('US| A&E: Live PD', 'us a e live pd'),
+                          ('Hot Bench - Timesharing Is Caring', 'hot bench timesharing is caring'),
+                          ('スーパー日々', 'スーパー日々'), (None, '')):
             with self.subTest(raw=raw):
-                self.assertEqual(comparison_title(raw), normalize_name(strip_marks(raw)))
+                self.assertEqual(comparison_title(raw), want)
+
+    def test_the_marks_come_from_program_titles(self):
+        comparison_title.cache_clear()
+        with patch('app.epg_sources.strip_marks', return_value='Stand In') as helper:
+            self.assertEqual(comparison_title('Anything ᴺᵉʷ'), 'stand in')
+        helper.assert_called_once_with('Anything ᴺᵉʷ')
+        comparison_title.cache_clear()
 
     def test_a_bare_leading_live_is_no_longer_dropped(self):
         """The looser rule turned ':' into a space before matching and so also dropped a
@@ -194,10 +204,12 @@ class ComparisonTitleAdoptsHelperTests(unittest.TestCase):
                     for i, t in enumerate(titles)]
 
         c = compare_listings(day(['U.S. Senate ᴸᶦᵛᵉ', 'The Good Side ᴺᵉʷ', 'News']),
-                             day(['Live: U.S. Senate', 'The Good Side', 'News']))
+                             day(['Live: U.S. Senate', 'The Good Side', 'News']), placeholders=frozenset())
         self.assertEqual(c.verdict, CMP_IDENTICAL)
-        c = compare_listings(day(['Live Wire', 'News']), day(['Wire', 'News']))
-        self.assertEqual(c.same, 1)
+        # `Live Wire` keeps its first word, and a one-word title never stands for a longer
+        # one (dev/changelog/1725).
+        c = compare_listings(day(['Live Wire', 'News']), day(['Wire', 'News']), placeholders=frozenset())
+        self.assertEqual((c.same, c.renamed), (1, 0))
         self.assertIn(ROW_DIFFERENT, {r.kind for r in c.rows})
 
 

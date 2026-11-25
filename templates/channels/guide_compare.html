@@ -51,8 +51,11 @@
 </div>
 {% call page_about() %}
   What each guide this channel's account reads lists for it, from now on, lined up by start
-  time. Two listings are the same program when their titles match and they start within five
-  minutes of each other. Nothing here changes which guide the channel uses.
+  time. Two listings are the same program when they start within five minutes of each other
+  and their titles match, or name one program two ways: one guide's episode title is the
+  other's title, one title holds every word of the other, or the same title is spelled
+  differently. A listing that is only the channel's own name is not counted as a program.
+  Nothing here changes which guide the channel uses.
 {% endcall %}
 
 {% if not active_source %}

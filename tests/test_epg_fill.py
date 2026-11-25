@@ -41,7 +41,7 @@ from app.database import (CHANNEL_EPG_FILL_CHANGED, Channel, ChannelEvent, EPGEn
                           EpgAlternateEntry, EpgChannelStretch, EpgFinding, EpgSource,
                           EpgSourceChannel, EpgSourceSubscription, Recording)
 from app.epg_sources import (Coverage, FILL_MIN_JUDGED, Listing, Span, decide_stretches,  # noqa: E402
-                             delete_url_source, move_source, place_stretches,
+                             delete_url_source, move_source, place_stretches, placeholder_names,
                              retire_expired_listings, set_channel_key, set_source_override,
                              stop_using_source)
 from tests.test_epg_sources import CFG, _Fixture  # noqa: E402
@@ -92,10 +92,11 @@ def _span(rows):
 class DecideTests(unittest.TestCase):
     REAL = Coverage(20, 20)
 
-    def _decide(self, held, later=(2,), covers=None, flagged=(), stored=None):
+    def _decide(self, held, later=(2,), covers=None, flagged=(), stored=None,
+                placeholders=frozenset()):
         covers = covers if covers is not None else {sid: self.REAL for sid in held}
         return decide_stretches(1, list(later), covers, {s: _span(r) for s, r in held.items() if r},
-                                set(flagged), stored or {}, held)
+                                set(flagged), stored or {}, held, placeholders)
 
     def test_a_source_that_agrees_and_reaches_further_fills_from_the_first_ones_end(self):
         (s,) = self._decide({1: _listings(0, 9), 2: _listings(0, 19)})
@@ -117,11 +118,29 @@ class DecideTests(unittest.TestCase):
 
     def test_a_verdict_it_does_not_know_is_never_read_as_agreement(self):
         from app import epg_sources
-        weak = epg_sources.compare_listings(_listings(0, 9), _listings(0, 19))._replace(
+        weak = epg_sources.compare_listings(_listings(0, 9), _listings(0, 19), placeholders=frozenset())._replace(
             verdict='something-new')
         with mock.patch('app.epg_sources.compare_listings', return_value=weak):
             with self.assertRaises(ValueError):
                 self._decide({1: _listings(0, 9), 2: _listings(0, 19)})
+
+    def test_a_source_naming_each_program_another_way_continues_the_guide(self):
+        """dev/changelog/1725: `Show 3` and `The Show 3 Special` in one slot are one program,
+        so the later source agrees and fills; judged on titles alone it was unrelated."""
+        renamed = [x._replace(title=f'The {x.title} Special') for x in _listings(0, 19)]
+        (s,) = self._decide({1: _listings(0, 9), 2: renamed})
+        self.assertEqual(s.outcome, EPG_STRETCH_FILLS)
+
+    def test_the_first_sources_placeholders_are_not_held_against_a_later_one(self):
+        """The first source lists only the channel's name for most of the overlap: judged
+        on the programs it does list, the later source agrees."""
+        first = [x._replace(title='UK: TALKSPORT') if n < 9 else x
+                 for n, x in enumerate(_listings(0, 15))]
+        (s,) = self._decide({1: first, 2: _listings(0, 24)})
+        self.assertEqual(s.outcome, EPG_STRETCH_UNRELATED)
+        (s,) = self._decide({1: first, 2: _listings(0, 24)},
+                            placeholders=placeholder_names(['UK: TALKSPORT']))
+        self.assertEqual(s.outcome, EPG_STRETCH_FILLS)
 
     def test_another_channels_schedule_is_unrelated(self):
         (s,) = self._decide({1: _listings(0, 9), 2: _listings(0, 19, 'Other')})

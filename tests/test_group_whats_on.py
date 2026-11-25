@@ -276,7 +276,7 @@ class ListingAgreementTests(unittest.TestCase):
                  self.L(3, 'Twice'),                    # a second listing at D's moment
                  self.L(4.5, 'Extra', mins=30),         # nothing in the guide near it
                  self.L(9, 'Late')]                     # past the stretch both list
-        cmp, agree, lacking = listing_agreement(ref, other, self.NOW)
+        cmp, agree, lacking = listing_agreement(ref, other, self.NOW, placeholders=frozenset())
         self.assertEqual([a.kind for a in agree],
                          [AGREE_PAST, AGREE_SAME, AGREE_MOVED, AGREE_SAME, AGREE_DIFFERENT,
                           AGREE_DOUBLED, AGREE_ONLY_HERE, AGREE_OUTSIDE])
@@ -288,8 +288,21 @@ class ListingAgreementTests(unittest.TestCase):
         # listing; F overlaps nothing on this side and is outlined.
         self.assertEqual([x.title for x in lacking], ['F'])
 
+    def test_a_placeholder_and_a_program_named_another_way(self):
+        """dev/changelog/1725: the schedule's `talkSPORT` in the guide's B slot is no program;
+        its `Epreuve de Nove Mesto` is the guide's `Nové Město`, named another way."""
+        ref = [self.L(0, 'Nové Město'), self.L(1, 'B'), self.L(2, 'C')]
+        other = [self.L(0, 'Epreuve de Nove Mesto'), self.L(1, 'talkSPORT'), self.L(2, 'C')]
+        cmp, agree, lacking = listing_agreement(
+            ref, other, self.NOW, placeholders=epg_sources.placeholder_names(['UK: TALKSPORT']))
+        self.assertEqual([a.kind for a in agree],
+                         [AGREE_SAME, epg_sources.AGREE_PLACEHOLDER, AGREE_SAME])
+        self.assertEqual([a.renamed for a in agree], [True, False, False])
+        self.assertEqual((cmp.placeholder_other, cmp.renamed), (1, 1))
+        self.assertEqual(lacking, [], 'the placeholder overlaps B, so no outline is drawn')
+
     def test_no_listings_is_no_overlap(self):
-        cmp, agree, lacking = listing_agreement([self.L(0, 'A')], [], self.NOW)
+        cmp, agree, lacking = listing_agreement([self.L(0, 'A')], [], self.NOW, placeholders=frozenset())
         self.assertEqual((cmp.verdict, agree, lacking), (epg_sources.CMP_NO_OVERLAP, [], []))
 
 

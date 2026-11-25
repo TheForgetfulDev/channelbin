@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sys
 import threading
 import time
 from collections import Counter, defaultdict
@@ -60,7 +61,8 @@ from .database import (EPGEntry, EpgAlternateEntry, EpgScan, EpgScanLink, EpgSca
                        EPG_SCAN_SUCCESS)
 from .db_utils import chunked, retry_on_locked
 from .epg_sources import (CMP_NO_OVERLAP, CMP_UNRELATED, Listing, case_sensitive_matching,
-                          compare_listings, comparison_title, keys_read_into)
+                          compare_listings, comparison_title, keys_read_into,
+                          placeholder_names)
 from .program_titles import strip_marks
 
 log = logging.getLogger(__name__)
@@ -125,9 +127,9 @@ class _Titles:
 class _Unit:
     """One (channel, source)'s listings as the scan holds them. Rows arrive in time
     order (the read sorts them) and go straight into the seven hashers; what is kept per
-    listing is what compare_listings() reads of a Listing - the title, the times and
-    whether a description exists, carried by a one-character stand-in so no description
-    text is held."""
+    listing is what compare_listings() reads of a Listing - the title, the episode title
+    (interned), the times and whether a description exists, carried by a one-character
+    stand-in so no description text is held."""
     __slots__ = ('h', 'listings', 'described', 'desc_chars', 'subtitled', 'marked', 'until')
 
     def __init__(self):
@@ -162,7 +164,8 @@ class _Unit:
             self.marked += 1
         if self.until is None or stop > self.until:
             self.until = stop
-        self.listings.append(Listing(title, None, 'x' if desc else None, start, stop))
+        self.listings.append(Listing(title, sys.intern(sub_title) if sub_title else None,
+                                     'x' if desc else None, start, stop))
 
     def finish(self) -> tuple[Facets, Stats, list]:
         facets = Facets(*(x.hexdigest() for x in self.h))
@@ -262,9 +265,15 @@ def _read_units(now, titles):
     return finished, n
 
 
-def _find_links(schedules, listings_of, ctitle):
+def _find_links(schedules, listings_of, ctitle, placeholders_of):
     """Pairs of schedules in different clusters that compare_listings() calls related,
-    found through the token index described in the module docstring."""
+    found through the token index described in the module docstring. `placeholders_of`
+    is each schedule's placeholder_names() over its channels' names.
+
+    The index is on whole comparison titles, so a pair agreeing mostly through
+    compare_listings()' other-name rule (one title's words inside the other's, a spelling)
+    may share too few tokens to be judged at all. A word index would multiply the pairs
+    counted; the scan only suggests, so it misses those (dev/changelog/1725)."""
     index: dict = defaultdict(list)
     tokens_of = []
     for i, s in enumerate(schedules):
@@ -288,7 +297,8 @@ def _find_links(schedules, listings_of, ctitle):
                 continue
             if n < MIN_SHARED * min(len(toks), len(tokens_of[b])):
                 continue
-            cmp = compare_listings(listings_of[a], listings_of[b])
+            cmp = compare_listings(listings_of[a], listings_of[b],
+                                   placeholders=placeholders_of[a] | placeholders_of[b])
             if cmp.verdict in (CMP_UNRELATED, CMP_NO_OVERLAP):
                 continue
             links.append(LinkResult(
@@ -318,10 +328,12 @@ def scan_listings(now=None, cfg=None) -> ScanResult:
                 Channel.id.in_(piece)):
             chans[cid] = _Chan(cid, eid)
     active_of = {}
+    name_of = {}
     for piece in chunked(cids, 500):
-        for cid, sid in db.session.query(Channel.id, Channel.epg_source_id).filter(
-                Channel.id.in_(piece)):
+        for cid, sid, name in db.session.query(Channel.id, Channel.epg_source_id,
+                                               Channel.name).filter(Channel.id.in_(piece)):
             active_of[cid] = sid
+            name_of[cid] = name
     cs = case_sensitive_matching(cfg)
     reads = keys_read_into([(chans[cid], sid) for cid, sid in finished if cid in chans], cs)
     collapsed = collapse_schedules(
@@ -332,6 +344,7 @@ def scan_listings(now=None, cfg=None) -> ScanResult:
     cluster_of: dict = {}
     schedules = []
     listings_of = []
+    placeholders_of = []
     for s in collapsed:
         facets, stats, listings = finished[s.channels[0]]
         cluster = cluster_of.setdefault(facets.programs, len(cluster_of))
@@ -341,10 +354,11 @@ def scan_listings(now=None, cfg=None) -> ScanResult:
             any(active_of.get(cid) == sid for cid, sid in s.channels),
             channel_ids, s.split, facets, stats))
         listings_of.append(listings)
+        placeholders_of.append(placeholder_names([name_of.get(cid) for cid in channel_ids]))
     timings['cluster'] = time.perf_counter() - t
 
     t = time.perf_counter()
-    links = _find_links(schedules, listings_of, titles.ctitle)
+    links = _find_links(schedules, listings_of, titles.ctitle, placeholders_of)
     timings['links'] = time.perf_counter() - t
     return ScanResult(now, n_rows, schedules, links, timings)
 

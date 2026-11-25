@@ -106,7 +106,7 @@
       <a href="{{ qs(kind='identical') }}" class="tab{{ ' active' if kind == 'identical' else '' }}"
          data-tip="Every copy holds the same titles, times, subtitles, descriptions, categories and ratings. Any of these ids could stand in for the others.">Identical in every way <span class="cnt">{{ '{:,}'.format(counts.identical) }}</span></a>
       <a href="{{ qs(kind='details') }}" class="tab{{ ' active' if kind == 'details' else '' }}"
-         data-tip="The same programs at the same times, with some field differing - title marks, descriptions, subtitles, end times. The columns say which copy has more.">Same programs, details differ <span class="cnt">{{ '{:,}'.format(counts.details) }}</span></a>
+         data-tip="The same programs at the same times, with some field differing - how a title is written (marks, case, accents, punctuation), descriptions, subtitles, end times. The columns say which copy has more.">Same programs, details differ <span class="cnt">{{ '{:,}'.format(counts.details) }}</span></a>
       <a href="{{ qs(kind='related') }}" class="tab{{ ' active' if kind == 'related' else '' }}"
          data-tip="Schedules that agree where both list but differ somewhere: one stops sooner, a few programs differ, or programs are shifted. Judged the way the compare-sources page judges two sources.">Related <span class="cnt">{{ '{:,}'.format(counts.related) }}</span></a>
     </div>

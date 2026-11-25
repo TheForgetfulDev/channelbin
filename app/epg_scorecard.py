@@ -40,7 +40,8 @@ from .db_utils import chunked, retry_on_locked
 from .epg_sources import (CMP_AGREEING, CMP_NO_OVERLAP, CMP_UNRELATED, MATCH_DISAGREE, MATCH_NEW,
                           REAL_SCHEDULE_MIN_TITLES, Listing,
                           Reach, account_filling_sources, channel_key, compare_listings, file_id_for, key_answers,
-                          norm_key, of_sources, reach_from_horizons, sources_without_directory)
+                          norm_key, of_sources, placeholder_names, reach_from_horizons,
+                          sources_without_directory)
 from .fmt_utils import counted, iso_or_none, plural
 
 log = logging.getLogger(__name__)
@@ -834,10 +835,11 @@ def _held_listings(channel_ids, source_ids, now) -> dict[int, dict[int, list]]:
     return out
 
 
-def judge(held: dict[int, list], order) -> list[tuple[int, int, object]]:
-    """[(earlier, later, Comparison)] for every pair of sources holding listings - pure."""
+def judge(held: dict[int, list], order, placeholders) -> list[tuple[int, int, object]]:
+    """[(earlier, later, Comparison)] for every pair of sources holding listings - pure.
+    `placeholders` is the channel's placeholder_names()."""
     present = [sid for sid in order if held.get(sid)]
-    return [(a, b, compare_listings(held[a], held[b]))
+    return [(a, b, compare_listings(held[a], held[b], placeholders=placeholders))
             for i, a in enumerate(present) for b in present[i + 1:]]
 
 
@@ -851,16 +853,17 @@ def check_account(account_id: int, order, now: datetime) -> int:
     if len(order) < 2:
         _clear_account(account_id)
         return 0
-    guided = [cid for (cid,) in db.session.query(Channel.id).filter(
+    names = dict(db.session.query(Channel.id, Channel.name).filter(
         Channel.account_id == account_id, Channel.hidden.is_(False),
-        Channel.epg_source_id.isnot(None))]
+        Channel.epg_source_id.isnot(None)))
+    guided = list(names)
     _clear_unguided(account_id)
     for chunk in chunked(guided, _CHUNK):
         held = _held_listings(chunk, order, now)
         db.session.rollback()   # end the read before the CPU work, so no snapshot is held
         found = []
         for cid in chunk:
-            for a, b, cmp in judge(held.get(cid, {}), order):
+            for a, b, cmp in judge(held.get(cid, {}), order, placeholder_names([names[cid]])):
                 found.append({'channel_id': cid, 'source_id': a, 'other_source_id': b,
                               'verdict': cmp.verdict, 'compared': cmp.compared,
                               'paired': cmp.same + cmp.moved, 'checked_at': now})
