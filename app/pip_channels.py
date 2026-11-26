@@ -588,12 +588,15 @@ def _resolve_game(source: Source, cfg: dict, feed_id: int, label: str, now: date
 
 
 def resolve_feed(feed_id: int, cfg: dict, exclude_ids=frozenset(), event_id: int = None,
-                 now: Optional[datetime] = None, viewer_id=None, preview: bool = False):
+                 now: Optional[datetime] = None, viewer_id=None, preview: bool = False,
+                 own_accounts: bool = False):
     """output_feed.resolve_play() for a picture-in-picture feed id: None for one that names
     nothing served (no such row, or a swapped copy that is not offered), else a Play carrying a
     Tuned. Its `member` is the channel the big picture plays, None when the play is on its card;
     never a fault, since a card is an ordinary state. A channel taken off the output is refused
-    by name as any row is, and a preview plays it all the same."""
+    by name as any row is, and a preview plays it all the same. `own_accounts` is a play whose
+    login plays only from accounts of its own, which is refused by name: the pictures are shared
+    by everyone watching and come from the output's accounts (dev/changelog/1765)."""
     row_id = output_feed.decode_feed_id(feed_id)[1]
     swapped = output_feed.pip_swapped(feed_id)
     row = db.session.get(PipChannel, row_id)
@@ -603,6 +606,9 @@ def resolve_feed(feed_id: int, cfg: dict, exclude_ids=frozenset(), event_id: int
     label = f'picture-in-picture channel {row.id} ({name})'
     if not row.on_output and not preview:
         return output_feed.Play(feed_id, label, why_none=output_feed.WHY_TAKEN_OFF, fault=False)
+    if own_accounts:
+        return output_feed.Play(feed_id, label, why_none=output_feed.WHY_PIP_OWN_ACCOUNTS, fault=False,
+                                own_accounts=True)
     tuned = Tuned(row.id, name, swapped, is_set(row))
     play = output_feed.Play(feed_id, label, fault=False, preview=preview, pip=tuned)
     if not tuned.set_up:

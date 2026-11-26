@@ -167,6 +167,7 @@ REASON_CARD_FAILED = 'card_failed'
 REASON_REPLACED = 'replaced'
 REASON_LOGIN_OFF = 'login_off'
 REASON_LINEUP = 'lineup'
+REASON_ACCOUNTS = 'login_accounts'
 
 #: What two of the reasons read as on a sports channel, which has no group.
 SPORTS_REASON_TEXT = {
@@ -200,6 +201,8 @@ REASON_TEXT = {
     REASON_REPLACED: 'Ended - the same IPTV player tuned in again, to another channel or this one.',
     REASON_LOGIN_OFF: 'Cut - its IPTV output login was turned off, changed or deleted.',
     REASON_LINEUP: 'Cut - the channel was taken out of its IPTV output login\'s channels.',
+    REASON_ACCOUNTS: ('Cut - its IPTV output login\'s accounts were changed, and the account it was '
+                      'playing from is not one of them.'),
     REASON_SCREEN_GONE: 'Cut - the sports channel is no longer on the IPTV output.',
     REASON_WINDOW_OPENED: ('Ended - the game came on. In redirect mode ChannelBin cannot tune a player in, '
                            'so the waiting screen stops and the next tune-in gets the game.'),
@@ -357,6 +360,11 @@ class FeedLogin:
     lineup: Optional[frozenset] = None
     # And how many times set_login_lineup() had run for it, as `generation` is for stop_login().
     lineup_generation: int = 0
+    # The IPTV accounts its plays come from (accounts_of()), None for the output's own list: the
+    # main login always, and a login for another user nobody tied to accounts (dev/changelog/1765).
+    accounts: Optional['LoginAccounts'] = None
+    # And how many times set_login_accounts() had run for it, as `generation` is for stop_login().
+    accounts_generation: int = 0
 
     @property
     def is_main(self) -> bool:
@@ -377,16 +385,21 @@ def main_login(fcfg: dict) -> FeedLogin:
     return FeedLogin(feed_username(fcfg), feed_password(fcfg))
 
 
-def _feed_login_of(row, generation: int = 0, lineup_generation: int = 0) -> FeedLogin:
+def _feed_login_of(row, counts: tuple) -> FeedLogin:
+    """`row`'s FeedLogin, with `counts` (_login_generation()) as they were before it was read."""
+    generation, lineup_generation, accounts_generation = counts
     return FeedLogin(row.username, row.password, feed_login_id=row.id, name=row.name or '',
-                     max_streams=max(1, int(row.max_streams or 1)), generation=generation,
-                     lineup=lineup_of(row), lineup_generation=lineup_generation)
+                     max_streams=max(1, int(row.max_streams or 1)),
+                     generation=generation.get(row.id, 0), lineup=lineup_of(row),
+                     lineup_generation=lineup_generation.get(row.id, 0), accounts=accounts_of(row),
+                     accounts_generation=accounts_generation.get(row.id, 0))
 
 
 def _login_generation() -> tuple:
-    """(stop_login() counts, set_login_lineup() counts), each by login id, read together."""
+    """(stop_login() counts, set_login_lineup() counts, set_login_accounts() counts), each by
+    login id, read together."""
     with _lock:
-        return dict(_login_changes), dict(_lineup_changes)
+        return dict(_login_changes), dict(_lineup_changes), dict(_accounts_changes)
 
 
 #: The most feed ids one login's lineup may hold: far past any TV Guide, and a bound on what a
@@ -443,6 +456,58 @@ def lineup_problem(value) -> tuple:
     return sorted(ids), ''
 
 
+class LoginAccounts(frozenset):
+    """A login for another user's own account list (accounts_of()): the set a play's walk is
+    handed in place of the output's (allowed_account_ids()). Its type is what tells a refusal to
+    name the login's accounts rather than the output's (_drop_allowed), so the walk's own
+    signatures stay one `allowed` set (dev/changelog/1765)."""
+    __slots__ = ()
+
+
+def accounts_of(row) -> Optional[LoginAccounts]:
+    """An OutputFeedLogin's own accounts, or None for the output's list. A value that does not
+    read as a list of ids is logged and read as no accounts rather than the output's list, so a
+    damaged row never widens what a login plays from."""
+    raw = getattr(row, 'accounts', None)
+    if raw is None:
+        return None
+    try:
+        ids = json.loads(raw)
+        if not isinstance(ids, list):
+            raise ValueError('not a list')
+        return LoginAccounts(int(i) for i in ids)
+    except (TypeError, ValueError) as exc:
+        log.warning('IPTV output: login %s has an account list that cannot be read (%s), so it '
+                    'plays from no account until its accounts are chosen again', row.username, exc)
+        return LoginAccounts()
+
+
+def accounts_problem(value, existing) -> tuple:
+    """(account ids to store, error) for a login's accounts a save sends: None for the output's
+    list, else a non-empty list of ids, each one of `existing` (the account ids there are)."""
+    if value is None:
+        return None, ''
+    if not isinstance(value, list):
+        return None, 'The accounts must be a list, or nothing for the IPTV output\'s accounts.'
+    if not value:
+        return None, 'Pick at least one account, or use the IPTV output\'s accounts.'
+    ids = set()
+    for v in value:
+        if isinstance(v, bool) or not isinstance(v, int):
+            return None, 'Every account must be an account id.'
+        if v not in existing:
+            return None, f'There is no account with id {v}.'
+        ids.add(v)
+    return sorted(ids), ''
+
+
+def play_accounts(fcfg: dict, accounts: Optional[frozenset]) -> Optional[frozenset]:
+    """The accounts a play may come from: `accounts`, its login's own list, when it has one, else
+    the output's (allowed_account_ids(), None for all). The one answer for every walk a play's
+    login can reach (dev/changelog/1765)."""
+    return accounts if accounts is not None else allowed_account_ids(fcfg)
+
+
 #: Wrong logins from one address before it is refused, and for how long. Its own counter, never
 #: the web login's (app/auth.py::web_login), so a lockout here never locks anyone out of
 #: ChannelBin's own pages. Higher than the web login's 5 because an IPTV player holding an old
@@ -468,12 +533,12 @@ def feed_login_for(fcfg: dict, username, password) -> Optional[FeedLogin]:
     from .database import OutputFeedLogin
     # Read BEFORE the row: a change committed after the row was read moves the count after
     # this read too, so a play this login starts is refused when it registers (_LoginRoom).
-    generation, lineup_generation = _login_generation()
+    counts = _login_generation()
     row = OutputFeedLogin.query.filter_by(username=username).first()
     stored = row.password if row is not None and row.enabled else ''
     if not hmac.compare_digest(stored.encode(), password.encode()) or not stored:
         return None
-    return _feed_login_of(row, generation.get(row.id, 0), lineup_generation.get(row.id, 0))
+    return _feed_login_of(row, counts)
 
 
 def login_taken(username: str, fcfg: dict, except_login_id: Optional[int] = None) -> bool:
@@ -520,6 +585,14 @@ _tuning_public: contextvars.ContextVar = contextvars.ContextVar('output_feed_tun
 def _tuning_log_name() -> Optional[str]:
     login = _tuning_login.get()
     return login.log_name if login is not None else None
+
+
+def _tuning_accounts() -> Optional[frozenset]:
+    """The tune-in's login's own accounts (FeedLogin.accounts), for a play built without the
+    login in hand - a waiting screen, an Up next picture, a card - so the first thing it asks
+    again is already held to them. None for the output's list."""
+    login = _tuning_login.get()
+    return login.accounts if login is not None else None
 
 
 def _on_login(name: Optional[str]) -> str:
@@ -865,12 +938,24 @@ class FeedRow:
 LEFT_OUT_ACCOUNT = 'its account is one the IPTV output is not allowed to play from'
 #: Why a play of a row a person took off the output is refused (Play.why_none).
 WHY_TAKEN_OFF = 'it was taken off the IPTV output'
+#: Why a channel is not on the list of a login with its own accounts (FeedRow.left_out), and why
+#: its play is refused (Play.why_none) (dev/changelog/1765).
+LEFT_OUT_LOGIN_ACCOUNT = "its account is not one of this IPTV output login's own accounts"
+WHY_LOGIN_ACCOUNT = LEFT_OUT_LOGIN_ACCOUNT
+#: Why a picture-in-picture channel is not on the list of a login with its own accounts, and why
+#: its play is refused: its pictures are shared by everyone watching it, from the output's list.
+LEFT_OUT_PIP_OWN_ACCOUNTS = ("its pictures are shared by everyone watching it and come from the IPTV "
+                             "output's accounts, and this IPTV output login plays only from its own")
+WHY_PIP_OWN_ACCOUNTS = LEFT_OUT_PIP_OWN_ACCOUNTS
+#: The two reasons a login's own accounts leave a row out (left_out_for_login).
+LOGIN_LEFT_OUT = (LEFT_OUT_LOGIN_ACCOUNT, LEFT_OUT_PIP_OWN_ACCOUNTS)
 
 
 #: Why a candidate was passed over, for the sentence a play with none left gives (_sports_member).
 _DROP_RECORDING = 'recording'   # a group with no member that has Recording on
 _DROP_BLOCKED = 'blocked'       # on an account blocked right now
 _DROP_ALLOWED = 'allowed'       # on an account the output may not serve from
+_DROP_LOGIN = 'login_accounts'  # on an account outside the play's login's own (LoginAccounts)
 _DROP_FAILED = 'failed'         # already failed this play
 _DROP_GONE = 'gone'             # its channel or group was removed while the play was worked out
 _DROP_OTHER_GAME = 'other_game' # a group whose members with Recording on all show something else
@@ -879,7 +964,14 @@ _GROUP_WHY = {
     _DROP_RECORDING: 'no channel in the group has Recording on',
     _DROP_BLOCKED: 'every channel in the group is on a blocked account',
     _DROP_ALLOWED: 'every channel in the group is on an account the IPTV output is not allowed to serve from',
+    _DROP_LOGIN: "every channel in the group is on an account outside this IPTV output login's own accounts",
 }
+
+
+def _drop_allowed(allowed) -> str:
+    """The _DROP_* for a channel the account list `allowed` leaves out: the login's own when it
+    is one (LoginAccounts), so the refusal names whose list it was, else the output's."""
+    return _DROP_LOGIN if isinstance(allowed, LoginAccounts) else _DROP_ALLOWED
 
 
 def _members_for_feed(group, blocked, allowed, game=None):
@@ -903,7 +995,7 @@ def _members_for_feed(group, blocked, allowed, game=None):
     if allowed is not None:
         kept = [m for m in kept if m.account_id in allowed]
         if not kept:
-            return [], _DROP_ALLOWED
+            return [], _drop_allowed(allowed)
     return kept, ''
 
 
@@ -1000,9 +1092,15 @@ def catalog(cfg=None, everything: bool = False, login: Optional[FeedLogin] = Non
 
     `login` narrows the answer to that login's lineup (FeedLogin.lineup, dev/changelog/1764)
     before the numbering, so each login's channels are numbered 1 to n with no gaps; a feed id
-    is the row's whatever the login. Ignored with `everything`, which is the owner's view."""
+    is the row's whatever the login. It also leaves out what the login's own accounts would
+    (FeedLogin.accounts, left_out_for_login(), dev/changelog/1765). Ignored with `everything`,
+    which is the owner's view."""
     fcfg = feed_config(cfg)
-    rows = guide_rows(fcfg, plays=everything) + _own_rows(everything, fcfg)
+    accounts = None if everything or login is None else login.accounts
+    rows = guide_rows(fcfg, plays=everything, accounts=accounts) + _own_rows(everything, fcfg)
+    if accounts is not None:
+        for row in rows:
+            row.left_out = left_out_for_login(row, accounts)
     lineup = None if everything or login is None else login.lineup
     offered = [row for row in rows if row.offered and lineup_offers(lineup, row.feed_id)]
     for n, row in enumerate(offered, start=1):
@@ -1010,17 +1108,35 @@ def catalog(cfg=None, everything: bool = False, login: Optional[FeedLogin] = Non
     return rows if everything else offered
 
 
-def guide_rows(fcfg: dict, plays: bool = False) -> list:
+def left_out_for_login(row: 'FeedRow', accounts: Optional[frozenset]) -> str:
+    """Why `row` is not on the channel list of a login whose own accounts are `accounts` (None
+    for the output's list, which leaves the row's own `left_out`): a channel on an account
+    outside them, and every picture-in-picture channel, whose pictures come from the output's
+    list (WHY_PIP_OWN_ACCOUNTS). Reads only the row, so the IPTV Output page asks it per login
+    over the one catalog it loads (dev/changelog/1765)."""
+    if accounts is None:
+        return row.left_out
+    if row.kind == KIND_CHANNEL:
+        return LEFT_OUT_LOGIN_ACCOUNT if row.row.account_id not in accounts else ''
+    if row.kind == KIND_PIP:
+        return LEFT_OUT_PIP_OWN_ACCOUNTS
+    if row.kind in (KIND_GROUP, KIND_SPORTS, KIND_UP_NEXT):
+        return row.left_out
+    raise ValueError(f'Unknown feed row kind "{row.kind}"')
+
+
+def guide_rows(fcfg: dict, plays: bool = False, accounts: Optional[frozenset] = None) -> list:
     """The TV Guide's own feed rows, in its order, unnumbered and whether or not each is on the
     output: catalog()'s first half, and what a picture-in-picture channel's search is matched
     against (app/pip_channels.py), so the page and a tune-in cannot disagree about which
-    channel a search names. `plays` fills each group's `plays`. Four queries."""
+    channel a search names. `plays` fills each group's `plays`. `accounts` is a login's own
+    account list, in place of the output's (play_accounts). Four queries."""
     from .channel_groups import (blocked_account_ids_now, guide_listings_member,
                                  guide_row_sort_key, member_eager_options, serving_member)
     from .database import Channel, ChannelGroup
     from .routes.channel_tests import _latest_tests_by_channel
 
-    allowed = allowed_account_ids(fcfg)
+    allowed = play_accounts(fcfg, accounts)
     blocked = blocked_account_ids_now()
     everything = plays
     channels = Channel.query.filter(Channel.in_guide.is_(True)).all()  # guide-flag-read-ok: the feed's own-row half; the grouped half is the groups below
@@ -1031,8 +1147,8 @@ def guide_rows(fcfg: dict, plays: bool = False) -> list:
 
     entries = []
     for ch in channels:
-        left_out = (LEFT_OUT_ACCOUNT if allowed is not None and ch.account_id not in allowed
-                    else '')
+        left_out = ('' if allowed is None or ch.account_id in allowed
+                    else LEFT_OUT_LOGIN_ACCOUNT if isinstance(allowed, LoginAccounts) else LEFT_OUT_ACCOUNT)
         entries.append((guide_row_sort_key(ch), FeedRow(
             feed_id=feed_id_for_channel(ch.id), kind=KIND_CHANNEL, num=0, name=ch.name,
             category=(ch.category_name or '').strip() or UNCATEGORIZED,
@@ -1197,12 +1313,14 @@ def _xmltv_time(dt: datetime) -> str:
     return dt.strftime('%Y%m%d%H%M%S') + ' +0000'
 
 
-def xmltv_lines(rows, cfg=None, now: Optional[datetime] = None):
+def xmltv_lines(rows, cfg=None, now: Optional[datetime] = None, accounts: Optional[frozenset] = None):
     """xmltv.php, streamed as it is built: the served rows as <channel> elements and their
     listings as <programme> elements, from ONE query over EPGEntry for the listings
     channels in the configured window. A channel that fills several feed rows (itself and a
     group) has its programs written under each feed id. The element is spelled `programme`
-    because it is the wire format's identifier; everything ChannelBin names is `program`."""
+    because it is the wire format's identifier; everything ChannelBin names is `program`.
+    `accounts` is the asking login's own account list (FeedLogin.accounts), which a sports
+    channel's games are told from in place of the output's."""
     from . import db
     from .database import EPGEntry
 
@@ -1246,7 +1364,7 @@ def xmltv_lines(rows, cfg=None, now: Optional[datetime] = None):
         from .channel_groups import blocked_account_ids_now
         from .tz_utils import get_display_tz, is_24h
         programs = sports_feed.guide_programs(sports, now, days, blocked=blocked_account_ids_now(),
-                                              allowed=allowed_account_ids(fcfg))
+                                              allowed=play_accounts(fcfg, accounts))
         for program in programs:
             yield (f'  <programme start="{_xmltv_time(program.start)}" '
                    f'stop="{_xmltv_time(program.stop)}" '
@@ -1346,6 +1464,9 @@ class Play:
     #: A picture-in-picture channel's play: its pip_channels.Tuned, the row and what its big
     #: picture is right now. With `member` None the play is on the channel's card.
     pip: object = field(default=None, repr=False)
+    #: `why_none` is that the play's login's own accounts leave out everything it could play
+    #: (dev/changelog/1765): refused by name with no alert, since nothing is broken.
+    own_accounts: bool = False
 
 
 def _resolve_sports_play(feed_id: int, row_id: int, allowed, exclude_ids, event_id, now,
@@ -1432,6 +1553,7 @@ def _play_found(play: Play, found, allowed, exclude_ids, now, cfg, viewer_id) ->
             return play
     if play.member is None:
         play.why_none = sports_drop_words(why, game, named=found.named is not None)
+        play.own_accounts = why == _DROP_LOGIN
     elif picked.why is not None:
         # The reason is the first choice's; a play that walked past it says that instead.
         play.picked = (picked.why.text if source is sources[0]
@@ -1472,6 +1594,7 @@ def sports_drop_words(why: str, game: str, named: bool = False) -> str:
         _DROP_FAILED: f'every channel {which} already failed this play',
         _DROP_ALLOWED: (f'every channel {which} is on an account the IPTV '
                         f'output is not allowed to serve from'),
+        _DROP_LOGIN: f"every channel {which} is on an account outside this IPTV output login's own accounts",
         _DROP_BLOCKED: f'every channel {which} is on a blocked account',
         _DROP_RECORDING: f'every channel group {which} has no channel with Recording on',
         _DROP_OTHER_GAME: (f'every channel group {which} has its channels with Recording on showing '
@@ -1550,12 +1673,13 @@ def _sports_member(sources, blocked, allowed, exclude_ids, live: bool = False,
         if ch.account_id in blocked:
             drops.add(_DROP_BLOCKED)
         elif allowed is not None and ch.account_id not in allowed:
-            drops.add(_DROP_ALLOWED)
+            drops.add(_drop_allowed(allowed))
         elif ch.id in exclude_ids:
             drops.add(_DROP_FAILED)
         else:
             return ch, '', s
-    for why in (_DROP_FAILED, _DROP_ALLOWED, _DROP_BLOCKED, _DROP_OTHER_GAME, _DROP_RECORDING, _DROP_GONE):
+    for why in (_DROP_FAILED, _DROP_LOGIN, _DROP_ALLOWED, _DROP_BLOCKED, _DROP_OTHER_GAME, _DROP_RECORDING,
+                _DROP_GONE):
         if why in drops:
             return None, why, None
     raise ValueError('_sports_member was handed no sources')
@@ -1563,7 +1687,7 @@ def _sports_member(sources, blocked, allowed, exclude_ids, live: bool = False,
 
 def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int = None,
                  now: Optional[datetime] = None, viewer_id=None, preview: bool = False,
-                 any_switch: bool = False) -> Optional[Play]:
+                 any_switch: bool = False, accounts: Optional[frozenset] = None) -> Optional[Play]:
     """The member `feed_id` plays right now, or None when the id names nothing served.
     A group is re-asked here on every tune-in and every failover (`exclude_ids` drops the
     members that already failed this play), so the IPTV player always gets the member a recording
@@ -1577,7 +1701,11 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int 
     channel and a sports channel are asked exactly as for a player. `any_switch` plays a channel
     or a group in the TV Guide whether or not its On the output switch is on: a
     picture-in-picture channel's picture may be a guide row kept off the player's list
-    (dev/docs/DESIGN-pip-channels.md 5). It never plays a row that left the guide."""
+    (dev/docs/DESIGN-pip-channels.md 5). It never plays a row that left the guide. `accounts` is
+    the play's login's own account list (RelaySession.login_accounts), which takes the place of
+    the output's list everywhere below (play_accounts); with one, a picture-in-picture channel is
+    refused by name, since its pictures are shared by everyone watching and come from the
+    output's list (dev/changelog/1765)."""
     from .channel_groups import blocked_account_ids_now, serving_member
     from .database import Channel, ChannelGroup
     from .routes.channel_tests import _latest_tests_by_channel
@@ -1587,12 +1715,13 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int 
         from .config import load_config
         cfg = load_config()
     fcfg = feed_config(cfg)
-    allowed = allowed_account_ids(fcfg)
+    allowed = play_accounts(fcfg, accounts)
     kind, row_id = decode_feed_id(feed_id)
     if kind == KIND_PIP:
         from . import pip_channels
         return pip_channels.resolve_feed(feed_id, cfg, exclude_ids=exclude_ids, event_id=event_id,
-                                         now=now, viewer_id=viewer_id, preview=preview)
+                                         now=now, viewer_id=viewer_id, preview=preview,
+                                         own_accounts=accounts is not None)
     if kind == KIND_UP_NEXT:
         from .sports_up_next import channels
         found = channels(everything=preview, number=row_id)
@@ -1615,7 +1744,10 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int 
             play.why_none, play.fault = WHY_TAKEN_OFF, False
             return play
         if allowed is not None and ch.account_id not in allowed:
-            play.why_none = 'its account is one the IPTV output is not allowed to serve from'
+            if isinstance(allowed, LoginAccounts):
+                play.why_none, play.own_accounts = WHY_LOGIN_ACCOUNT, True
+            else:
+                play.why_none = 'its account is one the IPTV output is not allowed to serve from'
             return play
         if ch.id in exclude_ids:
             play.why_none = 'it already failed this play'
@@ -1632,7 +1764,7 @@ def resolve_play(feed_id: int, cfg=None, exclude_ids=frozenset(), event_id: int 
     blocked = blocked_account_ids_now()
     members, why = _members_for_feed(group, blocked, allowed)
     if not members:
-        play.why_none = _GROUP_WHY[why]
+        play.why_none, play.own_accounts = _GROUP_WHY[why], why == _DROP_LOGIN
         return play
     latest = _latest_tests_by_channel([m.id for m in members])
     choice = serving_member(group, latest, blocked_account_ids=blocked, members=members,
@@ -1847,6 +1979,10 @@ class RelaySession:
     # Tuned in on the public port (app/public_listener.py), which is always relayed. Never read
     # as which login it is or where the player is.
     public: bool = False
+    # Its login's own accounts (FeedLogin.accounts), which every walk this play asks again takes
+    # in place of the output's list (play_accounts); None is the output's list, read afresh at
+    # each ask. Set when the play is built, and moved only by set_login_accounts().
+    login_accounts: Optional['LoginAccounts'] = None
     last_recheck_mono: float = 0.0
     _reserve_short_logged: bool = False
     _finishing: bool = False
@@ -2008,6 +2144,11 @@ _login_changes: dict = {}
 #: and the lineup it last set, which a play let in on an older one is checked against.
 _lineup_changes: dict = {}
 _lineup_now: dict = {}
+#: Login id -> how many times set_login_accounts() has run for it (FeedLogin.accounts_generation),
+#: and the accounts it last set (None for the output's list), which a play let in on older ones
+#: takes when it registers.
+_accounts_changes: dict = {}
+_accounts_now: dict = {}
 _reaper: Optional[threading.Thread] = None
 _play_queue: list = []        # lines of Recent plays waiting for the writer thread
 _log_writer: Optional[threading.Thread] = None
@@ -2113,7 +2254,10 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
     public_token = _tuning_public.set(public)
     try:
         session = _start_session(feed_id, client, cfg, preview, player, login, room)
-        gone = rechosen = False
+        gone = rechosen = outside = False
+        # The output's list as it is now, read before the lock, for a login whose accounts were
+        # set back to it while this play was starting (_LoginRoom.accounts_moved_locked).
+        allowed = allowed_account_ids(feed_config(cfg)) if room is not None else None
         with _lock:
             if player and not session.player:
                 # A waiting screen, card or Up next picture: built without it, and the play a
@@ -2128,6 +2272,7 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
                     session.replaced_feed_id = room.replaced_feed_id
                 gone = not room.still_good_locked()
                 rechosen = not gone and not room.lineup_still_offers_locked(feed_id)
+                outside = not gone and not rechosen and room.accounts_moved_locked(session, allowed)
         if gone:
             # The login was turned off, changed or deleted while this play was starting.
             _finish(session, REASON_LOGIN_OFF)
@@ -2137,6 +2282,11 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
             # play of a channel taken out does, one line in Recent plays.
             _finish(session, REASON_LINEUP)
             raise FeedRefused(REASON_TEXT[REASON_LINEUP], 404)
+        if outside:
+            # The login's accounts were changed while this play was starting, and its account is
+            # no longer one of them: it ends as a play already on it does.
+            _finish(session, REASON_ACCOUNTS)
+            raise FeedRefused(REASON_TEXT[REASON_ACCOUNTS], 409)
     finally:
         # After the play carries its login, so its count never dips between the two.
         if room is not None:
@@ -2174,6 +2324,19 @@ class _LoginRoom:
         if _lineup_changes.get(login_id, 0) == self.login.lineup_generation:
             return True
         return lineup_offers(_lineup_now.get(login_id), feed_id)
+
+    def accounts_moved_locked(self, session: RelaySession, output_allowed) -> bool:
+        """Whether set_login_accounts() ran for the login since the gate read it and left
+        `session`'s account out (`output_allowed` is the output's list, for accounts set back to
+        it). The play takes the accounts that call set either way, so what it asks next is
+        held to them (dev/changelog/1765)."""
+        login_id = self.login.feed_login_id
+        if _accounts_changes.get(login_id, 0) == self.login.accounts_generation:
+            return False
+        session.login_accounts = _accounts_now.get(login_id)
+        return _outside_accounts(session, session.login_accounts,
+                                 session.login_accounts if session.login_accounts is not None
+                                 else output_allowed)
 
     def claim(self, play: 'Play', client: str, player: str, alert: bool) -> None:
         """Take the place, or raise FeedRefused (503) naming the login's limit. A full limit
@@ -2257,6 +2420,44 @@ def set_login_lineup(login_id: int, lineup: Optional[frozenset]) -> int:
     return sum(1 for s in live if _finish(s, REASON_LINEUP))
 
 
+def _outside_accounts(session: RelaySession, accounts: Optional[frozenset], allowed) -> bool:
+    """Whether `session` plays from outside its login's accounts: `accounts` is the login's own
+    list (None for the output's), `allowed` the set that comes to (play_accounts). A
+    picture-in-picture play is outside any list of the login's own, since its pictures are
+    shared; a play on ChannelBin's own picture holds no account and is asked again on the new
+    set when it next looks."""
+    if session.pip_row_id is not None:
+        return accounts is not None
+    return session.account_id is not None and allowed is not None and session.account_id not in allowed
+
+
+def _outside_own_accounts_locked(session: RelaySession, account_id: int) -> bool:
+    """Whether `account_id` is outside the play's login's own accounts (False on the output's
+    list, which stop_account() answers for). Under _lock, where _launch() names the account a
+    play moves to, which every failover, move and game put on reaches."""
+    return session.login_accounts is not None and account_id not in session.login_accounts
+
+
+def set_login_accounts(login_id: int, accounts: Optional['LoginAccounts'], cfg=None) -> int:
+    """Hand login `login_id`'s live plays the accounts just committed for it (`accounts`, None
+    for the output's list), and end by name every one playing from outside them. How many it
+    ended. Called after the commit, never inside it. The count it moves, in the same lock as the
+    list it takes, hands the new accounts to a play the gate let in on the old ones that
+    registers after this list, which is ended too when it is outside them (start_session)."""
+    if accounts is not None and not isinstance(accounts, LoginAccounts):
+        # The type is what names the login's list in a refusal (_drop_allowed).
+        accounts = LoginAccounts(accounts)
+    allowed = play_accounts(feed_config(cfg), accounts)
+    with _lock:
+        _accounts_changes[login_id] = _accounts_changes.get(login_id, 0) + 1
+        _accounts_now[login_id] = accounts
+        mine = _login_plays_locked(login_id)
+        for s in mine:
+            s.login_accounts = accounts
+        cut = [s for s in mine if _outside_accounts(s, accounts, allowed)]
+    return sum(1 for s in cut if _finish(s, REASON_ACCOUNTS))
+
+
 def _not_in_lineup(play: 'Play', login: FeedLogin, client: str):
     """Refuse a tune-in to a channel outside its login's lineup: a player holding a list from
     before its channels were chosen again, or an id typed by hand. Named in the refused plays
@@ -2268,6 +2469,19 @@ def _not_in_lineup(play: 'Play', login: FeedLogin, client: str):
     raise FeedRefused(message, 404)
 
 
+def _outside_login_accounts(play: 'Play', login: FeedLogin, client: str):
+    """Refuse a tune-in whose login's own accounts leave out everything it could play: a
+    channel on another account, a group with no channel on them, a game none of them carries, or
+    a picture-in-picture channel. Named in the refused plays and the log with the login, and no
+    alert: nothing is broken, and its player asks again every half minute (dev/changelog/1765)."""
+    message = (f'Nothing to play for {play.label} on IPTV output login "{login.username}": '
+               f'{play.why_none}. Its accounts are chosen under Logins for other users on the IPTV '
+               f'Output page.')
+    _note_refused(play.feed_id, play.label, client, message)
+    log.info('Viewer from %s%s refused: %s', client, _on_login(login.log_name), message)
+    raise FeedRefused(message, 409)
+
+
 def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str,
                    login: Optional[FeedLogin] = None, room: Optional[_LoginRoom] = None) -> RelaySession:
     from flask import current_app
@@ -2275,11 +2489,14 @@ def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str,
 
     cfg = cfg or load_config()
     fcfg = feed_config(cfg)
-    play = resolve_play(feed_id, cfg, preview=preview)
+    accounts = login.accounts if login is not None else None
+    play = resolve_play(feed_id, cfg, preview=preview, accounts=accounts)
     if play is None:
         raise FeedRefused('No such channel on the IPTV output', 404)
     if login is not None and not login.offers(feed_id):
         _not_in_lineup(play, login, client)
+    if play.member is None and play.own_accounts and login is not None:
+        _outside_login_accounts(play, login, client)
     if room is not None:
         room.claim(play, client, player, alert=not preview)
     login_id = login.feed_login_id if login is not None else None
@@ -2327,6 +2544,7 @@ def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str,
         # A set-up picture-in-picture channel reaching here plays its big picture alone, a
         # plain stream copy on one connection: nothing can combine the two (section 7.3).
         combine_off=combine_off, player=player, feed_login_id=login_id, feed_login=login_name,
+        login_accounts=accounts,
     )
     deadline = time.monotonic() + SWITCH_GRACE_SECONDS
     if not _claim_slot(session, cap, deadline):
@@ -2489,7 +2707,8 @@ def play_alone(session: RelaySession) -> None:
     and let go of its pictures, and holds `_swap_lock`. Requires an app context."""
     from .config import load_config
     cfg = load_config()
-    play = resolve_play(session.feed_id, cfg, viewer_id=session.id, preview=session.preview)
+    play = resolve_play(session.feed_id, cfg, viewer_id=session.id, preview=session.preview,
+                        accounts=session.login_accounts)
     if play is None or play.pip is None:
         _finish(session, REASON_TAKEN_OFF)
         return
@@ -2617,6 +2836,10 @@ def _launch(session: RelaySession, member, cfg, first: bool = True,
         session.account_id = member.account_id
         seated = (first and not walked) or session.id in connlim.seated_holder_ids('viewer')
         ending = walked and (not session.live or session._finishing)
+        # Asked in the hold set_login_accounts() hands a play its new list in: a failover, a
+        # move or a game put on that was resolved on the old list ends here, and one named
+        # after this hold is the account that call checks (dev/changelog/1765).
+        outside = not ending and _outside_own_accounts_locked(session, member.account_id)
         if walked and seated and not ending:
             # A recording that started on the account the play was registered under flagged
             # it while it held no seat there (preempt_for_account matches by account). The
@@ -2627,6 +2850,10 @@ def _launch(session: RelaySession, member, cfg, first: bool = True,
         # whatever the walk had taken, and the play is neither held nor preempted.
         connlim.release(member.account_id, 'viewer', session.id)
         raise FeedRefused(session.reason_text() or REASON_TEXT[REASON_STOPPED], 409)
+    if outside:
+        _finish(session, REASON_ACCOUNTS,
+                detail=f'its login\'s accounts were changed as the play was moving to "{member.name}"')
+        raise FeedRefused(REASON_TEXT[REASON_ACCOUNTS], 409)
     if not seated and first and hold:
         # A recording took the seat the walk found before the play was named on its account:
         # nothing is held, and a sports play waits on the screen as it does for any seat.
@@ -2916,9 +3143,12 @@ def stop_feed_id(feed_id: int, reason: str) -> int:
 
 def stop_account(account_id: int, reason: str = REASON_ACCOUNT_OFF) -> int:
     """End every live play coming from `account_id`, by name, and every picture-in-picture
-    picture on it, whose window then says why. How many it ended."""
+    picture on it, whose window then says why, when the output's list stops naming the account.
+    How many it ended. A play whose login has accounts of its own (RelaySession.login_accounts)
+    does not play from the output's list and is left alone (dev/changelog/1765)."""
     with _lock:
-        live = [s for s in _all_live_locked() if s.account_id == account_id]
+        live = [s for s in _all_live_locked()
+                if s.account_id == account_id and s.login_accounts is None]
     # A picture is not a play: it is ended here and counted nowhere.
     return sum(1 for s in live if _finish(s, reason) and not s.internal)
 
@@ -3768,7 +3998,8 @@ def _next_channel_or_refuse(session: RelaySession) -> None:
     from .config import load_config
     exclude = frozenset(session.failed_ids | {session.channel_id})
     play = resolve_play(session.feed_id, load_config(), exclude_ids=exclude,
-                        event_id=session.event_id, viewer_id=session.id, preview=session.preview)
+                        event_id=session.event_id, viewer_id=session.id, preview=session.preview,
+                        accounts=session.login_accounts)
     stays = f'It stays on "{session.channel_name}".'
     if play is None or play.member is None:
         raise FeedRefused(f'No other channel can play {session.label} right now. {stays}', 409)
@@ -3984,7 +4215,7 @@ def start_waiting(play: Play, client: str, cfg: dict, held: str = None) -> Relay
         ring=Ring(int(fcfg.get('buffer_mb') or 64) * 1024 * 1024, 0.0),
         **_session_limits(cfg, fcfg), started_mono=time.monotonic(), state=STATE_WAITING,
         fails_over=True, app=current_app._get_current_object(), sports_row_id=row_id,
-        preview=play.preview)
+        preview=play.preview, login_accounts=_tuning_accounts())
     session.last_recheck_mono = session.started_mono
     _set_screen(session, screen, path, still, held)
     with _lock:
@@ -4144,7 +4375,8 @@ def start_showing(play: Play, client: str, cfg: dict) -> RelaySession:
         group_id=None, channel_id=None, channel_name='', account_id=None,
         ring=Ring(int(fcfg.get('buffer_mb') or 64) * 1024 * 1024, 0.0),
         **_session_limits(cfg, fcfg), started_mono=time.monotonic(), state=STATE_SHOWING,
-        app=current_app._get_current_object(), up_next_number=number, preview=play.preview)
+        app=current_app._get_current_object(), up_next_number=number, preview=play.preview,
+        login_accounts=_tuning_accounts())
     session.last_recheck_mono = session.started_mono
     _set_screen(session, rotation, path, still)
     with _lock:
@@ -4171,7 +4403,7 @@ def _recheck_showing(session: RelaySession) -> None:
     from .config import load_config
     ss = _screen_mod()
     cfg = load_config()
-    play = resolve_play(session.feed_id, cfg, preview=session.preview)
+    play = resolve_play(session.feed_id, cfg, preview=session.preview, accounts=session.login_accounts)
     if play is None or play.up_next is None:
         _finish(session, REASON_TAKEN_OFF)
         return
@@ -4268,7 +4500,7 @@ def _recheck_locked(session: RelaySession) -> None:
     ss = _screen_mod()
     cfg = load_config()
     fcfg = feed_config(cfg)
-    play = resolve_play(session.feed_id, cfg, preview=session.preview)
+    play = resolve_play(session.feed_id, cfg, preview=session.preview, accounts=session.login_accounts)
     if play is None or not play.sports:
         _finish(session, REASON_SCREEN_GONE)
         return
@@ -4376,7 +4608,7 @@ def _resolve_again(session: RelaySession, cfg: dict, exclude_ids, event_id=None)
     if session.picture is not None:
         return session.picture.resolve(cfg, exclude_ids, event_id, session.id)
     return resolve_play(session.feed_id, cfg, exclude_ids=exclude_ids, event_id=event_id,
-                        viewer_id=session.id, preview=session.preview)
+                        viewer_id=session.id, preview=session.preview, accounts=session.login_accounts)
 
 
 def _all_live_locked() -> list:
@@ -4485,7 +4717,7 @@ def start_card(play: Play, client: str, cfg: dict, held: str = None) -> RelaySes
         ring=Ring(int(fcfg.get('buffer_mb') or 64) * 1024 * 1024, 0.0),
         **_session_limits(cfg, fcfg), started_mono=time.monotonic(), state=STATE_CARD,
         fails_over=True, app=current_app._get_current_object(), pip_row_id=play.pip.row_id,
-        preview=play.preview)
+        preview=play.preview, login_accounts=_tuning_accounts())
     session.last_recheck_mono = session._screen_since = session.started_mono
     _set_card(session, card, path, still, held)
     with _lock:
@@ -4515,7 +4747,8 @@ def _recheck_card(session: RelaySession) -> None:
     # A card that followed every channel failing tries them all again: the failures are at
     # least a turn old, and nothing else would ever bring the picture back.
     session.failed_ids.clear()
-    play = resolve_play(session.feed_id, cfg, viewer_id=session.id, preview=session.preview)
+    play = resolve_play(session.feed_id, cfg, viewer_id=session.id, preview=session.preview,
+                        accounts=session.login_accounts)
     if play is None or play.pip is None:
         _finish(session, REASON_TAKEN_OFF)
         return
@@ -4675,7 +4908,7 @@ def _to_card_now(session: RelaySession) -> None:
             try:
                 _stop_detached(session, proc, reader)
                 cfg = load_config()
-                play = resolve_play(session.feed_id, cfg, preview=session.preview)
+                play = resolve_play(session.feed_id, cfg, preview=session.preview, accounts=session.login_accounts)
                 if play is None or play.pip is None:
                     _finish(session, REASON_TAKEN_OFF)
                 elif not _put_on_card(session, play, cfg) and session.live:
@@ -4702,9 +4935,10 @@ def redirect_play(feed_id: int, client: str, cfg=None, login: Optional[FeedLogin
     cfg = cfg or load_config()
     token = _tuning_login.set(login)
     try:
-        play = resolve_play(feed_id, cfg)
-        # Only the main login is redirected, and it has no lineup; asked anyway, so a change to
-        # relays_for() can never send a narrowed login's player to a channel outside its list.
+        # Only the main login is redirected, and it has no lineup or accounts of its own; both
+        # are asked anyway, so a change to relays_for() can never send a narrowed login's player
+        # to a channel outside its list or on an account outside its own.
+        play = resolve_play(feed_id, cfg, accounts=login.accounts if login is not None else None)
         if play is not None and login is not None and not login.offers(feed_id):
             _not_in_lineup(play, login, client)
         if play is not None and play.sports and play.member is None and not play.fault:
@@ -4806,6 +5040,8 @@ def reset_for_tests():
         _login_changes.clear()
         _lineup_changes.clear()
         _lineup_now.clear()
+        _accounts_changes.clear()
+        _accounts_now.clear()
         del _redirects[:]
     discard_play_log()
     _last_prune_mono = None

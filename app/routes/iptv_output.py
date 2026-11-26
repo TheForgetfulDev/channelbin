@@ -394,6 +394,12 @@ def _login_fields(data: dict, fcfg: dict, login_id=None) -> tuple:
         if problem:
             return None, problem
         out['lineup'] = None if ids is None else json.dumps(ids)
+    if 'accounts' in data:
+        existing = {a.id for a in Account.query.with_entities(Account.id)}
+        ids, problem = output_feed.accounts_problem(data.get('accounts'), existing)
+        if problem:
+            return None, problem
+        out['accounts'] = None if ids is None else json.dumps(ids)
     return out, ''
 
 
@@ -430,7 +436,8 @@ def create_login():
 def edit_login(login_id):
     """Change a login. Turning it off or changing its username or password ends the plays on
     it, after the commit: an IPTV player holding the old pair is not that login any more. A new
-    channel list ends its plays of the channels the list leaves out, after the commit too."""
+    channel list ends its plays of the channels the list leaves out, and new accounts its plays
+    from outside them, after the commit too."""
     data = request.get_json(silent=True) or {}
     fields, error = _login_fields(data, output_feed.feed_config(load_config()), login_id=login_id)
     if error:
@@ -446,12 +453,13 @@ def edit_login(login_id):
         cut = ((fields.get('enabled') is False and row.enabled)
                or ('username' in fields and fields['username'] != row.username)
                or ('password' in fields and fields['password'] != row.password))
-        before = output_feed.lineup_of(row)
+        before, accounts_before = output_feed.lineup_of(row), output_feed.accounts_of(row)
         for key, value in fields.items():
             setattr(row, key, value)
         db.session.commit()
-        after = output_feed.lineup_of(row)
-        return cut, (after if after != before else _UNCHANGED), row.username
+        after, accounts_after = output_feed.lineup_of(row), output_feed.accounts_of(row)
+        return (cut, (after if after != before else _UNCHANGED),
+                (accounts_after if accounts_after != accounts_before else _UNCHANGED), row.username)
 
     try:
         done = _edit()
@@ -460,19 +468,27 @@ def edit_login(login_id):
         return jsonify({'error': _TAKEN}), 409
     if done is None:
         return jsonify({'error': 'That login no longer exists'}), 404
-    cut, lineup, username = done
+    cut, lineup, accounts, username = done
     ended = output_feed.stop_login(login_id) if cut else 0
     if lineup is not _UNCHANGED:
         # After the commit: the plays its new channels leave out end by name (dev/changelog/1764).
         ended += output_feed.set_login_lineup(login_id, lineup)
         log.info('IPTV output: login %s now gets %s', username,
                  'every channel on the output' if lineup is None else counted(len(lineup), 'channel'))
+    if accounts is not _UNCHANGED:
+        # After the commit: its plays take the new accounts, and those outside them end by name
+        # (dev/changelog/1765).
+        ended += output_feed.set_login_accounts(login_id, accounts)
+        log.info('IPTV output: login %s now plays from %s', username,
+                 "the IPTV output's accounts" if accounts is None
+                 else f'its own {counted(len(accounts), "account")} ({", ".join(map(str, sorted(accounts)))})')
     log.info('IPTV output: login %d changed (%s)%s', login_id, ', '.join(sorted(fields)),
              f', {counted(ended, "play")} ended' if ended else '')
     return jsonify({'success': True, 'ended': ended})
 
 
-#: What _edit() hands back for a lineup the save left as it was, since None means everything.
+#: What _edit() hands back for a lineup or accounts the save left as they were, since None means
+#: everything (the lineup) or the output's list (the accounts).
 _UNCHANGED = object()
 
 
@@ -486,7 +502,20 @@ def login_channels(login_id):
     if row is None:
         return jsonify({'error': 'That login no longer exists'}), 404
     return jsonify({'success': True, 'name': row.name,
-                    **output_feed_view.lineup_choices(load_config(), output_feed.lineup_of(row))})
+                    **output_feed_view.lineup_choices(load_config(), output_feed.lineup_of(row),
+                                                      output_feed.accounts_of(row))})
+
+
+@iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>/accounts')
+def login_accounts(login_id):
+    """What the Choose accounts dialog lists for one login: every account, whether the output's
+    own list has it, and the login's own picks, or none when it plays from the output's list
+    (dev/changelog/1765)."""
+    row = db.session.get(OutputFeedLogin, login_id)
+    if row is None:
+        return jsonify({'error': 'That login no longer exists'}), 404
+    return jsonify({'success': True, 'name': row.name,
+                    **output_feed_view.account_choices(load_config(), output_feed.accounts_of(row))})
 
 
 @iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>', methods=['DELETE'])
