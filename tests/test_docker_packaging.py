@@ -416,6 +416,23 @@ class UnraidTemplateTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, icon[len(self.RAW):])),
                         f'Icon points at {icon}, which is not a file in this repository')
 
+    def test_the_public_port_is_mapped_where_the_image_exposes_it(self):
+        """The IPTV output's public port is idle until it is set in Settings, but a container
+        that does not publish it cannot be reached on it at all, so the Dockerfile, the compose
+        example and this template carry the same number as output_feed.SUGGESTED_PUBLIC_PORT
+        (dev/changelog/1762)."""
+        from app.output_feed import SUGGESTED_PUBLIC_PORT
+        port = str(SUGGESTED_PUBLIC_PORT)
+        ports = {c.get('Target'): c for c in self.root.findall('Config') if c.get('Type') == 'Port'}
+        self.assertIn(port, ports, 'the Unraid template does not map the public port')
+        self.assertEqual((ports[port].get('Default'), ports[port].text), (port, port))
+        self.assertEqual(ports[port].get('Required'), 'false')
+        with open(os.path.join(ROOT, 'Dockerfile'), encoding='utf-8') as fh:
+            self.assertIn(f'EXPOSE {port}', fh.read())
+        with open(os.path.join(ROOT, 'docker-compose.example.yml'), encoding='utf-8') as fh:
+            mapped = [ln.strip() for ln in fh if ln.strip().startswith('- "')]
+        self.assertIn(f'- "{port}:{port}"', mapped, 'the compose example does not map the public port')
+
     def test_the_catalog_profile_is_not_empty(self):
         """Community Apps refuses a repository whose ca_profile.xml has an empty <Profile>."""
         profile = ET.parse(os.path.join(ROOT, 'ca_profile.xml')).getroot().findtext('Profile')
