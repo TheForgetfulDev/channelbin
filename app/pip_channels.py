@@ -168,6 +168,10 @@ def _clean_source(raw, which: str) -> Source:
             raise PipRefused(f'A search is at most {QUERY_MAX} characters.')
         return Source(kind, None, words)
     ref = raw.get('ref')
+    if ref is None and kind in (PIP_SOURCE_CHANNEL, PIP_SOURCE_GROUP):
+        # A picture detach_refs() unlinked, sent back unchanged from the setup dialog.
+        what = 'channel group' if kind == PIP_SOURCE_GROUP else 'channel'
+        raise PipRefused(f'The {which} picture\'s {what} was removed. Choose another.', 409)
     if isinstance(ref, bool) or not isinstance(ref, int) or not 0 < ref <= REF_MAX:
         raise PipRefused(f'Choose what the {which} picture shows.')
     return Source(kind, ref)
@@ -290,6 +294,48 @@ def change(row_id: int, spec: dict) -> Optional[PipChannel]:
     row = db.session.get(PipChannel, row_id)
     log.info('Picture-in-picture channel %d (%s) changed: %s', row.id, row.name, _spec_words(spec))
     return row
+
+
+def detach_refs(kind: str, ids) -> set:
+    """Unlink every picture of kind `kind` (PIP_SOURCE_CHANNEL or PIP_SOURCE_GROUP) that names
+    one of `ids`, which are being deleted: the picture keeps its kind with no ref, which
+    resolve_source() and describe() read as removed until a person chooses again. Channel and
+    group ids are re-issued, so a ref left behind would play whatever gets the id next
+    (dev/docs/BUGS.md 2026-11-25 @ 07:47:14 PM). Mutates without committing, inside the
+    caller's delete unit; returns the row ids it unlinked, for refresh_detached() after that
+    commit."""
+    if kind not in (PIP_SOURCE_CHANNEL, PIP_SOURCE_GROUP):
+        raise ValueError(f'A picture of kind "{kind}" names no local id')
+    ids = list(ids)
+    touched = set()
+    if not ids:
+        return touched
+    for role in ROLES:
+        kind_col, ref_col = getattr(PipChannel, f'{role}_kind'), getattr(PipChannel, f'{role}_ref')
+        hit = PipChannel.query.filter(kind_col == kind, ref_col.in_(ids))
+        touched.update(row_id for (row_id,) in hit.with_entities(PipChannel.id))
+        hit.update({f'{role}_ref': None}, synchronize_session=False)
+    return touched
+
+
+def refresh_detached(row_ids, what: str) -> None:
+    """After the commit of a delete that detach_refs() unlinked pictures in, the last thing the
+    delete does: say so, and refresh each row's live plays (output_feed.refresh_pip), which
+    stops a combined play's picture of the gone channel or group and asks it again, onto the
+    "removed" card, and leaves a play on its big picture alone as it is until it tunes in
+    again. A refresh that fails is logged and never undoes or fails the delete. Requires an
+    app context."""
+    for row_id in sorted(row_ids):
+        row = db.session.get(PipChannel, row_id)
+        if row is None:
+            continue
+        log.info('Picture-in-picture channel %d (%s) lost a picture: its %s was deleted, and the '
+                 'picture shows it as removed until another is chosen', row.id, row.name, what)
+        try:
+            output_feed.refresh_pip(row_id)
+        except Exception:                               # noqa: BLE001 - one row's plays, never the delete
+            log.exception('Picture-in-picture channel %d: its plays could not be refreshed after the '
+                          'delete; they move at their next tune-in', row_id)
 
 
 def _spec_words(spec: dict) -> str:
@@ -456,9 +502,13 @@ def resolve_source(source: Optional[Source], cfg: dict, *, feed_id: int, label: 
         return _resolve_game(source, cfg, feed_id, label, now, exclude_ids, event_id, viewer_id)
     if source.kind in (PIP_SOURCE_CHANNEL, PIP_SOURCE_GROUP):
         group = source.kind == PIP_SOURCE_GROUP
+        what = 'channel group' if group else 'channel'
+        if source.ref is None:
+            # Unlinked by detach_refs() when it was deleted.
+            return Pane(PANE_GONE, source, f'A {what} that was removed',
+                        why=f'the {what} is no longer in your TV Guide')
         row = db.session.get(ChannelGroup if group else Channel, source.ref)
         row_feed = (output_feed.feed_id_for_group if group else output_feed.feed_id_for_channel)(source.ref)
-        what = 'channel group' if group else 'channel'
         play, could = _row_play(row_feed, cfg, exclude_ids, viewer_id)
         if row is None or play is None:
             return Pane(PANE_GONE, source, row.name if row is not None else f'A {what} that was removed',
@@ -749,7 +799,7 @@ def describe(rows, now: Optional[datetime] = None, guide=None, after: Optional[t
     sources = {k: s for k, s in sources.items() if s is not None}
 
     def refs(kind):
-        return sorted({s.ref for s in sources.values() if s.kind == kind})
+        return sorted({s.ref for s in sources.values() if s.kind == kind and s.ref is not None})
 
     events = ({e.tsdb_id: e for e in SportsEvent.query.filter(SportsEvent.tsdb_id.in_(refs(PIP_SOURCE_GAME)))}
               if refs(PIP_SOURCE_GAME) else {})

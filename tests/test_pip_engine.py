@@ -216,6 +216,64 @@ class SavedWhileWatchedTests(_Engine):
         self.assertTrue(big.live and small.live, 'neither connection was touched')
 
 
+class SavedDuringTuneInTests(_Engine):
+    """A Save that lands while a TV is tuning in, after the pictures were asked and before the
+    play is attached, reaches that play too (dev/docs/BUGS.md 2026-11-25 @ 07:56:12 PM)."""
+
+    def _save_during_asks(self, data):
+        real = engine.Picture.ask
+        done = []
+
+        def ask(picture, cfg, wait=True):
+            real(picture, cfg, wait)
+            if picture.role == pip.ROLE_INSET and not done:
+                done.append(True)
+                pip.change(self.row.id, pip.clean(data))
+                feed.refresh_pip(self.row.id)
+
+        patcher = mock.patch.object(engine.Picture, 'ask', ask)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return done
+
+    def test_a_swap_saved_during_the_tune_in_puts_the_pictures_in_the_swapped_windows(self):
+        done = self._save_during_asks({
+            'name': 'PiP 1', 'main': src(PIP_SOURCE_CHANNEL, self.small.id),
+            'inset': src(PIP_SOURCE_CHANNEL, self.big.id), 'layout': 'corner', 'corner': 'br', 'size': 's',
+            'swapped_copy': True})
+        _resp, s = self.combined()
+        self.assertTrue(done, 'the save ran inside the tune-in')
+        self.assertEqual((s.combined.big.session.channel_id, s.combined.small.session.channel_id),
+                         (self.small.id, self.big.id))
+
+    def test_a_layout_saved_during_the_tune_in_is_the_first_combiners(self):
+        from app.proc_utils import pip_geometry
+        done = self._save_during_asks({
+            'name': 'PiP 1', 'main': src(PIP_SOURCE_CHANNEL, self.big.id),
+            'inset': src(PIP_SOURCE_CHANNEL, self.small.id), 'layout': 'side', 'swapped_copy': True})
+        _resp, s = self.combined()
+        self.assertTrue(done, 'the save ran inside the tune-in')
+        self.assertEqual(s.combined.geometry, pip_geometry('side'))
+        self.assertEqual(self.asked('combiner')[0]['geometry'], pip_geometry('side'))
+
+
+class DeletedSourceTests(_Engine):
+    def test_a_deleted_channels_picture_leaves_its_connection_and_says_it_was_removed(self):
+        """dev/docs/BUGS.md 2026-11-25 @ 07:47:14 PM: a delete unlinks the picture, and the
+        refresh after its commit moves a watched play off the gone channel at once."""
+        from app import db
+        _resp, s = self.combined()
+        big, small = self.pictures()
+        kept, gone = big.session, small.session
+        rows = pip.detach_refs(PIP_SOURCE_CHANNEL, [self.small.id])
+        db.session.commit()
+        pip.refresh_detached(rows, 'channel')
+        self.assertTrue(wait_for(lambda: not gone.live and small.pane.state == pip.PANE_GONE, 15), small.pane)
+        self.assertEqual(self.seats(self.small.account), [])
+        self.assertIs(big.session, kept, 'the big picture keeps its connection')
+        self.assertIsNotNone(s.combined)
+
+
 class PictureEndTests(_Engine):
     """What a window says when its picture's session stops, by why it stopped."""
 
@@ -354,6 +412,60 @@ class CombinerDeathTests(_Engine):
                                  and s.state == feed.STATE_STREAMING, 20), s)
         self.assertIsNotNone(s.combined)
         self.assertEqual(len(self.asked('combiner')), 2)
+
+    def test_a_combiner_that_hangs_while_its_big_picture_arrives_is_restarted(self):
+        """dev/docs/BUGS.md 2026-11-25 @ 08:02:19 PM: a combiner alive and silent was never
+        noticed, so the TV sat on nothing until the player gave up."""
+        _resp, s = self.combined()
+        first = s.proc
+        s.stall_timeout = 2.0
+        os.kill(first.pid, signal.SIGSTOP)
+        self.addCleanup(lambda pid=first.pid: _cont(pid))
+        # Well inside the rig's 20 s clip, whose end would rebuild the combiner on its card
+        # for a reason of its own.
+        self.assertTrue(wait_for(lambda: s.proc is not None and s.proc is not first
+                                 and s.state == feed.STATE_STREAMING, 8), s)
+        self.assertIsNotNone(s.combined)
+        self.assertEqual([kw['big_input'] for kw in self.asked('combiner')], ['', ''],
+                         'restarted on the same big picture, not on its card')
+        self.assertIsNotNone(first.poll(), 'the hung combiner was killed')
+
+    def test_a_combiner_that_hangs_in_its_first_seconds_twice_drops_the_play_to_the_big_picture_alone(self):
+        """A combiner that wedges after a few frames every time is judged by when it last sent
+        anything, not by when the hang was noticed, so it ends on the big picture alone instead
+        of a restart every stall timeout for good."""
+        # Each hang is noticed past the settle time and each combiner last sent inside it,
+        # which is the case a settle measured to the noticing would read as two slow deaths.
+        settle = mock.patch.object(engine, 'COMBINER_SETTLE_SECONDS', 3.0)
+        settle.start()
+        self.addCleanup(settle.stop)
+        _resp, s = self.combined()
+        s.stall_timeout = 4.0
+        first = s.proc
+        os.kill(first.pid, signal.SIGSTOP)
+        self.addCleanup(lambda pid=first.pid: _cont(pid))
+        self.assertTrue(wait_for(lambda: s.proc is not None and s.proc is not first
+                                 and s.state == feed.STATE_STREAMING, 9), s)
+        second = s.proc
+        os.kill(second.pid, signal.SIGSTOP)
+        self.addCleanup(lambda pid=second.pid: _cont(pid))
+        self.assertTrue(wait_for(lambda: s.combined is None and s.state == feed.STATE_STREAMING, 9), s)
+        self.assertEqual(len(self.asked('combiner')), 2)
+        self.assertIn('could not be combined', feed.play_notes(s))
+
+    def test_a_combiner_silent_because_its_big_picture_stopped_is_left_alone(self):
+        """The big picture's stall is its own session's to judge: the combiner, starved, is not
+        restarted for it."""
+        _resp, s = self.combined()
+        first = s.proc
+        big, _small = self.pictures()
+        s.stall_timeout = 2.0
+        big_proc = big.session.proc
+        os.kill(big_proc.pid, signal.SIGSTOP)
+        self.addCleanup(lambda pid=big_proc.pid: _cont(pid))
+        time.sleep(6)
+        self.assertIs(s.proc, first)
+        self.assertEqual(len(self.asked('combiner')), 1)
 
     def test_dying_twice_drops_the_play_to_the_big_picture_alone_and_gives_the_small_seat_back(self):
         self.failing.add('combiner')

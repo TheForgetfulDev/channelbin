@@ -1796,7 +1796,7 @@ CHANNEL_NEEDING_STATUSES = (REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_ST
                             REC_STATUS_ANALYZING)
 
 
-def detach_channel_references(channel_ids) -> int:
+def detach_channel_references(channel_ids, pip_rows: set = None) -> int:
     """Unlink the history rows that name a channels.id and outlive the channel: a recording
     whose capture is over, that recording's segments, a group's event, an auto-record rule's
     ledger row, a Recent plays line and any recording's source listing. The EPG similarity
@@ -1827,10 +1827,18 @@ def detach_channel_references(channel_ids) -> int:
     they are. A NULL
     channel_id on a scheduled or running recording means "recorded from a typed URL" to the
     conflict check and the recorder, which a deleted channel is not. An account's delete does
-    not refuse over such a recording, so it can still leave one naming a gone channel."""
+    not refuse over such a recording, so it can still leave one naming a gone channel.
+
+    A picture-in-picture channel's picture of one of these channels is unlinked by
+    pip_channels.detach_refs(), that table's one writer; the rows it touched are added to
+    `pip_rows` when given, for the caller's pip_channels.refresh_detached() after its commit."""
     ids = list(channel_ids)
     if not ids:
         return 0
+    from .pip_channels import detach_refs
+    touched = detach_refs(PIP_SOURCE_CHANNEL, ids)
+    if pip_rows is not None:
+        pip_rows.update(touched)
     live = db.session.query(Recording.id).filter(
         Recording.status.in_(CHANNEL_NEEDING_STATUSES))
     unlinked = Recording.query.filter(

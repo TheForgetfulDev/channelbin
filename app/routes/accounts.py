@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 from flask import (Blueprint, render_template, request, redirect, url_for, flash, current_app,
                    abort, jsonify)
 
-from .. import channel_hiding, db, duplicate_streams
+from .. import channel_hiding, db, duplicate_streams, pip_channels
 from ..accounts import (NORM_DISABLED, NORM_HLS, NORM_MODES, NORM_MPEGTS, NORM_MPEGTS_LIVE,
                         coerce_normalization_mode, global_normalization_mode,
                         norm_mode_example, norm_mode_label, normalize_url_with_mode,
@@ -1019,8 +1019,11 @@ def _delete_account_and_jobs(account_id):
             Channel.account_id == account_id).distinct().all()
     }
 
+    pip_rows = set()
+
     @retry_on_locked()
     def _delete():
+        pip_rows.clear()    # a retried attempt names only what it deleted
         account = db.session.get(Account, account_id)
         if account is None:
             return None
@@ -1051,7 +1054,7 @@ def _delete_account_and_jobs(account_id):
         # match goes, and a finished recording, its segments and a group's events lose the id.
         for chunk in chunked(channel_ids, _DELETE_CHUNK_SIZE):
             SportsMatch.query.filter(SportsMatch.channel_id.in_(chunk)).delete(synchronize_session=False)
-            detach_channel_references(chunk)
+            detach_channel_references(chunk, pip_rows=pip_rows)
         # hidden-recompute-ok: the cascade takes memberships only of channels it deletes
         # too, so no surviving channel loses a protection.
         db.session.delete(account)
@@ -1091,6 +1094,7 @@ def _delete_account_and_jobs(account_id):
         touched_group_ids,
         cause=f'The channels it could record from belonged to the deleted account "{name}".'
         if name else 'The channels it could record from belonged to a deleted account.')
+    pip_channels.refresh_detached(pip_rows, 'channel')
     return True, name
 
 

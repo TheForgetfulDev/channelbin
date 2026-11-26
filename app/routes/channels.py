@@ -26,7 +26,7 @@ from ..accounts import (
 )
 from ..channel_groups import (clear_guide_listings_pins_on, group_channel_ids,
                               report_orphaned_guide_groups)
-from .. import channel_hiding, duplicate_streams, history_filter
+from .. import channel_hiding, duplicate_streams, history_filter, pip_channels
 from ..config import load_config
 from ..db_utils import chunked, retry_on_locked
 from ..logo_cache import get_logo_cache_dir, resolve_logo_url
@@ -1376,9 +1376,11 @@ def missing_delete():
     # zero-count a bare group/account sweep gets.
     explicit = requested_ids is not None
     cfg = load_config()
+    pip_rows = set()
 
     @retry_on_locked()
     def _do_delete_and_commit():
+        pip_rows.clear()    # a retried attempt names only what it deleted
         eligible, blocked_inuse, blocked_active = _missing_delete_candidates(
             account_id, cfg, group_id=group_id, channel_ids=requested_ids)
         # What the partition decided is carried back out of the closure rather than
@@ -1429,7 +1431,7 @@ def missing_delete():
         unlinked_recordings = 0
         for chunk in chunked(ids, _DELETE_CHUNK_SIZE):
             # No recording on an eligible channel is still capturing: an active one blocks it.
-            unlinked_recordings += detach_channel_references(chunk)
+            unlinked_recordings += detach_channel_references(chunk, pip_rows=pip_rows)
             db.session.query(ChannelGroupMember).filter(
                 ChannelGroupMember.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.query(ChannelTest).filter(
@@ -1493,6 +1495,7 @@ def missing_delete():
     broken = report_orphaned_guide_groups(
         touched, cause='The channels it could record from were deleted as missing from '
                        'the provider.')
+    pip_channels.refresh_detached(pip_rows, 'channel')
     log.info('Missing-channel bulk delete: %d channel(s) deleted (account_id=%s, group_id=%s, '
              'requested=%s), %d terminal recording(s) unlinked', deleted_count, account_id,
              group_id, len(requested_ids) if requested_ids is not None else None,

@@ -9,14 +9,14 @@ from datetime import datetime
 from flask import Blueprint, render_template, request, jsonify, url_for, abort
 from sqlalchemy.orm import selectinload
 
-from .. import db, health_bands, channel_hiding, duplicate_streams, history_filter, output_feed
+from .. import db, health_bands, channel_hiding, duplicate_streams, history_filter, output_feed, pip_channels
 from ..database import (
     Channel, ChannelGroup, ChannelGroupMember, ChannelEvent, ChannelTest, Tag,
     Recording, RecordingEvent, RecordingProfile, HealthCheckProfile, OnDemandTestJob,
     CHANNEL_GROUPED, CHANNEL_UNGROUPED, GROUP_MEMBER_SELECTED, GROUP_FAILOVER,
     CHANNEL_FAILOVER_HEALTH_OBSERVATION, CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION,
     CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION, CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION,
-    ChannelGroupEvent,
+    ChannelGroupEvent, PIP_SOURCE_GROUP,
     GROUP_FORMAT_STRATEGIES,
     GROUP_FORMAT_HIGHEST_SCORE, GROUP_FORMAT_MANUAL,
     GROUP_WARNING_KINDS,
@@ -2785,21 +2785,23 @@ def dissolve_group(group_id):
         members = member_channels(g.memberships)
         _grouping_events(members, g, CHANNEL_UNGROUPED,
                          'Channel group "{group_name}" dissolved')
+        pip_rows = pip_channels.detach_refs(PIP_SOURCE_GROUP, [group_id])
         db.session.delete(g)  # membership rows go via the delete-orphan cascade
         # After the group delete, not before it: the memberships that protect these
         # channels only stop existing when that cascade flushes, and a recompute run one
         # line earlier would still see them and leave every deferred hide deferred.
         channel_hiding.recompute([ch.id for ch in members])
         db.session.commit()
-        return cancelled, screenshot_paths
+        return cancelled, screenshot_paths, pip_rows
 
-    cancelled, screenshot_paths = _delete()
+    cancelled, screenshot_paths, pip_rows = _delete()
     from ..recorder import delete_files
     delete_files(screenshot_paths)
     deregister_cancelled_recordings(cancelled)
     # The group is gone, so an alert saying its guide row cannot record names a row that
     # no longer exists - and its deep link would 404 (dev/changelog/933).
     resolve_broken_guide_row(group_id)
+    pip_channels.refresh_detached(pip_rows, 'channel group')
     return cancelled
 
 
