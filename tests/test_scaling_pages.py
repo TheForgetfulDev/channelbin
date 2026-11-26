@@ -278,13 +278,17 @@ def _seed_pip_feed(n):
 def _seed_iptv_output(n):
     """The IPTV Output page at its widest: the guide scope with its sports channels and n
     picture-in-picture channels, n lines of Recent plays, n IPTV players watching n different channels
-    (dev/changelog/1526), and n logins for other users, each with a play and a line (dev/changelog/1760)."""
+    (dev/changelog/1526), and n logins for other users, each with a play and a line (dev/changelog/1760),
+    every other one with a channel list of its own (dev/changelog/1764)."""
+    import json
     import time
     import app.output_feed as feed
     from app.database import FEED_PLAY_ENDED, FEED_PLAY_REFUSED, OutputFeedLogin, OutputFeedPlay
     _seed_pip_feed(n)
     now = datetime.utcnow()
-    logins = [OutputFeedLogin(name=f'User {i}', username=f'user{i}', password=f'pw{i}', max_streams=2)
+    guide_ids = [feed.feed_id_for_channel(c.id) for c in Channel.query.filter(Channel.in_guide.is_(True)).all()]  # guide-flag-read-ok: seeding the feed's own rows
+    logins = [OutputFeedLogin(name=f'User {i}', username=f'user{i}', password=f'pw{i}', max_streams=2,
+                              lineup=json.dumps(guide_ids[:i + 1]) if i % 2 else None)
               for i in range(n)]
     db.session.add_all(logins)
     db.session.flush()

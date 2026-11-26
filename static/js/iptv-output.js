@@ -491,6 +491,87 @@
     showToast(`The details for ${tr.dataset.name} are copied. They hold the password, so send them only to that person.`);
   }
 
+  /* ---- A login's channels (dev/changelog/1764) ------------------------------------------- */
+  async function chooseChannels(tr) {
+    const d = await jsonFetch(`/api/iptv-output/logins/${tr.dataset.login}/channels`);
+    const picked = new Set(d.picked);
+    // Grouped by category in the output's own order, which is the order a player lists them.
+    const byCat = new Map();
+    d.rows.forEach((r) => {
+      if (!byCat.has(r.category)) byCat.set(r.category, []);
+      byCat.get(r.category).push(r);
+    });
+    // A search matches the category too, since a provider's category names its channels.
+    const rowHtml = (r) => `<label class="check-row" data-hay="${escHtml(`${r.name} ${r.category}`.toLowerCase())}">`
+      + `<input type="checkbox" value="${r.id}"${picked.has(r.id) ? ' checked' : ''}> <span>${escHtml(r.name)}`
+      + `${r.swapped ? ' <span class="text-muted">and its swapped copy</span>' : ''}`
+      + `${r.off ? ` <span class="text-warning">${escHtml(r.off)}</span>` : ''}</span></label>`;
+    const list = Array.from(byCat, ([cat, rows]) => `<div data-lu-cat><div class="of-lu-head">${escHtml(cat)}</div>`
+      + `${rows.map(rowHtml).join('')}</div>`).join('');
+    // Not inside .of-login, whose block labels would undo .check-row's line.
+    const body = `<div>
+      <label class="fp-radio"><input type="radio" name="of-lu-mode" value="all"${d.everything ? ' checked' : ''}> Everything on the output
+        <span class="text-muted">Every channel you offer, and any you add to the output later.</span></label>
+      <label class="fp-radio"><input type="radio" name="of-lu-mode" value="pick"${d.everything ? '' : ' checked'}> Only the channels I pick
+        <span class="text-muted">A channel added to the output later is not added here. A picture-in-picture channel shows its two pictures whatever channels they come from.</span></label>
+      <div class="of-lu-pick"${d.everything ? ' hidden' : ''}>
+        <div class="of-lu-tools"><input class="search" type="search" placeholder="Search channels" aria-label="Search channels">
+          <button class="btn btn-sm" type="button" data-lu="all">Pick all shown</button><button class="btn btn-sm" type="button" data-lu="none">Clear all shown</button>
+          <span class="of-lu-n"></span></div>
+        <div class="of-lu-list">${list || '<p class="card-note">The output has no channels yet.</p>'}</div>
+      </div>
+      <p class="card-note">Their IPTV player shows the change the next time it loads its channel list. A play of a channel you take out is cut now.</p></div>`;
+    const overlay = buildModal({
+      title: `Channels for ${tr.dataset.name}`,
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn' },
+        { label: 'Save', class: 'btn btn-primary', onClick: (close) => {
+          const all = $('input[name="of-lu-mode"]:checked', overlay).value === 'all';
+          const ids = boxes().filter((b) => b.checked).map((b) => Number(b.value));
+          if (!all && !ids.length) {
+            showToast('Pick at least one channel, or turn the login off.', { type: 'error' });
+            return false;
+          }
+          post(`/api/iptv-output/logins/${tr.dataset.login}`, { lineup: all ? null : ids }).then((res) => {
+            close();
+            // No count here: the card counts what the player lists, which a picture-in-picture
+            // pick (two channels) and a pick off the output make differ from the ticks.
+            return refresh(CARDS).then(() => showToast(`${all ? `${tr.dataset.name} gets every channel on the output.`
+              : `${tr.dataset.name} gets the channels you picked.`}${loginCutNote(res.ended)}`));
+          }).catch(fail);
+          return false;
+        } },
+      ],
+    });
+    const boxes = () => $$('.of-lu-list input[type="checkbox"]', overlay);
+    const shown = () => boxes().filter((b) => !b.closest('label').hidden);
+    const count = () => {
+      const n = boxes().filter((b) => b.checked).length;
+      $('.of-lu-n', overlay).textContent = `${n} picked`;
+    };
+    $$('input[name="of-lu-mode"]', overlay).forEach((r) => r.addEventListener('change', () => {
+      $('.of-lu-pick', overlay).hidden = r.value === 'all';
+    }));
+    $('.of-lu-tools .search', overlay).addEventListener('input', (e) => {
+      const q = e.target.value.trim().toLowerCase();
+      $$('[data-lu-cat]', overlay).forEach((cat) => {
+        let any = false;
+        $$('label[data-hay]', cat).forEach((label) => {
+          label.hidden = Boolean(q) && !label.dataset.hay.includes(q);
+          any = any || !label.hidden;
+        });
+        cat.hidden = !any;
+      });
+    });
+    $$('[data-lu]', overlay).forEach((btn) => btn.addEventListener('click', () => {
+      shown().forEach((b) => { b.checked = btn.dataset.lu === 'all'; });
+      count();
+    }));
+    $('.of-lu-list', overlay).addEventListener('change', count);
+    count();
+  }
+
   async function clearLockouts() {
     const d = await post('/api/iptv-output/lockouts/clear');
     await refresh(CARDS);
@@ -528,6 +609,7 @@
     else if (act === 'login-delete') guarded(deleteLogin)(t.closest('tr'));
     else if (act === 'login-reveal') guarded(revealLogin)(t);
     else if (act === 'login-copy') guarded(copyLogin)(t.closest('tr'));
+    else if (act === 'login-channels') guarded(chooseChannels)(t.closest('tr'));
     else if (act === 'lockouts-clear') guarded(clearLockouts)();
   });
   document.addEventListener('change', (e) => {

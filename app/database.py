@@ -3977,8 +3977,8 @@ class OutputFeedPlay(db.Model):
 
 class OutputFeedLogin(db.Model):
     """A login for someone other than the owner on the IPTV output (app/output_feed.py,
-    dev/changelog/1760). Every login gets the same output as the main one in Settings; this row
-    says who may log in, whether they may right now, and how many streams they may hold at once.
+    dev/changelog/1760). This row says who may log in, whether they may right now, how many
+    streams they may hold at once, and which of the output's channels they get (`lineup`).
 
     The password is plaintext for the reason dev/docs/DESIGN-output-feed.md 6.2 measured: an
     IPTV player sends it on every request, and a person types it into a TV with a remote, so it
@@ -3996,6 +3996,10 @@ class OutputFeedLogin(db.Model):
     enabled     = db.Column(db.Boolean, nullable=False, default=True, server_default=db.text('1'))
     max_streams = db.Column(db.Integer, nullable=False, default=1, server_default=db.text('1'))
     created_at  = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    # The channels this login gets, as a JSON list of feed ids; NULL is everything the output
+    # offers, a row added later included (output_feed.lineup_of(), dev/changelog/1764). A
+    # picture-in-picture channel is stored as its own feed id and brings its swapped copy.
+    lineup      = db.Column(db.Text)
 
 
 class SportsTeam(db.Model):

@@ -16,6 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.output_feed import FeedCase, feed_cfg  # noqa: E402
 
 import app.output_feed as feed  # noqa: E402
+from app import db  # noqa: E402
+from app.database import OutputFeedLogin  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HARNESS = os.path.join(REPO, 'tests', 'support', 'iptv_output_page.mjs')
@@ -39,6 +41,10 @@ class IptvOutputScriptTests(FeedCase):
         super().setUp()
         self.alpha_feed = feed.feed_id_for_channel(self.alpha.id)
         self.session(self.alpha_feed)
+        # A login with a channel list of its own, for the Choose channels dialog.
+        db.session.add(OutputFeedLogin(name='Kim', username='kim', password='couch42',
+                                       lineup=json.dumps([self.alpha_feed])))
+        db.session.commit()
         # Opened on a LAN address, so ChannelBin's address being unset is the hideable notice
         # rather than the localhost warning.
         html = self.client.get('/iptv-output', base_url=LAN).get_data(as_text=True)
@@ -50,6 +56,7 @@ class IptvOutputScriptTests(FeedCase):
         if proc.returncode != 0:
             raise AssertionError(f'harness failed:\n{proc.stdout}\n{proc.stderr[-4000:]}')
         _OBSERVED.update(json.loads(proc.stdout), alpha_feed=self.alpha_feed,
+                         login_id=OutputFeedLogin.query.one().id,
                          beta_feed=feed.feed_id_for_channel(self.beta.id),
                          account_id=self.account.id, stored_in_page=STORED in html)
         self.obs = _OBSERVED
@@ -156,6 +163,32 @@ class IptvOutputScriptTests(FeedCase):
         self.assertEqual(reqs[0], {'method': 'POST', 'path': f'/api/user-prefs/{ADDRESS_NOTICE_PREF}',
                                    'body': {'value': ADDRESS_NOTICE_VERSION}})
         self.assertIn('GET', [r['method'] for r in reqs[1:]])
+
+    def test_choose_channels_reads_the_logins_list_and_posts_feed_ids(self):
+        """dev/changelog/1764: the dialog draws the login's own read, a search narrows it and
+        Pick all shown picks only what it left; Save posts feed ids, nothing picked posts
+        nothing, and Everything posts null."""
+        lu = self.obs
+        self.assertEqual([x for x in lu['lu_fetch'] if x.startswith('GET /api/')],
+                         [f'GET /api/iptv-output/logins/{self.obs["login_id"]}/channels'])
+        self.assertEqual(lu['lu_initial']['title'], 'Channels for Kim')
+        self.assertEqual(lu['lu_initial']['picked'], [2])
+        self.assertTrue(lu['lu_initial']['pick_shown'])
+        self.assertEqual(lu['lu_initial']['n'], '1 picked')
+        self.assertEqual(lu['lu_initial']['heads'], ['News', 'Sports', 'ChannelBin'])
+        self.assertIn('Beta Taken off the output', lu['lu_initial']['notes'])
+        self.assertIn('PiP 1 and its swapped copy', lu['lu_initial']['notes'])
+        self.assertEqual(lu['lu_searched_category'], [2, 4])   # a category's name finds its channels
+        self.assertEqual(lu['lu_searched'], [3])
+        self.assertEqual(lu['lu_heads_shown'], ['Sports'])
+        self.assertEqual(lu['lu_after_pick_all'], {'picked': [2, 3], 'n': '2 picked'})
+        self.assertEqual(lu['lu_post'], [{'path': f'/api/iptv-output/logins/{self.obs["login_id"]}',
+                                          'body': {'lineup': [2, 3]}}])
+        self.assertTrue(lu['lu_closed'])
+        self.assertEqual(lu['lu_empty'], {'posts': 0, 'open': True, 'toast': True})
+        self.assertTrue(lu['lu_everything_hides_list'])
+        self.assertEqual(lu['lu_everything_post'], [{'lineup': None}])
+
 
 if __name__ == '__main__':
     unittest.main()

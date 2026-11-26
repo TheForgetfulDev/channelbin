@@ -6,6 +6,7 @@ the player's own login, this one is ChannelBin's own page about it. The output's
 its settings rows save through `/api/settings/field`, the one validator of those keys; what
 is here are the actions that route has no shape for.
 """
+import json
 import logging
 
 from flask import Blueprint, current_app, jsonify, render_template, request
@@ -388,6 +389,11 @@ def _login_fields(data: dict, fcfg: dict, login_id=None) -> tuple:
         if not isinstance(data.get('enabled'), bool):
             return None, 'The switch takes true or false.'
         out['enabled'] = data['enabled']
+    if 'lineup' in data:
+        ids, problem = output_feed.lineup_problem(data.get('lineup'))
+        if problem:
+            return None, problem
+        out['lineup'] = None if ids is None else json.dumps(ids)
     return out, ''
 
 
@@ -423,7 +429,8 @@ def create_login():
 @iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>', methods=['POST'])
 def edit_login(login_id):
     """Change a login. Turning it off or changing its username or password ends the plays on
-    it, after the commit: an IPTV player holding the old pair is not that login any more."""
+    it, after the commit: an IPTV player holding the old pair is not that login any more. A new
+    channel list ends its plays of the channels the list leaves out, after the commit too."""
     data = request.get_json(silent=True) or {}
     fields, error = _login_fields(data, output_feed.feed_config(load_config()), login_id=login_id)
     if error:
@@ -439,22 +446,47 @@ def edit_login(login_id):
         cut = ((fields.get('enabled') is False and row.enabled)
                or ('username' in fields and fields['username'] != row.username)
                or ('password' in fields and fields['password'] != row.password))
+        before = output_feed.lineup_of(row)
         for key, value in fields.items():
             setattr(row, key, value)
         db.session.commit()
-        return cut
+        after = output_feed.lineup_of(row)
+        return cut, (after if after != before else _UNCHANGED), row.username
 
     try:
-        cut = _edit()
+        done = _edit()
     except IntegrityError:
         db.session.rollback()
         return jsonify({'error': _TAKEN}), 409
-    if cut is None:
+    if done is None:
         return jsonify({'error': 'That login no longer exists'}), 404
+    cut, lineup, username = done
     ended = output_feed.stop_login(login_id) if cut else 0
+    if lineup is not _UNCHANGED:
+        # After the commit: the plays its new channels leave out end by name (dev/changelog/1764).
+        ended += output_feed.set_login_lineup(login_id, lineup)
+        log.info('IPTV output: login %s now gets %s', username,
+                 'every channel on the output' if lineup is None else counted(len(lineup), 'channel'))
     log.info('IPTV output: login %d changed (%s)%s', login_id, ', '.join(sorted(fields)),
              f', {counted(ended, "play")} ended' if ended else '')
     return jsonify({'success': True, 'ended': ended})
+
+
+#: What _edit() hands back for a lineup the save left as it was, since None means everything.
+_UNCHANGED = object()
+
+
+@iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>/channels')
+def login_channels(login_id):
+    """What the Choose channels dialog lists for one login: every row the output has, whether
+    or not it is offered right now (a pick outlives a channel taken off for a while), with a
+    picture-in-picture channel's swapped copy folded into its channel, and the login's picks
+    (dev/changelog/1764). One catalog."""
+    row = db.session.get(OutputFeedLogin, login_id)
+    if row is None:
+        return jsonify({'error': 'That login no longer exists'}), 404
+    return jsonify({'success': True, 'name': row.name,
+                    **output_feed_view.lineup_choices(load_config(), output_feed.lineup_of(row))})
 
 
 @iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>', methods=['DELETE'])

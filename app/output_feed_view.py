@@ -812,17 +812,56 @@ def _accounts(rows, sessions, accounts: dict, cfg: dict, fcfg: dict) -> list:
     return out
 
 
-def _logins(sessions) -> list:
-    """The Logins for other users card: one query, and each login's live plays counted from
-    the plays already in hand (dev/changelog/1760)."""
+def _logins(sessions, rows) -> list:
+    """The Logins for other users card: one query, each login's live plays counted from the
+    plays already in hand (dev/changelog/1760), and its channels from the catalog already in
+    hand (dev/changelog/1764)."""
     playing = {}
     for s in sessions:
         if s.feed_login_id is not None:
             playing[s.feed_login_id] = playing.get(s.feed_login_id, 0) + 1
-    return [{'id': row.id, 'name': row.name, 'username': row.username, 'on': row.enabled,
-             'max_streams': row.max_streams, 'playing': playing.get(row.id, 0)}
-            for row in OutputFeedLogin.query.order_by(db.func.lower(OutputFeedLogin.name),
-                                                      OutputFeedLogin.id).all()]
+    existing = {output_feed.lineup_key(r.feed_id) for r in rows}
+    offered = {output_feed.lineup_key(r.feed_id) for r in rows if r.offered}
+    out = []
+    for row in OutputFeedLogin.query.order_by(db.func.lower(OutputFeedLogin.name),
+                                              OutputFeedLogin.id).all():
+        lineup = output_feed.lineup_of(row)
+        view = {'id': row.id, 'name': row.name, 'username': row.username, 'on': row.enabled,
+                'max_streams': row.max_streams, 'playing': playing.get(row.id, 0),
+                'everything': lineup is None}
+        if lineup is not None:
+            # What its IPTV player lists (a swapped copy is a channel of its own there), and
+            # the picks it does not list because the output does not offer them right now.
+            listed = sum(1 for r in rows if r.offered and output_feed.lineup_key(r.feed_id) in lineup)
+            view['channels_text'] = counted(listed, 'channel')
+            view['channels_off'] = len((lineup & existing) - offered)
+        out.append(view)
+    return out
+
+
+#: What the Choose channels dialog says of a row the output does not offer right now.
+LINEUP_TAKEN_OFF = 'Taken off the output'
+
+
+def lineup_choices(cfg: dict, lineup) -> dict:
+    """The Choose channels dialog's list (routes/iptv_output.py::login_channels): every row the
+    output has, in its order, offered right now or not, a picture-in-picture channel's swapped
+    copy folded into its channel, and which of them `lineup` picks (None for everything). A
+    pick of a row the output no longer has at all is not listed, so the next save drops it."""
+    choices, by_key = [], {}
+    for r in output_feed.catalog(cfg, everything=True):
+        key = output_feed.lineup_key(r.feed_id)
+        if key in by_key:
+            by_key[key]['swapped'] = True     # the swapped copy, right after its channel
+            continue
+        off = '' if r.offered else (LINEUP_TAKEN_OFF if not r.on_output
+                                    else f'Not on the output now: {r.left_out}')
+        by_key[key] = {'id': key, 'name': r.name, 'category': r.category, 'num': r.num,
+                       'off': off, 'swapped': False}
+        choices.append(by_key[key])
+    return {'everything': lineup is None,
+            'picked': sorted(k for k in (lineup or ()) if k in by_key),
+            'rows': choices}
 
 
 def _public(fcfg: dict, connect_server: str, tz, h24) -> dict:
@@ -891,7 +930,7 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
              for r in rows]
     address = _address(cfg, host_url)
     max_viewers = int(fcfg.get('max_viewers') or 1)
-    logins = _logins(output_feed.live_sessions() if state == STATE_ON else [])
+    logins = _logins(output_feed.live_sessions() if state == STATE_ON else [], rows)
     connect = _connect(fcfg, address['base'])
     public = _public(fcfg, connect['server'], tz, h24)
     # The public port relays every play on it, whatever the mode (dev/changelog/1761).
