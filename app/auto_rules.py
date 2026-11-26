@@ -2395,7 +2395,8 @@ def _rearm(rule_id, holder) -> str:
     except Exception:
         log.exception('Auto-record rule #%d: recording #%d start could not be armed', rule_id, rid)
     sentence = (f'Recording #{rid} ("{holder["name"]}") was scheduled but its start could not '
-                'be armed, so it will not start on its own. Restarting ChannelBin arms it.')
+                'be armed, so it will not start on its own yet. ChannelBin tries again before it is due '
+                'to start.')
 
     @retry_on_locked()
     def _note():

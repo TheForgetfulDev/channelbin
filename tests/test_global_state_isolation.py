@@ -82,7 +82,7 @@ RESET = {
     'app/routes/system.py': {'_last_stats'},
     'app/routes/sports.py': {'_checked_leagues', '_checked_teams'},
     'app/sports_screen.py': {'_making', '_procs'},
-    'app/scheduler.py': {'_job_errors', '_stopping'},
+    'app/scheduler.py': {'_job_errors', '_starts_in_flight', '_stopping'},
     'app/search_index.py': {'_rebuilding'},
     'app/setup_steps.py': {'_nav_cache'},
     'app/toolchain.py': {'_gpu_trial'},

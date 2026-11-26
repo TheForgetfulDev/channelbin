@@ -53,6 +53,11 @@ class Case(unittest.TestCase):
             patcher = mock.patch(target)
             setattr(self, target.rsplit('.', 1)[1], patcher.start())
             self.addCleanup(patcher.stop)
+        # The repair of a start with no job arms through the scheduler's own function
+        # (scheduler.rearm_missing_start): one mock stands for both spellings.
+        patcher = mock.patch('app.scheduler.schedule_recording', self.schedule_recording)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.now = now_utc()
         self.listed = self.now + self.ahead
         self.league = SportsLeague(tsdb_id=9001, name='Pretend Football League', sport='Pretend Ball',
@@ -852,7 +857,7 @@ class UnarmedTests(Case):
         rid = self.recording()
         self.missing([rid])
         self.schedule_recording.side_effect = [RuntimeError('jobstore down'), None]
-        with self.assertLogs('app.sports_follow', 'WARNING'):
+        with self.assertLogs('app.scheduler', 'WARNING'):
             self.assertEqual(self.follow()['armed'], 0)
         self.assertEqual(self.events(rid, RECORDING_START_REARMED), [])
         self.assertEqual(self.follow()['armed'], 1)

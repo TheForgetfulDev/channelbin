@@ -15,7 +15,7 @@ import uuid
 from collections import namedtuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -812,6 +812,12 @@ def _claim_live_state(recording_id: int, state: RecordingState) -> bool:
         return True
 
 
+def has_live_state(recording_id: int) -> bool:
+    """Whether a start or resume has registered this recording's live state."""
+    with _lock:
+        return recording_id in _active
+
+
 def _release_live_state(recording_id: int, state: RecordingState) -> None:
     """Drop `state` from _active, but only while it is still the registered one.
 
@@ -1257,11 +1263,13 @@ def start_recording(app, recording_id: int):
         account_id = rec.channel.account_id if (rec.channel_id and rec.channel) else None
         if account_id is not None:
             if not _try_acquire_slot_with_preemption(app, recording_id, account_id):
-                moved_to, move_note = _move_off_full_account(app, recording_id, account_id)
-                if moved_to is None:
-                    _defer_start_for_slot(app, recording_id, account_id, move_note=move_note)
+                move = _move_off_full_account(app, recording_id, account_id)
+                if move.lost:
                     return
-                account_id = moved_to
+                if move.account_id is None:
+                    _defer_start_for_slot(app, recording_id, account_id, move_note=move.note)
+                    return
+                account_id = move.account_id
             # Fairness, checked only now that a slot is actually held: yielding on the
             # mere existence of an earlier waiter would defer this recording even when
             # the account has slots to spare. at_limit() is advisory and racy by its own
@@ -1276,8 +1284,8 @@ def start_recording(app, recording_id: int):
                 from . import connection_limits as connlim
                 ahead = _earlier_waiter_for_slot(recording_id, account_id, rec.start_time)
                 if ahead is not None and connlim.at_limit(account_id):
-                    connlim.release(account_id, 'recording', recording_id)
-                    _defer_start_for_slot(app, recording_id, account_id, waiting_on=ahead)
+                    if _yield_start_seat(recording_id, account_id):
+                        _defer_start_for_slot(app, recording_id, account_id, waiting_on=ahead)
                     return
 
         # Registration comes BEFORE the status claim, and abort_recording commits ABORTED
@@ -1288,11 +1296,15 @@ def start_recording(app, recording_id: int):
         # that necessarily follows the abort's write (dev/changelog/987).
         #
         # Nothing is released on this refusal: the caller holding the live state holds the
-        # slot too, under the same idempotent (recording, id) key this one just re-acquired.
+        # slot too, under the same (recording, id) key this one just re-acquired. The seat
+        # is only put back on that caller's account, when this one's acquire was on another
+        # (a row the owner moved after this start read it).
         state = RecordingState()
         if not _claim_live_state(recording_id, state):
             log.warning('start_recording: recording %d already has live state - another '
                         'caller owns this capture, so this start does nothing', recording_id)
+            if account_id is not None:
+                _settle_shared_seat(recording_id, account_id, scheduled_counts=True)
             return
 
         @retry_on_locked()
@@ -1346,6 +1358,8 @@ def start_recording(app, recording_id: int):
         if not claimed:
             _abandon_unclaimed_start(recording_id, state, account_id)
             return
+        if account_id is not None:
+            _hold_seat_after_claim(recording_id, account_id)
 
         # From here the row is claimed, so a raise can no longer be answered by the
         # scheduler trying the start again: start_recording() refuses a row that is not
@@ -1526,16 +1540,112 @@ def _abandon_unclaimed_start(recording_id: int, state: RecordingState, account_i
     states are told apart rather than lumped: IN_PROGRESS means another caller owns both the
     capture and the slot and this one touches neither; anything else - ABORTED by a cancel
     that raced this start, FAILED, or a row deleted underneath it - means no other teardown
-    will ever run and the slot is this caller's to release.
+    will ever run and the slot is this caller's to release. When the winner records on
+    another account than this caller acquired on, the seat is put back there
+    (_settle_shared_seat).
     """
     _release_live_state(recording_id, state)
-    rec = db.session.get(Recording, recording_id)
-    status = rec.status if rec is not None else None
+    status, _ = _start_row_now(recording_id)
     log.warning('Recording %d: the start claim was lost (row is %s) - abandoning this '
                 'start without launching', recording_id, status or 'gone')
-    if status != REC_STATUS_IN_PROGRESS and account_id is not None:
-        from . import connection_limits as connlim
-        connlim.release(account_id, 'recording', recording_id)
+    if account_id is not None:
+        _settle_shared_seat(recording_id, account_id, scheduled_counts=False)
+
+
+def _start_row_now(recording_id: int) -> tuple:
+    """(status, account id) of the recording as the database has it now, (None, None) when
+    the row is gone. For a start deciding whose a seat is: two starts of one recording share
+    one ('recording', id) seat, so what the other has written since is the whole question."""
+    r = db.session.get(Recording, recording_id, populate_existing=True)
+    if r is None:
+        return None, None
+    return r.status, (r.channel.account_id if (r.channel_id and r.channel) else None)
+
+
+def _settle_shared_seat(recording_id: int, took_account_id: int, scheduled_counts: bool):
+    """This start took (or re-took) the recording's seat on `took_account_id` and is now
+    stopping because the recording is not its own: another start moved or claimed it, or a
+    cancel or an edit landed. Leave the one seat where the recording is, and give it back
+    only when nothing will record.
+
+    Every start of one recording holds the same ('recording', id) seat, so a plain release
+    here strips the seat the winner captures on (dev/docs/BUGS.md 2026-11-26). And an acquire
+    on another account than the winner's carries the seat there (connection_limits.try_acquire
+    moves a holder, it never seats one twice), so it is put back on the row's account.
+
+    `scheduled_counts` says whether a row still SCHEDULED has an owner: yes for a start that
+    lost to another start which has not claimed yet, no for one that lost the claim itself.
+    A row an edit repointed keeps the seat until its start or a cancel, which both find it.
+    PAUSED and RETRYING hold no seat, so only IN_PROGRESS counts as recording."""
+    from . import connection_limits as connlim
+    status, row_account_id = _start_row_now(recording_id)
+    owned = status == REC_STATUS_IN_PROGRESS or (scheduled_counts
+                                                 and status == REC_STATUS_SCHEDULED)
+    if not owned or row_account_id is None:
+        connlim.release(took_account_id, 'recording', recording_id)
+        return
+    if row_account_id == took_account_id:
+        return
+    if not connlim.try_acquire(row_account_id, 'recording', recording_id):
+        # Never left counted on an account the recording is not on: that would keep a
+        # free connection from everything else for as long as it records.
+        connlim.release(took_account_id, 'recording', recording_id)
+        log.warning('Recording %d: another start has it on account %d while this one held '
+                    'its seat on account %d, and account %d has no seat free to put it back '
+                    'on - it is recording with no seat counted', recording_id, row_account_id,
+                    took_account_id, row_account_id, extra={'recording_id': recording_id})
+
+
+def _yield_start_seat(recording_id: int, account_id: int) -> bool:
+    """Give this start's seat to a recording ahead of it in the queue. True when the seat
+    was given up and the start should wait; False when the start must simply stop because
+    the recording is no longer this caller's to hold.
+
+    The seat is shared with any other start of the same recording, which may claim the row
+    at any moment (dev/changelog/987). So the row is read before the release and again after
+    it: a start that claimed in between gets the seat straight back, and the claimer asserts
+    its seat once more after its claim (_hold_seat_after_claim), which covers a claim that
+    lands after the second read."""
+    from . import connection_limits as connlim
+    status, _ = _start_row_now(recording_id)
+    if status != REC_STATUS_SCHEDULED:
+        log.info('Recording %d: not waiting behind an earlier recording - the row is %s now, '
+                 'so this start stops', recording_id, status or 'gone',
+                 extra={'recording_id': recording_id})
+        _settle_shared_seat(recording_id, account_id, scheduled_counts=False)
+        return False
+    connlim.release(account_id, 'recording', recording_id)
+    status, row_account_id = _start_row_now(recording_id)
+    if status == REC_STATUS_IN_PROGRESS:
+        if row_account_id is None or not connlim.try_acquire(row_account_id, 'recording',
+                                                             recording_id):
+            log.warning('Recording %d: another start claimed it while this one was giving '
+                        'its seat to an earlier recording, and the seat could not be taken '
+                        'back - it is recording with no seat counted', recording_id,
+                        extra={'recording_id': recording_id})
+        return False
+    return status == REC_STATUS_SCHEDULED
+
+
+def _hold_seat_after_claim(recording_id: int, account_id: int):
+    """Assert the claimed recording's seat once more. A no-op when it is held, as it is
+    unless another start of the same recording gave the shared seat away between this
+    start's acquire and its claim (_yield_start_seat). Never preempts and never stops the
+    capture: a seat that cannot be retaken is said in the log."""
+    from . import connection_limits as connlim
+    try:
+        held = connlim.try_acquire(account_id, 'recording', recording_id)
+    except Exception:
+        # Broad on purpose: the row is claimed and nothing is capturing yet, so a raise
+        # from here would leave it IN_PROGRESS with nothing armed to bring it back.
+        log.warning('Recording %d: could not confirm its connection seat after the claim',
+                    recording_id, exc_info=True, extra={'recording_id': recording_id})
+        db.session.rollback()
+        return
+    if not held:
+        log.warning('Recording %d: its seat on account %d was given away by another start '
+                    'before the claim and the account is full now - recording with no seat '
+                    'counted', recording_id, account_id, extra={'recording_id': recording_id})
 
 
 def _segment_file_is_growing(path: str, wait_seconds: float = 2.0) -> bool:
@@ -3627,12 +3737,22 @@ def end_capture_wait(recording_id: int):
 MAX_START_MOVE_TRIES = 6
 
 
-def _move_off_full_account(app, recording_id: int, account_id: int):
+class StartMove(NamedTuple):
+    """What _move_off_full_account() did. `account_id` is the account the recording now holds
+    a seat on, when it moved. `note` is why it did not. `lost` means another start of the same
+    recording (or a cancel or an edit) changed the row first: this start stops, and neither
+    waits nor writes anything on a recording that is no longer its own."""
+    account_id: Optional[int] = None
+    note: Optional[str] = None
+    lost: bool = False
+
+
+def _move_off_full_account(app, recording_id: int, account_id: int) -> StartMove:
     """Move a SCHEDULED single-channel recording whose account has no connection free (full or
-    blocked) to another channel with the same program, holding a seat there. Returns (that
-    channel's account id, None), or (None, why it did not move) - the start then waits as
-    before and its deferral event says why (app/seat_moves.py, dev/changelog/1611). A group
-    recording returns (None, None): its member choice above already looked for a free account.
+    blocked) to another channel with the same program, holding a seat there. Returns the
+    account it moved to, or why it did not move - the start then waits as before and its
+    deferral event says why (app/seat_moves.py, dev/changelog/1611). A group recording returns
+    an empty StartMove: its member choice above already looked for a free account.
 
     Asked again on every retry of a waiting start, so a seat that frees on another account later
     is taken then. The seat is taken BEFORE the row is rewritten - taking it is the in-memory
@@ -3640,20 +3760,19 @@ def _move_off_full_account(app, recording_id: int, account_id: int):
     seat is never held for a recording still pointing at the full account. The write happens
     only while the row is still SCHEDULED on the channel the move was decided from: two starts
     of one recording can run at once (an overdue job beside the startup sweep, dev/changelog/987),
-    and the one that loses must give its new seat back rather than repoint a row the other is
-    already capturing."""
-    from . import connection_limits as connlim
+    and the one that loses must not repoint a row the other is already capturing. The loser
+    does not release either: the seat is the one the winner holds (_settle_shared_seat)."""
     from . import seat_moves
     from .accounts import normalize_url
     rec = db.session.get(Recording, recording_id)
     if rec is None or rec.group_id is not None or rec.channel is None:
-        return None, None
+        return StartMove()
     cfg = load_config()
     level, allowed = seat_moves.move_source(cfg, rec.profile, rec)
     if not allowed:
-        return None, seat_moves.note_turned_off(level)
+        return StartMove(note=seat_moves.note_turned_off(level))
     if not seat_moves.has_program(rec):
-        return None, seat_moves.NOTE_NO_LISTING
+        return StartMove(note=seat_moves.NOTE_NO_LISTING)
     old = rec.channel
     old_id, old_name = old.id, old.name
     old_account = old.account.name if old.account else f'account {account_id}'
@@ -3673,11 +3792,18 @@ def _move_off_full_account(app, recording_id: int, account_id: int):
 
         @retry_on_locked()
         def _move_and_commit():
-            r = db.session.get(Recording, recording_id, populate_existing=True)
-            if r is None or r.status != REC_STATUS_SCHEDULED or r.channel_id != old_id:
+            # A conditional UPDATE, as _claim_status_row is and for its reason: two starts
+            # that both read the row SCHEDULED on the old channel would both write, each to
+            # the channel it picked, and neither would learn it lost.
+            moved_rows = Recording.query.filter(
+                Recording.id == recording_id,
+                Recording.status == REC_STATUS_SCHEDULED,
+                Recording.channel_id == old_id,
+            ).update({Recording.channel_id: new_id, Recording.url: new_url},
+                     synchronize_session='fetch')
+            if not moved_rows:
+                db.session.rollback()
                 return False
-            r.channel_id = new_id
-            r.url = new_url
             add_recording_event(recording_id, RECORDING_MOVED_FOR_CONNECTION, detail=detail,
                                 extra={'from_channel_id': old_id, 'from_account_id': account_id,
                                        'to_channel_id': new_id, 'to_account_id': new_account_id,
@@ -3688,16 +3814,28 @@ def _move_off_full_account(app, recording_id: int, account_id: int):
         try:
             moved = _move_and_commit()
         except Exception:
-            connlim.release(new_account_id, 'recording', recording_id)
+            # The write decided nothing, so the seat goes where the row is: back to another
+            # start that moved it meanwhile, or released when the row is still on the full
+            # account. A settle that cannot read the row leaves the seat rather than strip
+            # one a winner may hold; the scheduler's retry of this start finds it.
+            try:
+                db.session.rollback()
+                _settle_shared_seat(recording_id, new_account_id, scheduled_counts=True)
+            except SQLAlchemyError:
+                log.warning('Recording %d: could not settle its seat after a move that '
+                            'raised', recording_id, exc_info=True,
+                            extra={'recording_id': recording_id})
+                db.session.rollback()
             raise
         if not moved:
-            connlim.release(new_account_id, 'recording', recording_id)
+            _settle_shared_seat(recording_id, new_account_id, scheduled_counts=True)
             log.info('Recording %d: not moved to "%s" - another start already moved or claimed '
-                     'it', recording_id, new_name, extra={'recording_id': recording_id})
-            return None, None
+                     'it, so this start stops', recording_id, new_name,
+                     extra={'recording_id': recording_id})
+            return StartMove(lost=True)
         log.info('Recording %d: %s', recording_id, detail, extra={'recording_id': recording_id})
-        return new_account_id, None
-    return None, seat_moves.NOTE_NONE_FREE
+        return StartMove(account_id=new_account_id)
+    return StartMove(note=seat_moves.NOTE_NONE_FREE)
 
 
 def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=None,
@@ -3714,8 +3852,15 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
     another channel (_move_off_full_account), said in the first deferral event.
     """
     now = datetime.utcnow()
-    rec = db.session.get(Recording, recording_id)
+    rec = db.session.get(Recording, recording_id, populate_existing=True)
     if rec is None:
+        return
+    if rec.status != REC_STATUS_SCHEDULED:
+        # Another start of this recording claimed it, or a cancel landed: a wait note, a
+        # waiting alert or a re-armed start on such a row would describe a recording that is
+        # running or over.
+        log.info('Recording %d: not deferring its start - the row is %s now', recording_id,
+                 rec.status, extra={'recording_id': recording_id})
         return
     if waiting_on is None:
         from .account_blocks import free_at
@@ -3737,7 +3882,10 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
 
         @retry_on_locked()
         def _fail_slot_wait_and_commit():
-            r = db.session.get(Recording, recording_id)
+            r = db.session.get(Recording, recording_id, populate_existing=True)
+            if r is None or r.status != REC_STATUS_SCHEDULED:
+                db.session.rollback()
+                return False
             r.status = REC_STATUS_FAILED
             r.completed_at = now
             r.failure_reason = FAILURE_CONNECTION_SLOT_TIMEOUT
@@ -3747,8 +3895,12 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
                         f'account\'s connection limit. Waited for a free slot instead, and '
                         f'this recording\'s own window ended first'))
             db.session.commit()
+            return True
 
-        _fail_slot_wait_and_commit()
+        if not _fail_slot_wait_and_commit():
+            log.info('Recording %d: not failed for its wait - another start or a cancel '
+                     'changed it first', recording_id, extra={'recording_id': recording_id})
+            return
         from .health_score import dismiss_recording_failing_alerts
         dismiss_recording_failing_alerts(recording_id)
         # The wait is over, badly: RECORDING_FAILED_CONNECTION_LIMIT below is what the
@@ -3821,7 +3973,10 @@ def _defer_start_for_block(rec, account_id: int, block_until: datetime, now: dat
 
         @retry_on_locked()
         def _fail_block_wait_and_commit():
-            r = db.session.get(Recording, recording_id)
+            r = db.session.get(Recording, recording_id, populate_existing=True)
+            if r is None or r.status != REC_STATUS_SCHEDULED:
+                db.session.rollback()
+                return False
             r.status = REC_STATUS_FAILED
             r.completed_at = now
             r.failure_reason = FAILURE_ACCOUNT_BLOCKED
@@ -3830,8 +3985,12 @@ def _defer_start_for_block(rec, account_id: int, block_until: datetime, now: dat
                 detail=(f'Never started: {why}, and every account this recording could use '
                         f'stayed blocked until its window ended. Nothing was captured.'))
             db.session.commit()
+            return True
 
-        _fail_block_wait_and_commit()
+        if not _fail_block_wait_and_commit():
+            log.info('Recording %d: not failed for its wait - another start or a cancel '
+                     'changed it first', recording_id, extra={'recording_id': recording_id})
+            return
         from .health_score import dismiss_recording_failing_alerts
         dismiss_recording_failing_alerts(recording_id)
         end_capture_wait(recording_id)
@@ -3883,7 +4042,10 @@ def _defer_start_switched_off(rec, account_id: int, why: str, now: datetime, mov
 
         @retry_on_locked()
         def _fail_switched_off_and_commit():
-            r = db.session.get(Recording, recording_id)
+            r = db.session.get(Recording, recording_id, populate_existing=True)
+            if r is None or r.status != REC_STATUS_SCHEDULED:
+                db.session.rollback()
+                return False
             r.status = REC_STATUS_FAILED
             r.completed_at = now
             r.failure_reason = FAILURE_SWITCHED_OFF
@@ -3892,8 +4054,12 @@ def _defer_start_switched_off(rec, account_id: int, why: str, now: datetime, mov
                 detail=(f'Never started: {why}, and none was turned on before its window '
                         f'ended. Nothing was captured.'))
             db.session.commit()
+            return True
 
-        _fail_switched_off_and_commit()
+        if not _fail_switched_off_and_commit():
+            log.info('Recording %d: not failed for its wait - another start or a cancel '
+                     'changed it first', recording_id, extra={'recording_id': recording_id})
+            return
         from .health_score import dismiss_recording_failing_alerts
         dismiss_recording_failing_alerts(recording_id)
         end_capture_wait(recording_id)
