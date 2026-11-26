@@ -112,11 +112,26 @@
   {% endif %}
 
   {% if not needs_login %}
-  <div class="card" id="of-logins" data-server="{{ connect.server }}">
+  <div class="card" id="of-logins" data-server="{{ public.server }}">
     <div class="card-head"><h2>Logins for other users{% if logins %} <span class="cnt">{{ logins | length }}</span>{% endif %}</h2>
       <div class="card-head-actions"><button class="btn btn-sm" data-act="login-add" data-password="{{ login_password }}" data-min="{{ login_streams[0] }}" data-max="{{ login_streams[1] }}">{{ icon('add') }}Add a login</button></div></div>
     <div class="card-body">
-      <p class="card-note">Give someone else their own login to this IPTV output. They type the same server address with their own username and password, and get the same channels and guide. Each login can be turned off or deleted without touching the others or yours. A play on one of these logins always goes through ChannelBin, even in redirect or mixed mode, so your IPTV provider's login is never sent to their player. Their plays count against "IPTV players at once" as well as their own limit.</p>
+      <p class="card-note">Give someone else their own login to this IPTV output. They type the server address in the details you copy for them, with their own username and password, and get the same channels and guide. Each login can be turned off or deleted without touching the others or yours. A play on one of these logins always goes through ChannelBin, even in redirect or mixed mode, so your IPTV provider's login is never sent to their player. Their plays count against "IPTV players at once" as well as their own limit.</p>
+      {#- The public port (app/public_listener.py, dev/changelog/1761). -#}
+      {% if public.say == 'open' %}
+      <p class="card-note">From outside your home network they use <strong>{{ public.url }}</strong>, which your reverse proxy sends to ChannelBin's public port, {{ public.port }}. The details you copy below name that address. The public port answers an IPTV player and nothing else, and every play on it goes through ChannelBin.</p>
+      {% elif public.say == 'open-no-url' %}
+      <div class="notice notice-warn notice-act"><div><strong>The public port, {{ public.port }}, is open, but the address people outside your network use is not set.</strong> Until it is, the details you copy below name this page's address, which only works at home.</div><a class="btn btn-sm" href="{{ url_for('settings.settings', q='output_feed.public_url') }}">Set the address {{ icon('forward') }}</a></div>
+      {% elif public.say == 'failed' %}
+      <div class="notice notice-bad"><div><strong>The public port, {{ public.port }}, could not be opened:</strong> {{ public.error }}. Nothing outside your home network can reach the IPTV output until another port is set or the one in use is freed, and ChannelBin is restarted.</div></div>
+      {% elif public.say == 'waiting' %}
+      <p class="card-note">The public port is set to {{ public.set_port }} and opens when ChannelBin is restarted.</p>
+      {% elif public.say == 'unset' %}
+      <p class="card-note">To share it with people outside your home network, set a public port under Settings and point your reverse proxy at it. Only the IPTV output answers there, never ChannelBin's pages. README.md, "Sharing the IPTV output over the internet", has the steps.</p>
+      {% endif %}
+      {% if public.lockouts %}
+      <div class="notice notice-warn notice-act" id="of-lockouts"><div><strong>{{ public.lockouts | length }} address{{ '' if public.lockouts | length == 1 else 'es' }} {{ 'is' if public.lockouts | length == 1 else 'are' }} locked out after {{ public.lockout_tries }} wrong logins:</strong> {% for l in public.lockouts %}{{ l.address }} until {{ l.until }}{{ ', ' if not loop.last else '' }}{% endfor %}. Every request from {{ 'it' if public.lockouts | length == 1 else 'them' }} is refused, even with the right password, for {{ public.lockout_minutes }} minutes after the first wrong one. An IPTV player still holding an old password does this by itself.</div><button class="btn btn-sm" data-act="lockouts-clear">Let them try now</button></div>
+      {% endif %}
       {% if logins %}
       <div class="table-scroll"><table class="tbl tbl-cards rl-tbl">
         <thead><tr><th>Name</th><th>Username</th><th>Password</th><th class="tip-plain" data-tip="How many channels this login may play at once, and how many it is playing now.">Streams</th><th>On</th><th></th></tr></thead>
@@ -364,7 +379,7 @@
         {{ number_setting('sports_before_minutes', 'Sports channels: start early by (minutes)', 'A sports channel plays the channel listing its game this long before the listing starts, so tuning in early gets the pregame show. A game no guide lists, played from a channel whose name mentions it, starts this long before the time that name gives. 0 starts at the listing.') }}
         {{ number_setting('sports_after_minutes', 'Sports channels: keep playing after (minutes)', 'And this long after the listing ends, because games run long. A game played from a channel\'s name has no listing to run past, so it stops where a recording of it would. 0 stops at the listing\'s end. A play already running is never cut, even when its channel fails and it moves to another one carrying the game.') }}
         {% if relays_some %}
-        {{ number_setting('max_viewers', 'IPTV players at once', 'One more than this is refused, and the refusal says so. ' ~ ('In mixed mode only plays through ChannelBin count: a channel sent straight to your IPTV provider is never seen. ' if mixed else '') ~ ('In redirect mode only plays on logins for other users count: they always go through ChannelBin. ' if redirect else '') ~ 'A player on a sports channel\'s waiting screen is not counted until its game comes on, and one on an Up next channel is not counted at all.') }}
+        {{ number_setting('max_viewers', 'IPTV players at once', 'One more than this is refused, and the refusal says so. ' ~ ('In mixed mode only plays through ChannelBin count: a channel sent straight to your IPTV provider is never seen. ' if mixed else '') ~ ('In redirect mode only plays on logins for other users and on the public port count: they always go through ChannelBin. ' if redirect else '') ~ 'A player on a sports channel\'s waiting screen is not counted until its game comes on, and one on an Up next channel is not counted at all.') }}
         {{ number_setting('reserve_seconds', 'Seconds behind live', 'How much of the stream ChannelBin holds before the IPTV player gets it. A short dropout plays through without the picture freezing.') }}
         {{ number_setting('idle_seconds', 'Cut when the player reads nothing for (seconds)', 'A player that has stopped reading the stream has usually gone away without saying so. Its connection is freed after this long.') }}
         {{ number_setting('max_session_hours', 'Longest single play (hours)', 'So a player left on a channel for a week does not hold a connection for a week. It can tune in again right away.') }}

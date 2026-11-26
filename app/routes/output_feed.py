@@ -21,7 +21,7 @@ import os
 
 from flask import Blueprint, Response, current_app, g, jsonify, redirect, request, send_from_directory
 
-from .. import output_feed
+from .. import output_feed, public_listener
 from ..config import load_config
 
 log = logging.getLogger(__name__)
@@ -45,11 +45,26 @@ def _require_credentials():
     args = request.view_args or {}
     username = args.get('username', request.args.get('username'))
     password = args.get('password', request.args.get('password'))
+    address = request.remote_addr or 'unknown'
+    # One body for every cause, so nothing outside can tell the feed is off from a wrong
+    # password, a login turned off or an address locked out (section 6.1). A locked-out address
+    # is refused before its password is looked at, so a right one is refused too until the
+    # lockout ends (dev/changelog/1761).
+    refused = jsonify({'error': output_feed.AUTH_FAILED_MESSAGE}), 401
+    if output_feed.login_failures.check_lockout(address) is not None:
+        return refused
     login = output_feed.feed_login_for(fcfg, username, password)
     if login is None:
-        # One body for every cause, so nothing outside can tell the feed is off from a
-        # wrong password or a login turned off (section 6.1).
-        return jsonify({'error': output_feed.AUTH_FAILED_MESSAGE}), 401
+        if output_feed.is_enabled(fcfg) and output_feed.login_failures.record_failure(address):
+            log.warning('IPTV output: %s is locked out for %d minutes after %d wrong logins '
+                        '(user %r). Behind a reverse proxy this is the visitor\'s own address only '
+                        'when "Behind a reverse proxy" is on.', address,
+                        output_feed.LOGIN_LOCKOUT_WINDOW.seconds // 60,
+                        output_feed.LOGIN_MAX_FAILURES, str(username or '')[:output_feed.LOGIN_MAX])
+        return refused
+    # A right login never clears the address's count, as the web login's does: there one
+    # password opens the door, here many logins share it, and knowing your own says nothing
+    # about anyone else's. The count only ages out.
     g.cfg = cfg
     g.feed_cfg = fcfg
     g.feed_login = login
@@ -133,17 +148,19 @@ def logo(username, password, channel_id):
 @output_feed_bp.route('/live/<username>/<password>/<int:feed_id>')
 def live(username, password, feed_id):
     """Play one feed id: a relayed MPEG-TS body when the mode relays it (proxy mode, and a
-    group or sports channel in mixed mode), a 302 to the member's provider URL otherwise, and
+    group or sports channel in mixed mode) and for every play on the public port or a login for
+    another user, a 302 to the member's provider URL otherwise, and
     a sports channel's waiting screen in every mode when it has nothing to play. Every refusal
     names its reason in the body."""
     client = request.remote_addr or ''
     # The address names one player only when ProxyFix put the player's own there: with the
     # setting off, a reverse proxy in front gives every player its address (dev/changelog/1744).
     player = client if current_app.config.get('BEHIND_PROXY') else ''
+    public = public_listener.is_public(request)
     try:
-        if output_feed.relays_for(g.feed_cfg, feed_id, g.feed_login):
+        if output_feed.relays_for(g.feed_cfg, feed_id, g.feed_login, public=public):
             session = output_feed.start_session(feed_id, client, g.cfg, player=player,
-                                                login=g.feed_login)
+                                                login=g.feed_login, public=public)
         else:
             # A sports channel with nothing on is streamed its waiting screen in this mode too.
             target, session = output_feed.redirect_play(feed_id, client, g.cfg, login=g.feed_login)

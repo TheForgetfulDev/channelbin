@@ -9,6 +9,7 @@ from app.postprocessor import kill_active_conversions
 from app.concatenator import kill_active_joins
 from app.preview import kill_all_previews
 from app.output_feed import kill_all_viewers
+from app import public_listener
 from app.scheduler import release_pidfile, stop_taking_work
 
 app = create_app()
@@ -38,6 +39,8 @@ def _handle_shutdown(signum, frame):
     kill_active_joins()
     kill_all_previews()
     kill_all_viewers()
+    # After the viewers, so the public port's own plays end with a reason rather than a cut.
+    public_listener.stop()
     release_pidfile()
     sys.exit(0)
 
@@ -61,6 +64,9 @@ if __name__ == '__main__':
             host, port, gate_note)
     else:
         logging.getLogger(__name__).info('Listening on %s:%s', host, port)
+    # The IPTV output's public port, when one is set (dev/changelog/1761). A port that cannot
+    # be opened is logged and reported by the readiness check; the web UI starts regardless.
+    public_listener.start(app, cfg)
     app.run(
         host=host,
         port=port,

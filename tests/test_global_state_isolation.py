@@ -62,7 +62,6 @@ RESET = {
     'app/accounts.py': {'_sync_progress'},
     'app/admission.py': {'_active', '_next_seq'},
     'app/sync_queue.py': {'_state'},
-    'app/auth.py': {'_failures'},
     'app/channel_search.py': {'_tag_channel_ids_cache', '_standing_breakdown_cache',
                               '_now_tag_channel_ids_cache'},
     'app/channel_tester.py': {'_state', '_eta_smoother', '_eta_last_sample'},
@@ -76,6 +75,7 @@ RESET = {
     'app/output_feed.py': {'_sessions', '_internal', '_redirects', '_refused', '_login_starting', '_login_changes',
                            '_reaper', '_play_queue', '_log_writer', '_last_prune_mono'},
     'app/postprocessor.py': {'_analysis_progress'},
+    'app/public_listener.py': {'_server', '_thread'},
     'app/preview.py': {'_sessions', '_reaper'},
     'app/probe.py': {'_missing_reported'},
     'app/readiness.py': {'_ondemand', '_nav_cache'},
@@ -198,10 +198,14 @@ class ResetRestoresPristineStateTests(unittest.TestCase):
                          "activity indicator as active")
 
     def test_lockout_counters_do_not_survive_into_the_next_app(self):
-        auth._failures['127.0.0.1'] = ['x'] * 50
+        from app import output_feed
+        auth.web_login.failures['127.0.0.1'] = ['x'] * 50
+        output_feed.login_failures.failures['127.0.0.1'] = ['x'] * 50
         self.t = make_test_app()
-        self.assertEqual(auth._failures, {},
+        self.assertEqual(auth.web_login.failures, {},
                          'leaked failure counts can lock the next module out of every login')
+        self.assertEqual(output_feed.login_failures.failures, {},
+                         'leaked failure counts can lock the next module out of the IPTV output')
 
     def test_a_restart_required_latch_does_not_survive_into_the_next_app(self):
         cfgmod.set_restart_needed(True)

@@ -17,7 +17,7 @@ from urllib.parse import quote, urlsplit
 from flask import url_for
 
 from . import connection_limits as connlim
-from . import output_feed, pip_channels, pip_engine
+from . import output_feed, pip_channels, pip_engine, public_listener
 from . import db
 from .config import MASK_SENTINEL, PROXY_FIX_ARGS, public_url
 from .database import (FEED_PICTURE_BACK, FEED_PICTURE_STOPPED, FEED_PLAY_ENDED, FEED_PLAY_PICTURE, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED, Account,
@@ -88,6 +88,16 @@ KIND_TEXT = {output_feed.KIND_CHANNEL: 'Channel', output_feed.KIND_GROUP: 'Chann
              output_feed.KIND_PIP: 'Picture-in-picture channel'}
 _PLAY_CHIPS = {FEED_PLAY_ENDED: 'Ended', FEED_PLAY_REFUSED: 'Refused',
                FEED_PLAY_REDIRECTED: 'Tuned in', FEED_PLAY_PICTURE: 'Small picture'}
+#: What the Logins card says about the public port (_public()), one per case, each drawn by its
+#: own branch in templates/iptv_output.html.
+PUBLIC_OPEN = 'open'
+PUBLIC_OPEN_NO_URL = 'open-no-url'
+PUBLIC_FAILED = 'failed'
+PUBLIC_WAITING = 'waiting'
+PUBLIC_UNSET = 'unset'
+#: Added to the mode's help when the public port is open and the mode is not proxy.
+PUBLIC_MODE_NOTE = (' A play on the public port always goes through ChannelBin, whatever this says, '
+                    'so your IPTV provider\'s login never reaches a player outside your home network.')
 _LOCAL_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
 
 
@@ -815,6 +825,37 @@ def _logins(sessions) -> list:
                                                       OutputFeedLogin.id).all()]
 
 
+def _public(fcfg: dict, connect_server: str, tz, h24) -> dict:
+    """The public port, the address people outside use and the addresses locked out after
+    wrong logins, for the Logins for other users card (dev/changelog/1761). No query: the
+    listener's status and the lockout counts are in memory."""
+    listener = public_listener.status()
+    url = output_feed.feed_public_url(fcfg)
+    state = listener['state']
+    set_port = public_listener.public_port(fcfg)
+    serving = state == public_listener.STATE_SERVING
+    if serving:
+        say = PUBLIC_OPEN if url else PUBLIC_OPEN_NO_URL
+    elif state == public_listener.STATE_FAILED:
+        say = PUBLIC_FAILED
+    elif state == public_listener.STATE_OFF:
+        say = PUBLIC_WAITING if set_port else PUBLIC_UNSET
+    else:
+        raise ValueError(f'Unknown public port state "{state}"')
+    return {
+        'say': say, 'serving': serving, 'port': listener['port'] or set_port,
+        'set_port': set_port, 'error': listener['error'], 'url': url,
+        # What the Logins card copies as the server: outside people's address once the public
+        # port is open and that address is set, else the one in the Connect card.
+        'server': url if url and serving else connect_server,
+        'suggested': output_feed.SUGGESTED_PUBLIC_PORT,
+        'lockouts': [{'address': ip, 'until': format_local(until, 'clock', tz=tz, h24=h24)}
+                     for ip, until in output_feed.login_failures.locked_out()],
+        'lockout_minutes': output_feed.LOGIN_LOCKOUT_WINDOW.seconds // 60,
+        'lockout_tries': output_feed.LOGIN_MAX_FAILURES,
+    }
+
+
 def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
     """Everything templates/iptv_output.html draws. `host_url` is the address the page was
     opened on, used only when ChannelBin's own address is not set; `proxy` is proxy_state()."""
@@ -851,19 +892,24 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
     address = _address(cfg, host_url)
     max_viewers = int(fcfg.get('max_viewers') or 1)
     logins = _logins(output_feed.live_sessions() if state == STATE_ON else [])
+    connect = _connect(fcfg, address['base'])
+    public = _public(fcfg, connect['server'], tz, h24)
+    # The public port relays every play on it, whatever the mode (dev/changelog/1761).
+    public_relays = public['serving'] and mode != output_feed.MODE_PROXY
     return {
         'state': state, 'is_on': state == STATE_ON, 'is_off': state == STATE_OFF,
         'needs_login': state == STATE_SETUP, 'mode': mode, 'redirect': redirect,
         'mixed': mode == output_feed.MODE_MIXED,
         # A login for another user is relayed in every mode, so with one there is always
         # something the relay's settings and counts apply to (dev/changelog/1760).
-        'relays_some': output_feed.relays_some(fcfg) or bool(logins),
+        'relays_some': output_feed.relays_some(fcfg) or bool(logins) or public_relays,
         'redirects_some': output_feed.redirects_some(fcfg),
         'dormant': state != STATE_ON, 'mask': MASK_SENTINEL, 'bounds': output_feed.SETTING_BOUNDS,
         'address': address, 'proxy': proxy, 'channels_per_page': CHANNELS_PER_PAGE,
         'address_notice': {'hidden': address['state'] == ADDRESS_UNSET and address_notice_hidden(),
                            'pref': ADDRESS_NOTICE_PREF, 'version': ADDRESS_NOTICE_VERSION},
-        'connect': _connect(fcfg, address['base']),
+        'connect': connect,
+        'public': public,
         'logins': logins,
         'login_password': output_feed.generated_password(),
         'login_streams': output_feed.MAX_STREAMS_BOUNDS,
@@ -883,5 +929,6 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
         'recent': _recent(args, mode, by_feed, accounts, now, tz, h24),
         'accounts': _accounts(rows, sessions, accounts, cfg, fcfg),
         'feedcfg': fcfg,
-        'modes': MODE_LABELS, 'mode_help': MODE_HELP[mode],
+        'modes': MODE_LABELS,
+        'mode_help': MODE_HELP[mode] + (PUBLIC_MODE_NOTE if public_relays else ''),
     }

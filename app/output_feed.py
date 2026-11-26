@@ -107,6 +107,7 @@ from typing import Optional
 from xml.sax.saxutils import escape as xml_escape
 
 from . import connection_limits as connlim
+from .auth import FailureTracker
 from .database import FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED
 from .fmt_utils import counted, fmt_bytes, fmt_duration, iso_or_none
 from .proc_utils import build_relay_cmd, build_screen_play_cmd, read_stderr_tail, terminate_or_kill
@@ -375,6 +376,16 @@ def _login_generation() -> dict:
         return dict(_login_changes)
 
 
+#: Wrong logins from one address before it is refused, and for how long. Its own counter, never
+#: the web login's (app/auth.py::web_login), so a lockout here never locks anyone out of
+#: ChannelBin's own pages. Higher than the web login's 5 because an IPTV player holding an old
+#: password asks for the guide, the channel list and a logo per channel in one burst; 10 a
+#: quarter hour is still far too slow to guess a generated password (dev/changelog/1761).
+LOGIN_MAX_FAILURES = 10
+LOGIN_LOCKOUT_WINDOW = timedelta(minutes=15)
+login_failures = FailureTracker(LOGIN_MAX_FAILURES, LOGIN_LOCKOUT_WINDOW)
+
+
 def feed_login_for(fcfg: dict, username, password) -> Optional[FeedLogin]:
     """The login an IPTV player's credentials name, or None. None for every cause - the output
     off, an unknown username, a login turned off, a wrong password - so the caller answers them
@@ -433,9 +444,22 @@ _tuning_login: contextvars.ContextVar = contextvars.ContextVar('output_feed_tuni
                                                               default=None)
 
 
+#: And whether it came in on the public port (app/public_listener.py), set by start_session
+#: for the same duration.
+_tuning_public: contextvars.ContextVar = contextvars.ContextVar('output_feed_tuning_public',
+                                                               default=False)
+
+
 def _tuning_log_name() -> Optional[str]:
     login = _tuning_login.get()
     return login.log_name if login is not None else None
+
+
+def _tuning_always_relayed() -> bool:
+    """Whether the tune-in on this thread is relayed in every mode: a login for another user's
+    or one on the public port (relays_for)."""
+    login = _tuning_login.get()
+    return _tuning_public.get() or (login is not None and not login.is_main)
 
 
 #: The lowest and highest value each numeric setting takes. A number outside is moved to the
@@ -488,6 +512,42 @@ def sports_window(fcfg: dict) -> tuple:
     return tuple(out)
 
 
+#: The public port the docs, the Dockerfile's EXPOSE and the Settings help suggest. Far from the
+#: ports scanners try first (80, 443, 8080, 8000, 8888, and 25461, the Xtream panels' own), so a
+#: port opened by mistake straight to the internet is not found in the first sweep. Never a
+#: default: 0 (off) is (dev/changelog/1761).
+SUGGESTED_PUBLIC_PORT = 38517
+#: The lowest public port the save takes: below 1024 needs root on Linux.
+PUBLIC_PORT_MIN = 1024
+
+
+def public_port_problem(value, cfg: dict) -> tuple:
+    """(why `value` cannot be `public_port` or '', the value as a whole number)."""
+    try:
+        port = int(str(value).strip() or 0)
+    except (TypeError, ValueError):
+        return 'The public port must be a whole number, or 0 to turn it off.', value
+    if port == 0:
+        return '', 0
+    if port < PUBLIC_PORT_MIN or port > 65535:
+        return (f'The public port must be between {PUBLIC_PORT_MIN} and 65535, or 0 to turn it '
+                f'off.'), port
+    try:
+        web_port = int((cfg.get('flask') or {}).get('port') or 0)
+    except (TypeError, ValueError):
+        web_port = 0
+    if port == web_port:
+        return (f'Port {port} is the web UI\'s own. The public port has to be a different one, '
+                f'like {SUGGESTED_PUBLIC_PORT}.'), port
+    return '', port
+
+
+def feed_public_url(fcfg: dict) -> str:
+    """The address people outside the home network type as the server (`public_url`), with no
+    trailing slash, or ''."""
+    return str(fcfg.get('public_url') or '').strip().rstrip('/')
+
+
 def mode_of(fcfg: dict) -> str:
     mode = fcfg.get('mode') or MODE_PROXY
     return mode if mode in MODES else MODE_PROXY
@@ -512,22 +572,23 @@ def relays(fcfg: dict, feed_id: int) -> bool:
     raise ValueError(f'Unknown feed mode "{mode}"')
 
 
-def relays_for(fcfg: dict, feed_id: int, login: FeedLogin) -> bool:
+def relays_for(fcfg: dict, feed_id: int, login: FeedLogin, public: bool = False) -> bool:
     """relays() for one login's tune-in. A login for another user is always relayed, whatever
-    the mode: a redirect sends the player to the provider's own stream URL, which carries the
-    owner's provider username and password, and puts the provider account on that user's
-    address (dev/changelog/1760)."""
-    return not login.is_main or relays(fcfg, feed_id)
+    the mode, and so is any tune-in on the public port (`public`, app/public_listener.py): a
+    redirect sends the player to the provider's own stream URL, which carries the owner's
+    provider username and password, and puts the provider account on that player's address
+    (dev/changelog/1760, 1761)."""
+    return public or not login.is_main or relays(fcfg, feed_id)
 
 
 def seen_in_mode(session: 'RelaySession', mode: str) -> bool:
     """Whether Watching now lists `session` in `mode`. In redirect mode ChannelBin's own
-    pictures and a login for another user's plays are its own stream; anything else live then
-    is from before a change of mode."""
+    pictures, a login for another user's plays and every play on the public port are relayed
+    all the same; anything else live then is from before a change of mode."""
     if mode in (MODE_PROXY, MODE_MIXED):
         return True
     if mode == MODE_REDIRECT:
-        return session.own_picture or session.feed_login_id is not None
+        return session.own_picture or session.always_relayed
     raise ValueError(f'Unknown feed mode "{mode}"')
 
 
@@ -1691,6 +1752,9 @@ class RelaySession:
     feed_login_id: Optional[int] = None
     # That login's username as it was, for Watching now and Recent plays; '' for the main one.
     feed_login: str = ''
+    # Tuned in on the public port (app/public_listener.py), which is always relayed. Never read
+    # as which login it is or where the player is.
+    public: bool = False
     last_recheck_mono: float = 0.0
     _reserve_short_logged: bool = False
     _finishing: bool = False
@@ -1739,6 +1803,12 @@ class RelaySession:
     @property
     def on_card(self) -> bool:
         return self.state == STATE_CARD
+
+    @property
+    def always_relayed(self) -> bool:
+        """On a login for another user or the public port: relayed in every mode, so never
+        handled as a redirected play (relays_for, dev/changelog/1760, 1761)."""
+        return self.feed_login_id is not None or self.public
 
     @property
     def own_picture(self) -> bool:
@@ -1931,17 +2001,20 @@ def _refuse(feed_id: int, label: str, message: str, status: int, source_tail: st
 
 
 def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
-                  player: str = '', login: Optional[FeedLogin] = None) -> RelaySession:
+                  player: str = '', login: Optional[FeedLogin] = None,
+                  public: bool = False) -> RelaySession:
     """Start relaying `feed_id` to one IPTV player. Raises FeedRefused with a user-facing message:
     404 for an id the feed does not serve, 503 at the viewer cap or the login's own stream
     limit, 409 when nothing is playable (a blocked account, the allowlist, the connection
     limit) and 500 when ffmpeg could not start. Requires an app context; the returned session
     is registered and reaped. `preview` is a browser preview's play (RelaySession.preview), in
     every mode. `player` is RelaySession.player: the address when it names one IPTV player,
-    else ''. `login` is the login the player came in on, None for the main one.
+    else ''. `login` is the login the player came in on, None for the main one. `public` is
+    RelaySession.public.
     """
     room = _LoginRoom(login) if login is not None and not login.is_main else None
     token = _tuning_login.set(login)
+    public_token = _tuning_public.set(public)
     try:
         session = _start_session(feed_id, client, cfg, preview, player, login, room)
         gone = False
@@ -1950,6 +2023,8 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
                 # A waiting screen, card or Up next picture: built without it, and the play a
                 # later channel change from this player leaves all the same.
                 session.player = player
+            if public:
+                session.public = True
             if room is not None:
                 if session.feed_login_id is None:
                     session.feed_login_id, session.feed_login = login.feed_login_id, login.username
@@ -1965,6 +2040,7 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
         if room is not None:
             room.release()
         _tuning_login.reset(token)
+        _tuning_public.reset(public_token)
     return session
 
 
@@ -3676,14 +3752,15 @@ def _screen_mod():
     return sports_screen
 
 
-def _screen_of(play: Play, cfg: dict, held: str = None, other_login: bool = False):
+def _screen_of(play: Play, cfg: dict, held: str = None, always_relayed: bool = False):
     """The waiting screen `play` shows now. A few queries (sports_screen.screen_for).
-    `other_login` is a play on a login for another user, which is always relayed (relays_for)."""
+    `always_relayed` is a play on a login for another user or on the public port, which is
+    relayed in every mode (relays_for)."""
     fcfg = feed_config(cfg)
     before, _after = sports_window(fcfg)
     # The screen's words follow how this play is delivered, so mixed mode's sports channel,
     # which is relayed, says the game starts by itself.
-    mode = (MODE_PROXY if play.preview or other_login or relays(fcfg, play.feed_id)
+    mode = (MODE_PROXY if play.preview or always_relayed or relays(fcfg, play.feed_id)
             else MODE_REDIRECT)
     return _screen_mod().screen_for(play.served, play.found, datetime.utcnow(), cfg, mode=mode,
                                     before_minutes=int(before.total_seconds() // 60), held=held,
@@ -3754,8 +3831,7 @@ def start_waiting(play: Play, client: str, cfg: dict, held: str = None) -> Relay
     fcfg = feed_config(cfg)
     row_id = play.served.row.id
     try:
-        tuning = _tuning_login.get()
-        screen = _screen_of(play, cfg, held, other_login=tuning is not None and not tuning.is_main)
+        screen = _screen_of(play, cfg, held, always_relayed=_tuning_always_relayed())
         path, still = _clip_for(cfg, row_id, screen)
     except ss.ClipFailed as exc:
         from .sports_feed import event_word
@@ -4057,7 +4133,7 @@ def _recheck_locked(session: RelaySession) -> None:
         _finish(session, REASON_SCREEN_GONE)
         return
     held = None
-    if (play.member is not None and not session.preview and session.feed_login_id is None
+    if (play.member is not None and not session.preview and not session.always_relayed
             and not relays(fcfg, session.feed_id)):
         # A redirected play cannot put the game on in place: ChannelBin never sends a provider
         # stream through itself for it. The stream ends, and the player's next tune-in is the
@@ -4079,7 +4155,7 @@ def _recheck_locked(session: RelaySession) -> None:
                              body=f'An IPTV player on the waiting screen of {play.label} was cut: {detail}.',
                              source=source)
         return
-    screen = _screen_of(play, cfg, held, other_login=session.feed_login_id is not None)
+    screen = _screen_of(play, cfg, held, always_relayed=session.always_relayed)
     if ss.clip_key(screen) == session.screen_key:
         return
     try:
@@ -4530,11 +4606,17 @@ def readiness_facts(cfg=None) -> dict:
     """What the readiness check reads, gathered once (app/readiness.py)."""
     from .database import Account
     fcfg = feed_config(cfg)
+    from . import public_listener
+    from .database import OutputFeedLogin
     facts = {'enabled': is_enabled(fcfg), 'mode': mode_of(fcfg),
              'credentials_set': credentials_set(fcfg), 'reserve_fits': reserve_fits(fcfg),
-             'served': 0, 'missing_held_accounts': []}
+             'served': 0, 'missing_held_accounts': [], 'logins_on': 0,
+             'public_port': public_listener.public_port(fcfg),
+             'public_url': feed_public_url(fcfg),
+             'listener': public_listener.status()}
     if not facts['enabled']:
         return facts
+    facts['logins_on'] = OutputFeedLogin.query.filter_by(enabled=True).count()
     facts['served'] = len(catalog(cfg))
     held = held_seats_map(fcfg)
     if held and redirects_some(fcfg):
@@ -4581,3 +4663,4 @@ def reset_for_tests():
         del _redirects[:]
     discard_play_log()
     _last_prune_mono = None
+    login_failures.reset()

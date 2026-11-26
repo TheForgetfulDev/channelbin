@@ -45,8 +45,8 @@ class _ConfigSandbox(ConfigSandbox):
         super().setUp()
         # The failed-attempt tracker is module-level state shared across every test in
         # the process (nothing else in the app touches it) - reset per test for isolation.
-        authmod._failures.clear()
-        self.addCleanup(authmod._failures.clear)
+        authmod.web_login.failures.clear()
+        self.addCleanup(authmod.web_login.failures.clear)
 
 
 
@@ -454,20 +454,20 @@ class FailureTrackerBoundsTests(_ConfigSandbox):
         with self.t.app.test_request_context('/login'):
             for i in range(500):
                 authmod.check_lockout('10.0.%d.%d' % (i // 256, i % 256))
-        self.assertEqual(authmod._failures, {})
+        self.assertEqual(authmod.web_login.failures, {})
 
     def test_tracked_ips_are_capped(self):
         with self.t.app.test_request_context('/login'):
             for i in range(authmod.MAX_TRACKED_IPS + 250):
                 authmod.record_failure('10.1.%d.%d' % (i // 256, i % 256))
-        self.assertLessEqual(len(authmod._failures), authmod.MAX_TRACKED_IPS)
+        self.assertLessEqual(len(authmod.web_login.failures), authmod.MAX_TRACKED_IPS)
 
     def test_expired_entries_are_dropped(self):
         stale = datetime.utcnow() - (authmod.LOCKOUT_WINDOW + timedelta(minutes=1))
-        authmod._failures['192.0.2.9'] = [stale, stale]
+        authmod.web_login.failures['192.0.2.9'] = [stale, stale]
         with self.t.app.test_request_context('/login'):
             self.assertIsNone(authmod.check_lockout('192.0.2.9'))
-        self.assertNotIn('192.0.2.9', authmod._failures)
+        self.assertNotIn('192.0.2.9', authmod.web_login.failures)
 
 
 class RecoveryPathTests(_ConfigSandbox):

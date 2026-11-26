@@ -48,6 +48,7 @@ It's actually been really fun using the search and surfacing channels that I did
 - [Versioning and upgrades](#versioning-and-upgrades)
 - [Home Assistant integration](#home-assistant-integration)
 - [IPTV output](#iptv-output)
+  - [Sharing the IPTV output over the internet](#sharing-the-iptv-output-over-the-internet)
 - [Troubleshooting a provider sync](#troubleshooting-a-provider-sync)
 - [How I use AI on this project](#how-i-use-ai-on-this-project)
 - [Feedback and contributions](#feedback-and-contributions)
@@ -375,6 +376,7 @@ ever set. The table below is only the handful people change first.
 | `flask.host` | `0.0.0.0` | Bind address, see below. config.yaml only, for the same reason; not ChannelBin's address |
 | `flask.public_url` | none | ChannelBin's address (Settings, System): the server address IPTV Output shows and the start of push-notification links. Never where it listens |
 | `flask.behind_proxy` | False | "Behind a reverse proxy" (Settings, System), with a Test of your proxy under the switch; restart required |
+| `integrations.output_feed.public_port` | 0 | Off at 0. A second port answering only the IPTV output, for a reverse proxy to put on the internet ([Sharing the IPTV output over the internet](#sharing-the-iptv-output-over-the-internet)); restart required |
 | `ffmpeg.extra_input_args` | `[]` | Extra ffmpeg arguments before `-i` |
 
 ## Network binding and exposure
@@ -647,7 +649,7 @@ one dies.
 Go to the **IPTV Output** page, under Channels & guide:
 
 1. **Set login**: the username and password the IPTV player logs in with. They are typed on a
-   remote, so short is fine; the IPTV output is only as reachable as this server is.
+   remote, so short is fine on your home network.
 2. **Turn on**.
 3. In the IPTV player, add an Xtream Codes account with the server address, username and
    password from the page's **Connect an IPTV player** card (each has a Copy button). A player
@@ -676,6 +678,82 @@ Three ways the stream can reach the IPTV player, chosen by **How the IPTV player
 The page's **Watching now** and **Recent plays** cards list each IPTV player playing and how every
 play ended or why it was refused, and the Readiness check says whether the IPTV output can serve. It is off by default
 and nothing of it runs while it is off.
+
+### Sharing the IPTV output over the internet
+
+To let people outside your home watch, give each of them a login on the IPTV Output page's
+**Logins for other users** card, and put the IPTV output - only the IPTV output - on the internet
+through a reverse proxy. The web UI stays on your home network: **never forward ChannelBin's own
+port (5000) to the internet** (see [Network binding and exposure](#network-binding-and-exposure)).
+
+ChannelBin can open a second port for this, the **public port**, which answers an IPTV player
+and nothing else. Every page, every setting, the API and every other file ChannelBin serves is a
+plain 404 there, so a mistake in the proxy cannot expose the web UI. On the public port:
+
+- Every play goes through ChannelBin, even in Redirect or Mixed mode, so your IPTV provider's
+  username and password never reach a player outside your home.
+- An address that gets the login wrong 10 times in 15 minutes is refused for the rest of those
+  15 minutes, even with the right password. This counts on the main port too. The Logins card
+  lists any address locked out now, with a button to let them try again.
+
+Steps:
+
+1. In Settings, IPTV output, set **Public port for the IPTV output** (`integrations.output_feed.public_port`)
+   to a port nothing else uses. `38517` is the suggested one: far from the ports internet
+   scanners try first. Set **Address for people outside your network** to the address your
+   proxy answers on, like `https://tv.example.com`; the Logins card copies it into the
+   details you send each person.
+2. In Settings, System, turn on **Behind a reverse proxy** (`flask.behind_proxy`). Without it
+   every player looks like the proxy, so a few wrong passwords from anyone lock everyone out.
+3. In Docker, map the port too: `-p 38517:38517` (there is a commented line for it in
+   `docker-compose.example.yml`), or `-p 127.0.0.1:38517:38517` when the proxy runs on the same
+   machine. On Unraid, add a port to the container with the same number on both sides.
+4. Restart ChannelBin. The log says `IPTV output public port listening on 0.0.0.0:38517`, and the
+   Readiness check names any problem: the port could not be opened, the proxy setting is off, or
+   the outside address is not set.
+5. Point the reverse proxy at the public port only. nginx:
+
+   ```nginx
+   server {
+       listen 443 ssl;
+       server_name tv.example.com;
+       # ssl_certificate ...; ssl_certificate_key ...;
+       location / {
+           proxy_pass http://192.168.1.10:38517;
+           proxy_set_header Host $host;
+           proxy_set_header X-Forwarded-Host $host;
+           proxy_set_header X-Forwarded-Proto $scheme;
+           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+           proxy_buffering off;        # a live stream goes out as it arrives
+           proxy_read_timeout 1h;
+       }
+   }
+   ```
+
+   Caddy:
+
+   ```caddyfile
+   tv.example.com {
+       reverse_proxy 192.168.1.10:38517 {
+           flush_interval -1
+       }
+   }
+   ```
+
+6. **Forward only the proxy's port (443) on your router, never the public port itself.** With
+   "Behind a reverse proxy" on, ChannelBin believes the address the proxy says a player has; a
+   player reaching the public port directly could claim any address it likes and get past the
+   wrong-login lockout.
+7. Your own login (the one in the Connect card) works on the public port too. If you will use it
+   from outside, change it to a long password; the logins for other users get a 12-character
+   generated one.
+8. From outside your network (a phone off Wi-Fi), check it:
+   `curl "https://tv.example.com/player_api.php?username=NAME&password=PASSWORD"` answers with the
+   login's details, and `curl -i https://tv.example.com/` answers 404.
+
+`integrations.output_feed.public_host` (config.yaml only, default `0.0.0.0`) is where the public
+port listens; set it to `127.0.0.1` only when the proxy runs on the same machine. ChannelBin does
+not do TLS itself: the proxy does.
 
 ---
 

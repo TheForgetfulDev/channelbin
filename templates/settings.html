@@ -828,6 +828,15 @@
       {{ field_number('integrations.output_feed.xmltv_days', 'Days of guide it sends',
          'How far ahead the guide an IPTV player downloads reaches. A channel\'s listings end where ChannelBin\'s own guide does, which is set to ' ~ sync_cfg.get('epg_days_ahead', 3) ~ (' day' if sync_cfg.get('epg_days_ahead', 3) == 1 else ' days') ~ ' ("EPG days ahead"). A sports channel\'s games come from TheSportsDB and can reach further.',
          feedcfg.get('xmltv_days', 3), tier='advanced', gated_by=['integrations.output_feed.enabled']) }}
+      {#- The public port (app/public_listener.py, dev/changelog/1761). Not gated on the switch:
+          it is opened at startup whether or not the output is on, and answers 401 while off. -#}
+      {{ field_number('integrations.output_feed.public_port', 'Public port for the IPTV output',
+         'To share the IPTV output with people outside your home network. ChannelBin opens this second port at startup, and it answers an IPTV player and nothing else: no page, no setting and no other address of ChannelBin is reachable on it. Point your reverse proxy at this port only, never at the web UI\'s own, turn on "Behind a reverse proxy" under System, and forward only the proxy\'s port on your router, never this one: a player reaching it directly could claim any address and get past the wrong-login lockout. Your own login works here too, so give it a long password if you will use it from outside. Every play on it goes through ChannelBin whatever "How the IPTV player gets the stream" says, so your IPTV provider\'s login never reaches a player outside. 0 is off. Pick a port nothing else uses, like ' ~ suggested_public_port ~ ': far from the ones scanners try first. In Docker, map it too. README.md, "Sharing the IPTV output over the internet", has the steps.',
+         feedcfg.get('public_port', 0), restart=True, tier='advanced') }}
+      {{ field_text('integrations.output_feed.public_url', 'Address for people outside your network',
+         'The address people outside your home network type into their IPTV player as the server: your reverse proxy\'s, starting with https://. The Logins for other users card puts it in the details it copies for them. Only handed out, never where ChannelBin listens.',
+         feedcfg.get('public_url', ''), tier='advanced', placeholder='https://tv.example.com',
+         examples=['https://tv.example.com']) }}
 
       {#- How the Sports Schedules page's worker paces itself (app/sports_data.py). What to follow
           is on that page, not here: these are the system's half of it. -#}

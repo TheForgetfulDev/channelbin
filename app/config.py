@@ -116,6 +116,10 @@ RESTART_REQUIRED_KEYS = {
     # app/auth.py::refresh_auth() re-reads app.config['AUTH'] on every write to those,
     # so they take effect immediately with no restart.
     'auth.cookie_secure',
+    # The IPTV output's public port is opened once, by run.py at startup (app/public_listener.py,
+    # dev/changelog/1761). Every other output_feed key is read per request.
+    'integrations.output_feed.public_port',
+    'integrations.output_feed.public_host',
     # display.nav_poll_interval_seconds is deliberately NOT here, despite looking like a
     # sibling of the create_app()-time keys above: it's read inside inject_globals(), a
     # @app.context_processor that calls load_config() fresh on every request, so it
@@ -537,8 +541,8 @@ _DEFAULTS = {
         # The output feed: ChannelBin as an Xtream/M3U/XMLTV source an IPTV player adds as an
         # account, serving the TV Guide's channels and groups (app/output_feed.py,
         # dev/docs/DESIGN-output-feed.md). The first optional module: off by default, one
-        # switch, nothing runs or is written while it is off. None of these keys needs a
-        # restart - the blueprint is always registered and reads them per request.
+        # switch, nothing runs or is written while it is off. Only public_port and public_host
+        # need a restart - the blueprint is always registered and reads the rest per request.
         'output_feed': {
             'enabled': False,
             'username': '',
@@ -566,6 +570,16 @@ _DEFAULTS = {
             # (dev/changelog/1529). 0 and 0 is the listing's own time.
             'sports_before_minutes': 60,
             'sports_after_minutes': 120,
+            # A second port that answers the IPTV output and nothing else, for a reverse proxy
+            # to put on the internet while the web UI stays on the home network
+            # (app/public_listener.py, dev/changelog/1761). 0 is off. Every play on it is
+            # relayed whatever `mode` says. Restart required.
+            'public_port': 0,
+            'public_host': '0.0.0.0',
+            # The address people outside the home network type as the server: the reverse
+            # proxy's, whole, like https://tv.example.com. Only handed out (the Logins card's
+            # details to send, the readiness check), never where anything listens.
+            'public_url': '',
         },
     },
     'database': {

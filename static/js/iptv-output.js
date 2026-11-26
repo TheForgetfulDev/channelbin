@@ -247,7 +247,7 @@
   function openLogin(btn) {
     const first = btn.dataset.first === '1';
     const body = `<div class="of-login"><p>${first
-      ? 'An IPTV player sends these every time it asks for anything. Short is fine: they are typed with a remote. A short login is one more reason to keep ChannelBin on your home network: do not open it to the internet.'
+      ? 'An IPTV player sends these every time it asks for anything. Short is fine on your home network: they are typed with a remote. Never forward ChannelBin\'s own port to the internet. To share the IPTV output outside your home, use the public port in Settings, which answers an IPTV player and nothing else, and give that login a long password.'
       : 'Every IPTV player using the old login is refused the next time it asks for anything, until the new one is typed into it. A play that is already running carries on until then.'}</p>
       <label for="of-user">Username</label>
       <input class="form-control" id="of-user" value="${escHtml(btn.dataset.user || '')}" autocomplete="off" maxlength="60">
@@ -401,7 +401,7 @@
     const max = Number(btn.dataset.max);
     const body = `<div class="of-login"><p>${editing
       ? 'A new username or password cuts any play on this login now, and its IPTV player is refused until the new one is typed into it.'
-      : 'They type the same server address as you, with this username and password. Short is fine: they are typed with a remote.'}</p>
+      : 'They type the server address in the details this card copies for them, with this username and password. Short is easier to type with a remote, but a login used from outside your home network should be long.'}</p>
       <label for="of-l-name">Who it is for</label>
       <input class="form-control" id="of-l-name" value="${escHtml(editing ? tr.dataset.name : '')}" autocomplete="off" maxlength="100">
       <label for="of-l-user">Username</label>
@@ -491,6 +491,14 @@
     showToast(`The details for ${tr.dataset.name} are copied. They hold the password, so send them only to that person.`);
   }
 
+  async function clearLockouts() {
+    const d = await post('/api/iptv-output/lockouts/clear');
+    await refresh(CARDS);
+    showToast(d.cleared
+      ? 'They can try again now. A player still holding a wrong password is locked out again after a few more tries.'
+      : 'Nothing was locked out any more.');
+  }
+
   const guarded = (fn) => (...args) => Promise.resolve(fn(...args)).catch(fail);
 
   document.addEventListener('click', (e) => {
@@ -520,6 +528,7 @@
     else if (act === 'login-delete') guarded(deleteLogin)(t.closest('tr'));
     else if (act === 'login-reveal') guarded(revealLogin)(t);
     else if (act === 'login-copy') guarded(copyLogin)(t.closest('tr'));
+    else if (act === 'lockouts-clear') guarded(clearLockouts)();
   });
   document.addEventListener('change', (e) => {
     const t = e.target;

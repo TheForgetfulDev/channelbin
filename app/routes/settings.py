@@ -107,6 +107,21 @@ def _raw_yaml_problems(text):
     if failing is not None and failing not in health_bands.FAILING_VALUES:
         refuse('channel_testing.failing_band',
                'Must be one of ' + ', '.join(health_bands.FAILING_VALUES) + '.')
+    # dev/changelog/1761: the IPTV output's public port, checked as api_settings_field checks
+    # it, so a raw save can never put it on the web UI's port (the public port opens first at
+    # startup, and the web UI could then not open its own).
+    integrations = data.get('integrations') if isinstance(data.get('integrations'), dict) else {}
+    feed_block = (integrations.get('output_feed')
+                  if isinstance(integrations.get('output_feed'), dict) else {})
+    if feed_block.get('public_port') is not None:
+        flask_block = data.get('flask') if isinstance(data.get('flask'), dict) else {}
+        web = {'flask': {'port': flask_block.get('port') or config_default('flask.port')}}
+        from .. import output_feed
+        problem, _port = output_feed.public_port_problem(feed_block.get('public_port'), web)
+        if problem:
+            refuse('integrations.output_feed.public_port', problem)
+    if public_url_problem(feed_block.get('public_url')):
+        refuse('integrations.output_feed.public_url', public_url_problem(feed_block.get('public_url')))
     search = data.get('search') if isinstance(data.get('search'), dict) else {}
     page_size = search.get('page_size')
     if page_size is not None and _page_size_choice(page_size) is None:
@@ -287,6 +302,7 @@ def _render_settings(yaml_text=None, yaml_problems=None):
         feed_held_seats_lines=[f'{a}: {n}' for a, n in sorted(
             output_feed.held_seats_map(
                 (unmasked_cfg.get('integrations') or {}).get('output_feed') or {}).items())],
+        suggested_public_port=output_feed.SUGGESTED_PUBLIC_PORT,
     )
 
 
@@ -562,6 +578,18 @@ def api_settings_field():
                         f'{output_feed.max_reserve_seconds(trial["buffer_mb"])} seconds fits '
                         f'(about 1 MB per second at a typical HD bitrate, with room to spare). '
                         f'Lower the reserve or raise the buffer.')}), 400
+            if leaf == 'public_port':
+                problem, value = output_feed.public_port_problem(value, cfg)
+                if problem:
+                    return jsonify({'error': problem}), 400
+            if leaf == 'public_host':
+                # Where the public port listens, like flask.host: changed in config.yaml only.
+                return jsonify({'error': f'{path} is changed in config.yaml only'}), 400
+            if leaf == 'public_url':
+                value = str(value or '').strip()
+                problem = public_url_problem(value)
+                if problem:
+                    return jsonify({'error': problem}), 400
             if leaf == 'accounts':
                 ids = []
                 for raw in (value or []):

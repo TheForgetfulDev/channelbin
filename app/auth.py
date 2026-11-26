@@ -49,13 +49,6 @@ LOCKOUT_WINDOW = timedelta(minutes=15)
 # survivors after that: lockout accuracy degrades under flood, memory does not.
 MAX_TRACKED_IPS = 1024
 
-# In-memory {ip: [failure datetimes]}. Reset on process restart, and only as meaningful
-# as request.remote_addr - which is the single real client only when flask.behind_proxy
-# is on (ProxyFix); otherwise every proxied request looks like one IP. This is a brute-
-# force speed bump, not a durable audit log, so neither limitation is a defect here.
-_failures = {}
-_failures_lock = threading.Lock()
-
 
 def wants_json(req) -> bool:
     """True when a denied request should get a 401 JSON body instead of an HTML redirect.
@@ -179,53 +172,98 @@ def clear_session():
     g.pop(field_name, None)
 
 
-def _prune_locked(now):
-    """Drop entries with nothing live left, then enforce MAX_TRACKED_IPS. Caller holds
-    the lock. An IP with no failures inside the window is indistinguishable from one that
-    was never seen, so keeping its key buys nothing and costs memory forever."""
-    for ip in [ip for ip, times in _failures.items() if not times]:
-        del _failures[ip]
-    if len(_failures) <= MAX_TRACKED_IPS:
-        return
-    # Oldest-first by that IP's most recent failure: the entries closest to expiring
-    # anyway, and never the one actively being brute-forced.
-    for ip, _ in sorted(_failures.items(), key=lambda kv: max(kv[1]))[
-            :len(_failures) - MAX_TRACKED_IPS]:
-        del _failures[ip]
+class FailureTracker:
+    """Wrong-password counts per address, and the lockout they trip: `max_failures` inside
+    `window` locks an address out until the oldest of them is `window` old.
+
+    In memory, reset on process restart, and only as meaningful as request.remote_addr - which
+    is the single real client only when flask.behind_proxy is on (ProxyFix); otherwise every
+    proxied request looks like one address. A brute-force speed bump, not a durable audit log,
+    so neither limitation is a defect here. One instance per door, so a lockout at one never
+    locks anyone out of another: the web login's is `web_login` below, the IPTV output's is
+    output_feed.login_failures (dev/changelog/1761)."""
+
+    def __init__(self, max_failures: int, window: timedelta, max_tracked: int = MAX_TRACKED_IPS):
+        self.max_failures = max_failures
+        self.window = window
+        self.max_tracked = max_tracked
+        # {address: [failure datetimes]}
+        self.failures = {}
+        self._lock = threading.Lock()
+
+    def _prune_locked(self, now):
+        """Drop entries with nothing live left, then enforce max_tracked. Caller holds the
+        lock. An address with no failures inside the window is indistinguishable from one that
+        was never seen, so keeping its key buys nothing and costs memory forever."""
+        for ip in [ip for ip, times in self.failures.items() if not times]:
+            del self.failures[ip]
+        if len(self.failures) <= self.max_tracked:
+            return
+        # Oldest-first by that address's most recent failure: the entries closest to expiring
+        # anyway, and never the one actively being brute-forced.
+        for ip, _ in sorted(self.failures.items(), key=lambda kv: max(kv[1]))[
+                :len(self.failures) - self.max_tracked]:
+            del self.failures[ip]
+
+    def check_lockout(self, ip: str):
+        """Return the UTC unlock time if `ip` is currently locked out, else None."""
+        now = datetime.utcnow()
+        with self._lock:
+            times = [t for t in self.failures.get(ip, []) if now - t < self.window]
+            if times:
+                self.failures[ip] = times
+            else:
+                # Never write an empty list back: every GET /login called through here, so
+                # storing one entry per address that merely loaded the page grew this dict
+                # without bound for the life of the process (dev/changelog/487).
+                self.failures.pop(ip, None)
+            self._prune_locked(now)
+            if len(times) >= self.max_failures:
+                return times[0] + self.window
+        return None
+
+    def record_failure(self, ip: str) -> bool:
+        """Record a failed attempt. Returns True if this attempt just tripped the lockout."""
+        now = datetime.utcnow()
+        with self._lock:
+            times = [t for t in self.failures.get(ip, []) if now - t < self.window]
+            times.append(now)
+            self.failures[ip] = times
+            self._prune_locked(now)
+            return len(times) == self.max_failures
+
+    def record_success(self, ip: str):
+        with self._lock:
+            self.failures.pop(ip, None)
+
+    def locked_out(self) -> list:
+        """[(address, unlock time)] for every address locked out now, soonest unlock first."""
+        now = datetime.utcnow()
+        out = []
+        with self._lock:
+            for ip, times in self.failures.items():
+                live = [t for t in times if now - t < self.window]
+                if len(live) >= self.max_failures:
+                    out.append((ip, live[0] + self.window))
+        return sorted(out, key=lambda pair: pair[1])
+
+    def clear(self) -> int:
+        """Forget every count, so every address may try again now. Returns how many addresses
+        were locked out."""
+        n = len(self.locked_out())
+        self.reset()
+        return n
+
+    def reset(self):
+        """Forget every count. tests/support/app.py, and clear()."""
+        with self._lock:
+            self.failures.clear()
 
 
-def check_lockout(ip: str):
-    """Return the UTC unlock time if `ip` is currently locked out, else None."""
-    now = datetime.utcnow()
-    with _failures_lock:
-        times = [t for t in _failures.get(ip, []) if now - t < LOCKOUT_WINDOW]
-        if times:
-            _failures[ip] = times
-        else:
-            # Never write an empty list back: every GET /login called through here, so
-            # storing one entry per IP that merely loaded the page grew this dict without
-            # bound for the life of the process (dev/changelog/487).
-            _failures.pop(ip, None)
-        _prune_locked(now)
-        if len(times) >= MAX_FAILURES:
-            return times[0] + LOCKOUT_WINDOW
-    return None
-
-
-def record_failure(ip: str) -> bool:
-    """Record a failed login attempt. Returns True if this attempt just tripped lockout."""
-    now = datetime.utcnow()
-    with _failures_lock:
-        times = [t for t in _failures.get(ip, []) if now - t < LOCKOUT_WINDOW]
-        times.append(now)
-        _failures[ip] = times
-        _prune_locked(now)
-        return len(times) == MAX_FAILURES
-
-
-def record_success(ip: str):
-    with _failures_lock:
-        _failures.pop(ip, None)
+web_login = FailureTracker(MAX_FAILURES, LOCKOUT_WINDOW)
+check_lockout = web_login.check_lockout
+record_failure = web_login.record_failure
+record_success = web_login.record_success
 
 
 def password_epoch(auth_cfg: dict) -> str:
