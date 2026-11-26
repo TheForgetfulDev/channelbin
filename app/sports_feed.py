@@ -141,6 +141,10 @@ class NowPlaying:
     why_none: str = ''
     note: str = ''
     named: object = field(default=None, repr=False)
+    # The same game's listings that ended inside the window, when `listings` are the ones on now
+    # and so the only ones played from: a play whose every channel listing it now cannot play
+    # takes one of these next, since its game may be running long (dev/changelog/1745).
+    ended: frozenset = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -823,7 +827,8 @@ def playing_now(served: Served, now: datetime, event_id: int = None, before: tim
             if found is not None:
                 return found
     if picked is None:
-        picked = _pick(by_id, sports_match.airing_now(list(by_id), now, before, tail, listed=True), now)
+        rows = sports_match.airing_now(list(by_id), now, before, tail, listed=True)
+        picked = _pick(by_id, rows, now)
         if picked is None or picked[2] != PHASE_ON:
             from_name = _name_play(by_id, named(), now, before)
             found = (_named_now(from_name, now)
@@ -833,8 +838,11 @@ def playing_now(served: Served, now: datetime, event_id: int = None, before: tim
     if picked is not None:
         event, listings, phase, begin, stop = picked
         channels = Channel.query.filter(Channel.id.in_({c for c, _start in listings})).all()
+        ended = (frozenset((c, listed_at) for found_id, c, _begin, end, listed_at in rows
+                           if found_id == event.id and end <= now)
+                 if phase == PHASE_ON else frozenset())
         return NowPlaying(event=event, channels=channels, listings=frozenset(listings),
-                          note=_phase_note(phase, begin, stop, now))
+                          note=_phase_note(phase, begin, stop, now), ended=ended)
     if opened:
         name = event_game_name(min(opened.values(), key=lambda e: (e.live_now_until, e.id)))
         return NowPlaying(why_none=(f"{name} was started early with Start broadcast, but no channel's guide lists it any more, "

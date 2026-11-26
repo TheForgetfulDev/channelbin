@@ -601,6 +601,28 @@ def _watching(sessions, by_feed: dict, accounts: dict, sports: dict, now, tz, h2
     return out
 
 
+def play_names(cfg: dict, plays) -> tuple:
+    """({feed id: {'name', 'kind_text'}}, {event id: game}) for `plays` (dicts with a
+    `feed_id`, and an `event_id` for a sports play): the guide row's name and its kind, as
+    Watching now and Recent plays on the IPTV Output page name a play (_watching, _recent), and
+    the game a sports play is, for a page that lists plays without the rest of this one (the
+    dashboard). A row no longer in the catalog is left out, and its play keeps its label. One
+    catalog read, and none with no play to name: 0.2 s measured on a guide of 105 rows
+    (dev/changelog/1746)."""
+    from .database import SportsEvent
+    from .sports_data import event_game_name
+    plays = list(plays)
+    ids = {p['feed_id'] for p in plays}
+    if not ids:
+        return {}, {}
+    names = {r.feed_id: {'name': r.name, 'kind_text': KIND_TEXT[r.kind]}
+             for r in output_feed.catalog(cfg, everything=True) if r.feed_id in ids}
+    event_ids = {p.get('event_id') for p in plays} - {None}
+    games = ({e.id: event_game_name(e) for e in SportsEvent.query.filter(SportsEvent.id.in_(event_ids))}
+             if event_ids else {})
+    return names, games
+
+
 def _waiting_text(s) -> str:
     """What Watching now says a play on the waiting screen is waiting for, or ''."""
     if s.state != output_feed.STATE_WAITING:

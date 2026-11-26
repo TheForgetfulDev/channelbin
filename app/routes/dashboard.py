@@ -648,6 +648,11 @@ def dashboard():
                 'redirects': (output_feed.recent_redirects()[:5]
                               if output_feed.redirects_some(feed_cfg) else []),
                 'refused': output_feed.recent_refused()[:5]}
+        # Named as the IPTV Output page names them: the guide row and its kind, never the
+        # label the logs use (dev/changelog/1746).
+        from ..output_feed_view import play_names
+        feed['names'], feed['games'] = play_names(
+            cfg, feed['live'] + feed['ended'] + feed['redirects'] + feed['refused'])
     else:
         feed = None
         section_defs.pop(DASHBOARD_FEED_SECTION, None)

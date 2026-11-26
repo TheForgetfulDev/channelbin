@@ -539,6 +539,51 @@ class WindowTests(_Case):
         self.assertIsNone(over.member)
         self.assertIn('any more', over.why_none)
 
+    def _ended_and_on(self):
+        """A game three hours in: its listing on two channels ended a minute ago, and a longer
+        listing of it on two more is on now."""
+        e = self.event(BEARS, GULLS, self.now - timedelta(hours=3))
+        ended_a, ended_b = self.channel('Ended a', score=90.0), self.channel('Ended b', score=80.0)
+        on_a, on_b = self.channel('On a', score=50.0), self.channel('On b', score=40.0)
+        for ch in (ended_a, ended_b):
+            self.listing(e, ch, hours=2 + 59 / 60)
+        for ch in (on_a, on_b):
+            self.listing(e, ch, hours=4)
+        db.session.commit()
+        return e, ended_a, ended_b, on_a, on_b
+
+    def test_a_play_whose_channels_on_now_all_failed_takes_one_whose_listing_ended(self):
+        """dev/docs/BUGS.md 2026-11-26 @ 12:53:08 AM: after a restart a fresh tune-in took the
+        game's channels listing it now, both were dead, and the play ended "nothing left to play"
+        while the channels whose listing of it had ended a minute before were never asked."""
+        fid = self.fid()
+        e, ended_a, ended_b, on_a, on_b = self._ended_and_on()
+        first = feed.resolve_play(fid)
+        self.assertIn(first.member.id, {on_a.id, on_b.id}, 'a listing on now goes first')
+        moved = feed.resolve_play(fid, event_id=e.id, exclude_ids=frozenset({on_a.id, on_b.id}))
+        self.assertEqual((moved.member.id, moved.event_id), (ended_a.id, e.id))
+        self.assertIn('running long', moved.picked)
+        last = feed.resolve_play(fid, event_id=e.id,
+                                 exclude_ids=frozenset({on_a.id, on_b.id, ended_a.id}))
+        self.assertEqual(last.member.id, ended_b.id)
+        none = feed.resolve_play(fid, event_id=e.id,
+                                 exclude_ids=frozenset({on_a.id, on_b.id, ended_a.id, ended_b.id}))
+        self.assertIsNone(none.member)
+
+    def test_a_fresh_tune_in_whose_channels_on_now_are_blocked_takes_an_ended_listing(self):
+        from app.database import AccountBlock
+        fid = self.fid()
+        other = make_account('Other', max_connections=1)
+        e = self.event(BEARS, GULLS, self.now - timedelta(hours=3))
+        ended = self.channel('Ended', score=90.0, account=other)
+        on = self.channel('On', score=50.0)
+        self.listing(e, ended, hours=2 + 59 / 60)
+        self.listing(e, on, hours=4)
+        db.session.add(AccountBlock(account_id=self.account.id, start_time=self.now - timedelta(hours=1),
+                                    stop_time=self.now + timedelta(hours=1)))
+        db.session.commit()
+        self.assertEqual(feed.resolve_play(fid).member.id, ended.id)
+
     def _ran_long(self):
         """A game whose only listings ended 2 h 10 min ago, past the 2-hour tail, on two channels."""
         e = self.event(BEARS, GULLS, self.now - timedelta(hours=5, minutes=10))

@@ -38,6 +38,12 @@
   </div>
 {% endmacro %}
 
+{#- A play named as the IPTV Output page names it: the guide row and its kind, with a sports
+    play's game (output_feed_view.play_names, dev/changelog/1746). The label is kept only for
+    a row no longer in the catalog. -#}
+{% macro play_name(p) %}{% set n = feed.names.get(p.feed_id) %}{{ n.name if n else p.label }}{% endmacro %}
+{% macro play_kind(p) %}{% set n = feed.names.get(p.feed_id) %}{% if n %}{{ n.kind_text }}{% if p.event_id is not none and feed.games.get(p.event_id) %}: {{ feed.games.get(p.event_id) }}{% endif %} &middot; {% endif %}{% endmacro %}
+
 {% macro empty(title, body) %}
   <div class="dash-empty"><strong>{{ title }}</strong>{{ body }}</div>
 {% endmacro %}
@@ -389,13 +395,13 @@
         {% for s in feed.live %}
         <div class="drow st-live">
           <span class="d-title">
-            <span class="d-name">{{ s.label }}</span>
+            <span class="d-name">{{ play_name(s) }}</span>
             {%- if s.showing %}
-            <span class="d-meta">ChannelBin's own picture of the coming games</span>
+            <span class="d-meta">{{ play_kind(s) }}ChannelBin's own picture of the coming games</span>
             {%- elif s.on_card %}
-            <span class="d-meta">on its card{% if s.card_text %}: {{ s.card_text }}{% endif %}</span>
+            <span class="d-meta">{{ play_kind(s) }}on its card{% if s.card_text %}: {{ s.card_text }}{% endif %}</span>
             {%- elif s.waiting %}
-            <span class="d-meta">on the waiting screen{% if s.waiting_for %}, waiting for {{ s.waiting_for }}{% endif %} &middot; it stops when the game comes on</span>
+            <span class="d-meta">{{ play_kind(s) }}on the waiting screen{% if s.waiting_for %}, waiting for {{ s.waiting_for }}{% endif %} &middot; it stops when the game comes on</span>
             {%- endif %}
           </span>
           <span class="d-cell d-badge">{% if s.showing %}{{ m.status_badge('b-running', 'UP NEXT') }}{% elif s.on_card %}{{ m.status_badge('b-sched', 'CARD') }}{% elif s.waiting %}{{ m.status_badge('b-sched', 'WAITING SCREEN') }}{% endif %}</span>
@@ -408,8 +414,8 @@
         {% for r in feed.redirects %}
         <div class="drow" data-href="{{ url_for('channels.channel_detail', channel_id=r.channel_id) }}">
           <span class="d-title">
-            <span class="d-name">{{ r.label }}</span>
-            <span class="d-meta">{{ r.channel_name }}</span>
+            <span class="d-name">{{ play_name(r) }}</span>
+            <span class="d-meta">{{ play_kind(r) }}{{ r.channel_name }}</span>
           </span>
           <span class="d-cell d-badge">{{ m.status_badge('b-sched', 'REDIRECTED') }}</span>
           <span class="d-cell"><span class="d-k">When</span>{{ r.at | local_time_only }}</span>
@@ -433,8 +439,8 @@
         {#- A play of ChannelBin's own picture has no channel to link to. -#}
         <div class="drow{{ ' st-live' if s.state != 'STOPPED' else '' }}"{% if s.channel_id is not none %} data-href="{{ url_for('channels.channel_detail', channel_id=s.channel_id) }}"{% endif %}>
           <span class="d-title">
-            <span class="d-name">{{ s.label }}</span>
-            <span class="d-meta">
+            <span class="d-name">{{ play_name(s) }}</span>
+            <span class="d-meta">{{ play_kind(s) }}
               {%- if s.showing %}ChannelBin's own picture of the coming games &middot; not counted against the limit
               {%- elif s.waiting %}on the waiting screen{% if s.waiting_for %}, waiting for {{ s.waiting_for }}{% endif %} &middot; not counted against the limit
               {%- elif s.on_card %}on its card{% if s.card_text %}: {{ s.card_text }}{% endif %} &middot; not counted against the limit
@@ -455,7 +461,7 @@
           <span class="d-cell"><span class="d-k">IPTV player</span>{{ s.client }}</span>
           <span class="c-actions">
             {%- if s.move_offered or s.move_why %}<span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
-              <div class="menu pop-left">{% if s.move_offered %}<button class="menu-item" data-act="move-play" data-id="{{ s.session_id }}" data-client="{{ s.client }}" data-name="{{ s.label }}" data-channel="{{ s.channel_name }}">Move to another channel</button>{% else %}<button class="menu-item" disabled>{{ s.move_why }}</button>{% endif %}</div></span>
+              <div class="menu pop-left">{% if s.move_offered %}<button class="menu-item" data-act="move-play" data-id="{{ s.session_id }}" data-client="{{ s.client }}" data-name="{{ play_name(s) }}" data-channel="{{ s.channel_name }}">Move to another channel</button>{% else %}<button class="menu-item" disabled>{{ s.move_why }}</button>{% endif %}</div></span>
             {%- endif -%}
           </span>
         </div>
@@ -464,8 +470,8 @@
         {% for r in feed.redirects %}
         <div class="drow" data-href="{{ url_for('channels.channel_detail', channel_id=r.channel_id) }}">
           <span class="d-title">
-            <span class="d-name">{{ r.label }}</span>
-            <span class="d-meta">sent to {{ r.channel_name }} at {{ r.at | local_time_only }}</span>
+            <span class="d-name">{{ play_name(r) }}</span>
+            <span class="d-meta">{{ play_kind(r) }}sent to {{ r.channel_name }} at {{ r.at | local_time_only }}</span>
           </span>
           <span class="d-cell d-badge">{{ m.status_badge('b-sched', 'REDIRECTED') }}</span>
           <span class="d-cell"></span>
@@ -484,8 +490,8 @@
         {% for r in feed.refused %}
         <div class="drow">
           <span class="d-title">
-            <span class="d-name">{{ r.label }}</span>
-            <span class="d-meta">{{ r.message }}{% if r.count > 1 %} &middot; asked {{ r.count }} times{% endif %}{% if feed.mode != 'redirect' %} &middot; last at {{ r.at | local_time_only }}{% endif %}</span>
+            <span class="d-name">{{ play_name(r) }}</span>
+            <span class="d-meta">{{ play_kind(r) }}{{ r.message | replace(' for ' ~ r.label, '') }}{% if r.count > 1 %} &middot; asked {{ r.count }} times{% endif %}{% if feed.mode != 'redirect' %} &middot; last at {{ r.at | local_time_only }}{% endif %}</span>
           </span>
           <span class="d-cell d-badge">{{ m.status_badge('b-abort', 'REFUSED') }}</span>
           {#- The cells sit under the mode's own column heads, which differ. -#}
