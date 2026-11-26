@@ -919,9 +919,13 @@ def _band(event) -> tuple:
 
 
 def _race_words(text: str, lt: LeagueText) -> set:
+    """The words of a race's name or listing that say which race it is. The season's own year says
+    nothing (`2026 Supercars Championship` on race day, dev/changelog/1766); another year does."""
     for term in lt.terms:
         text = f' {text} '.replace(f' {term} ', ' ')
-    return {s for w in text.split() if w not in _RACE_FILLER for s in _RACE_SPELLINGS.get(w, (w,))}
+    season = set(normalize(lt.league.current_season).split()) if lt.league.current_season else set()
+    return {s for w in text.split() if w not in _RACE_FILLER and w not in season
+            for s in _RACE_SPELLINGS.get(w, (w,))}
 
 
 def _session_words(text: str, lt: LeagueText) -> set:
@@ -944,10 +948,53 @@ def _race_number(text: str) -> int | None:
     return int(found.group(1)) if found else None
 
 
-def _race_hit(row, lt: LeagueText, events: list, kinds: dict):
+def _weekends(league_id: int, fields: list) -> dict:
+    """{(season, round): the round's races by start} for the rounds of `fields`, read whole: a run's
+    events start 15 hours back (LOOKBACK), so by a weekend's last race its first is no longer among
+    them, and counting the races in hand would make `Race 2` the wrong one. One query."""
+    rounds = {(e.season, e.round) for e in fields if e.round is not None}
+    if not rounds:
+        return {}
+    found = SportsEvent.query.filter(
+        SportsEvent.league_id == league_id, SportsEvent.round.in_({r for _s, r in rounds}),
+        SportsEvent.start_at.isnot(None)).all()
+    out = {}
+    for e in sorted(found, key=lambda e: e.start_at):
+        if (e.season, e.round) in rounds and event_session(e).kind == SESSION_RACE:
+            out.setdefault((e.season, e.round), []).append(e)
+    return out
+
+
+def _weekend_race(row, said: int, words: set, lt: LeagueText, in_band: list, weekends: dict):
+    """(event, strength, why) for a listing that numbers a race no race in its band has: the number
+    may count the races of the weekend, as `Adelaide Grand Final - Race 3` does for Race 37
+    (dev/changelog/1766). It is that race of the round when the listing is on the air at the race's
+    start, or names the weekend: a replay of the season's Race 3 at another time and naming another
+    place stays unmatched. None otherwise."""
+    rounds = {(e.season, e.round) for e in in_band if e.round is not None}
+    if len(rounds) != 1:
+        return None
+    races = weekends.get(rounds.pop(), [])
+    if not 1 <= said <= len(races) or races[said - 1].id not in {e.id for e in in_band}:
+        return None
+    event = races[said - 1]
+    rest = words - {str(said)}
+    names_weekend = rest <= _race_words(normalize(event.name), lt)
+    on_air = row.start <= event.start_at < row.stop
+    why = f'Matched on the series and the date, and the listing names race {said} of the weekend, which is {event.name}.'
+    if names_weekend and (rest or on_air):
+        return event, SPORTS_MATCH_STRONG, why
+    if on_air:
+        return (event, SPORTS_MATCH_WEAK,
+                f'{why[:-1]}, but the guide calls it "{strip_marks(row.sub_title or row.title)}".')
+    return None
+
+
+def _race_hit(row, lt: LeagueText, events: list, kinds: dict, weekends: dict):
     """(event, strength, why) for a listing that names no session, or None. Only a race is ever its
     event. One that does not name the race in full is matched by the race's number when it gives one
-    (`Supercars: Race 35`), and never to a race with another number. One that gives neither is matched
+    (`Supercars: Race 35`), and never to a race with another number, except a number that counts the
+    weekend's races (_weekend_race()). One that gives neither is matched
     when the race is the one event of any kind in its band: `Formula 1` on qualifying day is as likely
     the qualifying, and a race-day replay of another race is not a practice's (dev/changelog/1633).
     On a weekend of races on consecutive days every race-time listing sits in several races' bands,
@@ -967,6 +1014,8 @@ def _race_hit(row, lt: LeagueText, events: list, kinds: dict):
     numbered = {e.id: n for e in in_band if (n := _race_number(normalize(e.name))) is not None}
     if said is not None and numbered:
         named = [e for e in in_band if numbered.get(e.id) == said]
+        if not named:
+            return _weekend_race(row, said, words, lt, in_band, weekends)
         if len(named) != 1:
             return None
         return (named[0], SPORTS_MATCH_STRONG,
@@ -1039,7 +1088,7 @@ def _race_start(items: list, event) -> tuple:
 
 
 def _judge_field_events(lt: LeagueText, events: list, rows: list, trusted: bool, now: datetime,
-                        rejected=frozenset()) -> dict:
+                        weekends: dict, rejected=frozenset()) -> dict:
     """{event id: ([Found], guide start, channels)} for a league's races and their sessions. A
     listing that names a session (practice, qualifying, a shootout, a sprint) is only ever a listing
     of that session, and one that names none only ever of a race: a race-day replay once landed on
@@ -1054,7 +1103,7 @@ def _judge_field_events(lt: LeagueText, events: list, rows: list, trusted: bool,
         if said.kind == SESSION_RACE:
             if row.minutes < lt.skips.minutes(sports_skips.LENGTH_RACE) or lt.evidence(row.text, row.category) is None:
                 continue
-            hit = _race_hit(row, lt, events, kinds)
+            hit = _race_hit(row, lt, events, kinds, weekends)
         elif said.kind in SESSIONS:
             if row.minutes < lt.skips.minutes(sports_skips.LENGTH_SESSION) or lt.evidence(row.text, row.category) is None:
                 continue
@@ -1633,7 +1682,7 @@ def match_league(league_id: int, now: datetime, pause: float = PAUSE_SECONDS, cl
                 kept += 1
                 if last_run is None or event.start_changed_at > last_run:
                     _log_kept(event)
-        field_results = _judge_field_events(lt, fields, rows, trusted, now, rejected)
+        field_results = _judge_field_events(lt, fields, rows, trusted, now, _weekends(league_id, fields), rejected)
         for event in fields:
             unheard = (([], event.guide_start, event.guide_channels or 0) if kept_start(event)
                        else ([], *_settled_start(event, None, 0, now)))
@@ -1832,6 +1881,7 @@ def source_games(account_id: int, source_ids, now: datetime, skip_rules=None) ->
         spans = [(_anchor(e) - WINDOW, _anchor(e) + WINDOW) for e in matchups] + [_band(e) for e in fields]
         lo, hi = min(s[0] for s in spans), max(s[1] for s in spans)
         rejected = _rejected_anchors(events)
+        weekends = _weekends(league.id, fields)
         for sid in source_ids:
             rows = []
             for model in (EPGEntry, EpgAlternateEntry):
@@ -1843,7 +1893,7 @@ def source_games(account_id: int, source_ids, now: datetime, skip_rules=None) ->
             hits = _identify_matchups(lt, matchups, rows)
             found = {e.id: _judge_matchup(e, lt, hits.get(e.id, []), trusted, now, clock, rejected)[0]
                      for e in matchups}
-            for event_id, judged in _judge_field_events(lt, fields, rows, trusted, now, rejected).items():
+            for event_id, judged in _judge_field_events(lt, fields, rows, trusted, now, weekends, rejected).items():
                 found[event_id] = judged[0]
             for event_id in ahead:
                 kept = [f for f in found.get(event_id, ()) if not f.rejected]

@@ -1336,7 +1336,7 @@ class RaceWeekendTests(MatchCase):
     def setUp(self):
         super().setUp()
         self.series = self.league(4489, 'Pretend Touring Car Series', ['Pretend Touring Car Series', 'PTCS'],
-                                  sport='Motorsport')
+                                  sport='Motorsport', current_season='2099')
         self.ev = {}
         for key, name, start in (
                 ('p2', 'Harbor Grand Final Practice 2', datetime(2099, 11, 26, 23, 30)),
@@ -1347,6 +1347,8 @@ class RaceWeekendTests(MatchCase):
                 ('r36', 'Harbor Grand Final Race 36', datetime(2099, 11, 28, 4, 50)),
                 ('r37', 'Harbor Grand Final Race 37', datetime(2099, 11, 29, 4, 45))):
             self.ev[key] = self.race(name, start, (start + timedelta(hours=10)).date(), self.series)
+            self.ev[key].season, self.ev[key].round = '2099', 14
+        db.session.commit()
 
     maxDiff = None
 
@@ -1420,6 +1422,65 @@ class RaceWeekendTests(MatchCase):
         self.run_match(now=datetime(2099, 12, 4, 12))
         self.assertEqual([(m.program_title, m.strength) for m in self.matches(alone)],
                          [('PTCS: Race 35', SPORTS_MATCH_STRONG)])
+
+    def test_a_listing_counting_the_weekends_races_goes_to_that_race(self):
+        """dev/docs/BUGS.md 2026-11-26: six channels listed Adelaide's races as `2026 Supercars
+        Championship` / `Adelaide Grand Final - Race 1`, `- Race 2`, `- Race 3`, and the rule that a
+        listing numbering another race is never this one refused all of them, leaving Race 37 one
+        channel."""
+        for n, key in ((1, 'r35'), (2, 'r36'), (3, 'r37')):
+            start = self.ev[key].start_at
+            for _ in range(2):
+                self.row('2099 PTCS Championship ᴺᵉʷ', sub_title=f'Harbor Grand Final - Race {n}', start=start,
+                         minutes=150)
+        self.run_match(now=datetime(2099, 11, 24, 12))
+        for n, key in ((1, 'r35'), (2, 'r36'), (3, 'r37')):
+            got = self.matches(self.ev[key])
+            self.assertEqual([(m.program_sub_title, m.strength, m.airing) for m in got],
+                             [(f'Harbor Grand Final - Race {n}', SPORTS_MATCH_STRONG, SPORTS_AIRING_FIRST)] * 2, key)
+            self.assertEqual(got[0].reason, f'Matched on the series and the date, and the listing names race {n} '
+                                            f'of the weekend, which is {self.ev[key].name}.')
+        for key in ('p2', 'q35', 'q36', 's36'):
+            self.assertEqual(self.found(key), [], key)
+
+    def test_a_weekend_numbered_replay_matches_only_when_it_names_the_weekend(self):
+        r36 = self.ev['r36'].start_at
+        self.row('PTCS', sub_title='Harbor Grand Final - Race 2', start=r36 + timedelta(hours=3), minutes=90)
+        self.row('PTCS: Race 2', start=r36 + timedelta(hours=5), minutes=90)
+        self.row('PTCS Lakeside - Race 2', start=r36 + timedelta(hours=6), minutes=90)
+        self.row('PTCS Lakeside - Race 2', start=r36 - timedelta(minutes=5), minutes=150)
+        self.run_match(now=datetime(2099, 11, 24, 12))
+        self.assertEqual([(m.program_title, m.program_sub_title, m.program_start_time, m.strength)
+                          for m in self.matches(self.ev['r36'])],
+                         [('PTCS Lakeside - Race 2', None, r36 - timedelta(minutes=5), SPORTS_MATCH_WEAK),
+                          ('PTCS', 'Harbor Grand Final - Race 2', r36 + timedelta(hours=3), SPORTS_MATCH_STRONG)])
+
+    def test_a_number_past_the_weekends_races_matches_none(self):
+        """Last round's `Race 34` replayed on this round's race day, and a `Race 4` on a three-race weekend."""
+        r36 = self.ev['r36'].start_at
+        self.row('PTCS Sandown - Race 34', start=r36 - timedelta(minutes=5), minutes=120)
+        self.row('PTCS Harbor Grand Final - Race 4', start=r36 - timedelta(minutes=5), minutes=150)
+        self.run_match(now=datetime(2099, 11, 24, 12))
+        for key in self.ev:
+            self.assertEqual(self.found(key), [], key)
+
+    def test_the_weekend_is_counted_whole_when_its_first_races_are_past(self):
+        """By the last race the run no longer holds the first two (LOOKBACK): `Race 3` is still Race 37,
+        and `Race 1` is never read as the one race left."""
+        r37 = self.ev['r37'].start_at
+        self.row('PTCS', sub_title='Harbor Grand Final - Race 3', start=r37, minutes=150)
+        self.row('PTCS', sub_title='Lakeside - Race 1', start=r37, minutes=150)
+        self.run_match(now=r37 - timedelta(hours=4))
+        self.assertEqual([(m.program_sub_title, m.strength) for m in self.matches(self.ev['r37'])],
+                         [('Harbor Grand Final - Race 3', SPORTS_MATCH_STRONG)])
+
+    def test_the_seasons_own_year_says_nothing_about_which_race(self):
+        r35 = self.ev['r35'].start_at
+        self.row('2099 PTCS Championship', start=r35, minutes=90)
+        self.row('2098 PTCS Championship', start=r35, minutes=90)
+        self.run_match(now=datetime(2099, 11, 24, 12))
+        self.assertEqual({(m.program_title, m.strength) for m in self.matches(self.ev['r35'])},
+                         {('2099 PTCS Championship', SPORTS_MATCH_STRONG), ('2098 PTCS Championship', SPORTS_MATCH_WEAK)})
 
 
 class StorageTests(MatchCase):
