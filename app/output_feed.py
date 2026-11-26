@@ -455,6 +455,12 @@ def _tuning_log_name() -> Optional[str]:
     return login.log_name if login is not None else None
 
 
+def _on_login(name: Optional[str]) -> str:
+    """The fragment every Viewer log line puts after the player's address to say who it was:
+    ' on login <username>' for a login for another user, '' for the main login."""
+    return f' on login {name}' if name else ''
+
+
 def _tuning_always_relayed() -> bool:
     """Whether the tune-in on this thread is relayed in every mode: a login for another user's
     or one on the public port (relays_for)."""
@@ -1964,7 +1970,7 @@ def _refuse_nothing_on(play: Play, client: str):
     no alert."""
     message = f'Nothing to play for {play.label}: {play.why_none}.'
     _note_refused(play.feed_id, play.label, client, message)
-    log.info('Viewer from %s refused: %s', client, message)
+    log.info('Viewer from %s%s refused: %s', client, _on_login(_tuning_log_name()), message)
     raise FeedRefused(message, 409)
 
 
@@ -2218,7 +2224,7 @@ def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str,
         return start_waiting(play, client, cfg, held=_screen_mod().HELD_NO_CONNECTION)
     _ensure_reaper()
     log.info('Viewer %s from %s%s: %s playing channel %d (%s) on account %d%s%s', session.id,
-             client, f' on login {session.feed_login}' if session.feed_login else '', session.label, session.channel_id, session.channel_name, session.account_id,
+             client, _on_login(session.feed_login), session.label, session.channel_id, session.channel_name, session.account_id,
              f' ({play.note})' if play.note else '', f' Why this channel: {play.picked}' if play.picked else '')
     return session
 
@@ -2340,7 +2346,8 @@ def _start_combined(play: Play, client: str, cfg: dict, device: str, player: str
         with _lock:
             _sessions.pop(session.id, None)
         return None
-    log.info('Viewer %s from %s: %s playing its two pictures combined', session.id, client, session.label)
+    log.info('Viewer %s from %s%s: %s playing its two pictures combined', session.id, client,
+             _on_login(session.feed_login), session.label)
     return session
 
 
@@ -3838,7 +3845,7 @@ def start_waiting(play: Play, client: str, cfg: dict, held: str = None) -> Relay
         why = play.why_none or f'the {event_word(play.served.league)} cannot start here yet'
         message = f'Nothing to play for {play.label}: {why}. Its waiting screen could not be shown: {exc}.'
         _note_refused(play.feed_id, play.label, client, message)
-        log.warning('Viewer from %s refused: %s', client, message)
+        log.warning('Viewer from %s%s refused: %s', client, _on_login(_tuning_log_name()), message)
         raise FeedRefused(message, 409)
     session = RelaySession(
         id=secrets.token_urlsafe(12), feed_id=play.feed_id, label=play.label, client=client,
@@ -3861,7 +3868,8 @@ def start_waiting(play: Play, client: str, cfg: dict, held: str = None) -> Relay
     if still:
         _make_moving_later(session, cfg, screen, held)
     _ensure_reaper()
-    log.info('Viewer %s from %s: %s on the waiting screen (%s%s)%s', session.id, client, session.label,
+    log.info('Viewer %s from %s%s: %s on the waiting screen (%s%s)%s', session.id, client,
+             _on_login(_tuning_log_name()), session.label,
              screen.state, f', {held}' if held else '', f', waiting for {session.waiting_for}'
              if session.waiting_for else '')
     return session
@@ -3998,7 +4006,7 @@ def start_showing(play: Play, client: str, cfg: dict) -> RelaySession:
     except ss.ClipFailed as exc:
         message = f'{play.up_next.name} could not be shown: {exc}.'
         _note_refused(play.feed_id, play.label, client, message)
-        log.warning('Viewer from %s refused: %s', client, message)
+        log.warning('Viewer from %s%s refused: %s', client, _on_login(_tuning_log_name()), message)
         raise FeedRefused(message, 409)
     session = RelaySession(
         id=secrets.token_urlsafe(12), feed_id=play.feed_id, label=play.label, client=client,
@@ -4020,7 +4028,8 @@ def start_showing(play: Play, client: str, cfg: dict) -> RelaySession:
     if still:
         _make_moving_later(session, cfg, rotation)
     _ensure_reaper()
-    log.info('Viewer %s from %s: %s on its picture (%s)%s', session.id, client, session.label,
+    log.info('Viewer %s from %s%s: %s on its picture (%s)%s', session.id, client,
+             _on_login(_tuning_log_name()), session.label,
              counted(len(rotation.pages), 'page'), ', the quick still while the moving one is made' if still else '')
     return session
 
@@ -4337,7 +4346,7 @@ def start_card(play: Play, client: str, cfg: dict, held: str = None) -> RelaySes
     except ss.ClipFailed as exc:
         message = f'Nothing to play for {play.label}: {card.text}. Its card could not be shown: {exc}.'
         _note_refused(play.feed_id, play.label, client, message)
-        log.warning('Viewer from %s refused: %s', client, message)
+        log.warning('Viewer from %s%s refused: %s', client, _on_login(_tuning_log_name()), message)
         raise FeedRefused(message, 409)
     session = RelaySession(
         id=secrets.token_urlsafe(12), feed_id=play.feed_id, label=play.label, client=client,
@@ -4359,8 +4368,8 @@ def start_card(play: Play, client: str, cfg: dict, held: str = None) -> RelaySes
     if still:
         _make_moving_later(session, cfg, card.screen, held)
     _ensure_reaper()
-    log.info('Viewer %s from %s: %s on its card (%s: %s)', session.id, client, session.label, card.state,
-             card.text)
+    log.info('Viewer %s from %s%s: %s on its card (%s: %s)', session.id, client,
+             _on_login(_tuning_log_name()), session.label, card.state, card.text)
     return session
 
 

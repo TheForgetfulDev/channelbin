@@ -369,3 +369,101 @@ class StartWrapperTests(_LoginCase):
         page = self.client.get('/iptv-output').get_data(as_text=True)
         recent = page[page.index('id="of-recent"'):]
         self.assertIn(f'Login {FRIEND}', recent)
+
+
+class StartLogLineTests(_LoginCase):
+    """Every Viewer log line a tune-in writes names the login for another user it came in on,
+    whatever it starts on: a waiting screen, an Up next picture, a picture-in-picture card or
+    its two pictures combined, or a refusal; the main login's lines name none
+    (dev/docs/BUGS.md 2026-11-26 03:12:35 PM). Each of those lines was written before
+    start_session() put the login on the play, so only a relayed play's said who it was.
+
+    What each kind's screen or picture is made of is stood in for: what is tested is the line,
+    through the real start_session()."""
+
+    def setUp(self):
+        super().setUp()
+        self.fid = feed.feed_id_for_channel(self.alpha.id)
+        clip = mock.Mock(pages=[1], state='card', text='Nothing on')
+        for name, value in (('_screen_of', clip), ('_rotation_of', clip), ('_card_of', clip),
+                            ('_clip_for', ('clip.ts', False)), ('_launch_clip', None),
+                            ('_set_screen', None), ('_set_card', None), ('_note_badges', None),
+                            ('_ensure_reaper', None)):
+            patcher = mock.patch.object(feed, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def lines(self, play, login, refused=False):
+        """The output feed's log lines while `play` is tuned in on `login` (None: the main one)."""
+        with mock.patch.object(feed, 'resolve_play', return_value=play), \
+                self.assertLogs('app.output_feed', level='INFO') as logs:
+            if refused:
+                with self.assertRaises(feed.FeedRefused):
+                    feed.start_session(self.fid, '203.0.113.7', login=login)
+            else:
+                feed.start_session(self.fid, '203.0.113.7', login=login)
+        return [line for line in logs.output if 'Viewer' in line]
+
+    def assert_named(self, make_play, refused=False):
+        mine = self.lines(make_play(), self.friend(), refused)
+        self.assertTrue(mine)
+        for line in mine:
+            self.assertIn(f'from 203.0.113.7 on login {FRIEND}', line)
+        feed.stop_all()
+        for line in self.lines(make_play(), None, refused):
+            self.assertNotIn(' on login ', line)
+
+    def waiting(self):
+        play = feed.Play(self.fid, 'NHL 1', sports=True, fault=False, why_none='no game on')
+        play.served = mock.Mock(row=mock.Mock(id=1))
+        return play
+
+    def pip(self, set_up):
+        play = feed.Play(self.fid, 'PiP 1')
+        play.pip = mock.Mock(row_id=1, set_up=set_up)
+        play.pip.name = 'PiP 1'
+        return play
+
+    def test_a_waiting_screen_names_the_login(self):
+        self.assert_named(self.waiting)
+
+    def test_an_up_next_picture_names_the_login(self):
+        def up_next():
+            play = feed.Play(self.fid, 'Up next')
+            play.up_next = mock.Mock(number=0)
+            return play
+        self.assert_named(up_next)
+
+    def test_a_picture_in_picture_card_names_the_login(self):
+        self.assert_named(lambda: self.pip(set_up=False))
+
+    def test_two_pictures_combined_name_the_login(self):
+        engine = mock.Mock(gpu_state=mock.Mock(return_value=('/dev/dri/renderD128', '')),
+                           begin=mock.Mock(return_value=True))
+        with mock.patch.object(feed, '_pip_engine', return_value=engine):
+            self.assert_named(lambda: self.pip(set_up=True))
+
+    def test_a_refusal_with_nothing_on_names_the_login(self):
+        self.assert_named(lambda: feed.Play(self.fid, 'channel (Alpha)', fault=False, why_none='nothing on'),
+                          refused=True)
+
+    def test_a_waiting_screen_that_could_not_be_shown_names_the_login(self):
+        import app.sports_screen as ss
+        with mock.patch.object(feed, '_clip_for', side_effect=ss.ClipFailed('no font')):
+            self.assert_named(self.waiting, refused=True)
+
+    def test_an_up_next_picture_that_could_not_be_shown_names_the_login(self):
+        import app.sports_screen as ss
+
+        def up_next():
+            play = feed.Play(self.fid, 'Up next')
+            play.up_next = mock.Mock(number=0)
+            play.up_next.name = 'Up next'
+            return play
+        with mock.patch.object(feed, '_clip_for', side_effect=ss.ClipFailed('no font')):
+            self.assert_named(up_next, refused=True)
+
+    def test_a_card_that_could_not_be_shown_names_the_login(self):
+        import app.sports_screen as ss
+        with mock.patch.object(feed, '_clip_for', side_effect=ss.ClipFailed('no font')):
+            self.assert_named(lambda: self.pip(set_up=False), refused=True)
