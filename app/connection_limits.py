@@ -210,6 +210,9 @@ def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
     (so callers like watchdog-triggered segment restarts, which don't re-acquire, can't
     accidentally leak or duplicate a slot even if they did call this again).
 
+    A holder already seated on a different account is moved here when a seat is free, and
+    left exactly where it is when none is: one holder never holds two seats.
+
     With logins listed, the pools are walked in list order and a login refused inside the
     refusal cooldown is passed over when another has a free seat; when none other has one,
     the refused login is tried again (DESIGN-account-providers.md §5.4).
@@ -234,9 +237,14 @@ def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
             return False
         pools = _usable_limits(account, default_max_connections, taken(), seats, hosts_off)
         key = (holder_kind, holder_id)
-        if any(key in _held_in(pool) for pool, _, _ in pools):
-            return True
         seated = _seat_of.get(key)
+        for pool, _, _ in pools:
+            if key in _held_in(pool):
+                if seated is not None and seated[1] == pool and seated[0] != account_id:
+                    # Held in a login pool the two accounts share: one connection, one
+                    # seat, now counted to the account asked for (as move_seat does).
+                    _seat_of[key] = (account_id, pool)
+                return True
         if seated is not None and seated[0] == account_id and key in _held_in(seated[1]):
             # Already counted on this account, in a pool its list no longer names (a login
             # removed while the seat was held). Still one seat, still this account's.
@@ -244,6 +252,17 @@ def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
         pool = _pick_free_locked(pools, datetime.utcnow(), cooldown)
         if pool is None:
             return False
+        if seated is not None:
+            # Seated on another account: a holder is one connection, so the seat moves here
+            # and never counts twice. Left in the old pool, nothing would point at it and
+            # release() could not find it, so that account would read one seat short until
+            # the process restarted (dev/docs/BUGS.md 2026-11-26). Given up only now that
+            # the new seat is found, so a refusal above leaves the holder where it was.
+            old = _held_in(seated[1])
+            if key in old:
+                old.remove(key)
+                if not old:
+                    _holders.pop(seated[1], None)
         _holders[pool].append(key)
         _seat_of[key] = (account_id, pool)
         return True
@@ -731,19 +750,33 @@ def describe_pool_holders(login_id: int, account_id: Optional[int] = None,
 def release(account_id: int, holder_kind: str, holder_id):
     """Release the holder's seat from the pool it was counted in - never re-derived from
     the account's current list."""
+    with _lock:
+        _release_locked((holder_kind, holder_id), account_id)
+
+
+def release_holder(holder_kind: str, holder_id) -> bool:
+    """Release the holder's seat wherever it is counted, for a caller that knows the holder
+    but not the account it was seated on. True when it held one."""
     key = (holder_kind, holder_id)
     with _lock:
-        seated = _seat_of.pop(key, None)
-        pool = seated[1] if seated is not None else account_id
-        holders = _holders.get(pool)
-        if not holders:
-            return
-        try:
-            holders.remove(key)
-        except ValueError:
-            pass
-        if not holders:
-            _holders.pop(pool, None)
+        if key not in _seat_of:
+            return False
+        _release_locked(key, None)
+        return True
+
+
+def _release_locked(key, fallback_pool):
+    seated = _seat_of.pop(key, None)
+    pool = seated[1] if seated is not None else fallback_pool
+    holders = _holders.get(pool)
+    if not holders:
+        return
+    try:
+        holders.remove(key)
+    except ValueError:
+        pass
+    if not holders:
+        _holders.pop(pool, None)
 
 
 def _strip_kind(account_id: int, holder_kind: str, keep: Optional[dict] = None,

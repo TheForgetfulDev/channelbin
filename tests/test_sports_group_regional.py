@@ -266,6 +266,109 @@ class GroupRecordingTests(_Regional):
         self.assertEqual(rec.source_channel_id, here.id)
 
 
+class ScheduledStampTests(_Regional):
+    """The member a scheduled group recording names before it starts
+    (routes/recordings.py::_resolve_group_member) is one showing its game, the answer record
+    start gives (dev/docs/BUGS.md 2026-11-26, dev/changelog/1758)."""
+
+    def stamp(self, group, supplied, listing):
+        from app.database import EPGEntry
+        from app.routes import recordings as rec_routes
+        entry = EPGEntry.query.filter_by(channel_id=listing.id).one() if listing is not None else None
+        return rec_routes._resolve_group_member(
+            group, supplied.id, self.now + timedelta(hours=1), self.now + timedelta(hours=4), 3,
+            listing=rec_routes._listing_of(entry) if entry is not None else None)
+
+    def test_a_supplied_member_showing_another_game_gives_way_to_one_showing_this_one(self):
+        elsewhere, here = self.channel(100, 'Green Bay'), self.channel(50, 'San Diego')
+        group = make_group('CBS Stations', members=[elsewhere, here])
+        self.shows(self.other, elsewhere)
+        self.shows(self.event, here)
+        resolved, reason = self.stamp(group, elsewhere, here)
+        self.assertEqual(resolved, here.id)
+        self.assertEqual(reason, 'its guide shows Northgate Panthers at Eastport Owls at this time, not '
+                                 'Harborview Gulls at Ironvale Bears')
+
+    def test_a_supplied_member_showing_the_game_is_kept(self):
+        elsewhere, here = self.channel(100), self.channel(50)
+        group = make_group('CBS Stations', members=[elsewhere, here])
+        self.shows(self.other, elsewhere)
+        self.shows(self.event, here)
+        self.assertEqual(self.stamp(group, here, here), (here.id, None))
+
+    def test_a_member_with_no_guide_gives_way_to_one_whose_guide_shows_the_game(self):
+        blind, here = self.channel(99), self.channel(40)
+        group = make_group('CBS Stations', members=[blind, here])
+        self.shows(self.event, here)
+        resolved, reason = self.stamp(group, blind, here)
+        self.assertEqual(resolved, here.id)
+        self.assertIn('does not say what it shows', reason)
+
+    def test_a_blocked_member_showing_the_game_leaves_the_one_record_start_would_take(self):
+        """Record start drops a blocked member before it prefers the members whose guide shows
+        the game, so with the one carrier blocked it records from the member with no guide.
+        The stamp names that member too."""
+        from app.account_blocks import add_account_block
+        blind, here = self.channel(40), self.channel(99)
+        group = make_group('CBS Stations', members=[blind, here])
+        self.shows(self.event, here)
+        add_account_block(here.account_id, self.now + timedelta(hours=8))
+        db.session.commit()
+        resolved, reason = self.stamp(group, here, here)
+        self.assertEqual(resolved, blind.id)
+        self.assertEqual(reason, 'its account is blocked in this window')
+
+    def test_no_member_showing_the_game_is_stamped_as_if_no_game_were_known(self):
+        """An override, never a skip: the supplied member stays, and record start says so."""
+        off, elsewhere = self.channel(90), self.channel(60)
+        group = make_group('CBS Stations', members=[off, elsewhere], disabled={off.id})
+        self.shows(self.other, elsewhere)
+        self.shows(self.event, off)
+        self.assertEqual(self.stamp(group, elsewhere, off), (elsewhere.id, None))
+
+    def test_a_listing_of_no_game_and_no_listing_at_all_change_nothing(self):
+        best, other = self.channel(100), self.channel(50)
+        group = make_group('Locals', members=[best, other])
+        make_epg_entry(best, title='Evening News', start_time=self.start, duration_minutes=180)
+        make_epg_entry(other, title='Something Else', start_time=self.start, duration_minutes=180)
+        db.session.commit()
+        self.assertEqual(self.stamp(group, other, other), (other.id, None))
+        self.assertEqual(self.stamp(group, other, None), (other.id, None))
+
+    def test_an_edit_asks_about_the_recording_s_own_listing(self):
+        from app.routes import recordings as rec_routes
+        elsewhere, here = self.channel(100), self.channel(50)
+        group = make_group('CBS Stations', members=[elsewhere, here])
+        self.shows(self.other, elsewhere)
+        self.shows(self.event, here)
+        rec = make_recording(status=REC_STATUS_SCHEDULED, name='game', group_id=group.id,
+                             channel_id=elsewhere.id, start_time=self.now + timedelta(hours=1),
+                             stop_time=self.now + timedelta(hours=4), program_start_time=self.start,
+                             program_title=TITLE, source_channel_id=here.id)
+        db.session.commit()
+        resolved, _reason = rec_routes._resolve_group_member(
+            group, rec.channel_id, rec.start_time, rec.stop_time, 3, exclude_recording_id=rec.id,
+            listing=rec_routes._listing_of(rec))
+        self.assertEqual(resolved, here.id)
+
+    def test_the_record_dialog_s_create_stamps_the_member_showing_the_game(self):
+        from app.database import EPGEntry
+        from app.tz_utils import local_input_value
+        elsewhere, here = self.channel(100), self.channel(50)
+        group = make_group('CBS Stations', members=[elsewhere, here])
+        self.shows(self.other, elsewhere)
+        self.shows(self.event, here)
+        entry = EPGEntry.query.filter_by(channel_id=here.id).one()
+        start, stop = self.now + timedelta(hours=1), self.now + timedelta(hours=4)
+        with mock.patch('app.routes.recordings.schedule_recording'):
+            resp = self.t.client.post('/recordings/new-json', data={
+                'name': 'game', 'url': 'http://example.test/live/1', 'channel_id': elsewhere.id,
+                'group_id': group.id, 'source_epg_id': entry.id, 'force': '1',
+                'start_time': local_input_value(start), 'stop_time': local_input_value(stop)})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertEqual(Recording.query.one().channel_id, here.id)
+
+
 class MembershipShapeTests(_Regional):
     """sports_match.members_for_game() itself."""
 

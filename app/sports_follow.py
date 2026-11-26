@@ -41,7 +41,7 @@ from types import SimpleNamespace
 from . import db, sports_words
 from .database import (
     REC_STATUS_SCHEDULED, RECORDING_EDITED, RECORDING_SPORTS_RETIMED, RECORDING_SPORTS_SECOND, RECORDING_SPORTS_TIME_KEPT,
-    RECORDING_START_NOT_ARMED, RECORDING_START_REARMED, RULE_MATCH_SCHEDULED, WINDOW_OPEN_STATUSES, Recording, RecordingEvent,
+    RECORDING_START_NOT_ARMED, RULE_MATCH_SCHEDULED, WINDOW_OPEN_STATUSES, Recording, RecordingEvent,
     RecordingProfile, RecordingSports, RuleMatch, SportsEvent, SportsLeague, add_recording_event)
 from .db_utils import retry_on_locked
 from .auto_rules_sports import START_FROM_TSDB
@@ -1177,43 +1177,10 @@ def _unarmed(ctx) -> set:
 
 
 def _arm_unarmed(rec_id, run) -> bool:
-    """Arm a recording found SCHEDULED with no start job at its own times, and say so on it. A start
-    already passed fires at once, as a restart's sweep starts a missed one. One whose window is over
-    is left as it is: only a restart's sweep ends a missed recording. The job is asked about again
-    here, after the row: the pass's first check is from before its moves, and a start that fired
-    since, or an edit that re-armed it, has a job again or has left SCHEDULED."""
-    from flask import current_app
-    from .routes import recordings as rec_routes
-    from .scheduler import missing_starts
-    rec = db.session.get(Recording, rec_id, populate_existing=True)
-    state = (rec.status, rec.start_time, rec.stop_time) if rec is not None else None
-    db.session.rollback()
-    if state is None or state[0] != REC_STATUS_SCHEDULED or state[2] <= datetime.utcnow():
-        return False
-    if not missing_starts([rec_id]):
-        return False
-    _status, start, stop = state
-    try:
-        rec_routes.schedule_recording(current_app._get_current_object(), rec_id, start, stop)
-    except Exception:
-        log.warning('Recording %d: still has nothing armed to start it; the next sports pass tries again',
-                    rec_id, exc_info=True, extra={'recording_id': rec_id})
-        return False
-    when = 'now, its start time having passed' if start <= run.now else f'at {run.clock(start)}'
-    detail = f'Found with nothing armed to start it, so ChannelBin armed it again: it starts {when}.'
-
-    @retry_on_locked()
-    def _note():
-        if db.session.get(Recording, rec_id) is None:
-            db.session.rollback()
-            return
-        add_recording_event(rec_id, RECORDING_START_REARMED, detail=detail,
-                            extra={'start': iso_seconds_or_none(start), 'stop': iso_seconds_or_none(stop)})
-        db.session.commit()
-
-    _note()
-    log.info('Recording %d: had nothing armed to start it; armed again', rec_id, extra={'recording_id': rec_id})
-    return True
+    """Arm a recording this pass found SCHEDULED with no start job (scheduler.rearm_missing_start,
+    which asks about the job again: the pass's first check is from before its moves)."""
+    from .scheduler import rearm_missing_start
+    return rearm_missing_start(rec_id, run.now)
 
 
 def _rearm_stop(rec_id, stop):
@@ -1253,7 +1220,7 @@ def _rearm(rec_id, start, stop, start_moved, run):
     def _note():
         add_recording_event(rec_id, RECORDING_START_NOT_ARMED,
                             detail=('This recording was moved to its event\'s time, but its start could not be armed, '
-                                    'so it will not start on its own. Restarting ChannelBin arms it.'))
+                                    'so it will not start on its own yet. ChannelBin tries again before it is due to start.'))
         db.session.commit()
 
     _note()

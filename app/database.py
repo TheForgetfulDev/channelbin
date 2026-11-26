@@ -125,13 +125,15 @@ RECORDING_REPLACED_OTHER            = 'RECORDING_REPLACED_OTHER'
 # matched program, the channels it was chosen over and the warnings it was scheduled with.
 RECORDING_RULE_SCHEDULED            = 'RECORDING_RULE_SCHEDULED'
 # The recording's start and stop jobs could not be registered after it was created - twice,
-# since the creating path retries once. The row exists and is SCHEDULED, but nothing will
-# start it until a restart re-registers every future SCHEDULED recording
-# (scheduler.init_scheduler). Its own type: a recording that will not start on its own is a
-# different fact from any of the creation events beside it.
+# since the creating path retries once. The row exists and is SCHEDULED with nothing to start
+# it until the periodic check arms it again (scheduler._unarmed_start_job, within half an hour
+# of its start) or a restart re-registers every future SCHEDULED recording. Its own type: a
+# recording with nothing armed to start it is a different fact from any of the creation
+# events beside it.
 RECORDING_START_NOT_ARMED           = 'RECORDING_START_NOT_ARMED'
-# A pass that follows this recording found it SCHEDULED with no start job (an earlier re-arm
-# failed twice, RECORDING_START_NOT_ARMED) and armed it again at its own times. Its own type:
+# The periodic check, or a pass that follows this recording, found it SCHEDULED with no start
+# job (an earlier re-arm failed twice, RECORDING_START_NOT_ARMED) and armed it again at its
+# own times. Its own type:
 # the answer to "will it start on its own" changed back, and the note above stays true of then.
 RECORDING_START_REARMED             = 'RECORDING_START_REARMED'
 # The guide moved the program an auto-record rule scheduled this recording for, and the rule
@@ -548,7 +550,7 @@ EVENT_LABELS = {
     PROVIDER_STALLS_CORRELATED: 'Other accounts on the provider stalled too',
     RECORDING_REPLACED_OTHER: 'Replaced another recording',
     RECORDING_RULE_SCHEDULED: 'Scheduled by an auto-record rule',
-    RECORDING_START_NOT_ARMED: 'Will not start on its own',
+    RECORDING_START_NOT_ARMED: 'Start could not be armed',
     RECORDING_START_REARMED: 'Armed to start again',
     RECORDING_RULE_RETRACKED: 'Moved with its program',
     RECORDING_RULE_PROGRAM_MOVED: 'Program moved, recording stayed',

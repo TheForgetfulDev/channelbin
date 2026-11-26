@@ -367,6 +367,7 @@ def init_scheduler(app):
     schedule_account_stats_fold(app)
     schedule_host_resolve_check(app)
     schedule_epg_source_expiry_check(app)
+    schedule_unarmed_start_check(app)
     schedule_auto_rule_sweep(app)
     schedule_sports_worker(app)
 
@@ -401,12 +402,64 @@ def schedule_recording(app, recording_id: int, start_time: datetime, stop_time: 
 def missing_starts(recording_ids) -> set:
     """The ids among `recording_ids` with no start_<id> job: a SCHEDULED recording in that state
     will not start on its own. Every wait (a slot, a conversion, a raise) re-arms start_<id>, so
-    a held start still has one; a start in flight has none, and the claim in start_recording()
-    refuses a second start of it. Empty when the scheduler is not live, which could arm nothing.
-    One jobstore read per id."""
+    a held start still has one. A start running right now has none either and is left out: its
+    job came off when it fired, and it re-arms itself if it has to wait. Empty when the
+    scheduler is not live, which could arm nothing. One jobstore read per id."""
     if not recording_ids or not scheduler_is_live():
         return set()
-    return {rid for rid in recording_ids if _scheduler.get_job(f'start_{rid}') is None}
+    with _starts_in_flight_lock:
+        running = set(_starts_in_flight)
+    return {rid for rid in recording_ids
+            if rid not in running and _scheduler.get_job(f'start_{rid}') is None}
+
+
+def rearm_missing_start(recording_id: int, now: datetime = None) -> bool:
+    """Arm a recording found SCHEDULED with no start job at its own times, and say so on it.
+    True when it was armed. A start already passed fires at once, as a restart's sweep starts
+    a missed one. One whose window is over is left as it is: only a restart's sweep ends a
+    missed recording. The job is asked about again here, after the row: a caller's own check
+    may be minutes old, and a start that fired since, or an edit that re-armed it, has a job
+    again or has left SCHEDULED. The one home of this repair (dev/changelog/1739, 1757): the
+    sports pass and the periodic check both call it."""
+    from . import db
+    from .database import (REC_STATUS_SCHEDULED, RECORDING_START_REARMED, Recording,
+                           add_recording_event)
+    from .db_utils import retry_on_locked
+    from .fmt_utils import iso_seconds_or_none
+    from .tz_utils import format_local
+    now = now or datetime.utcnow()
+    rec = db.session.get(Recording, recording_id, populate_existing=True)
+    state = (rec.status, rec.start_time, rec.stop_time) if rec is not None else None
+    db.session.rollback()
+    if state is None or state[0] != REC_STATUS_SCHEDULED or state[2] <= datetime.utcnow():
+        return False
+    if not missing_starts([recording_id]):
+        return False
+    _status, start, stop = state
+    try:
+        schedule_recording(_app, recording_id, start, stop)
+    except Exception:
+        log.warning('Recording %d: still has nothing armed to start it; the next check tries '
+                    'again', recording_id, exc_info=True, extra={'recording_id': recording_id})
+        return False
+    when = ('now, its start time having passed' if start <= now
+            else f'at {format_local(start, "day_datetime")}')
+    detail = f'Found with nothing armed to start it, so ChannelBin armed it again: it starts {when}.'
+
+    @retry_on_locked()
+    def _note_rearmed_and_commit():
+        if db.session.get(Recording, recording_id) is None:
+            db.session.rollback()
+            return
+        add_recording_event(recording_id, RECORDING_START_REARMED, detail=detail,
+                            extra={'start': iso_seconds_or_none(start),
+                                   'stop': iso_seconds_or_none(stop)})
+        db.session.commit()
+
+    _note_rearmed_and_commit()
+    log.info('Recording %d: had nothing armed to start it; armed again', recording_id,
+             extra={'recording_id': recording_id})
+    return True
 
 
 def unschedule_recording(recording_id: int):
@@ -417,6 +470,23 @@ def unschedule_recording(recording_id: int):
     for job_id in (f'start_{recording_id}', f'stop_{recording_id}', f'precheck_{recording_id}',
                    f'retry_{recording_id}', f'resume_{recording_id}'):
         remove_job_if_exists(job_id)
+    _release_unstarted_seat(recording_id)
+
+
+def _release_unstarted_seat(recording_id: int):
+    """Give back a connection seat held by a recording nothing is capturing. A start that
+    raised after taking its seat leaves the row SCHEDULED and seated while the start is tried
+    again; a cancel, a delete or an edit in those minutes removes the retry, and the seat
+    would then be counted until the process restarted. A recording with live state is left
+    alone: its own teardown gives the seat back. A start in flight that has not registered
+    yet loses the seat here and asserts it again after its claim
+    (recorder._hold_seat_after_claim)."""
+    from . import connection_limits, recorder
+    if recorder.has_live_state(recording_id):
+        return
+    if connection_limits.release_holder('recording', recording_id):
+        log.info('Recording %d: gave back a connection seat it held with nothing capturing',
+                 recording_id, extra={'recording_id': recording_id})
 
 
 def unschedule_recording_resumes(recording_id: int):
@@ -1198,6 +1268,14 @@ STOP_JOB_MAX_TRIES = 10
 _job_errors = {}
 _job_errors_lock = threading.Lock()
 
+# Recording id -> how many starts of it are running right now (_start_watched; two can run
+# at once, dev/changelog/987). A SCHEDULED row with no start_<id> job is either one of these
+# or one nothing will start, and missing_starts() has to tell them apart: arming the first
+# kind runs another start beside it. A start the executor has queued but not begun is not
+# here yet, so the check can still arm one; the claim in start_recording() absorbs that.
+_starts_in_flight = {}
+_starts_in_flight_lock = threading.Lock()
+
 
 def _describe_error(exc) -> str:
     text = f'{type(exc).__name__}: {exc}'.strip()
@@ -1397,16 +1475,26 @@ def _start_watched(app, recording_id):
     that starts a SCHEDULED recording comes through here, the startup sweep's late start
     included: its thread has no scheduler job behind it, so a raise there left the row
     SCHEDULED with nothing armed to start it (dev/docs/BUGS.md 2026-11-23 @ 10:40:09 PM)."""
-    with app.app_context():
-        from .recorder import start_recording
-        try:
-            start_recording(app, recording_id)
-        except Exception as exc:
-            _start_job_raised(recording_id, exc)
-            return
-        entry = _clear_job_error('start', recording_id)
-        if entry is not None:
-            _start_job_recovered(recording_id, entry)
+    with _starts_in_flight_lock:
+        _starts_in_flight[recording_id] = _starts_in_flight.get(recording_id, 0) + 1
+    try:
+        with app.app_context():
+            from .recorder import start_recording
+            try:
+                start_recording(app, recording_id)
+            except Exception as exc:
+                _start_job_raised(recording_id, exc)
+                return
+            entry = _clear_job_error('start', recording_id)
+            if entry is not None:
+                _start_job_recovered(recording_id, entry)
+    finally:
+        with _starts_in_flight_lock:
+            left = _starts_in_flight.get(recording_id, 1) - 1
+            if left > 0:
+                _starts_in_flight[recording_id] = left
+            else:
+                _starts_in_flight.pop(recording_id, None)
 
 
 def _start_job_recovered(recording_id, entry):
@@ -3368,6 +3456,65 @@ def _epg_source_expiry_job():
             log.exception('EPG source expiry check failed')
 
 
+UNARMED_START_JOB_ID = 'recording_start_check'
+_UNARMED_START_INTERVAL_MINUTES = 5
+#: The least distance ahead of its start a recording is looked at: narrow enough that a pass
+#: reads the jobstore for a handful of recordings, never every future one. The job widens it
+#: to the pre-record check's lead plus two of its own intervals, so a recording armed again
+#: here still gets its check.
+UNARMED_START_HORIZON = timedelta(minutes=30)
+
+
+def schedule_unarmed_start_check(app):
+    """Register the check for SCHEDULED recordings nothing is armed to start, first tick two
+    minutes after startup (the startup sweep has just armed every one). Arming a start can
+    fail twice in a row (RECORDING_START_NOT_ARMED), and this is what looks again
+    (dev/changelog/1757)."""
+    if _scheduler is None:
+        return
+    _add_job(
+        func=_unarmed_start_job,
+        trigger='interval',
+        minutes=_UNARMED_START_INTERVAL_MINUTES,
+        next_run_time=datetime.utcnow() + timedelta(seconds=120),
+        id=UNARMED_START_JOB_ID,
+        replace_existing=True,
+    )
+
+
+def _unarmed_start_job():
+    """Arm every SCHEDULED recording due within the horizon, or already due with
+    its window still open, that has no start job. One query and one jobstore read per
+    recording that close to its start, so no admission ticket and no JobRun, the same
+    answer the storage-directory sweep gives. Returns how many it armed."""
+    with _app.app_context():
+        from . import db
+        from .database import REC_STATUS_SCHEDULED, Recording
+        from .config import load_config
+        armed = 0
+        try:
+            now = datetime.utcnow()
+            lead = load_config().get('channel_testing', {}).get('pre_check', {}).get(
+                'lead_minutes', 15)
+            horizon = max(UNARMED_START_HORIZON, timedelta(
+                minutes=int(lead) + 2 * _UNARMED_START_INTERVAL_MINUTES))
+            due = [rid for (rid,) in db.session.query(Recording.id).filter(
+                Recording.status == REC_STATUS_SCHEDULED,
+                Recording.start_time <= now + horizon,
+                Recording.stop_time > now).all()]
+            db.session.rollback()
+            for rid in sorted(missing_starts(due)):
+                try:
+                    armed += bool(rearm_missing_start(rid, now))
+                except Exception:
+                    db.session.rollback()
+                    log.error('Recording %d: has nothing armed to start it and could not be '
+                              'armed again', rid, exc_info=True, extra={'recording_id': rid})
+        except Exception:
+            log.exception('Recording start check failed')
+        return armed
+
+
 _ACCOUNT_STATS_FOLD_INTERVAL_MINUTES = 60
 
 
@@ -3424,6 +3571,7 @@ _RUN_NOW_PLAIN = {
     'account_stats_fold': _account_stats_fold_job,
     'host_resolve_check': _host_resolve_job,
     EPG_EXPIRY_JOB_ID: _epg_source_expiry_job,
+    UNARMED_START_JOB_ID: _unarmed_start_job,
 }
 RUN_NOW_SYSTEM_JOBS = frozenset(_RUN_NOW_ADMITTED) | frozenset(_RUN_NOW_PLAIN)
 

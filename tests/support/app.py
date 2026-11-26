@@ -410,6 +410,7 @@ def reset_module_globals():
 
     # A start or stop that raised in one module must not count as a retry in the next.
     scheduler._job_errors.clear()
+    scheduler._starts_in_flight.clear()
     # A test of the stop path must not leave the next module's submit errors demoted.
     scheduler._stopping = False
     # A run abandoned mid-flight leaves its admission ticket held, and the next module's

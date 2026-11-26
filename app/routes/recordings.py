@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from flask import (
     Blueprint, render_template, request, redirect, url_for, flash, jsonify,
@@ -44,6 +45,7 @@ from ..recorder import (
     abort_recording, get_state, stop_recording, pause_recording, resume_recording,
     get_live_segment_path, recording_disk_paths, recording_image_paths, delete_files, end_capture_wait,
     finished_image_dirs, finished_image_path, MoveRequest, switch_choices, block_move_preview,
+    game_members,
 )
 from ..tz_utils import parse_form_time, format_local
 from ..account_blocks import recording_blocks, set_recording_blocks, rearm_waiting_starts
@@ -735,14 +737,29 @@ def _members_committed_in_window(members, start_utc, stop_utc, exclude_recording
             if ch.account_id in seats.accounts and not seats.free_for(ch.account_id, ch.id)}
 
 
+def _listing_of(source):
+    """The listing a recording is (or will be) made from, in the shape recorder.game_members()
+    reads: `source` is the guide entry at schedule time, or the recording itself at an edit."""
+    if isinstance(source, Recording):
+        return source
+    return SimpleNamespace(source_channel_id=source.channel_id,
+                           program_start_time=source.start_time, program_title=source.title)
+
+
 def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_threshold,
-                          exclude_recording_id=None, pending_blocks=None, pending=None):
+                          exclude_recording_id=None, pending_blocks=None, pending=None,
+                          listing=None):
     """The member a group-backed recording should be stamped with for [start_utc, stop_utc).
 
     Returns (channel_id, reason). The supplied `channel_id` is kept (reason None) unless it
     is genuinely unusable in this window - not a recording-enabled member, outside the
-    format lock, or on an account already committed then - so a schedule that would have
-    gone through is never quietly moved to a different feed. Otherwise the best member on
+    format lock, on an account already committed then, or showing another game than the one
+    `listing` is of - so a schedule that would have gone through is never quietly moved to a
+    different feed. `listing` (_listing_of()) is asked the question record start asks,
+    recorder.game_members(): a group of local stations shows each city's own game, and the
+    member named before the start should be one that shows this one (dev/changelog/1758).
+    No member showing it is an override, never a skip: the stamp is then chosen as if no
+    game were known, and record start says so when it comes to it. Otherwise the best member on
     an uncommitted account wins, and `reason` says why the supplied one was passed over.
     Every account committed is an override, never a skip: the supplied member is kept if
     it is one, else the plain best member is taken. (None, None) only when the group has
@@ -754,17 +771,31 @@ def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_thresho
     from ..account_blocks import blocked_account_ids
     enabled = recording_members(group.memberships)
     latest_by_channel = _latest_tests_by_channel([ch.id for ch in enabled])
-    # Format lock filters, health score ranks (DESIGN-channel-groups-model.md 5).
-    active = format_eligible_members(group, enabled, latest_by_channel).members
-    committed = _members_committed_in_window(
-        active, start_utc, stop_utc, exclude_recording_id=exclude_recording_id,
-        pending=pending)
+    # Members showing another game come out before the format lock, as at record start, so
+    # its zero-survivors override never counts one.
+    by_game = game_members(listing, enabled) if listing is not None else None
+    in_game = by_game.members if by_game is not None and by_game.members else enabled
     # A member on an account blocked in this window is as unusable as one on a full
     # account - including a block this same request is setting (dev/changelog/1151). Only
     # the stamp: record start re-decides against the blocks as they stand then.
-    blocked = blocked_account_ids({ch.account_id for ch in active}, start=start_utc,
+    blocked = blocked_account_ids({ch.account_id for ch in in_game}, start=start_utc,
                                   stop=stop_utc, pending=pending_blocks,
                                   exclude_recording_id=exclude_recording_id)
+    shows_other, no_guide = {}, set()
+    if by_game is not None and by_game.members:
+        # In record start's order: blocked members drop out first, then a member whose
+        # guide shows the game goes ahead of one with no guide. A blocked member stays a
+        # candidate here so the stamp can say its account is blocked.
+        shows_other = dict((ch.id, what) for ch, what in by_game.skipped)
+        free = [ch for ch in in_game if ch.account_id not in blocked] or in_game
+        preferred = {ch.id for ch in by_game.preferred(free)}
+        no_guide = {ch.id for ch in free} - preferred
+        in_game = [ch for ch in in_game if ch.id not in no_guide]
+    # Format lock filters, health score ranks (DESIGN-channel-groups-model.md 5).
+    active = format_eligible_members(group, in_game, latest_by_channel).members
+    committed = _members_committed_in_window(
+        active, start_utc, stop_utc, exclude_recording_id=exclude_recording_id,
+        pending=pending)
     committed |= {ch.id for ch in active if ch.account_id in blocked}
 
     supplied_is_member = (channel_id is not None
@@ -777,6 +808,12 @@ def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_thresho
         reason = 'it is no longer a member of this group'
     elif channel_id not in {ch.id for ch in enabled}:
         reason = 'it is no longer enabled for recording in this group'
+    elif channel_id in shows_other:
+        reason = (f'its guide shows {shows_other[channel_id]} at this time, not '
+                  f'{by_game.game}')
+    elif channel_id in no_guide:
+        reason = (f'its guide does not say what it shows at this time, and another member\'s '
+                  f'shows {by_game.game}')
     elif channel_id not in active_ids:
         reason = "it does not match the group's format lock"
     elif _account_of(active, channel_id) in blocked:
@@ -786,7 +823,8 @@ def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_thresho
 
     member = pick_best_member(active, latest_by_channel, exclude_ids=committed,
                               streak_threshold=streak_threshold)
-    if member is None and supplied_is_member:
+    if member is None and supplied_is_member and not (channel_id in shows_other
+                                                      or channel_id in no_guide):
         return channel_id, None
     if member is None:
         # Nothing on an uncommitted account and nothing supplied to fall back on: stamp
@@ -2719,7 +2757,6 @@ def resume_recording_route(recording_id):
 
 
 @recordings_bp.route('/recordings/<int:recording_id>/adjust-stop', methods=['POST'])
-@retry_on_locked()
 def adjust_stop_time(recording_id):
     """JSON endpoint - change stop_time of an active recording from the TV Guide."""
     rec = db.session.get(Recording, recording_id)
@@ -2740,21 +2777,34 @@ def adjust_stop_time(recording_id):
     if stop_utc <= rec.start_time:
         return jsonify({'error': 'Stop time must be after start time'}), 400
 
-    old_stop = rec.stop_time
-    rec.stop_time = stop_utc
-    if old_stop != stop_utc:
-        db.session.add(RecordingEvent(
-            recording_id=rec.id,
-            event_type=RECORDING_STOP_TIME_ADJUSTED,
-            detail=f'Stop time adjusted: {old_stop} → {stop_utc}',
-        ))
-    db.session.commit()
+    @retry_on_locked()
+    def _adjust_stop_and_commit():
+        """True when the stop time was written. The row is read again and its status checked
+        again in here: the recording can end between the check above and this write, and a
+        retry after a locked database starts from a rolled-back session."""
+        r = db.session.get(Recording, recording_id, populate_existing=True)
+        if r is None or r.status not in WINDOW_OPEN_STATUSES:
+            db.session.rollback()
+            return False
+        old_stop = r.stop_time
+        r.stop_time = stop_utc
+        if old_stop != stop_utc:
+            add_recording_event(
+                recording_id, RECORDING_STOP_TIME_ADJUSTED,
+                detail=f'Stop time adjusted: {format_local(old_stop)} → {format_local(stop_utc)}',
+                extra={'old_stop': fmt_utils.iso_seconds_or_none(old_stop),
+                       'new_stop': fmt_utils.iso_seconds_or_none(stop_utc)})
+        db.session.commit()
+        return True
+
+    if not _adjust_stop_and_commit():
+        return jsonify({'error': 'Recording is not active'}), 400
 
     # The stop job only. The start has already happened, and a full unschedule would also
     # drop a RETRYING recording's pending retry_<id> and a deferred resume_<id>
     # (dev/changelog/1677).
     from ..scheduler import reschedule_recording_stop
-    reschedule_recording_stop(rec.id, stop_utc)
+    reschedule_recording_stop(recording_id, stop_utc)
 
     return jsonify({'success': True, 'stop_time': stop_utc.strftime('%Y-%m-%dT%H:%M:%S')})
 
@@ -3104,9 +3154,12 @@ def new_recording_json():
             # rather than stamping a member the limit check below would refuse.
             streak_threshold = cfg.get('channel_testing', {}).get(
                 'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
+            listed_raw = request.form.get('source_epg_id', '').strip()
+            listed = db.session.get(EPGEntry, int(listed_raw)) if listed_raw.isdecimal() else None
             resolved, _reason = _resolve_group_member(
                 group, channel_id, start_utc, stop_utc, streak_threshold,
-                exclude_recording_id=replace_recording_id, pending_blocks=wanted_blocks)
+                exclude_recording_id=replace_recording_id, pending_blocks=wanted_blocks,
+                listing=_listing_of(listed) if listed is not None else None)
             if resolved is None:
                 group_id = None
             else:
@@ -3360,7 +3413,8 @@ def _plan_bulk_schedule(items, profile_choice, cfg, skip_overlapped=True):
             # The same resolver the record modal's group path uses, counting this request's
             # earlier picks, so a multi-account group rolls onto an account with room.
             resolved, _reason = _resolve_group_member(
-                group, ch.id, start, stop, streak_threshold, pending=pending)
+                group, ch.id, start, stop, streak_threshold, pending=pending,
+                listing=_listing_of(entry))
             if resolved is None:
                 group = None
                 plan['group_id'] = None
@@ -3613,7 +3667,8 @@ def edit_recording_json(recording_id):
             'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
         resolved, reason = _resolve_group_member(
             rec.group, rec.channel_id, start_utc, stop_utc, streak_threshold,
-            exclude_recording_id=recording_id, pending_blocks=pending_blocks)
+            exclude_recording_id=recording_id, pending_blocks=pending_blocks,
+            listing=_listing_of(rec))
         if resolved is not None and resolved != rec.channel_id:
             channel_id, member_reason = resolved, reason
 
