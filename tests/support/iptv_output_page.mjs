@@ -28,6 +28,14 @@ const copied = [];
 Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: (t) => { copied.push(t); return Promise.resolve(); } } });
 const requests = [];
 const REFUSE = new Set();
+// What a login's Choose channels read answers (routes/iptv_output.py::login_channels): two
+// categories, a row off the output, a picture-in-picture channel with its swapped copy.
+const CHANNELS = { success: true, name: 'Kim', everything: false, picked: [2], rows: [
+  { id: 2, name: 'Alpha', category: 'News', num: 1, off: '', swapped: false },
+  { id: 4, name: 'Beta', category: 'News', num: 0, off: 'Taken off the output', swapped: false },
+  { id: 3, name: 'Game feeds', category: 'Sports', num: 2, off: '', swapped: false },
+  { id: 2000000002, name: 'PiP 1', category: 'ChannelBin', num: 3, off: '', swapped: true },
+] };
 w.fetch = (url, opts = {}) => {
   const method = (opts.method || 'GET').toUpperCase();
   const path = String(url).replace('http://localhost:5000', '');
@@ -37,6 +45,7 @@ w.fetch = (url, opts = {}) => {
     json: () => Promise.resolve(payload), text: () => Promise.resolve(HTML) });
   if (path.startsWith('/api/settings/reveal')) return json(200, { success: true, value: PASSWORD });
   if (REFUSE.has(path)) return json(400, { error: 'Refused by the server.' });
+  if (/^\/api\/iptv-output\/logins\/\d+\/channels$/.test(path)) return json(200, CHANNELS);
   if (method === 'POST' && path.startsWith('/api/iptv-output/rows/')) return json(200, { success: true, name: 'x', on: body.on, cut: body.on ? 0 : 1 });
   return json(200, { success: true });
 };
@@ -182,6 +191,62 @@ out.stop_asks = modal() ? modal().querySelector('.modal-head h2').textContent.tr
 await click(modalButton('Stop'));
 await wait(40);
 out.stop_posts = since(mark);
+
+/* Choose channels (dev/changelog/1764): the list comes from the login's own read, a search
+   narrows it, "Pick all shown" picks only what the search left, and Save posts feed ids. */
+const luBoxes = () => Array.from(modal().querySelectorAll('.of-lu-list input[type="checkbox"]'));
+const luTicked = () => luBoxes().filter((b) => b.checked).map((b) => Number(b.value));
+const luSearch = (text) => {
+  const box = modal().querySelector('.of-lu-tools .search');
+  box.value = text;
+  box.dispatchEvent(new w.Event('input', { bubbles: true }));
+};
+const luOpen = async () => {
+  // Asked again each time: a save swaps the card for the server's render.
+  await click(d.querySelector('#of-logins tr[data-login] [data-act="login-channels"]'));
+  await wait(40);
+};
+mark = requests.length;
+await luOpen();
+out.lu_fetch = since(mark);
+out.lu_initial = {
+  title: modal().querySelector('.modal-head h2').textContent.trim(),
+  picked: luTicked(),
+  pick_shown: !modal().querySelector('.of-lu-pick').hidden,
+  n: modal().querySelector('.of-lu-n').textContent,
+  heads: Array.from(modal().querySelectorAll('.of-lu-head')).map((h) => h.textContent),
+  notes: Array.from(modal().querySelectorAll('.of-lu-list .check-row')).map((l) => l.textContent.replace(/\s+/g, ' ').trim()),
+};
+luSearch('news');
+out.lu_searched_category = luBoxes().filter((b) => !b.closest('label').hidden).map((b) => Number(b.value));
+luSearch('ga');
+out.lu_searched = luBoxes().filter((b) => !b.closest('label').hidden).map((b) => Number(b.value));
+out.lu_heads_shown = Array.from(modal().querySelectorAll('[data-lu-cat]')).filter((c) => !c.hidden).map((c) => c.querySelector('.of-lu-head').textContent);
+await click(modal().querySelector('[data-lu="all"]'));
+out.lu_after_pick_all = { picked: luTicked(), n: modal().querySelector('.of-lu-n').textContent };
+luSearch('');
+mark = requests.length;
+await click(modalButton('Save'));
+await wait(40);
+out.lu_post = requests.slice(mark).filter((r) => r.method === 'POST').map((r) => ({ path: r.path, body: r.body }));
+out.lu_closed = !modal();
+// Nothing picked is refused before anything is sent.
+await luOpen();
+await click(modal().querySelector('[data-lu="none"]'));
+mark = requests.length;
+await click(modalButton('Save'));
+await wait(40);
+out.lu_empty = { posts: requests.slice(mark).filter((r) => r.method === 'POST').length, open: Boolean(modal()),
+                 toast: toasts().some((t) => t.includes('Pick at least one channel')) };
+// Everything hides the list and posts null.
+const all = modal().querySelector('input[name="of-lu-mode"][value="all"]');
+all.checked = true;
+await change(all);
+out.lu_everything_hides_list = modal().querySelector('.of-lu-pick').hidden;
+mark = requests.length;
+await click(modalButton('Save'));
+await wait(40);
+out.lu_everything_post = requests.slice(mark).filter((r) => r.method === 'POST').map((r) => r.body);
 
 /* Change login: an empty password is sent as empty, never a mask. */
 mark = requests.length;

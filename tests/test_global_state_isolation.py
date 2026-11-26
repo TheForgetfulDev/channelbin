@@ -73,6 +73,7 @@ RESET = {
     # output_feed.reset_for_tests() resets the engine with it (pip_engine.reset_for_tests).
     'app/pip_engine.py': {'_pairs', '_gpu_why'},
     'app/output_feed.py': {'_sessions', '_internal', '_redirects', '_refused', '_login_starting', '_login_changes',
+                           '_lineup_changes', '_lineup_now',
                            '_reaper', '_play_queue', '_log_writer', '_last_prune_mono'},
     'app/postprocessor.py': {'_analysis_progress'},
     'app/public_listener.py': {'_server', '_thread'},

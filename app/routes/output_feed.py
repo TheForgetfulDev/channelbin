@@ -86,9 +86,10 @@ def player_api():
         port = port or ('443' if request.scheme == 'https' else '80')
         return jsonify(output_feed.auth_payload(g.feed_cfg, g.feed_login, host, port, request.scheme))
     if action == _ACTION_CATEGORIES:
-        return jsonify(output_feed.category_payload(output_feed.catalog(g.cfg)))
+        return jsonify(output_feed.category_payload(output_feed.catalog(g.cfg, login=g.feed_login)))
     if action == _ACTION_STREAMS:
-        return jsonify(output_feed.live_streams_payload(output_feed.catalog(g.cfg), _base_url(), g.feed_login))
+        return jsonify(output_feed.live_streams_payload(output_feed.catalog(g.cfg, login=g.feed_login),
+                                                        _base_url(), g.feed_login))
     if action in _EMPTY_ACTIONS:
         return jsonify([])
     log.info('Output feed: unknown player_api action %r from %s answered empty', action,
@@ -98,14 +99,14 @@ def player_api():
 
 @output_feed_bp.route('/get.php')
 def get_php():
-    text = output_feed.m3u_text(output_feed.catalog(g.cfg), _base_url(), g.feed_login)
+    text = output_feed.m3u_text(output_feed.catalog(g.cfg, login=g.feed_login), _base_url(), g.feed_login)
     return Response(text, mimetype='audio/x-mpegurl',
                     headers={'Content-Disposition': 'attachment; filename="channelbin.m3u"'})
 
 
 @output_feed_bp.route('/xmltv.php')
 def xmltv():
-    rows = output_feed.catalog(g.cfg)
+    rows = output_feed.catalog(g.cfg, login=g.feed_login)
     # Built whole inside the request: the generator reads the database, and a body
     # streamed after the request ends has no session to read it with.
     body = ''.join(output_feed.xmltv_lines(rows, g.cfg))
@@ -125,7 +126,9 @@ def logo(username, password, channel_id):
     password gate on. The provider's URL never reaches the player (dev/changelog/1618)."""
     from ..logo_cache import download_logo, get_logo_cache_dir
     channel = output_feed.logo_channel(channel_id)
-    if channel is None:
+    # A channel outside the login's lineup answers as one the output does not have
+    # (dev/changelog/1764).
+    if channel is None or not output_feed.logo_in_lineup(g.feed_login, channel_id):
         return jsonify({'error': 'No such channel on the IPTV output'}), 404
     if channel.logo_cache_path:
         cache_dir = get_logo_cache_dir(g.cfg)

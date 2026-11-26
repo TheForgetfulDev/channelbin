@@ -166,6 +166,7 @@ REASON_PICTURE_FAILED = 'picture_failed'
 REASON_CARD_FAILED = 'card_failed'
 REASON_REPLACED = 'replaced'
 REASON_LOGIN_OFF = 'login_off'
+REASON_LINEUP = 'lineup'
 
 #: What two of the reasons read as on a sports channel, which has no group.
 SPORTS_REASON_TEXT = {
@@ -198,6 +199,7 @@ REASON_TEXT = {
     REASON_CARD_FAILED: 'Cut - the picture-in-picture card stopped playing.',
     REASON_REPLACED: 'Ended - the same IPTV player tuned in again, to another channel or this one.',
     REASON_LOGIN_OFF: 'Cut - its IPTV output login was turned off, changed or deleted.',
+    REASON_LINEUP: 'Cut - the channel was taken out of its IPTV output login\'s channels.',
     REASON_SCREEN_GONE: 'Cut - the sports channel is no longer on the IPTV output.',
     REASON_WINDOW_OPENED: ('Ended - the game came on. In redirect mode ChannelBin cannot tune a player in, '
                            'so the waiting screen stops and the next tune-in gets the game.'),
@@ -350,10 +352,19 @@ class FeedLogin:
     # How many times stop_login() had run for this login when the gate read it: a play started
     # on an older count is refused when it registers (_LoginRoom.still_good_locked).
     generation: int = 0
+    # The feed ids it gets (lineup_of()), None for everything the output offers: the main login
+    # always, and a login for another user nobody narrowed (dev/changelog/1764).
+    lineup: Optional[frozenset] = None
+    # And how many times set_login_lineup() had run for it, as `generation` is for stop_login().
+    lineup_generation: int = 0
 
     @property
     def is_main(self) -> bool:
         return self.feed_login_id is None
+
+    def offers(self, feed_id: int) -> bool:
+        """Whether `feed_id` is one of this login's channels."""
+        return lineup_offers(self.lineup, feed_id)
 
     @property
     def log_name(self) -> Optional[str]:
@@ -366,14 +377,70 @@ def main_login(fcfg: dict) -> FeedLogin:
     return FeedLogin(feed_username(fcfg), feed_password(fcfg))
 
 
-def _feed_login_of(row, generation: int = 0) -> FeedLogin:
+def _feed_login_of(row, generation: int = 0, lineup_generation: int = 0) -> FeedLogin:
     return FeedLogin(row.username, row.password, feed_login_id=row.id, name=row.name or '',
-                     max_streams=max(1, int(row.max_streams or 1)), generation=generation)
+                     max_streams=max(1, int(row.max_streams or 1)), generation=generation,
+                     lineup=lineup_of(row), lineup_generation=lineup_generation)
 
 
-def _login_generation() -> dict:
+def _login_generation() -> tuple:
+    """(stop_login() counts, set_login_lineup() counts), each by login id, read together."""
     with _lock:
-        return dict(_login_changes)
+        return dict(_login_changes), dict(_lineup_changes)
+
+
+#: The most feed ids one login's lineup may hold: far past any TV Guide, and a bound on what a
+#: save is asked to store.
+LINEUP_MAX = 20_000
+
+
+def lineup_key(feed_id: int) -> int:
+    """The feed id a lineup stores for `feed_id`: a picture-in-picture channel's own, for its
+    swapped copy too, since the two share their pictures and are offered as one."""
+    if feed_id >= PIP_FEED_BASE and pip_swapped(feed_id):
+        return feed_id - 1
+    return feed_id
+
+
+def lineup_offers(lineup: Optional[frozenset], feed_id: int) -> bool:
+    return lineup is None or lineup_key(feed_id) in lineup
+
+
+def lineup_of(row) -> Optional[frozenset]:
+    """An OutputFeedLogin's lineup: its stored feed ids, or None for everything. A value that
+    does not read as a list of ids is logged and read as nothing rather than everything, so a
+    damaged row never widens what a login gets."""
+    raw = getattr(row, 'lineup', None)
+    if raw is None:
+        return None
+    try:
+        ids = json.loads(raw)
+        if not isinstance(ids, list):
+            raise ValueError('not a list')
+        return frozenset(lineup_key(int(i)) for i in ids)
+    except (TypeError, ValueError) as exc:
+        log.warning('IPTV output: login %s has a channel list that cannot be read (%s), so it '
+                    'gets no channels until its channels are chosen again', row.username, exc)
+        return frozenset()
+
+
+def lineup_problem(value) -> tuple:
+    """(feed ids to store, error) for a lineup a save sends: None for everything, else a
+    non-empty list of feed ids, each one stored as lineup_key() names it."""
+    if value is None:
+        return None, ''
+    if not isinstance(value, list):
+        return None, 'The channels must be a list, or nothing for everything.'
+    if not value:
+        return None, 'Pick at least one channel, or turn the login off.'
+    if len(value) > LINEUP_MAX:
+        return None, f'A login can have at most {LINEUP_MAX} channels picked.'
+    ids = set()
+    for v in value:
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            return None, 'Every channel must be a feed id.'
+        ids.add(lineup_key(v))
+    return sorted(ids), ''
 
 
 #: Wrong logins from one address before it is refused, and for how long. Its own counter, never
@@ -401,12 +468,12 @@ def feed_login_for(fcfg: dict, username, password) -> Optional[FeedLogin]:
     from .database import OutputFeedLogin
     # Read BEFORE the row: a change committed after the row was read moves the count after
     # this read too, so a play this login starts is refused when it registers (_LoginRoom).
-    generation = _login_generation()
+    generation, lineup_generation = _login_generation()
     row = OutputFeedLogin.query.filter_by(username=username).first()
     stored = row.password if row is not None and row.enabled else ''
     if not hmac.compare_digest(stored.encode(), password.encode()) or not stored:
         return None
-    return _feed_login_of(row, generation.get(row.id, 0))
+    return _feed_login_of(row, generation.get(row.id, 0), lineup_generation.get(row.id, 0))
 
 
 def login_taken(username: str, fcfg: dict, except_login_id: Optional[int] = None) -> bool:
@@ -885,6 +952,20 @@ def logo_channel(channel_id: int):
     return channel if in_guide_group is not None else None
 
 
+def logo_in_lineup(login: FeedLogin, channel_id: int) -> bool:
+    """Whether the feed's logo route may serve channel `channel_id`'s logo to `login`: always
+    for a login with every channel, else when the channel's own row or a group it is in is one
+    of its channels - the only rows whose logo is that channel's (catalog()). One query."""
+    if login.lineup is None:
+        return True
+    if feed_id_for_channel(channel_id) in login.lineup:
+        return True
+    from .database import ChannelGroupMember
+    group_ids = [gid for (gid,) in ChannelGroupMember.query.with_entities(ChannelGroupMember.group_id)
+                 .filter(ChannelGroupMember.channel_id == channel_id)]
+    return any(feed_id_for_group(gid) in login.lineup for gid in group_ids)
+
+
 def _group_lead(group, members, latest_by_channel, blocked):
     """The member whose category and logo a group's feed row carries: the pinned listings
     member, else the member the group would play now, else its first member."""
@@ -900,7 +981,7 @@ def _group_lead(group, members, latest_by_channel, blocked):
     return next((m.channel for m in group.memberships), None)
 
 
-def catalog(cfg=None, everything: bool = False) -> list:
+def catalog(cfg=None, everything: bool = False, login: Optional[FeedLogin] = None) -> list:
     """Every feed row in the guide's order: the in-guide channels and the in-guide groups,
     interleaved by their shared guide_sort_order (channel_groups.guide_row_sort_key), then
     ChannelBin's own channels, Up next and sports, by league (_own_rows). A fixed number
@@ -915,10 +996,15 @@ def catalog(cfg=None, everything: bool = False) -> list:
     is not served either, and takes no number, so the rows after it move up.
 
     `everything` is the IPTV Output page's view: the rows that are not offered come back too,
-    with `num` 0 and the reason on the row (`on_output`, `left_out`), from the same queries."""
+    with `num` 0 and the reason on the row (`on_output`, `left_out`), from the same queries.
+
+    `login` narrows the answer to that login's lineup (FeedLogin.lineup, dev/changelog/1764)
+    before the numbering, so each login's channels are numbered 1 to n with no gaps; a feed id
+    is the row's whatever the login. Ignored with `everything`, which is the owner's view."""
     fcfg = feed_config(cfg)
     rows = guide_rows(fcfg, plays=everything) + _own_rows(everything, fcfg)
-    offered = [row for row in rows if row.offered]
+    lineup = None if everything or login is None else login.lineup
+    offered = [row for row in rows if row.offered and lineup_offers(lineup, row.feed_id)]
     for n, row in enumerate(offered, start=1):
         row.num = n
     return rows if everything else offered
@@ -1918,6 +2004,10 @@ _refused: dict = {}           # (feed id, message, login) -> the last _KEEP_ENDE
 _login_starting: dict = {}
 #: Login id -> how many times stop_login() has run for it (FeedLogin.generation).
 _login_changes: dict = {}
+#: Login id -> how many times set_login_lineup() has run for it (FeedLogin.lineup_generation),
+#: and the lineup it last set, which a play let in on an older one is checked against.
+_lineup_changes: dict = {}
+_lineup_now: dict = {}
 _reaper: Optional[threading.Thread] = None
 _play_queue: list = []        # lines of Recent plays waiting for the writer thread
 _log_writer: Optional[threading.Thread] = None
@@ -2023,7 +2113,7 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
     public_token = _tuning_public.set(public)
     try:
         session = _start_session(feed_id, client, cfg, preview, player, login, room)
-        gone = False
+        gone = rechosen = False
         with _lock:
             if player and not session.player:
                 # A waiting screen, card or Up next picture: built without it, and the play a
@@ -2037,10 +2127,16 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
                 if session.replaced_feed_id is None:
                     session.replaced_feed_id = room.replaced_feed_id
                 gone = not room.still_good_locked()
+                rechosen = not gone and not room.lineup_still_offers_locked(feed_id)
         if gone:
             # The login was turned off, changed or deleted while this play was starting.
             _finish(session, REASON_LOGIN_OFF)
             raise FeedRefused(AUTH_FAILED_MESSAGE, 401)
+        if rechosen:
+            # Taken out of the login's channels while this play was starting: it ends as a
+            # play of a channel taken out does, one line in Recent plays.
+            _finish(session, REASON_LINEUP)
+            raise FeedRefused(REASON_TEXT[REASON_LINEUP], 404)
     finally:
         # After the play carries its login, so its count never dips between the two.
         if room is not None:
@@ -2069,6 +2165,15 @@ class _LoginRoom:
         Under _lock, at the moment the play takes the login's name, which is the moment
         stop_login() could start finding it."""
         return _login_changes.get(self.login.feed_login_id, 0) == self.login.generation
+
+    def lineup_still_offers_locked(self, feed_id: int) -> bool:
+        """Whether `feed_id` is still one of the login's channels: no set_login_lineup() has
+        run for it since the gate read the list, or the list it last set still has the channel
+        (dev/changelog/1764)."""
+        login_id = self.login.feed_login_id
+        if _lineup_changes.get(login_id, 0) == self.login.lineup_generation:
+            return True
+        return lineup_offers(_lineup_now.get(login_id), feed_id)
 
     def claim(self, play: 'Play', client: str, player: str, alert: bool) -> None:
         """Take the place, or raise FeedRefused (503) naming the login's limit. A full limit
@@ -2139,6 +2244,30 @@ def stop_login(login_id: int, reason: str = REASON_LOGIN_OFF) -> int:
     return sum(1 for s in live if _finish(s, reason))
 
 
+def set_login_lineup(login_id: int, lineup: Optional[frozenset]) -> int:
+    """End every live play on login `login_id` whose channel `lineup` (the one just committed,
+    None for everything) leaves out, by name. How many it ended. Called after the commit, never
+    inside it. The count it moves, in the same lock as the list it takes, catches a play the
+    gate let in on the old list that registers after this list, which is ended too when `lineup`
+    leaves its channel out (start_session)."""
+    with _lock:
+        _lineup_changes[login_id] = _lineup_changes.get(login_id, 0) + 1
+        _lineup_now[login_id] = lineup
+        live = [s for s in _login_plays_locked(login_id) if not lineup_offers(lineup, s.feed_id)]
+    return sum(1 for s in live if _finish(s, REASON_LINEUP))
+
+
+def _not_in_lineup(play: 'Play', login: FeedLogin, client: str):
+    """Refuse a tune-in to a channel outside its login's lineup: a player holding a list from
+    before its channels were chosen again, or an id typed by hand. Named in the refused plays
+    and the log, and no alert: nothing is broken."""
+    message = (f'{play.label} is not one of the channels of IPTV output login "{login.username}". '
+               f'Its channels are chosen under Logins for other users on the IPTV Output page.')
+    _note_refused(play.feed_id, play.label, client, message)
+    log.info('Viewer from %s%s refused: %s', client, _on_login(login.log_name), message)
+    raise FeedRefused(message, 404)
+
+
 def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str,
                    login: Optional[FeedLogin] = None, room: Optional[_LoginRoom] = None) -> RelaySession:
     from flask import current_app
@@ -2149,6 +2278,8 @@ def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str,
     play = resolve_play(feed_id, cfg, preview=preview)
     if play is None:
         raise FeedRefused('No such channel on the IPTV output', 404)
+    if login is not None and not login.offers(feed_id):
+        _not_in_lineup(play, login, client)
     if room is not None:
         room.claim(play, client, player, alert=not preview)
     login_id = login.feed_login_id if login is not None else None
@@ -4572,6 +4703,10 @@ def redirect_play(feed_id: int, client: str, cfg=None, login: Optional[FeedLogin
     token = _tuning_login.set(login)
     try:
         play = resolve_play(feed_id, cfg)
+        # Only the main login is redirected, and it has no lineup; asked anyway, so a change to
+        # relays_for() can never send a narrowed login's player to a channel outside its list.
+        if play is not None and login is not None and not login.offers(feed_id):
+            _not_in_lineup(play, login, client)
         if play is not None and play.sports and play.member is None and not play.fault:
             return None, start_waiting(play, client, cfg)
         return redirect_target(feed_id, client, cfg, play=play), None
@@ -4669,6 +4804,8 @@ def reset_for_tests():
         _refused.clear()
         _login_starting.clear()
         _login_changes.clear()
+        _lineup_changes.clear()
+        _lineup_now.clear()
         del _redirects[:]
     discard_play_log()
     _last_prune_mono = None

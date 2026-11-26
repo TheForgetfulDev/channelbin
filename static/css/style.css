@@ -5007,6 +5007,9 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .rl-when .day { display: block; color: var(--text); font-weight: 500; }
 .rl-prog .t { color: var(--text); font-weight: 500; }
 .rl-prog .s { display: block; color: var(--text-muted); font-size: var(--fs-sm); }
+/* A sub-line marked as a warning keeps the warning color: `.rl-prog .s` outranks the bare
+   .text-warning, which drew every one of them muted (dev/docs/BUGS.md 2026-11-26 04:01 PM). */
+.rl-prog .s.text-warning { color: var(--warn); }
 .rl-where { color: var(--text-muted); }
 .rl-where .via { display: block; color: var(--text-faint); font-size: var(--fs-xs); white-space: normal; max-width: 200px; }
 .rl-why { color: var(--text-muted); line-height: 1.45; }
@@ -5094,12 +5097,20 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
      160px, so the name gets what the window has to spare and is whole from about 1020. */
   .of-acct .acct-pill { max-width: max(6rem, calc(100vw - 830px)); overflow: hidden; white-space: nowrap; }
 }
-/* The cost of leaving every connection alone, in the warning color over .rl-prog's muted .s. */
-.of-acct .s.text-warning { color: var(--warn); }
 /* Sized by its longest choice, and the choices are short (output_feed_view._held_choices). */
 .of-held { width: auto; max-width: 100%; }
 .of-login label { display: block; margin-top: 12px; }
 .of-login .card-note { margin-top: 12px; }
+/* A login's Choose channels dialog (static/js/iptv-output.js::chooseChannels, dev/changelog/1764):
+   the list scrolls inside the dialog, so the search and the buttons above it stay in view. */
+.of-lu-pick { margin-top: 10px; }
+.of-lu-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.of-lu-tools .search { flex: 1 1 12rem; min-width: 0; }
+.of-lu-n { margin-left: auto; color: var(--text-muted); font-size: var(--fs-sm); }
+.of-lu-list { max-height: 50vh; overflow-y: auto; margin-top: 8px; padding: 2px 10px 8px;
+  border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }
+.of-lu-head { margin-top: 10px; color: var(--text-muted); font-size: var(--fs-sm); font-weight: 600; }
+.of-lu-list .check-row .text-muted, .of-lu-list .check-row .text-warning { font-size: var(--fs-sm); }
 
 /* Picture-in-picture channels (mockup 63, dev/docs/DESIGN-pip-channels.md 12).
    The stand-in picture: a channel's layout with the big picture dark and the small one light,

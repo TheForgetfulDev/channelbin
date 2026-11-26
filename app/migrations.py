@@ -4147,6 +4147,15 @@ def _m152_output_feed_logins(conn, cur):
     conn.commit()
 
 
+def _m153_output_feed_login_lineup(conn, cur):
+    """output_feed_logins.lineup: the channels a login for another user gets (dev/changelog/1764).
+    No backfill: NULL is every channel the output offers, which keeps every login made before
+    step 153 as it was. Re-runnable from the top: the ADD COLUMN asks PRAGMA table_info first."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(output_feed_logins)').fetchall()}
+    if cols and 'lineup' not in cols:
+        cur.execute('ALTER TABLE output_feed_logins ADD COLUMN lineup TEXT')
+    conn.commit()
+
 #: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
 #: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
 #: time; the rebuild test holds step 148's output to this text, and the column list after
@@ -5027,6 +5036,8 @@ SCHEMA_MIGRATIONS = [
      _m151_epg_source_games),
     (152, 'output_feed_logins + output_feed_plays.feed_login: logins for other users on the IPTV '
           'output', _m152_output_feed_logins),
+    (153, 'output_feed_logins.lineup: the channels each login for another user gets',
+     _m153_output_feed_login_lineup),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

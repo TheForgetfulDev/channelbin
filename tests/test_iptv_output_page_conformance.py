@@ -166,5 +166,17 @@ class IptvOutputPageConformanceTests(FeedCase):
         self.assertNotRegex(body, '[←-⇿✀-➿\U0001f300-\U0001faff]')
 
 
+class WarningSubLineTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-26 04:01 PM: a `.rl-prog` cell's second line marked
+    `.text-warning` drew muted, because `.rl-prog .s` outranks the bare `.text-warning`. Every
+    such line (this page's Logins, Watching now and Accounts cards, a rule's postponed game, a
+    league's categories) needs a rule at least as specific that keeps the warning color."""
+
+    def test_a_warning_sub_line_keeps_the_warning_color(self):
+        with open(os.path.join(REPO, 'static', 'css', 'style.css'), encoding='utf-8') as f:
+            css = f.read()
+        self.assertRegex(css, r'(^|[,}\s])\.rl-prog \.s\.text-warning\s*(,[^{]*)?\{[^}]*color:\s*var\(--warn\)')
+
+
 if __name__ == '__main__':
     unittest.main()

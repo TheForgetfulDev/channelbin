@@ -1,12 +1,15 @@
 """Logins for other users on the IPTV output (app/output_feed.py FeedLogin, the routes in
 app/routes/iptv_output.py, dev/changelog/1760).
 
-Each login gets the same output as the main one in Settings; what these hold is that the
-gate tells them apart, that every URL an answer carries is the asking login's own, that a
-login's stream limit is held under the one lock, that two logins behind one address never end
-each other's plays, that a login is never redirected to the provider, and that turning one
-off, changing it or deleting it ends its plays and keeps its lines in Recent plays."""
+What these hold is that the gate tells the logins apart, that every URL an answer carries is
+the asking login's own, that a login's stream limit is held under the one lock, that two logins
+behind one address never end each other's plays, that a login is never redirected to the provider, and that turning one
+off, changing it or deleting it ends its plays and keeps its lines in Recent plays. A login's
+channel list (dev/changelog/1764) narrows its catalog, its plays and its logos, numbers its
+channels from 1, and ends the plays a new list leaves out."""
+import json
 import time
+import unittest
 from unittest import mock
 
 import app.output_feed as feed
@@ -15,6 +18,7 @@ from app.database import (FEED_PLAY_ENDED, FEED_PLAY_REFUSED, OutputFeedLogin,
                           OutputFeedPlay)
 from app.url_utils import mask_creds_in_text
 from tests.support.output_feed import PASS, USER, FeedCase, feed_cfg
+from tests.support.seed import make_channel
 
 FRIEND, FRIEND_PASS = 'kim', 'couch42'
 
@@ -467,3 +471,190 @@ class StartLogLineTests(_LoginCase):
         import app.sports_screen as ss
         with mock.patch.object(feed, '_clip_for', side_effect=ss.ClipFailed('no font')):
             self.assert_named(lambda: self.pip(set_up=False), refused=True)
+
+
+class _LineupCase(_LoginCase):
+    """A login's channel list (FeedLogin.lineup, dev/changelog/1764): Alpha, Game feeds and Beta
+    are the output's rows 1-3, and a lineup of Beta alone is that login's channel 1."""
+
+    def setUp(self):
+        super().setUp()
+        self.fid_alpha = feed.feed_id_for_channel(self.alpha.id)
+        self.fid_beta = feed.feed_id_for_channel(self.beta.id)
+        self.fid_group = feed.feed_id_for_group(self.group.id)
+
+    def set_lineup(self, ids):
+        self.login.lineup = None if ids is None else json.dumps(ids)
+        db.session.commit()
+
+    def streams_as(self):
+        return self.get_as('/player_api.php', action='get_live_streams').get_json()
+
+
+class LineupCatalogTests(_LineupCase):
+    def test_a_login_with_no_lineup_gets_everything_and_a_row_added_later(self):
+        gamma = make_channel(self.account, name='Gamma', in_guide=True)
+        gamma.guide_sort_order = 4
+        db.session.commit()
+        self.assertEqual([r['name'] for r in self.streams_as()], [r['name'] for r in self.streams()])
+        self.assertIn('Gamma', [r['name'] for r in self.streams_as()])
+
+    def test_a_lineup_numbers_its_channels_from_one_and_keeps_their_feed_ids(self):
+        self.set_lineup([self.fid_beta])
+        rows = self.streams_as()
+        self.assertEqual([(r['name'], r['num'], r['stream_id']) for r in rows], [('Beta', 1, self.fid_beta)])
+        main = {r['name']: r['num'] for r in self.streams()}
+        self.assertEqual(main['Beta'], 3)
+
+    def test_a_row_added_later_is_not_added_to_a_lineup(self):
+        self.set_lineup([self.fid_beta])
+        make_channel(self.account, name='Gamma', in_guide=True)
+        db.session.commit()
+        self.assertEqual([r['name'] for r in self.streams_as()], ['Beta'])
+
+    def test_the_playlist_and_the_guide_carry_only_its_channels(self):
+        self.set_lineup([self.fid_beta, self.fid_group])
+        m3u = self.get_as('/get.php').get_data(as_text=True)
+        self.assertIn(f'/{self.fid_beta}.ts', m3u)
+        self.assertIn(f'/{self.fid_group}.ts', m3u)
+        self.assertNotIn(f'/{self.fid_alpha}.ts', m3u)
+        xml = self.get_as('/xmltv.php').get_data(as_text=True)
+        self.assertIn(f'<channel id="{self.fid_beta}">', xml)
+        self.assertNotIn(f'<channel id="{self.fid_alpha}">', xml)
+
+    def test_a_picture_in_picture_pick_brings_its_swapped_copy(self):
+        own, swapped = feed.feed_id_for_pip(3), feed.feed_id_for_pip(3, swapped=True)
+        self.assertTrue(feed.lineup_offers(frozenset({own}), swapped))
+        self.assertFalse(feed.lineup_offers(frozenset({feed.feed_id_for_pip(4)}), swapped))
+        self.assertEqual(feed.lineup_problem([swapped, own]), ([own], ''))
+
+    def test_a_damaged_lineup_gets_nothing_rather_than_everything(self):
+        self.login.lineup = 'not json'
+        db.session.commit()
+        with self.assertLogs('app.output_feed', 'WARNING'):
+            self.assertEqual(feed.lineup_of(self.login), frozenset())
+
+
+class LineupPlayTests(_LineupCase):
+    def test_a_channel_outside_the_lineup_is_refused_by_name(self):
+        """Without the check the play route served any feed id a player asked for."""
+        self.set_lineup([self.fid_beta])
+        resp = self.client.get(f'/live/{FRIEND}/{FRIEND_PASS}/{self.fid_alpha}.ts')
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn(f'IPTV output login "{FRIEND}"', resp.get_json()['error'])
+        feed.flush_play_log()
+        line = OutputFeedPlay.query.filter_by(kind=FEED_PLAY_REFUSED).one()
+        self.assertEqual((line.feed_id, line.feed_login), (self.fid_alpha, FRIEND))
+
+    def test_a_channel_in_the_lineup_gets_past_it(self):
+        self.set_lineup([self.fid_beta])
+        with mock.patch.object(feed, '_claim_slot', return_value=False), \
+                mock.patch.object(feed, 'SWITCH_GRACE_SECONDS', 0):
+            resp = self.client.get(f'/live/{FRIEND}/{FRIEND_PASS}/{self.fid_beta}.ts')
+        self.assertEqual(resp.status_code, 503)    # the output's own cap, past the lineup
+
+    def test_the_main_login_is_never_held_to_a_lineup(self):
+        self.set_lineup([self.fid_beta])
+        main = feed.main_login(feed_cfg()['integrations']['output_feed'])
+        self.assertTrue(main.offers(self.fid_alpha))
+
+    def test_the_logo_route_refuses_a_channel_outside_the_lineup(self):
+        self.alpha.logo_url = 'http://logos.example.test/alpha.png'
+        self.member.logo_url = 'http://logos.example.test/member.png'
+        db.session.commit()
+        self.set_lineup([self.fid_group])
+        with mock.patch('app.logo_cache.download_logo', return_value=(b'png', 'image/png')):
+            member = self.client.get(f'/logo/{FRIEND}/{FRIEND_PASS}/{self.member.id}')
+            alpha = self.client.get(f'/logo/{FRIEND}/{FRIEND_PASS}/{self.alpha.id}')
+            main = self.client.get(f'/logo/{USER}/{PASS}/{self.alpha.id}')
+        self.assertEqual((member.status_code, alpha.status_code, main.status_code), (200, 404, 200))
+
+
+class LineupSaveTests(_LineupCase):
+    def post_lineup(self, value):
+        return self.client.post(f'/api/iptv-output/logins/{self.login.id}', json={'lineup': value})
+
+    def test_a_lineup_is_saved_and_everything_clears_it(self):
+        swapped = feed.feed_id_for_pip(2, swapped=True)
+        self.assertEqual(self.post_lineup([self.fid_beta, swapped]).status_code, 200)
+        db.session.expire_all()
+        self.assertEqual(json.loads(self.login.lineup), sorted([self.fid_beta, swapped - 1]))
+        self.assertEqual(self.post_lineup(None).status_code, 200)
+        db.session.expire_all()
+        self.assertIsNone(self.login.lineup)
+
+    def test_a_bad_lineup_is_refused(self):
+        for value in ([], 'all', [True], [0], ['5'], [1.5]):
+            self.assertEqual(self.post_lineup(value).status_code, 400, value)
+        db.session.expire_all()
+        self.assertIsNone(self.login.lineup)
+
+    def test_a_lineup_change_ends_only_the_plays_it_leaves_out(self):
+        self.login.max_streams = 3
+        db.session.commit()
+        out = self.play(self.fid_alpha, login=self.friend())
+        kept = self.play(self.fid_beta, login=self.friend())
+        mains = self.play(self.fid_alpha)
+        resp = self.post_lineup([self.fid_beta])
+        self.assertEqual(resp.get_json()['ended'], 1)
+        self.assertEqual(out.reason, feed.REASON_LINEUP)
+        self.assertTrue(kept.live)
+        self.assertTrue(mains.live)
+        self.assertTrue(feed.REASON_TEXT[feed.REASON_LINEUP])
+
+    def test_a_play_let_in_on_the_old_lineup_is_ended_when_the_new_one_leaves_it_out(self):
+        login = self.friend()                                     # what the gate read
+        feed.set_login_lineup(self.login.id, frozenset({self.fid_beta}))   # chosen again meanwhile
+        started = []
+
+        def start(feed_id, *_a, **_k):
+            started.append(self.play(feed_id))
+            return started[-1]
+        with mock.patch.object(feed, '_start_session', side_effect=start):
+            with self.assertRaises(feed.FeedRefused) as cm:
+                feed.start_session(self.fid_alpha, 'a', login=login)
+            kept = feed.start_session(self.fid_beta, 'a', login=login)
+        self.assertEqual(cm.exception.status, 404)
+        self.assertEqual(started[0].reason, feed.REASON_LINEUP)
+        self.assertEqual(feed.login_plays(self.login.id), [kept])     # still in the new list
+        feed.flush_play_log()
+        self.assertEqual([(x.kind, x.feed_id) for x in OutputFeedPlay.query.all()],
+                         [(FEED_PLAY_ENDED, self.fid_alpha)])          # one line, not two
+
+
+class LineupPageTests(_LineupCase):
+    def test_the_dialog_lists_every_row_and_the_logins_picks(self):
+        self.switch(feed.KIND_CHANNEL, self.alpha.id, False)
+        self.set_lineup([self.fid_alpha, 999_998])     # the second names a row that is gone
+        d = self.client.get(f'/api/iptv-output/logins/{self.login.id}/channels').get_json()
+        self.assertFalse(d['everything'])
+        self.assertEqual(d['picked'], [self.fid_alpha])
+        rows = {r['name']: r for r in d['rows']}
+        self.assertEqual(set(rows), {'Alpha', 'Game feeds', 'Beta'})
+        self.assertEqual(rows['Alpha']['off'], 'Taken off the output')
+        self.assertEqual(rows['Beta']['off'], '')
+
+    def test_the_logins_card_says_what_its_player_lists(self):
+        page = self.client.get('/iptv-output').get_data(as_text=True)
+        self.assertIn('>Everything<', page)
+        self.switch(feed.KIND_CHANNEL, self.alpha.id, False)
+        self.set_lineup([self.fid_alpha, self.fid_beta])
+        page = self.client.get('/iptv-output').get_data(as_text=True)
+        logins = page[page.index('id="of-logins"'):page.index('id="of-watching"')]
+        self.assertIn('1 channel<', logins)
+        self.assertIn('1 more picked, not on the output now', logins)
+        self.assertIn('data-act="login-channels"', logins)
+
+
+class LineupMigrationTests(unittest.TestCase):
+    def test_step_153_adds_the_column_and_runs_again(self):
+        import sqlite3
+        from app.migrations import _m153_output_feed_login_lineup
+        conn = sqlite3.connect(':memory:')
+        conn.execute('CREATE TABLE output_feed_logins (id INTEGER PRIMARY KEY, username TEXT)')
+        conn.execute("INSERT INTO output_feed_logins (username) VALUES ('kim')")
+        for _ in range(2):
+            _m153_output_feed_login_lineup(conn, conn.cursor())
+        cols = [r[1] for r in conn.execute('PRAGMA table_info(output_feed_logins)')]
+        self.assertIn('lineup', cols)
+        self.assertEqual(conn.execute('SELECT lineup FROM output_feed_logins').fetchone(), (None,))
