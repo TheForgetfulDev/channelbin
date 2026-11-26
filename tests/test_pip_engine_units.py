@@ -102,6 +102,46 @@ class PictureBufferTests(unittest.TestCase):
         self.assertEqual(self.buf.untaken_age(), 0.0, 'a picture is never an idle IPTV player')
 
 
+class SilentCombinerTests(unittest.TestCase):
+    """Combined.silent_for(), the combiner hang check (dev/docs/BUGS.md 2026-11-25 @ 08:02:19 PM),
+    on a play stood in for by its fields."""
+
+    def _combined(self):
+        c = object.__new__(engine.Combined)
+        c.session = SimpleNamespace(last_data_mono=100.0)
+        c.big = SimpleNamespace(live=True, buffer=SimpleNamespace(total_in=1000, source_no=1))
+        c.big_now = (engine.INPUT_LIVE, 1)
+        c._out_mark = (None, 0, None)
+        return c
+
+    def test_silence_runs_from_the_big_picture_arriving_again_not_from_the_last_output(self):
+        c = self._combined()
+        self.assertIsNone(c.silent_for(100.5))          # the output's mark
+        self.assertIsNone(c.silent_for(110.0), 'the big picture paused: its stall, not the combiner\'s')
+        c.big.buffer.total_in = 1500                     # it comes back 29 s after the last output
+        self.assertEqual(c.silent_for(129.0), 0.0)
+        self.assertEqual(c.silent_for(140.0), 11.0)
+
+    def test_output_moving_again_resets_it(self):
+        c = self._combined()
+        c.silent_for(100.5)
+        c.big.buffer.total_in = 1500
+        self.assertEqual(c.silent_for(101.0), 0.0)
+        self.assertEqual(c.silent_for(101.5), 0.5)
+        c.session.last_data_mono = 102.0
+        self.assertIsNone(c.silent_for(102.5))
+
+    def test_a_big_picture_between_sources_or_on_its_card_never_counts(self):
+        c = self._combined()
+        c.silent_for(100.5)
+        c.big.buffer.total_in = 1500
+        c.big.buffer.source_no = 2
+        self.assertIsNone(c.silent_for(140.0))
+        c.big.buffer.source_no = 1
+        c.big_now = (engine.INPUT_CARD, 'over', 'A game', '')
+        self.assertIsNone(c.silent_for(140.0))
+
+
 class CardFrameTests(unittest.TestCase):
     def test_a_card_is_one_nv12_frame_of_the_windows_size_in_tv_range(self):
         frame = engine.card_frame('Paused for a recording', 480, 270)
@@ -229,6 +269,20 @@ class GpuOverlayTrialTests(unittest.TestCase):
         self.assertEqual(device, '')
         self.assertIn('combining two pictures', why)
         self.assertIn('overlay_vaapi', notice)
+
+    def test_a_passing_gpu_is_tried_once_however_often_a_play_asks(self):
+        """Characterization (dev/changelog/1737): a card play asks gpu_state() at every
+        re-check and every tune-in asks it too, and the two trials' passes are kept for the
+        life of the process (toolchain._gpu_trial), so the asking spawns nothing after the
+        first pass. A cache dropped here would put two GPU processes on every 30 s re-check."""
+        cfg = cfgmod._deep_merge(cfgmod.load_config(), {'recording': {'post_process': {'vaapi_device': DEVICE}}})
+        encode, overlay = _trial(0), _trial(0)
+        with mock.patch.object(engine.os.path, 'exists', return_value=True), \
+                mock.patch.object(toolchain, '_run_gpu_trial', encode), \
+                mock.patch.object(toolchain, '_run_gpu_overlay_trial', overlay):
+            answers = [engine.gpu_state(cfg) for _ in range(5)]
+        self.assertEqual(answers, [(DEVICE, '')] * 5)
+        self.assertEqual((len(encode.calls), len(overlay.calls)), (1, 1))
 
     def test_a_conversion_running_does_not_stop_a_play_combining(self):
         """Characterization: the engine asks nothing about conversions today, so this passes

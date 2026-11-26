@@ -818,6 +818,9 @@ class Pair:
         self.idle_since: Optional[float] = None
         self.closed = False
         self.ask_lock = threading.Lock()
+        # The layout the last Save gave the row (row_changed), None before one: a play that
+        # attaches after the Save listed the row's plays takes it here (Combined.attach_locked).
+        self.geometry = None
 
     def ordered(self) -> list:
         return sorted(self.pictures.values(), key=lambda p: p.role != self.first_role)
@@ -920,11 +923,19 @@ def picture_accounts() -> list:
                 if s.live and s.picture is not None and s.account_id is not None]
 
 
-def _swap_roles(pair: Pair, row, combos) -> bool:
+def _combos_locked(pair: Pair) -> list:
+    """The live plays on `pair` combined. The caller holds output_feed._lock."""
+    return [s.combined for s in feed._sessions.values()
+            if s.live and s.combined is not None and s.combined.pair is pair]
+
+
+def _swap_roles(pair: Pair, row) -> bool:
     """When the row's two pictures were exchanged and nothing else about them changed, the
     pair's two pictures change places and each play's windows with them, on the connections
     they already hold (section 9). False, with nothing touched, for any other change. The
-    caller holds the pair's `ask_lock`, so no ask reads a role half way through."""
+    caller holds the pair's `ask_lock`, so no ask reads a role half way through. The plays are
+    listed in the hold that swaps the pair: one that attaches later reads the roles from the
+    pair (Combined.attach_locked)."""
     P = pip_channels
     main, inset = pair.pictures[P.ROLE_MAIN], pair.pictures[P.ROLE_INSET]
     want_main, want_inset = P.source_of(row, P.ROLE_MAIN), P.source_of(row, P.ROLE_INSET)
@@ -940,7 +951,7 @@ def _swap_roles(pair: Pair, row, combos) -> bool:
         for picture in (main, inset):
             # One that gave its connection to the other may now be the big picture.
             picture.ask_due = picture.ask_due or not picture.live
-        for combined in combos:
+        for combined in _combos_locked(pair):
             combined.swap_roles_locked()
     log.info('Picture in picture: channel %d (%s) had its two pictures swapped, on the '
              'connections they hold', pair.row_id, pair.name)
@@ -959,16 +970,19 @@ def row_changed(row_id: int) -> int:
     from .database import PipChannel
     with feed._lock:
         pair = _pairs.get(row_id)
-        combos = [s.combined for s in feed._sessions.values()
-                  if s.live and s.combined is not None and s.pip_row_id == row_id]
     if pair is None:
         return 0
     row = db.session.get(PipChannel, row_id)
     if row is None:
         return 0
+    geometry = pip_geometry(row.layout, row.corner, row.size)
     stopping = []
     with pair.ask_lock:
-        _swap_roles(pair, row, combos)
+        with feed._lock:
+            # Before the plays are listed below: a play that attaches in between takes it
+            # (dev/docs/BUGS.md 2026-11-25 @ 07:56:12 PM).
+            pair.geometry = geometry
+        _swap_roles(pair, row)
         for picture in list(pair.pictures.values()):
             if pip_channels.source_of(row, picture.role) == picture.source:
                 continue
@@ -983,7 +997,8 @@ def row_changed(row_id: int) -> int:
                 stopping.append(session)
     for session in stopping:
         feed._finish(session, feed.REASON_STOPPED, detail='its picture was changed')
-    geometry = pip_geometry(row.layout, row.corner, row.size)
+    with feed._lock:
+        combos = _combos_locked(pair)
     for combined in combos:
         combined.set_geometry(geometry)
     return len(combos)
@@ -1060,6 +1075,10 @@ class Combined:
         # rebuild that started before one records nothing as built, so the next turn builds
         # again to what the windows are now.
         self._shape = 0
+        # (session.last_data_mono, the big picture's buffer.total_in, when that buffer was
+        # first seen to grow past it) as of the combiner's output last moving: what
+        # silent_for() measures from.
+        self._out_mark: tuple = (None, 0, None)
 
     @property
     def had_frame(self) -> bool:
@@ -1152,6 +1171,33 @@ class Combined:
         self._rebuild_combiner(want_big, '')
         if not self.closed and self.session.live:
             self._rebuild_decoder(want_small)
+
+    def silent_for(self, now: float) -> Optional[float]:
+        """How long the combiner has sent nothing while its big picture kept arriving, or None
+        when that is not what is happening: it has sent nothing yet (the connect timeout's), the
+        big window is on its card, or the big picture is between sources, where the pump holds
+        the pipe open on purpose and the combiner waits for its rebuild. A big picture that
+        stopped arriving is its own session's stall, never the combiner's, so the silence runs
+        from the later of the last output and the big picture arriving again after it: a source
+        that paused and came back gives the combiner the whole timeout to answer."""
+        session = self.session
+        with feed._lock:
+            last, big, big_now = session.last_data_mono, self.big, self.big_now
+            live = big.live
+        if last is None:
+            return None
+        total = big.buffer.total_in
+        mark_last, mark_total, grew_at = self._out_mark
+        if mark_last != last:
+            self._out_mark = (last, total, None)
+            return None
+        if (not live or big_now is None or big_now[0] != INPUT_LIVE
+                or big_now[1] != big.buffer.source_no or total <= mark_total):
+            return None
+        if grew_at is None:
+            grew_at = now
+            self._out_mark = (mark_last, mark_total, grew_at)
+        return now - max(last, grew_at)
 
     def swap_roles_locked(self) -> None:
         """The row's two pictures changed places: this play's two windows exchange what they
@@ -1339,11 +1385,14 @@ class Combined:
             return ''
         return path
 
-    def combiner_died(self, proc, why: str) -> None:
+    def combiner_died(self, proc, why: str, worked_until: Optional[float] = None) -> None:
         """The reaper found the combiner dead, or silent past the connect timeout
         (output_feed._check). One restart decoding the big picture on the CPU when its GPU
         decode is what failed; otherwise one restart, and the big picture alone when that one
-        dies in its first seconds too (section 7.3)."""
+        dies in its first seconds too (section 7.3). `worked_until` is when a combiner that
+        hung last sent anything: its first seconds are judged by that, not by when the hang
+        was noticed a stall timeout later, so one that wedges after a few frames every time
+        still ends on the big picture alone."""
         from .preview import gpu_decode_failure
         session = self.session
         blamed = (gpu_decode_failure(session.stderr_path) if self.big_gpu and self.big_now
@@ -1365,7 +1414,8 @@ class Combined:
                             'restarts decoding it on the CPU', session.id, blamed)
                 self._rebuild_combiner(want, 'its big picture decoded on the CPU')
                 return
-            quick = time.monotonic() - self.combiner_started < COMBINER_SETTLE_SECONDS
+            ended = worked_until if worked_until is not None else time.monotonic()
+            quick = ended - self.combiner_started < COMBINER_SETTLE_SECONDS
             self.deaths = self.deaths + 1 if quick else 1
             log.warning('Viewer %s: the combiner stopped (%s), time %d', session.id, detail, self.deaths)
             if self.deaths >= 2:
@@ -1523,13 +1573,28 @@ class Combined:
         are built to it, at the reaper's next turn. The frames in hand are the old size, so the
         small window shows its card until the new decoder's first frame."""
         with feed._lock:
-            if self.closed or geometry == self.geometry:
+            if self.closed:
                 return
-            self.geometry = geometry
-            self.frame_bytes = pip_frame_bytes(geometry)
-            self.frames = NewestFrame(self.frame_bytes)
-            self.big_now = self.small_now = None
-            self._shape += 1
+            self._geometry_locked(geometry)
+
+    def _geometry_locked(self, geometry) -> None:
+        if geometry == self.geometry:
+            return
+        self.geometry = geometry
+        self.frame_bytes = pip_frame_bytes(geometry)
+        self.frames = NewestFrame(self.frame_bytes)
+        self.big_now = self.small_now = None
+        self._shape += 1
+
+    def attach_locked(self) -> None:
+        """Read this play's two pictures and layout off the pair again, as it attaches to its
+        session: a Save during its tune-in swapped the pair's roles and stored the new layout,
+        while this play was not yet one row_changed() lists. Nothing is built yet, so only the
+        windows move. The caller holds output_feed._lock."""
+        roles = (pip_channels.ROLE_INSET, pip_channels.ROLE_MAIN) if self.swapped else pip_channels.ROLES
+        self.big, self.small = self.pair.pictures[roles[0]], self.pair.pictures[roles[1]]
+        if self.pair.geometry is not None:
+            self._geometry_locked(self.pair.geometry)
 
     def view(self) -> dict:
         return {'big': self.big.view(), 'small': self.small.view()}
@@ -1571,6 +1636,7 @@ def begin(session, tuned, cfg: dict, device: str, wait: bool = True) -> bool:
         playing = combined.big.live or combined.small.live
         ok = playing and session.live and not session._finishing
         if ok:
+            combined.attach_locked()
             session.combined = combined
     # Running either way: a pair nothing plays is the reaper's to close after its linger.
     feed._ensure_reaper()
@@ -1615,15 +1681,22 @@ def leave(session) -> None:
 
 
 def check(session, proc, now: float, state: str) -> None:
-    """The reaper's turn for a combined play's own ffmpeg, the combiner. A stall is the big
-    picture's own session's to judge and fail over from; this only sees a combiner that
-    exited or never sent anything."""
+    """The reaper's turn for a combined play's own ffmpeg, the combiner. A stall of the big
+    picture is its own session's to judge and fail over from; this sees a combiner that exited,
+    never sent anything, or went silent while the big picture kept arriving (a hang:
+    dev/docs/BUGS.md 2026-11-25 @ 08:02:19 PM), and restarts it as it does one that exited."""
     combined = session.combined
     rc = proc.poll()
     if rc is not None:
         combined.combiner_died(proc, f'the combining ffmpeg exited with code {rc}')
-    elif state == feed.STATE_STARTING and now - session.launched_mono > feed.CONNECT_TIMEOUT_SECONDS:
-        combined.combiner_died(proc, 'the combining ffmpeg sent nothing in time')
+    elif state == feed.STATE_STARTING:
+        if now - session.launched_mono > feed.CONNECT_TIMEOUT_SECONDS:
+            combined.combiner_died(proc, 'the combining ffmpeg sent nothing in time')
+    else:
+        silent = combined.silent_for(now)
+        if silent is not None and silent > session.stall_timeout:
+            combined.combiner_died(proc, f'the combining ffmpeg sent nothing for {silent:.0f}s while its '
+                                         f'big picture kept arriving', worked_until=session.last_data_mono)
 
 
 def tick() -> None:
