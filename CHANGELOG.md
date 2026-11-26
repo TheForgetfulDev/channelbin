@@ -5,6 +5,71 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.50.0 - 2026-11-25
+
+Lots of EPG source changes and fixes: guides that continue into the next source, sources a
+whole provider shares, a scorecard and findings for every source, and a reorder that shows
+what it would change. Also fixes to host checks, picture-in-picture and recordings.
+
+**Added**
+
+- A channel's guide no longer stops where its first EPG source stops. It carries on from the
+  next source the account reads, wherever that source runs further and its listings agree,
+  and the channel page says where each part of the guide came from. (#94)
+- An EPG source can belong to a provider instead of a single account. Every account on the
+  provider reads it, and each account follows the provider's order of sources or keeps an
+  order of its own. (#95)
+- Moving an EPG source up or down, or turning one off, shows what it would change before it
+  runs.
+- An EPG source can carry the date its paid subscription ends, with an alert a week before
+  and another on the day. (#96)
+- Each EPG source an account reads has a scorecard: how many channels it covers and how many
+  only it covers, how much detail its listings carry, how reliably it refreshes, how many of
+  your followed sports games it would match, and which source serves each channel best.
+- The EPG check says what each account could improve, such as channels with no guide that a
+  source would fill or a source that adds nothing, and the Dashboard flags accounts with
+  channels showing no guide or the wrong one. The Name matches page can accept every match
+  at once.
+- The Accounts list and each account's page say how far ahead its guide runs.
+
+**Changed**
+
+- Comparing two guides recognizes one program listed under two names (accents, punctuation,
+  an episode title used as the title, small spelling differences), so filling a guide, the
+  scorecard and the guide comparison all match more listings, in about half the time.
+
+**Fixed**
+
+- When a provider gives one guide id to unrelated channels, the account's EPG sources card
+  says so and lets you stop using that id for those channels in one step, instead of every
+  one of them silently showing another channel's schedule. (#93)
+- Supercars race listings match their race on a weekend with a race every day, so a rule
+  records them and the sports channels play them.
+- A followed game's recording that is waiting for a free connection keeps its place in line,
+  instead of being moved to "now" again on every sports check.
+- A recording due to start while ChannelBin was restarting no longer stays Scheduled with
+  nothing to start it if its late start hits an error.
+- An error while measuring a recording's picture and sound gaps no longer leaves it stuck on
+  Analyzing.
+- Deleting a channel clears it from the recordings made from its guide, so a channel added
+  later with the same id is never mistaken for it.
+- A host check no longer reports a host as answering when it skipped it because a stream was
+  using it. (#112)
+- One failed lookup no longer leaves a host on "Doesn't resolve" after later lookups find it.
+  (#113)
+- The "active host isn't answering" warning comes down when the host or the account is
+  removed. (#114)
+- A backup host on an https account is checked over https, not marked down on port 80. (#111)
+- Deleting a channel or group removes it from any picture-in-picture channel showing it, so
+  a channel added later can never take its place. (#116)
+- A picture-in-picture swap or layout saved while a TV is tuning in reaches that TV. (#117)
+- A picture-in-picture channel whose picture freezes after it starts is restarted, instead of
+  showing nothing while listed as playing. (#118)
+- A picture-in-picture window no longer goes back to "Reconnecting" after it has already said
+  a recording took its connection.
+- Malformed requests to the picture-in-picture and sports pages' actions are refused with a
+  message instead of a server error.
+
 ## 0.49.1 - 2026-11-23
 
 The TV Guide's program chooser opens one at a time.
