@@ -395,6 +395,25 @@ class WatchingTests(_PageCase):
         self.assertNotIn('data-act="move-play"', watching)
         self.assertIn(f'<button class="menu-item" disabled>{feed.MOVE_NOWHERE_TEXT}</button>', watching)
 
+    def test_the_dashboard_names_a_play_as_this_page_does(self):
+        """dev/docs/BUGS.md 2026-11-26 @ 12:53:09 AM: the dashboard's Watching now read the
+        internal label, "group 3 (FS1)", where this page names the row and its kind."""
+        live = self.session(feed.feed_id_for_group(self.group.id))
+        live.label = f'group {self.group.id} (Game feeds)'
+        ended = self.session(feed.feed_id_for_channel(self.beta.id))
+        ended.label = f'channel {self.beta.id} (Beta)'
+        feed._finish(ended, feed.REASON_CLIENT_GONE)
+        feed._note_refused(feed.feed_id_for_channel(self.alpha.id), f'channel {self.alpha.id} (Alpha)',
+                           '192.168.1.24', f'Nothing to play for channel {self.alpha.id} (Alpha): its account is off.')
+        html = self.client.get('/').get_data(as_text=True)
+        self.assertIn('<span class="d-name">Game feeds</span>', html)
+        self.assertIn('Channel group &middot; playing Alpha', html)
+        self.assertIn('<span class="d-name">Beta</span>', html)
+        self.assertIn('<span class="d-name">Alpha</span>', html)
+        self.assertIn('Nothing to play: its account is off.', html)
+        for label in (f'group {self.group.id} (', f'channel {self.beta.id} (', f'channel {self.alpha.id} ('):
+            self.assertNotIn(label, html)
+
     def test_the_dashboard_offers_the_same_move(self):
         group_play = self.session(feed.feed_id_for_group(self.group.id))
         group_play.fails_over = True

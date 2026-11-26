@@ -1780,7 +1780,10 @@ class RedirectModeTests(_FeedCase):
         # The dashboard's redirect branch renders the tune-ins and says what it cannot see.
         html = self.client.get('/').get_data(as_text=True)
         self.assertIn('REDIRECTED', html)
-        self.assertIn('group ' + str(group.id) + ' (G)', html)
+        # Named as the IPTV Output page names it, never by its log label (dev/changelog/1746).
+        self.assertIn('<span class="d-name">G</span>', html)
+        self.assertIn('Channel group &middot; B<', html)
+        self.assertNotIn('group ' + str(group.id) + ' (G)', html)
         self.assertIn('cannot see when a redirected play ends', html)
 
     def test_a_numeric_login_in_a_hand_edited_config_still_works(self):
@@ -2050,6 +2053,161 @@ class DashboardAndBundleTests(_FeedCase):
         self.assertNotIn('username', data)
         self.assertNotIn('password', data)
         self.assertEqual(data['viewers_now'], 0)
+
+
+class ChannelChangeTakeOverTests(_Relay):
+    """dev/docs/BUGS.md 2026-11-26 @ 12:53:03 AM: an IPTV player changing channel kept the old
+    connection open 10 to 27 s, past SWITCH_GRACE_SECONDS, so the new channel was held or
+    refused by the play it replaced. With flask.behind_proxy on, the address names the player,
+    and its own old play is ended at once."""
+
+    def setUp(self):
+        super().setUp()
+        self.t.app.config['BEHIND_PROXY'] = True
+
+    def _play_from(self, address, feed_id, expect=200):
+        resp = self.client.get(f'/live/{USER}/{PASS}/{feed_id}.ts',
+                               environ_base={'REMOTE_ADDR': address})
+        self.assertEqual(resp.status_code, expect, resp.get_data(as_text=True)[:300]
+                         if resp.status_code != 200 else '')
+        if expect == 200:
+            self.open.append(resp)
+        return resp
+
+    def _two_channels(self, same_account=False):
+        ch = self._clip_channel('Paced')
+        ch.in_guide = True
+        account = self.account if same_account else make_account('Other', max_connections=1)
+        ch2 = self._clip_channel('Second', account=account)
+        ch2.in_guide = True
+        db.session.commit()
+        return ch, ch2
+
+    def _ended(self, session):
+        with session._teardown_lock:
+            pass
+        return session.live, session.reason
+
+    def test_at_the_viewer_cap_the_same_player_changing_channel_ends_its_old_play_at_once(self):
+        self.t.sandbox_config(_feed_cfg(max_viewers=1))
+        ch, ch2 = self._two_channels()
+        self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id)))
+        old = self._session()
+        asked = time.monotonic()
+        self._play_from('10.0.0.5', feed.feed_id_for_channel(ch2.id))
+        self.assertLess(time.monotonic() - asked, feed.SWITCH_GRACE_SECONDS / 2,
+                        'the change must not wait out the grace for a play its own player is leaving')
+        self.assertEqual(self._ended(old), (False, feed.REASON_REPLACED))
+        self.assertEqual(self._session().channel_id, ch2.id)
+        self.assertEqual(feed.recent_refused(), [])
+        self.assertEqual(Alert.query.filter_by(alert_type='VIEWER_REFUSED').count(), 0)
+
+    def test_on_a_one_connection_account_the_same_player_takes_its_old_plays_seat(self):
+        self.t.sandbox_config(_feed_cfg(max_viewers=3))
+        ch, ch2 = self._two_channels(same_account=True)
+        self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id)))
+        old = self._session()
+        asked = time.monotonic()
+        self._play_from('10.0.0.5', feed.feed_id_for_channel(ch2.id))
+        self.assertLess(time.monotonic() - asked, feed.SWITCH_GRACE_SECONDS / 2)
+        self.assertEqual(self._ended(old), (False, feed.REASON_REPLACED))
+        new = self._session()
+        self.assertEqual(connlim._holders.get(self.account.id), [('viewer', new.id)])
+
+    def test_a_seat_on_another_account_is_not_a_reason_to_end_the_old_play(self):
+        """Under the cap, on a free account: nothing is in the way, so nothing is ended -
+        a multi-view TV adding a second channel keeps the first."""
+        self.t.sandbox_config(_feed_cfg(max_viewers=3))
+        ch, ch2 = self._two_channels()
+        self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id)))
+        old = self._session()
+        self._play_from('10.0.0.5', feed.feed_id_for_channel(ch2.id))
+        self.assertTrue(old.live)
+        self.assertEqual(len(feed.live_sessions()), 2)
+
+    def test_another_players_play_is_waited_for_and_never_ended(self):
+        self.t.sandbox_config(_feed_cfg(max_viewers=1))
+        ch, ch2 = self._two_channels()
+        self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id)))
+        old = self._session()
+        from unittest import mock
+        with mock.patch.object(feed, 'SWITCH_GRACE_SECONDS', 0.3):
+            self._play_from('10.0.0.6', feed.feed_id_for_channel(ch2.id), expect=503)
+        self.assertTrue(old.live)
+
+    def test_without_behind_proxy_the_address_names_no_player_and_the_old_play_is_waited_for(self):
+        self.t.app.config.pop('BEHIND_PROXY', None)
+        self.t.sandbox_config(_feed_cfg(max_viewers=1))
+        ch, ch2 = self._two_channels()
+        self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id)))
+        old = self._session()
+        from unittest import mock
+        with mock.patch.object(feed, 'SWITCH_GRACE_SECONDS', 0.3):
+            self._play_from('10.0.0.5', feed.feed_id_for_channel(ch2.id), expect=503)
+        self.assertTrue(old.live)
+        self.assertEqual(old.player, '')
+
+    def test_tuning_back_to_the_channel_a_play_took_over_from_waits(self):
+        """Two players behind one address past the cap: the one that was cut tunes back in to
+        its channel, and ending the play that cut it would start the two cutting each other on
+        every retry. A new channel still takes over at once."""
+        self.t.sandbox_config(_feed_cfg(max_viewers=1))
+        ch, ch2 = self._two_channels()
+        third = make_account('Third', max_connections=1)
+        ch3 = self._clip_channel('Third', account=third)
+        ch3.in_guide = True
+        db.session.commit()
+        self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id)))
+        first = self._session()
+        self._play_from('10.0.0.5', feed.feed_id_for_channel(ch2.id))
+        self.assertEqual(self._ended(first), (False, feed.REASON_REPLACED))
+        second = self._session()
+        from unittest import mock
+        with mock.patch.object(feed, 'SWITCH_GRACE_SECONDS', 0.3):
+            self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id), expect=503)
+        self.assertTrue(second.live)
+        self._play_from('10.0.0.5', feed.feed_id_for_channel(ch3.id))
+        self.assertEqual(self._ended(second), (False, feed.REASON_REPLACED))
+        self.assertEqual(self._session().channel_id, ch3.id)
+
+    def test_a_seat_the_old_play_is_not_in_the_way_of_is_not_a_reason_to_end_it(self):
+        """The new channel's account is full because of a recording; the old play is on another
+        account, so ending it would free nothing."""
+        self.t.sandbox_config(_feed_cfg(max_viewers=3))
+        ch, ch2 = self._two_channels()
+        self.assertTrue(connlim.try_acquire(self.account.id, 'recording', 4242))
+        self.addCleanup(connlim.release, self.account.id, 'recording', 4242)
+        self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch2.id)))
+        old = self._session()
+        from unittest import mock
+        with mock.patch.object(feed, 'SWITCH_GRACE_SECONDS', 0.3):
+            self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id), expect=409)
+        self.assertTrue(old.live)
+
+    def test_a_reconnect_to_the_same_channel_is_not_called_a_channel_change(self):
+        self.t.sandbox_config(_feed_cfg(max_viewers=1))
+        ch, _ch2 = self._two_channels()
+        self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id)))
+        old = self._session()
+        self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id))
+        self.assertEqual(self._ended(old), (False, feed.REASON_REPLACED))
+        self.assertNotIn('changed channel', old.reason_text())
+        self.assertIn('tuned in again', old.reason_text())
+
+    def test_a_player_with_two_plays_has_neither_ended(self):
+        """A multi-view TV at the cap: which of its two plays it is leaving cannot be told."""
+        self.t.sandbox_config(_feed_cfg(max_viewers=2))
+        ch, ch2 = self._two_channels()
+        third = make_account('Third', max_connections=1)
+        ch3 = self._clip_channel('Third', account=third)
+        ch3.in_guide = True
+        db.session.commit()
+        self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id)))
+        self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch2.id)))
+        from unittest import mock
+        with mock.patch.object(feed, 'SWITCH_GRACE_SECONDS', 0.3):
+            self._play_from('10.0.0.5', feed.feed_id_for_channel(ch3.id), expect=503)
+        self.assertEqual(len(feed.live_sessions()), 2)
 
 
 if __name__ == '__main__':

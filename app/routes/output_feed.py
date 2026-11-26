@@ -17,7 +17,7 @@ calls get.php, and builds `/live/<user>/<pass>/<id>.ts` against the address it w
 import logging
 import os
 
-from flask import Blueprint, Response, g, jsonify, redirect, request, send_from_directory
+from flask import Blueprint, Response, current_app, g, jsonify, redirect, request, send_from_directory
 
 from .. import output_feed
 from ..config import load_config
@@ -133,9 +133,12 @@ def live(username, password, feed_id):
     a sports channel's waiting screen in every mode when it has nothing to play. Every refusal
     names its reason in the body."""
     client = request.remote_addr or ''
+    # The address names one player only when ProxyFix put the player's own there: with the
+    # setting off, a reverse proxy in front gives every player its address (dev/changelog/1744).
+    player = client if current_app.config.get('BEHIND_PROXY') else ''
     try:
         if output_feed.relays(g.feed_cfg, feed_id):
-            session = output_feed.start_session(feed_id, client, g.cfg)
+            session = output_feed.start_session(feed_id, client, g.cfg, player=player)
         else:
             # A sports channel with nothing on is streamed its waiting screen in this mode too.
             target, session = output_feed.redirect_play(feed_id, client, g.cfg)

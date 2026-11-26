@@ -162,6 +162,7 @@ REASON_SCREEN_GONE = 'screen_gone'
 REASON_WINDOW_OPENED = 'window_opened'
 REASON_PICTURE_FAILED = 'picture_failed'
 REASON_CARD_FAILED = 'card_failed'
+REASON_REPLACED = 'replaced'
 
 #: What two of the reasons read as on a sports channel, which has no group.
 SPORTS_REASON_TEXT = {
@@ -192,6 +193,7 @@ REASON_TEXT = {
     REASON_SCREEN_FAILED: 'Cut - the waiting screen stopped playing.',
     REASON_PICTURE_FAILED: 'Cut - the Up next picture stopped playing.',
     REASON_CARD_FAILED: 'Cut - the picture-in-picture card stopped playing.',
+    REASON_REPLACED: 'Ended - the same IPTV player tuned in again, to another channel or this one.',
     REASON_SCREEN_GONE: 'Cut - the sports channel is no longer on the IPTV output.',
     REASON_WINDOW_OPENED: ('Ended - the game came on. In redirect mode ChannelBin cannot tune a player in, '
                            'so the waiting screen stops and the next tune-in gets the game.'),
@@ -1106,12 +1108,34 @@ def _play_found(play: Play, found, allowed, exclude_ids, now, cfg, viewer_id) ->
         play.label = f'{play.label}: {game}'
         picked = game_sources(found.event.id, now, cfg, listings=found.listings)
         sources = picked.sources if picked is not None else []
-        if not sources:
+        if not sources and not found.ended:
             play.why_none = (f'your guide lists {game} on {counted(len(found.channels), "channel")} now, but '
                              f'none of those listings is one Record would pick for it')
             return play
-    play.member, why, source = _sports_member(sources, blocked_account_ids_now(), allowed, exclude_ids,
-                                              live=True, viewer_id=viewer_id)
+    blocked = blocked_account_ids_now()
+    play.member, why, source = (_sports_member(sources, blocked, allowed, exclude_ids,
+                                               live=True, viewer_id=viewer_id)
+                                if sources else (None, None, None))
+    if play.member is None and found.ended:
+        # Every channel listing the game now failed or cannot be used: a channel whose listing of
+        # it ended inside the window may still carry it running long, in Record's order over
+        # those listings (dev/changelog/1745).
+        later = game_sources(found.event.id, now, cfg, listings=found.ended)
+        if later is not None and later.sources:
+            member, later_why, _source = _sports_member(later.sources, blocked, allowed, exclude_ids,
+                                                        live=True, viewer_id=viewer_id)
+            if member is not None:
+                play.member = member
+                play.picked = (f'No channel whose guide lists {game} now could be used, so this is one '
+                               f'whose listing of it has ended: the game may be running long.')
+                return play
+            if not sources:
+                why = later_why
+        elif not sources:
+            play.why_none = (f'your guide lists {game} on {counted(len(found.channels), "channel")} now, but '
+                             f'none of those listings, or of the ones that ended a little earlier, is one '
+                             f'Record would pick for it')
+            return play
     if play.member is None:
         play.why_none = sports_drop_words(why, game, named=found.named is not None)
     elif picked.why is not None:
@@ -1512,6 +1536,13 @@ class RelaySession:
     # resolves with resolve_play(preview=True), relays in every mode because it cannot tune in
     # again, and raises no alert when refused - the preview names the refusal itself.
     preview: bool = False
+    # The IPTV player's address when it names one player - flask.behind_proxy is on, so the
+    # address is the player's and not a reverse proxy's - else ''. Only ever compared with
+    # another play's, to tell the play a player is changing channel from (_take_over).
+    player: str = ''
+    # The feed id of the play this one ended when it took over from its player's last one
+    # (_take_over), None if it never did.
+    replaced_feed_id: Optional[int] = None
     last_recheck_mono: float = 0.0
     _reserve_short_logged: bool = False
     _finishing: bool = False
@@ -1600,6 +1631,7 @@ class RelaySession:
         return {
             'session_id': self.id, 'feed_id': self.feed_id, 'label': self.label,
             'client': self.client, 'group_id': self.group_id, 'channel_id': self.channel_id,
+            'event_id': self.event_id,
             'channel_name': self.channel_name, 'account_id': self.account_id,
             'state': self.state, 'reason': self.reason, 'reason_text': self.reason_text(),
             'detail': self.detail, 'bytes_sent': self.bytes_sent,
@@ -1743,13 +1775,25 @@ def _refuse(feed_id: int, label: str, message: str, status: int, source_tail: st
     raise FeedRefused(message, status)
 
 
-def start_session(feed_id: int, client: str, cfg=None, preview: bool = False) -> RelaySession:
+def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
+                  player: str = '') -> RelaySession:
     """Start relaying `feed_id` to one IPTV player. Raises FeedRefused with a user-facing message:
     404 for an id the feed does not serve, 503 at the viewer cap, 409 when nothing is
     playable (a blocked account, the allowlist, the connection limit) and 500 when ffmpeg
     could not start. Requires an app context; the returned session is registered and reaped.
-    `preview` is a browser preview's play (RelaySession.preview), in every mode.
+    `preview` is a browser preview's play (RelaySession.preview), in every mode. `player` is
+    RelaySession.player: the address when it names one IPTV player, else ''.
     """
+    session = _start_session(feed_id, client, cfg, preview, player)
+    if player and not session.player:
+        # A waiting screen, card or Up next picture: built without it, and the play a later
+        # channel change from this player leaves all the same.
+        with _lock:
+            session.player = player
+    return session
+
+
+def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str) -> RelaySession:
     from flask import current_app
     from .config import load_config
 
@@ -1764,7 +1808,7 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False) ->
     if play.pip is not None and play.pip.set_up:
         device, combine_off = _pip_engine().gpu_state(cfg)
         if device:
-            session = _start_combined(play, client, cfg, device)
+            session = _start_combined(play, client, cfg, device, player)
             if session is not None:
                 return session
             # Neither picture can play right now, or no slot is free: the card says which.
@@ -1800,25 +1844,10 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False) ->
         pip_row_id=play.pip.row_id if play.pip is not None else None,
         # A set-up picture-in-picture channel reaching here plays its big picture alone, a
         # plain stream copy on one connection: nothing can combine the two (section 7.3).
-        combine_off=combine_off,
+        combine_off=combine_off, player=player,
     )
-    # The cap is counted and the session registered under the ONE lock, so two tune-ins in
-    # the same instant cannot both pass the count (the check-then-act shape
-    # .claude/rules/background-jobs.md names). Registered BEFORE the seat is taken, so a
-    # recording preempting in the window between acquire and Popen finds something to flag.
-    # A play on a waiting screen is not counted: it holds no seat and plays ChannelBin's own
-    # clip (dev/changelog/1534).
     deadline = time.monotonic() + SWITCH_GRACE_SECONDS
-    while True:
-        with _lock:
-            live = sum(1 for s in _sessions.values() if s.counted)
-            if live < cap:
-                _sessions[session.id] = session
-                _prune_ended_locked()
-        if live < cap or time.monotonic() >= deadline:
-            break
-        time.sleep(_SWITCH_POLL)
-    if live >= cap:
+    if not _claim_slot(session, cap, deadline):
         if play.sports:
             # A game that is on and cannot start here yet waits on the screen, which says
             # why and starts the game by itself when a slot is free.
@@ -1849,7 +1878,82 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False) ->
     return session
 
 
-def _start_combined(play: Play, client: str, cfg: dict, device: str) -> Optional[RelaySession]:
+def _claim_slot(session: RelaySession, cap: int, deadline: float) -> bool:
+    """Register `session` under the viewer cap. True once it is registered; False, with nothing
+    registered, when the cap is still full at `deadline`.
+
+    The cap is counted and the session registered under the ONE lock, so two tune-ins in the
+    same instant cannot both pass the count (the check-then-act shape
+    .claude/rules/background-jobs.md names). Registered BEFORE the seat is taken, so a
+    recording preempting in the window between acquire and Popen finds something to flag. A
+    play on a waiting screen is not counted: it holds no seat and plays ChannelBin's own clip
+    (dev/changelog/1534). A full cap is asked again until `deadline` (SWITCH_GRACE_SECONDS),
+    after the play this player is changing channel from is ended, when it can be told
+    (_take_over)."""
+    asked = False
+    while True:
+        with _lock:
+            live = sum(1 for s in _sessions.values() if s.counted)
+            if live < cap:
+                _sessions[session.id] = session
+                _prune_ended_locked()
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        if not asked:
+            asked = True
+            if _take_over(session):
+                continue
+        time.sleep(_SWITCH_POLL)
+
+
+def _leaving_play(session: RelaySession) -> Optional[RelaySession]:
+    """The play `session`'s IPTV player is changing channel from: its one other live play on
+    the output. None when the player cannot be told from others (RelaySession.player is ''), it
+    has no other play, or more than one (a multi-view TV, and which it is leaving cannot be
+    told), when that play is not counted against the cap, or when `session` asks for the very
+    channel that play took over from. That last is what a second player behind one address
+    does when it tunes back in to the channel it was cut from, and ending the play that cut it
+    would start the two cutting each other on every retry; a person flipping back to the last
+    channel waits as any tune-in did before (dev/changelog/1744)."""
+    if not session.player or session.preview or session.internal:
+        return None
+    with _lock:
+        mine = [s for s in _sessions.values()
+                if s is not session and s.live and not s.internal and not s.preview
+                and s.player == session.player]
+    if len(mine) != 1 or not mine[0].counted:
+        return None
+    old = mine[0]
+    if old.replaced_feed_id is not None and old.replaced_feed_id == session.feed_id:
+        return None
+    return old
+
+
+def _take_over(session: RelaySession, account_id: Optional[int] = None) -> bool:
+    """End the play `session`'s IPTV player is changing channel from (_leaving_play) so the new
+    one can start now: an IPTV player asks for the new channel before it closes the old one,
+    and prod measured the old one going 2 to 27 s later (dev/docs/BUGS.md 2026-11-12,
+    dev/changelog/1744). With `account_id`, only when the old play's seat is the one that
+    account needs. True when it ended one."""
+    old = _leaving_play(session)
+    if old is None:
+        return False
+    if account_id is not None:
+        standing = connlim.seat_standing([account_id], 'viewer', exclude_holder=('viewer', old.id))
+        if standing.get(account_id) != connlim.SEAT_FREE:
+            return False
+    if not _finish(old, REASON_REPLACED):
+        return False
+    with _lock:
+        session.replaced_feed_id = old.feed_id
+    log.info('Viewer %s from %s: %s ended %s, the play the same IPTV player is changing channel from',
+             session.id, session.client, session.label, old.id)
+    return True
+
+
+def _start_combined(play: Play, client: str, cfg: dict, device: str,
+                    player: str = '') -> Optional[RelaySession]:
     """Start `play`, a set-up picture-in-picture channel's, on its two pictures combined
     (app/pip_engine.py). The session holds no seat and names no channel: its pictures do. None,
     with nothing registered or held, when no slot is free or neither picture can play right
@@ -1863,21 +1967,10 @@ def _start_combined(play: Play, client: str, cfg: dict, device: str) -> Optional
         group_id=None, channel_id=None, channel_name='', account_id=None,
         ring=Ring(int(fcfg.get('buffer_mb') or 64) * 1024 * 1024, float(fcfg.get('reserve_seconds') or 0)),
         **_session_limits(cfg, fcfg), started_mono=time.monotonic(), fails_over=True,
-        app=current_app._get_current_object(), preview=play.preview, pip_row_id=tuned.row_id)
+        app=current_app._get_current_object(), preview=play.preview, pip_row_id=tuned.row_id,
+        player=player)
     cap = int(fcfg.get('max_viewers') or 1)
-    # Counted and registered under the one lock, with the channel-change grace, as
-    # start_session() does for a plain play.
-    deadline = time.monotonic() + SWITCH_GRACE_SECONDS
-    while True:
-        with _lock:
-            live = sum(1 for s in _sessions.values() if s.counted)
-            if live < cap:
-                _sessions[session.id] = session
-                _prune_ended_locked()
-        if live < cap or time.monotonic() >= deadline:
-            break
-        time.sleep(_SWITCH_POLL)
-    if live >= cap:
+    if not _claim_slot(session, cap, time.monotonic() + SWITCH_GRACE_SECONDS):
         return None
     try:
         began = _pip_engine().begin(session, tuned, cfg, device)
@@ -1936,10 +2029,12 @@ def _take_seat(session: RelaySession, member, first: bool, deadline: float = 0.0
     (connection_limits.move_seat - never release-then-acquire, which can leave the session
     holding nothing). A first play refused the seat asks again until `deadline` while another
     play of the output is live: that is the channel an IPTV player is changing from, about
-    to let its seat go (SWITCH_GRACE_SECONDS). With no other play the refusal is at once."""
+    to let its seat go (SWITCH_GRACE_SECONDS), and first ends it when it is this player's own
+    and holds the seat needed (_take_over). With no other play the refusal is at once."""
     if first:
         # A picture's own plays are not a channel being left: they are who it plays for.
         mine = session.picture.pair.plays if session.picture is not None else ()
+        asked = False
         while True:
             if connlim.try_acquire(member.account_id, 'viewer', session.id):
                 return True
@@ -1947,6 +2042,10 @@ def _take_seat(session: RelaySession, member, first: bool, deadline: float = 0.0
             # anything asks (dev/docs/DESIGN-pip-channels.md 9).
             if _pip_engine().drop_lingering() and connlim.try_acquire(member.account_id, 'viewer', session.id):
                 return True
+            if not asked:
+                asked = True
+                if _take_over(session, member.account_id):
+                    continue
             # Any other play, not only one on this account: two accounts can be one login
             # and so one seat (app/account_links.py).
             with _lock:
@@ -2234,7 +2333,7 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
     if not on_screen and reason != REASON_SHUTDOWN:
         # A slot or a seat may have come free for a game waiting on the screen for one.
         recheck_waiting(held_only=True)
-    level = logging.INFO if reason in (REASON_CLIENT_GONE, REASON_SHUTDOWN) else logging.WARNING
+    level = logging.INFO if reason in (REASON_CLIENT_GONE, REASON_SHUTDOWN, REASON_REPLACED) else logging.WARNING
     if session.internal:
         level = logging.INFO   # the engine says what became of the picture (pip_engine.Picture.ended)
     log.log(level, 'Viewer %s: %s stopped after %s - %s%s', session.id, session.label,
