@@ -608,6 +608,7 @@ def _check_output_feed(ctx):
     """Evaluated only while the feed is on: a credential is stored, the ring holds the
     reserve, something is served, and every held-seats account still exists. The detail
     carries the URL to type into the IPTV player (DESIGN-output-feed.md section 8)."""
+    from . import public_listener
     from .output_feed import MODE_MIXED, MODE_PROXY, MODE_REDIRECT, max_reserve_seconds
     feed = ctx.feed
     tested = 'Read the IPTV output settings and counted what the TV Guide would serve'
@@ -618,10 +619,13 @@ def _check_output_feed(ctx):
     url = public_url(ctx.cfg)
     detail = (f'In an IPTV player, add an Xtream Codes account with the server set to '
               f'{url or "this ChannelBin address"} and the login set on the IPTV Output page.')
-    if not feed['credentials_set']:
+    if not feed['credentials_set'] and not feed['logins_on']:
         return Result(PROBLEM, tested,
                       'The IPTV output is on but has no username or password, so every request '
                       'is refused', detail=detail)
+    public = _output_public_port(feed, tested, detail)
+    if public is not None and public.status == PROBLEM:
+        return public
     if not feed['reserve_fits']:
         return Result(PROBLEM, tested,
                       f'The buffer ({fcfg.get("buffer_mb")} MB) cannot hold the reserve '
@@ -636,6 +640,8 @@ def _check_output_feed(ctx):
     if not feed['served']:
         return Result(ATTENTION, tested,
                       'The TV Guide is empty, so the IPTV player sees no channels', detail=detail)
+    if public is not None:
+        return public
     if feed['mode'] == MODE_PROXY:
         mode = 'relayed through ChannelBin'
     elif feed['mode'] == MODE_MIXED:
@@ -644,9 +650,55 @@ def _check_output_feed(ctx):
         mode = 'played straight from the provider'
     else:
         raise ValueError(f'Unknown feed mode "{feed["mode"]}"')
-    return Result(READY, tested,
-                  f'{feed["served"]} {plural(feed["served"], "channel")} served, {mode}',
-                  detail=detail)
+    summary = f'{feed["served"]} {plural(feed["served"], "channel")} served, {mode}'
+    if feed['listener']['state'] == public_listener.STATE_SERVING:
+        port = feed['listener']['port']
+        summary += f'; the public port {port} is open, and every play on it is relayed'
+        detail += (f' People outside your network use {feed["public_url"]} as the server, with '
+                   f'their own login.')
+    return Result(READY, tested, summary, detail=detail)
+
+
+def _output_public_port(feed, tested, detail):
+    """The IPTV output's public port (app/public_listener.py, dev/changelog/1761): None when
+    there is nothing to say, else the Result to report."""
+    from flask import current_app
+    from .public_listener import STATE_FAILED, STATE_OFF, STATE_SERVING
+    want = feed['public_port']
+    listener = feed['listener']
+    state = listener['state']
+    if state == STATE_FAILED:
+        return Result(PROBLEM, tested,
+                      f'The public port {listener["host"]}:{listener["port"]} could not be opened '
+                      f'({listener["error"]}), so nothing outside your network can reach the IPTV '
+                      f'output. Free the port or pick another, then restart ChannelBin',
+                      detail=detail)
+    if state == STATE_SERVING and listener['port'] != want:
+        now = f'set to {want}' if want else 'turned off'
+        return Result(ATTENTION, tested,
+                      f'The public port is {now}, but port {listener["port"]} stays open until '
+                      f'ChannelBin is restarted', detail=detail)
+    if state == STATE_OFF and want:
+        return Result(ATTENTION, tested,
+                      f'The public port is set to {want} but is not open yet. Restart ChannelBin '
+                      f'to open it', detail=detail)
+    if state == STATE_OFF:
+        return None
+    if state != STATE_SERVING:
+        raise ValueError(f'Unknown public port state "{state}"')
+    if not current_app.config.get('BEHIND_PROXY'):
+        return Result(PROBLEM, tested,
+                      f'The public port {want} is open but "Behind a reverse proxy" is off (or '
+                      f'waits for a restart), so ChannelBin sees the proxy in place of every IPTV '
+                      f'player: a few wrong passwords from anyone lock everyone out, and every '
+                      f'play is listed under the proxy\'s address. Turn it on in Settings and '
+                      f'restart', detail=detail)
+    if not feed['public_url']:
+        return Result(ATTENTION, tested,
+                      f'The public port {want} is open, but the address people outside your '
+                      f'network use is not set, so the details the IPTV Output page copies for '
+                      f'them name this one. Set it under Settings, IPTV output', detail=detail)
+    return None
 
 
 def _check_accounts_any(ctx):

@@ -293,6 +293,10 @@ integrations:
     xmltv_days: 3           # listings depth in xmltv.php
     sports_before_minutes: 60   # a sports channel plays the channel listing its game from this long
     sports_after_minutes: 120   # before the listing starts to this long after it ends (pregame, overtime)
+    public_port: 0          # a second port answering only the IPTV output, for a reverse proxy to put
+                            # on the internet (README); 0 = off, 38517 suggested; restart required
+    public_host: 0.0.0.0    # where the public port listens
+    public_url: ''          # the address people outside your network use, like https://tv.example.com
 
 database:
   # path and logging.file default to repo-relative locations (dvr.db beside the app,

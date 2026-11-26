@@ -194,6 +194,16 @@ def pip_remove(row_id):
     return jsonify({'success': True, 'name': name, 'cut': cut})
 
 
+@iptv_output_bp.route('/api/iptv-output/lockouts/clear', methods=['POST'])
+def clear_lockouts():
+    """Let every address locked out of the IPTV output after wrong logins try again now
+    (output_feed.login_failures, dev/changelog/1761)."""
+    cleared = output_feed.login_failures.clear()
+    log.info('IPTV output: wrong-login lockouts cleared from the IPTV Output page (%s)',
+             counted(cleared, 'address', 'addresses'))
+    return jsonify({'success': True, 'cleared': cleared})
+
+
 @iptv_output_bp.route('/api/iptv-output/plays/<session_id>/stop', methods=['POST'])
 def stop_play(session_id):
     if not output_feed.stop_session(session_id):

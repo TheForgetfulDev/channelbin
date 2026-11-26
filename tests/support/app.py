@@ -388,6 +388,7 @@ def reset_module_globals():
     import app.connection_limits as connection_limits
     import app.admission as admission
     import app.auth as auth
+    import app.public_listener as public_listener
     import app.channel_search as channel_search
     import app.channel_tester as channel_tester
     import app.concatenator as concatenator
@@ -467,7 +468,10 @@ def reset_module_globals():
     # facts and stay (tests/test_global_state_isolation.py).
     toolchain._gpu_trial.clear()
     # Lockout counters are keyed by IP, and every test client is 127.0.0.1.
-    auth._failures = {}
+    auth.web_login.reset()
+    # A public port a test opened is a listening socket and a serving thread; stop() shuts
+    # both and puts the status back to off (app/public_listener.py).
+    public_listener.reset_for_tests()
     # Latched after the first probe that cannot run ffprobe, so a module that exercised the
     # missing-binary path leaves the next one's identical probe silent - i.e. no warning and
     # no standing alert where the test set up a freshly-missing tool.
