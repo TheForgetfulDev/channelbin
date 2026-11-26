@@ -572,6 +572,45 @@
     count();
   }
 
+  /* ---- A login's accounts (dev/changelog/1765) ------------------------------------------- */
+  async function chooseAccounts(tr) {
+    const d = await jsonFetch(`/api/iptv-output/logins/${tr.dataset.login}/accounts`);
+    const picked = new Set(d.picked);
+    const rowHtml = (a) => `<label class="check-row"><input type="checkbox" value="${a.id}"${picked.has(a.id) ? ' checked' : ''}> `
+      + `<span>${escHtml(a.name)}${a.on_output ? '' : ' <span class="text-muted">Not one of the output\'s accounts</span>'}</span></label>`;
+    const body = `<div>
+      <label class="fp-radio"><input type="radio" name="of-la-mode" value="output"${d.own ? '' : ' checked'}> The IPTV output's accounts
+        <span class="text-muted">The ones switched on in the Accounts card, and whatever that list becomes later.</span></label>
+      <label class="fp-radio"><input type="radio" name="of-la-mode" value="pick"${d.own ? ' checked' : ''}> Only the accounts I pick
+        <span class="text-muted">These take the place of the output's list for this login, so one the output leaves out can be picked here. Its IPTV player does not list picture-in-picture channels: their pictures are shared by everyone watching and come from the output's accounts.</span></label>
+      <div class="of-la-pick"${d.own ? '' : ' hidden'}>${d.accounts.map(rowHtml).join('') || '<p class="card-note">There are no accounts yet.</p>'}</div>
+      <p class="card-note">Their IPTV player shows the change the next time it loads its channel list. A play from an account you take out is cut now. A recording still takes a connection from any of these plays when it needs one.</p></div>`;
+    const overlay = buildModal({
+      title: `Accounts for ${tr.dataset.name}`,
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn' },
+        { label: 'Save', class: 'btn btn-primary', onClick: (close) => {
+          const output = $('input[name="of-la-mode"]:checked', overlay).value === 'output';
+          const ids = $$('.of-la-pick input[type="checkbox"]', overlay).filter((b) => b.checked).map((b) => Number(b.value));
+          if (!output && !ids.length) {
+            showToast("Pick at least one account, or use the IPTV output's accounts.", { type: 'error' });
+            return false;
+          }
+          post(`/api/iptv-output/logins/${tr.dataset.login}`, { accounts: output ? null : ids }).then((res) => {
+            close();
+            return refresh(CARDS).then(() => showToast(`${output ? `${tr.dataset.name} plays from the IPTV output's accounts.`
+              : `${tr.dataset.name} plays only from the accounts you picked.`}${loginCutNote(res.ended)}`));
+          }).catch(fail);
+          return false;
+        } },
+      ],
+    });
+    $$('input[name="of-la-mode"]', overlay).forEach((r) => r.addEventListener('change', () => {
+      $('.of-la-pick', overlay).hidden = r.value === 'output';
+    }));
+  }
+
   async function clearLockouts() {
     const d = await post('/api/iptv-output/lockouts/clear');
     await refresh(CARDS);
@@ -610,6 +649,7 @@
     else if (act === 'login-reveal') guarded(revealLogin)(t);
     else if (act === 'login-copy') guarded(copyLogin)(t.closest('tr'));
     else if (act === 'login-channels') guarded(chooseChannels)(t.closest('tr'));
+    else if (act === 'login-accounts') guarded(chooseAccounts)(t.closest('tr'));
     else if (act === 'lockouts-clear') guarded(clearLockouts)();
   });
   document.addEventListener('change', (e) => {

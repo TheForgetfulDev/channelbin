@@ -22,7 +22,7 @@ from . import db
 from .config import MASK_SENTINEL, PROXY_FIX_ARGS, public_url
 from .database import (FEED_PICTURE_BACK, FEED_PICTURE_STOPPED, FEED_PLAY_ENDED, FEED_PLAY_PICTURE, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED, Account,
                        EPGEntry, OutputFeedLogin, OutputFeedPlay, UserPref)
-from .fmt_utils import counted, fmt_bytes, fmt_duration
+from .fmt_utils import counted, fmt_bytes, fmt_duration, join_labels
 from .tz_utils import day_label, format_local, get_display_tz, is_24h
 
 log = logging.getLogger(__name__)
@@ -812,29 +812,43 @@ def _accounts(rows, sessions, accounts: dict, cfg: dict, fcfg: dict) -> list:
     return out
 
 
-def _logins(sessions, rows) -> list:
+def _logins(sessions, rows, accounts: dict) -> list:
     """The Logins for other users card: one query, each login's live plays counted from the
-    plays already in hand (dev/changelog/1760), and its channels from the catalog already in
-    hand (dev/changelog/1764)."""
+    plays already in hand (dev/changelog/1760), its channels from the catalog already in hand
+    (dev/changelog/1764), and its own accounts (dev/changelog/1765) named from `accounts`
+    ({id: Account}, already loaded). A login's own accounts are applied to that catalog in
+    memory (output_feed.left_out_for_login), never by asking for it again."""
     playing = {}
     for s in sessions:
         if s.feed_login_id is not None:
             playing[s.feed_login_id] = playing.get(s.feed_login_id, 0) + 1
     existing = {output_feed.lineup_key(r.feed_id) for r in rows}
-    offered = {output_feed.lineup_key(r.feed_id) for r in rows if r.offered}
     out = []
     for row in OutputFeedLogin.query.order_by(db.func.lower(OutputFeedLogin.name),
                                               OutputFeedLogin.id).all():
-        lineup = output_feed.lineup_of(row)
+        lineup, own = output_feed.lineup_of(row), output_feed.accounts_of(row)
         view = {'id': row.id, 'name': row.name, 'username': row.username, 'on': row.enabled,
                 'max_streams': row.max_streams, 'playing': playing.get(row.id, 0),
-                'everything': lineup is None}
+                'everything': lineup is None, 'own_accounts': own is not None}
+        if own is not None:
+            names = sorted((accounts[a].name for a in own if a in accounts), key=str.lower)
+            view['accounts_text'] = join_labels(names) if names else 'None'
+            gone = sum(1 for a in own if a not in accounts)
+            view['accounts_gone_text'] = f'{counted(gone, "picked account")} deleted since' if gone else ''
         if lineup is not None:
-            # What its IPTV player lists (a swapped copy is a channel of its own there), and
-            # the picks it does not list because the output does not offer them right now.
-            listed = sum(1 for r in rows if r.offered and output_feed.lineup_key(r.feed_id) in lineup)
-            view['channels_text'] = counted(listed, 'channel')
-            view['channels_off'] = len((lineup & existing) - offered)
+            # What its IPTV player lists (a swapped copy is a channel of its own there), the
+            # picks it does not list because the output does not offer them right now, and
+            # those its own accounts leave out.
+            listed, by_accounts = set(), set()
+            for r in rows:
+                why = output_feed.left_out_for_login(r, own) if r.on_output else None
+                if why == '':
+                    listed.add(output_feed.lineup_key(r.feed_id))
+                elif why in output_feed.LOGIN_LEFT_OUT:
+                    by_accounts.add(output_feed.lineup_key(r.feed_id))
+            view['channels_text'] = counted(len(lineup & listed), 'channel')
+            view['channels_off_accounts'] = len(lineup & by_accounts)
+            view['channels_off'] = len((lineup & existing) - listed - by_accounts)
         out.append(view)
     return out
 
@@ -843,25 +857,48 @@ def _logins(sessions, rows) -> list:
 LINEUP_TAKEN_OFF = 'Taken off the output'
 
 
-def lineup_choices(cfg: dict, lineup) -> dict:
+def lineup_choices(cfg: dict, lineup, accounts=None) -> dict:
     """The Choose channels dialog's list (routes/iptv_output.py::login_channels): every row the
     output has, in its order, offered right now or not, a picture-in-picture channel's swapped
     copy folded into its channel, and which of them `lineup` picks (None for everything). A
-    pick of a row the output no longer has at all is not listed, so the next save drops it."""
+    pick of a row the output no longer has at all is not listed, so the next save drops it.
+    `accounts` is the login's own account list (None for the output's), which says which rows
+    its player would leave out (output_feed.left_out_for_login, dev/changelog/1765)."""
     choices, by_key = [], {}
     for r in output_feed.catalog(cfg, everything=True):
         key = output_feed.lineup_key(r.feed_id)
         if key in by_key:
             by_key[key]['swapped'] = True     # the swapped copy, right after its channel
             continue
-        off = '' if r.offered else (LINEUP_TAKEN_OFF if not r.on_output
-                                    else f'Not on the output now: {r.left_out}')
+        why = output_feed.left_out_for_login(r, accounts)
+        if not r.on_output:
+            off = LINEUP_TAKEN_OFF
+        elif why in output_feed.LOGIN_LEFT_OUT:
+            off = f'Not for this login: {why}'
+        elif why:
+            off = f'Not on the output now: {why}'
+        else:
+            off = ''
         by_key[key] = {'id': key, 'name': r.name, 'category': r.category, 'num': r.num,
                        'off': off, 'swapped': False}
         choices.append(by_key[key])
     return {'everything': lineup is None,
             'picked': sorted(k for k in (lineup or ()) if k in by_key),
             'rows': choices}
+
+
+def account_choices(cfg: dict, accounts) -> dict:
+    """The Choose accounts dialog's list (routes/iptv_output.py::login_accounts): every account
+    by name, whether the output's own list has it (`on_output`), and which `accounts` (a login's
+    own list, None for the output's) picks. A pick of an account since deleted is not listed,
+    so the next save drops it. One query."""
+    allowed = output_feed.allowed_account_ids(output_feed.feed_config(cfg))
+    rows = sorted(Account.query.all(), key=lambda a: (a.name or '').lower())
+    ids = {a.id for a in rows}
+    return {'own': accounts is not None,
+            'picked': sorted(a for a in (accounts or ()) if a in ids),
+            'accounts': [{'id': a.id, 'name': a.name,
+                          'on_output': allowed is None or a.id in allowed} for a in rows]}
 
 
 def _public(fcfg: dict, connect_server: str, tz, h24) -> dict:
@@ -930,7 +967,7 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
              for r in rows]
     address = _address(cfg, host_url)
     max_viewers = int(fcfg.get('max_viewers') or 1)
-    logins = _logins(output_feed.live_sessions() if state == STATE_ON else [], rows)
+    logins = _logins(output_feed.live_sessions() if state == STATE_ON else [], rows, accounts)
     connect = _connect(fcfg, address['base'])
     public = _public(fcfg, connect['server'], tz, h24)
     # The public port relays every play on it, whatever the mode (dev/changelog/1761).

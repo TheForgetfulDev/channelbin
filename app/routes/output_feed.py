@@ -109,7 +109,7 @@ def xmltv():
     rows = output_feed.catalog(g.cfg, login=g.feed_login)
     # Built whole inside the request: the generator reads the database, and a body
     # streamed after the request ends has no session to read it with.
-    body = ''.join(output_feed.xmltv_lines(rows, g.cfg))
+    body = ''.join(output_feed.xmltv_lines(rows, g.cfg, accounts=g.feed_login.accounts))
     return Response(body, mimetype='application/xml')
 
 

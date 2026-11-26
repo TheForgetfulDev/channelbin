@@ -5101,16 +5101,17 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .of-held { width: auto; max-width: 100%; }
 .of-login label { display: block; margin-top: 12px; }
 .of-login .card-note { margin-top: 12px; }
-/* A login's Choose channels dialog (static/js/iptv-output.js::chooseChannels, dev/changelog/1764):
-   the list scrolls inside the dialog, so the search and the buttons above it stay in view. */
-.of-lu-pick { margin-top: 10px; }
+/* A login's Choose channels and Choose accounts dialogs (static/js/iptv-output.js, dev/changelog/1764,
+   1765): the channel list scrolls inside the dialog, so the search and the buttons above it stay in view. */
+.of-lu-pick, .of-la-pick { margin-top: 10px; }
 .of-lu-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .of-lu-tools .search { flex: 1 1 12rem; min-width: 0; }
 .of-lu-n { margin-left: auto; color: var(--text-muted); font-size: var(--fs-sm); }
 .of-lu-list { max-height: 50vh; overflow-y: auto; margin-top: 8px; padding: 2px 10px 8px;
   border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }
 .of-lu-head { margin-top: 10px; color: var(--text-muted); font-size: var(--fs-sm); font-weight: 600; }
-.of-lu-list .check-row .text-muted, .of-lu-list .check-row .text-warning { font-size: var(--fs-sm); }
+.of-lu-list .check-row .text-muted, .of-lu-list .check-row .text-warning,
+.of-la-pick .check-row .text-muted { font-size: var(--fs-sm); }
 
 /* Picture-in-picture channels (mockup 63, dev/docs/DESIGN-pip-channels.md 12).
    The stand-in picture: a channel's layout with the big picture dark and the small one light,

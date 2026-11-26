@@ -116,7 +116,7 @@
     <div class="card-head"><h2>Logins for other users{% if logins %} <span class="cnt">{{ logins | length }}</span>{% endif %}</h2>
       <div class="card-head-actions"><button class="btn btn-sm" data-act="login-add" data-password="{{ login_password }}" data-min="{{ login_streams[0] }}" data-max="{{ login_streams[1] }}">{{ icon('add') }}Add a login</button></div></div>
     <div class="card-body">
-      <p class="card-note">Give someone else their own login to this IPTV output. They type the server address in the details you copy for them, with their own username and password, and get the same channels and guide as you, or only the channels you choose for them with Choose channels in their row's menu. Each login can be turned off or deleted without touching the others or yours. A play on one of these logins always goes through ChannelBin, even in redirect or mixed mode, so your IPTV provider's login is never sent to their player. Their plays count against "IPTV players at once" as well as their own limit.</p>
+      <p class="card-note">Give someone else their own login to this IPTV output. They type the server address in the details you copy for them, with their own username and password, and get the same channels and guide as you, or only the channels you choose for them with Choose channels in their row's menu. Their plays come from the output's accounts, or only from the accounts you pick with Choose accounts. Each login can be turned off or deleted without touching the others or yours. A play on one of these logins always goes through ChannelBin, even in redirect or mixed mode, so your IPTV provider's login is never sent to their player. Their plays count against "IPTV players at once" as well as their own limit.</p>
       {#- The public port (app/public_listener.py, dev/changelog/1761). -#}
       {% if public.say == 'open' %}
       <p class="card-note">From outside your home network they use <strong>{{ public.url }}</strong>, which your reverse proxy sends to ChannelBin's public port, {{ public.port }}. The details you copy below name that address. The public port answers an IPTV player and nothing else, and every play on it goes through ChannelBin.</p>
@@ -134,7 +134,7 @@
       {% endif %}
       {% if logins %}
       <div class="table-scroll"><table class="tbl tbl-cards rl-tbl">
-        <thead><tr><th>Name</th><th>Username</th><th>Password</th><th class="tip-plain" data-tip="How many channels this login may play at once, and how many it is playing now.">Streams</th><th class="tip-plain" data-tip="The channels its IPTV player lists. Choose them with Choose channels in the row's menu.">Channels</th><th>On</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Username</th><th>Password</th><th class="tip-plain" data-tip="How many channels this login may play at once, and how many it is playing now.">Streams</th><th class="tip-plain" data-tip="The channels its IPTV player lists. Choose them with Choose channels in the row's menu.">Channels</th><th class="tip-plain" data-tip="The IPTV accounts its plays come from. Choose them with Choose accounts in the row's menu.">Accounts</th><th>On</th><th></th></tr></thead>
         <tbody>
           {% for l in logins %}
           <tr{{ ' class="of-off"' | safe if not l.on else '' }} data-login="{{ l.id }}" data-name="{{ l.name }}" data-user="{{ l.username }}" data-streams="{{ l.max_streams }}" data-playing="{{ l.playing }}">
@@ -142,13 +142,15 @@
             <td data-label="Username">{{ l.username }}</td>
             <td data-label="Password"><span data-secret-text="{password}">{{ mask }}</span> <button class="btn btn-sm btn-icon" data-act="login-reveal" aria-label="Show the password">{{ icon('reveal') }}</button></td>
             <td data-label="Streams">{% if l.playing %}{{ l.playing }} of {{ l.max_streams }} playing{% else %}Up to {{ l.max_streams }}{% endif %}</td>
-            <td data-label="Channels" class="rl-prog">{% if l.everything %}<span class="t tip-plain" data-tip="Every channel on the output, and any added to it later.">Everything</span>{% else %}<span class="t">{{ l.channels_text }}</span>{% if l.channels_off %}<span class="s text-warning tip-plain" data-tip="Picked for this login, but not on the output right now, so its IPTV player does not list them. They come back by themselves when the output offers them again.">{{ l.channels_off }} more picked, not on the output now</span>{% endif %}{% endif %}</td>
+            <td data-label="Channels" class="rl-prog">{% if l.everything %}<span class="t tip-plain" data-tip="Every channel on the output, and any added to it later.">Everything</span>{% else %}<span class="t">{{ l.channels_text }}</span>{% if l.channels_off %}<span class="s text-warning tip-plain" data-tip="Picked for this login, but not on the output right now, so its IPTV player does not list them. They come back by themselves when the output offers them again.">{{ l.channels_off }} more picked, not on the output now</span>{% endif %}{% if l.channels_off_accounts %}<span class="s text-warning tip-plain" data-tip="Picked for this login, but on an account that is not one of its own, or a picture-in-picture channel, whose pictures come from the output's accounts. Its IPTV player does not list them.">{{ l.channels_off_accounts }} more picked, not on its accounts</span>{% endif %}{% endif %}</td>
+            <td data-label="Accounts" class="rl-prog">{% if l.own_accounts %}<span class="t">{{ l.accounts_text }}</span>{% if l.accounts_gone_text %}<span class="s text-warning tip-plain" data-tip="Picked for this login, but deleted since. Choose its accounts again to tidy the list.">{{ l.accounts_gone_text }}</span>{% endif %}{% else %}<span class="t tip-plain" data-tip="The accounts switched on in the Accounts card below, and whatever that list becomes later.">Same as the output</span>{% endif %}</td>
             <td data-label="On" class="of-sw">{{ switch('login-on', l.id, l.on, 'Let ' ~ l.name ~ ' log in') }}</td>
             <td data-label="" class="sp-kebab"><span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
               <div class="menu pop-left">
                 <button class="menu-item" data-act="login-copy">Copy the details to send</button>
                 <button class="menu-item" data-act="login-edit">Change</button>
                 <button class="menu-item" data-act="login-channels">Choose channels</button>
+                <button class="menu-item" data-act="login-accounts">Choose accounts</button>
                 <button class="menu-item danger" data-act="login-delete">Delete</button>
               </div></span></td>
           </tr>
@@ -327,7 +329,7 @@
   <div class="card{{ ' of-inert' if dormant else '' }}" id="of-accounts"{{ ' inert' if dormant else '' }}>
     <div class="card-head"><h2>Accounts it may play from</h2></div>
     <div class="card-body">
-      <p class="card-note">While someone watches, the play uses one connection of one of your IPTV accounts, and a recording that needs that connection takes it. Switch an account off to keep the IPTV output away from it altogether: a channel on it leaves the output, and a group plays from its channels on the other accounts.</p>
+      <p class="card-note">While someone watches, the play uses one connection of one of your IPTV accounts, and a recording that needs that connection takes it. Switch an account off to keep the IPTV output away from it: a channel on it leaves the output, and a group plays from its channels on the other accounts. A login for another user can be given accounts of its own with Choose accounts in its row's menu, and those take the place of these switches for that login.</p>
       {% if mixed %}
       <p class="card-note">In mixed mode a channel that is not a group or a sports channel plays straight from your IPTV provider, and ChannelBin cannot see whether an IPTV player is still watching it, so it cannot take that connection back when a recording needs it. If a recording starts on an account whose connections are all in use, your IPTV provider refuses one of the two. To keep that from happening, tell recordings to leave a connection alone on the accounts players watch from. A group or sports channel playing through ChannelBin uses one of those connections first, so the same player is never counted twice. "None" is how it starts: recordings may use every connection. Leaving all of them alone means nothing records from that account. Whether the output may use an account at all is the switch, not this.</p>
       {% elif redirect %}

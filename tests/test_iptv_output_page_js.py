@@ -190,5 +190,22 @@ class IptvOutputScriptTests(FeedCase):
         self.assertEqual(lu['lu_everything_post'], [{'lineup': None}])
 
 
+    def test_choose_accounts_reads_the_logins_accounts_and_posts_ids(self):
+        """dev/changelog/1765: the dialog draws the login's own read with the list hidden while
+        it plays from the output's accounts; nothing picked posts nothing, a pick posts account
+        ids and the output's accounts post null."""
+        la, login = self.obs, self.obs['login_id']
+        self.assertEqual([x for x in la['la_fetch'] if x.startswith('GET /api/')],
+                         [f'GET /api/iptv-output/logins/{login}/accounts'])
+        self.assertEqual(la['la_initial']['title'], 'Accounts for Kim')
+        self.assertTrue(la['la_initial']['list_hidden'])
+        self.assertEqual(la['la_initial']['rows'], ['Acct', "Other Not one of the output's accounts"])
+        self.assertTrue(la['la_list_shown'])
+        self.assertEqual(la['la_empty'], {'posts': 0, 'open': True, 'toast': True})
+        self.assertEqual(la['la_post'], [{'path': f'/api/iptv-output/logins/{login}', 'body': {'accounts': [2]}}])
+        self.assertTrue(la['la_closed'])
+        self.assertEqual(la['la_output_post'], [{'accounts': None}])
+
+
 if __name__ == '__main__':
     unittest.main()

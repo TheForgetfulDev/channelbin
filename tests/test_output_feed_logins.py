@@ -6,7 +6,10 @@ the asking login's own, that a login's stream limit is held under the one lock, 
 behind one address never end each other's plays, that a login is never redirected to the provider, and that turning one
 off, changing it or deleting it ends its plays and keeps its lines in Recent plays. A login's
 channel list (dev/changelog/1764) narrows its catalog, its plays and its logos, numbers its
-channels from 1, and ends the plays a new list leaves out."""
+channels from 1, and ends the plays a new list leaves out. A login's own accounts
+(dev/changelog/1765) take the place of the output's list in its catalog and in every walk its
+plays ask, are named in its refusals, keep it off picture-in-picture channels, and end its plays
+from an account a new list leaves out."""
 import json
 import time
 import unittest
@@ -18,7 +21,7 @@ from app.database import (FEED_PLAY_ENDED, FEED_PLAY_REFUSED, OutputFeedLogin,
                           OutputFeedPlay)
 from app.url_utils import mask_creds_in_text
 from tests.support.output_feed import PASS, USER, FeedCase, feed_cfg
-from tests.support.seed import make_channel
+from tests.support.seed import make_channel, make_group
 
 FRIEND, FRIEND_PASS = 'kim', 'couch42'
 
@@ -375,6 +378,20 @@ class StartWrapperTests(_LoginCase):
         self.assertIn(f'Login {FRIEND}', recent)
 
 
+def _stand_in_screens(case):
+    """Stand in for what a waiting screen, an Up next picture and a card are drawn and played
+    with, for the rest of `case`'s test, so a tune-in reaches them through the real
+    start_session()."""
+    clip = mock.Mock(pages=[1], state='card', text='Nothing on')
+    for name, value in (('_screen_of', clip), ('_rotation_of', clip), ('_card_of', clip),
+                        ('_clip_for', ('clip.ts', False)), ('_launch_clip', None),
+                        ('_set_screen', None), ('_set_card', None), ('_note_badges', None),
+                        ('_ensure_reaper', None)):
+        patcher = mock.patch.object(feed, name, return_value=value)
+        patcher.start()
+        case.addCleanup(patcher.stop)
+
+
 class StartLogLineTests(_LoginCase):
     """Every Viewer log line a tune-in writes names the login for another user it came in on,
     whatever it starts on: a waiting screen, an Up next picture, a picture-in-picture card or
@@ -388,14 +405,7 @@ class StartLogLineTests(_LoginCase):
     def setUp(self):
         super().setUp()
         self.fid = feed.feed_id_for_channel(self.alpha.id)
-        clip = mock.Mock(pages=[1], state='card', text='Nothing on')
-        for name, value in (('_screen_of', clip), ('_rotation_of', clip), ('_card_of', clip),
-                            ('_clip_for', ('clip.ts', False)), ('_launch_clip', None),
-                            ('_set_screen', None), ('_set_card', None), ('_note_badges', None),
-                            ('_ensure_reaper', None)):
-            patcher = mock.patch.object(feed, name, return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        _stand_in_screens(self)
 
     def lines(self, play, login, refused=False):
         """The output feed's log lines while `play` is tuned in on `login` (None: the main one)."""
@@ -658,3 +668,308 @@ class LineupMigrationTests(unittest.TestCase):
         cols = [r[1] for r in conn.execute('PRAGMA table_info(output_feed_logins)')]
         self.assertIn('lineup', cols)
         self.assertEqual(conn.execute('SELECT lineup FROM output_feed_logins').fetchone(), (None,))
+
+
+class _AccountsCase(_LoginCase):
+    """A login's own accounts (FeedLogin.accounts, dev/changelog/1765). The rig's Alpha and Beta
+    are on `account`, the group's one channel on `other`."""
+
+    def setUp(self):
+        super().setUp()
+        self.fid_alpha = feed.feed_id_for_channel(self.alpha.id)
+        self.fid_beta = feed.feed_id_for_channel(self.beta.id)
+        self.fid_group = feed.feed_id_for_group(self.group.id)
+
+    def set_accounts(self, ids):
+        self.login.accounts = None if ids is None else json.dumps(ids)
+        db.session.commit()
+
+    def streams_as(self):
+        return self.get_as('/player_api.php', action='get_live_streams').get_json()
+
+    def own(self, *accounts):
+        return feed.LoginAccounts(a.id for a in accounts)
+
+
+class AccountsCatalogTests(_AccountsCase):
+    def test_a_login_on_its_own_accounts_lists_only_their_channels(self):
+        self.set_accounts([self.other.id])
+        rows = self.streams_as()
+        # A group stays listed whatever its channels' accounts: its play refuses by name.
+        self.assertEqual([(r['name'], r['num']) for r in rows], [('Game feeds', 1)])
+        self.assertEqual([r['name'] for r in self.streams()], ['Alpha', 'Game feeds', 'Beta'])
+
+    def test_its_own_accounts_take_the_place_of_the_outputs(self):
+        gamma = make_channel(self.other, name='Gamma', in_guide=True)
+        gamma.guide_sort_order = 4
+        db.session.commit()
+        self.t.sandbox_config(feed_cfg(accounts=[self.account.id]))
+        self.set_accounts([self.other.id])
+        self.assertNotIn('Gamma', [r['name'] for r in self.streams()])
+        self.assertEqual([r['name'] for r in self.streams_as()], ['Game feeds', 'Gamma'])
+        self.assertNotIn(f'<channel id="{self.fid_alpha}">', self.get_as('/xmltv.php').get_data(as_text=True))
+
+    def test_a_login_on_the_outputs_list_is_unchanged(self):
+        self.assertEqual(self.streams_as(), self.streams())
+
+    def test_a_picture_in_picture_channel_is_left_out_for_a_login_on_its_own_accounts(self):
+        row = mock.Mock(kind=feed.KIND_PIP, left_out='')
+        self.assertEqual(feed.left_out_for_login(row, self.own(self.account)), feed.LEFT_OUT_PIP_OWN_ACCOUNTS)
+        self.assertEqual(feed.left_out_for_login(row, None), '')
+
+    def test_damaged_accounts_play_from_none_rather_than_the_outputs(self):
+        self.login.accounts = '{"a": 1}'
+        db.session.commit()
+        with self.assertLogs('app.output_feed', 'WARNING'):
+            self.assertEqual(feed.accounts_of(self.login), frozenset())
+        self.assertIsInstance(feed.accounts_of(self.login), feed.LoginAccounts)
+
+
+class AccountsPlayTests(_AccountsCase):
+    def test_a_channel_outside_its_accounts_is_refused_naming_them(self):
+        self.set_accounts([self.other.id])
+        resp = self.client.get(f'/live/{FRIEND}/{FRIEND_PASS}/{self.fid_alpha}.ts')
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("this IPTV output login's own accounts", resp.get_json()['error'])
+
+    def test_a_group_is_walked_over_its_accounts_alone(self):
+        """Every re-ask of a play (a failover, a move, a seat walk) goes through _resolve_again,
+        and each must be held to the play's login's accounts, not the output's."""
+        near = make_channel(self.account, name='Near')
+        far = make_channel(self.other, name='Far')
+        both = make_group('Both', members=[near, far])
+        db.session.commit()
+        cfg = feed_cfg()
+        session = self.play(feed.feed_id_for_group(both.id), login=self.friend())
+        found = {}
+        for who in (self.account, self.other):
+            session.login_accounts = self.own(who)
+            found[who.name] = feed._resolve_again(session, cfg, frozenset()).member.name
+        self.assertEqual(found, {'Acct': 'Near', 'Other': 'Far'})
+        session.login_accounts = feed.LoginAccounts({self.account.id + self.other.id + 99})
+        play = feed._resolve_again(session, cfg, frozenset())
+        self.assertIsNone(play.member)
+        self.assertIn("this IPTV output login's own accounts", play.why_none)
+
+    def test_a_sports_walk_names_the_logins_accounts(self):
+        words = feed.sports_drop_words(feed._drop_allowed(self.own(self.account)), 'Game')
+        self.assertIn("this IPTV output login's own accounts", words)
+        self.assertNotIn("login's own", feed.sports_drop_words(feed._drop_allowed(frozenset({1})), 'Game'))
+
+    def test_every_ask_of_a_play_carries_its_accounts(self):
+        """A call of resolve_play() that left them out would walk the output's list, and a login
+        tied to one account would fail over onto another. Every call in the module passes
+        `accounts=`, whatever its spelling, but redirect_target()'s, which is handed the play
+        redirect_play() resolved with them (and only the main login is redirected)."""
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(feed))
+        missing, seen = [], 0
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef) or fn.name in ('resolve_play', 'redirect_target'):
+                continue
+            for call in ast.walk(fn):
+                if isinstance(call, ast.Call) and getattr(call.func, 'id', '') == 'resolve_play':
+                    seen += 1
+                    if 'accounts' not in {k.arg for k in call.keywords}:
+                        missing.append(f'{fn.name}: {ast.unparse(call)}')
+        self.assertGreaterEqual(seen, 9)
+        self.assertEqual(missing, [])
+
+    def test_a_move_resolved_on_the_old_accounts_ends_rather_than_plays_outside_the_new(self):
+        """A failover, a move or a game put on that was already walking when the list changed
+        names its account in _launch(), in the hold set_login_accounts() hands over the new list
+        in: one outside it ends there, by name, rather than playing from an account the login
+        no longer has."""
+        session = self.play(self.fid_group, login=self.friend())
+        session.login_accounts = self.own(self.account)          # the list just set
+        with mock.patch.object(feed, '_take_seat', return_value=True):
+            with self.assertRaises(feed.FeedRefused):
+                feed._launch(session, self.member, feed_cfg(), first=False)   # Member is on `other`
+        self.assertEqual(session.reason, feed.REASON_ACCOUNTS)
+
+    def test_a_refusal_over_its_accounts_raises_no_alert(self):
+        """Its player asks again every half minute and nothing is broken, as a channel outside
+        its list is (_not_in_lineup); an alert would also name no login."""
+        from app.database import Alert
+        self.set_accounts([self.other.id])
+        for _ in range(2):
+            resp = self.client.get(f'/live/{FRIEND}/{FRIEND_PASS}/{self.fid_alpha}.ts')
+            self.assertEqual(resp.status_code, 409)
+        self.assertIn(f'IPTV output login "{FRIEND}"', resp.get_json()['error'])
+        self.assertEqual(Alert.query.count(), 0)
+        feed.flush_play_log()
+        line = OutputFeedPlay.query.filter_by(kind=FEED_PLAY_REFUSED).one()
+        self.assertEqual((line.feed_id, line.feed_login, line.count), (self.fid_alpha, FRIEND, 2))
+
+    def test_a_picture_in_picture_channel_is_refused_by_name(self):
+        from app import pip_channels
+        from app.database import PipChannel
+        row = PipChannel(name='PiP 1', on_output=True)
+        db.session.add(row)
+        db.session.commit()
+        fid = feed.feed_id_for_pip(row.id)
+        play = feed.resolve_play(fid, feed_cfg(), accounts=self.own(self.account))
+        self.assertEqual(play.why_none, feed.WHY_PIP_OWN_ACCOUNTS)
+        self.assertIsNone(play.pip)
+        self.assertIsNotNone(pip_channels.resolve_feed(fid, feed_cfg()).pip)
+        self.set_accounts([self.account.id])
+        resp = self.client.get(f'/live/{FRIEND}/{FRIEND_PASS}/{fid}.ts')
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn('shared by everyone watching', resp.get_json()['error'])
+
+    def test_a_waiting_screen_carries_its_logins_accounts(self):
+        """Built before start_session() puts the login on the play, so the first recheck of a
+        sports channel's waiting screen would otherwise walk the output's list."""
+        _stand_in_screens(self)
+        self.set_accounts([self.other.id])
+        play = feed.Play(self.fid_alpha, 'NHL 1', sports=True, fault=False, why_none='no game on')
+        play.served = mock.Mock(row=mock.Mock(id=1))
+        with mock.patch.object(feed, 'resolve_play', return_value=play):
+            session = feed.start_session(self.fid_alpha, '203.0.113.7', login=self.friend())
+        self.assertEqual(session.state, feed.STATE_WAITING)
+        self.assertEqual(session.login_accounts, {self.other.id})
+
+    def test_a_relayed_play_carries_its_logins_accounts(self):
+        self.set_accounts([self.account.id])
+        with mock.patch.object(feed, '_launch'), mock.patch.object(feed, '_ensure_reaper'):
+            session = feed.start_session(self.fid_alpha, '203.0.113.7', login=self.friend())
+        self.assertEqual(session.login_accounts, {self.account.id})
+
+
+class AccountsChangeTests(_AccountsCase):
+    def post_accounts(self, value):
+        return self.client.post(f'/api/iptv-output/logins/{self.login.id}', json={'accounts': value})
+
+    def test_accounts_are_saved_and_the_outputs_list_clears_them(self):
+        self.assertEqual(self.post_accounts([self.other.id]).status_code, 200)
+        db.session.expire_all()
+        self.assertEqual(json.loads(self.login.accounts), [self.other.id])
+        self.assertEqual(self.post_accounts(None).status_code, 200)
+        db.session.expire_all()
+        self.assertIsNone(self.login.accounts)
+
+    def test_bad_accounts_are_refused(self):
+        for value in ([], 'all', [True], ['1'], [1.5], [999_999]):
+            self.assertEqual(self.post_accounts(value).status_code, 400, value)
+        db.session.expire_all()
+        self.assertIsNone(self.login.accounts)
+
+    def test_a_change_ends_only_the_plays_outside_the_new_accounts(self):
+        self.login.max_streams = 3
+        db.session.commit()
+        out = self.play(self.fid_alpha, login=self.friend())
+        kept = self.play(self.fid_group, login=self.friend())
+        kept.account_id = self.other.id
+        mains = self.play(self.fid_alpha)
+        resp = self.post_accounts([self.other.id])
+        self.assertEqual(resp.get_json()['ended'], 1)
+        self.assertEqual(out.reason, feed.REASON_ACCOUNTS)
+        self.assertTrue(kept.live)
+        self.assertEqual(kept.login_accounts, {self.other.id})     # its next re-ask is held to them
+        self.assertTrue(mains.live)
+        self.assertIsNone(mains.login_accounts)
+        self.assertTrue(feed.REASON_TEXT[feed.REASON_ACCOUNTS])
+
+    def test_back_to_the_outputs_list_ends_a_play_the_output_leaves_out(self):
+        self.t.sandbox_config(feed_cfg(accounts=[self.other.id]))
+        self.set_accounts([self.account.id])
+        session = self.play(self.fid_alpha, login=self.friend())
+        session.login_accounts = self.own(self.account)
+        self.assertEqual(feed.set_login_accounts(self.login.id, None), 1)
+        self.assertEqual(session.reason, feed.REASON_ACCOUNTS)
+
+    def test_a_picture_in_picture_play_ends_when_the_login_gets_its_own_accounts(self):
+        session = self.play(feed.feed_id_for_pip(1), login=self.friend())
+        session.pip_row_id = 1
+        session.account_id = None
+        self.assertEqual(feed.set_login_accounts(self.login.id, self.own(self.account)), 1)
+        self.assertEqual(session.reason, feed.REASON_ACCOUNTS)
+
+    def test_a_play_let_in_on_the_old_accounts_takes_the_new_ones(self):
+        login = self.friend()                                     # what the gate read
+        feed.set_login_accounts(self.login.id, self.own(self.other))    # chosen again meanwhile
+        started = []
+
+        def start(feed_id, *_a, **_k):
+            started.append(self.play(feed_id))
+            return started[-1]
+        with mock.patch.object(feed, '_start_session', side_effect=start):
+            with self.assertRaises(feed.FeedRefused) as cm:
+                feed.start_session(self.fid_alpha, 'a', login=login)
+            started_ok = []
+
+            def start_other(feed_id, *_a, **_k):
+                s = self.play(feed_id)
+                s.account_id = self.other.id
+                started_ok.append(s)
+                return s
+            with mock.patch.object(feed, '_start_session', side_effect=start_other):
+                kept = feed.start_session(self.fid_group, 'a', login=login)
+        self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(started[0].reason, feed.REASON_ACCOUNTS)
+        self.assertTrue(kept.live)
+        self.assertEqual(kept.login_accounts, {self.other.id})
+
+    def test_the_outputs_account_switch_spares_a_login_on_its_own_accounts(self):
+        self.login.max_streams = 2
+        db.session.commit()
+        own = self.play(self.fid_alpha, login=self.friend())
+        own.login_accounts = self.own(self.account)
+        follows = self.play(self.fid_beta, login=self.friend())
+        mains = self.play(self.fid_alpha)
+        self.assertEqual(feed.stop_account(self.account.id), 2)
+        self.assertTrue(own.live)
+        self.assertEqual((follows.reason, mains.reason), (feed.REASON_ACCOUNT_OFF, feed.REASON_ACCOUNT_OFF))
+
+
+class AccountsPageTests(_AccountsCase):
+    def logins_card(self):
+        page = self.client.get('/iptv-output').get_data(as_text=True)
+        return page[page.index('id="of-logins"'):page.index('id="of-watching"')]
+
+    def test_the_card_names_its_accounts_or_the_outputs(self):
+        self.assertIn('Same as the output', self.logins_card())
+        self.set_accounts([self.other.id, 999_999])
+        card = self.logins_card()
+        self.assertIn('>Other<', card)
+        self.assertIn('1 picked account deleted since', card)
+        self.assertIn('data-act="login-accounts"', card)
+
+    def test_the_card_counts_what_its_own_accounts_list(self):
+        self.login.lineup = json.dumps([self.fid_alpha, self.fid_group])
+        self.set_accounts([self.other.id])
+        card = self.logins_card()
+        self.assertIn('1 channel<', card)
+        self.assertIn('1 more picked, not on its accounts', card)
+        self.assertNotIn('not on the output now', card)
+
+    def test_the_accounts_dialog_lists_every_account_and_the_picks(self):
+        self.t.sandbox_config(feed_cfg(accounts=[self.account.id]))
+        d = self.client.get(f'/api/iptv-output/logins/{self.login.id}/accounts').get_json()
+        self.assertFalse(d['own'])
+        self.assertEqual({a['name']: a['on_output'] for a in d['accounts']}, {'Acct': True, 'Other': False})
+        self.set_accounts([self.other.id, 999_999])
+        d = self.client.get(f'/api/iptv-output/logins/{self.login.id}/accounts').get_json()
+        self.assertEqual((d['own'], d['picked']), (True, [self.other.id]))
+
+    def test_the_channels_dialog_marks_rows_its_accounts_leave_out(self):
+        self.set_accounts([self.other.id])
+        d = self.client.get(f'/api/iptv-output/logins/{self.login.id}/channels').get_json()
+        rows = {r['name']: r['off'] for r in d['rows']}
+        self.assertEqual(rows['Alpha'], f'Not for this login: {feed.LEFT_OUT_LOGIN_ACCOUNT}')
+        self.assertEqual(rows['Game feeds'], '')
+
+
+class AccountsMigrationTests(unittest.TestCase):
+    def test_step_154_adds_the_column_and_runs_again(self):
+        import sqlite3
+        from app.migrations import _m154_output_feed_login_accounts
+        conn = sqlite3.connect(':memory:')
+        conn.execute('CREATE TABLE output_feed_logins (id INTEGER PRIMARY KEY, username TEXT)')
+        conn.execute("INSERT INTO output_feed_logins (username) VALUES ('kim')")
+        for _ in range(2):
+            _m154_output_feed_login_accounts(conn, conn.cursor())
+        cols = [r[1] for r in conn.execute('PRAGMA table_info(output_feed_logins)')]
+        self.assertIn('accounts', cols)
+        self.assertEqual(conn.execute('SELECT accounts FROM output_feed_logins').fetchone(), (None,))

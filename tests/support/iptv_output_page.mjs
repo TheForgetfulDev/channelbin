@@ -36,6 +36,12 @@ const CHANNELS = { success: true, name: 'Kim', everything: false, picked: [2], r
   { id: 3, name: 'Game feeds', category: 'Sports', num: 2, off: '', swapped: false },
   { id: 2000000002, name: 'PiP 1', category: 'ChannelBin', num: 3, off: '', swapped: true },
 ] };
+// What a login's Choose accounts read answers (routes/iptv_output.py::login_accounts): one
+// account the output plays from and one it leaves out, the login on the output's list.
+const ACCOUNTS = { success: true, name: 'Kim', own: false, picked: [], accounts: [
+  { id: 1, name: 'Acct', on_output: true },
+  { id: 2, name: 'Other', on_output: false },
+] };
 w.fetch = (url, opts = {}) => {
   const method = (opts.method || 'GET').toUpperCase();
   const path = String(url).replace('http://localhost:5000', '');
@@ -46,6 +52,7 @@ w.fetch = (url, opts = {}) => {
   if (path.startsWith('/api/settings/reveal')) return json(200, { success: true, value: PASSWORD });
   if (REFUSE.has(path)) return json(400, { error: 'Refused by the server.' });
   if (/^\/api\/iptv-output\/logins\/\d+\/channels$/.test(path)) return json(200, CHANNELS);
+  if (/^\/api\/iptv-output\/logins\/\d+\/accounts$/.test(path)) return json(200, ACCOUNTS);
   if (method === 'POST' && path.startsWith('/api/iptv-output/rows/')) return json(200, { success: true, name: 'x', on: body.on, cut: body.on ? 0 : 1 });
   return json(200, { success: true });
 };
@@ -247,6 +254,41 @@ mark = requests.length;
 await click(modalButton('Save'));
 await wait(40);
 out.lu_everything_post = requests.slice(mark).filter((r) => r.method === 'POST').map((r) => r.body);
+
+/* Choose accounts (dev/changelog/1765): the login's own read, the list hidden while it plays
+   from the output's accounts, nothing picked refused, Save posts account ids or null. */
+const laOpen = async () => {
+  await click(d.querySelector('#of-logins tr[data-login] [data-act="login-accounts"]'));
+  await wait(40);
+};
+mark = requests.length;
+await laOpen();
+out.la_fetch = since(mark);
+out.la_initial = {
+  title: modal().querySelector('.modal-head h2').textContent.trim(),
+  list_hidden: modal().querySelector('.of-la-pick').hidden,
+  rows: Array.from(modal().querySelectorAll('.of-la-pick .check-row')).map((l) => l.textContent.replace(/\s+/g, ' ').trim()),
+};
+const pick = modal().querySelector('input[name="of-la-mode"][value="pick"]');
+pick.checked = true;
+await change(pick);
+out.la_list_shown = !modal().querySelector('.of-la-pick').hidden;
+mark = requests.length;
+await click(modalButton('Save'));
+await wait(40);
+out.la_empty = { posts: requests.slice(mark).filter((r) => r.method === 'POST').length, open: Boolean(modal()),
+                 toast: toasts().some((t) => t.includes('Pick at least one account')) };
+modal().querySelector('.of-la-pick input[value="2"]').checked = true;
+mark = requests.length;
+await click(modalButton('Save'));
+await wait(40);
+out.la_post = requests.slice(mark).filter((r) => r.method === 'POST').map((r) => ({ path: r.path, body: r.body }));
+out.la_closed = !modal();
+await laOpen();
+mark = requests.length;
+await click(modalButton('Save'));
+await wait(40);
+out.la_output_post = requests.slice(mark).filter((r) => r.method === 'POST').map((r) => r.body);
 
 /* Change login: an empty password is sent as empty, never a mask. */
 mark = requests.length;
