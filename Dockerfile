@@ -131,7 +131,8 @@ RUN if [ -n "$CHANNELBIN_BUILD" ]; then printf '%s\n' "$CHANNELBIN_BUILD" > /app
 VOLUME ["/config", "/dvr"]
 EXPOSE 5000
 # The IPTV output's public port (integrations.output_feed.public_port), off until it is set:
-# this is the port the docs suggest. The healthcheck stays on the web UI's.
+# the port the docs, docker-compose.example.yml and the Unraid template use. The healthcheck
+# stays on the web UI's.
 EXPOSE 38517
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \

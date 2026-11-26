@@ -229,7 +229,9 @@ brings the app back** - without a restart policy the container simply stops.
 ### Unraid
 
 The Unraid template is [`docker/unraid-template.xml`](docker/unraid-template.xml). It maps the
-same two volumes, defaults PUID/PGID to Unraid's `99`/`100`, and sets `--restart=unless-stopped`
+same two volumes and the IPTV output's public port (38517, idle until it is set in Settings -
+[Sharing the IPTV output over the internet](#sharing-the-iptv-output-over-the-internet)),
+defaults PUID/PGID to Unraid's `99`/`100`, and sets `--restart=unless-stopped`
 under Extra Parameters - keep that, for the reason above. Unraid's autostart toggle is not a
 restart policy.
 
@@ -705,9 +707,10 @@ Steps:
    details you send each person.
 2. In Settings, System, turn on **Behind a reverse proxy** (`flask.behind_proxy`). Without it
    every player looks like the proxy, so a few wrong passwords from anyone lock everyone out.
-3. In Docker, map the port too: `-p 38517:38517` (there is a commented line for it in
-   `docker-compose.example.yml`), or `-p 127.0.0.1:38517:38517` when the proxy runs on the same
-   machine. On Unraid, add a port to the container with the same number on both sides.
+3. In Docker, the port has to be mapped. `docker-compose.example.yml` and the Unraid template
+   both map 38517 already (nothing listens on it until the public port is set). With
+   `docker run`, add `-p 38517:38517`, or `-p 127.0.0.1:38517:38517` when the proxy runs on the
+   same machine. If you picked another port, change the mapping to match.
 4. Restart ChannelBin. The log says `IPTV output public port listening on 0.0.0.0:38517`, and the
    Readiness check names any problem: the port could not be opened, the proxy setting is off, or
    the outside address is not set.
@@ -740,7 +743,9 @@ Steps:
    }
    ```
 
-6. **Forward only the proxy's port (443) on your router, never the public port itself.** With
+6. **Players connect to the proxy, and only the proxy connects to the public port.** The server
+   address people type is the proxy's (`https://tv.example.com`, port 443), so on your router
+   forward only the proxy's port, never the public port itself. With
    "Behind a reverse proxy" on, ChannelBin believes the address the proxy says a player has; a
    player reaching the public port directly could claim any address it likes and get past the
    wrong-login lockout.
