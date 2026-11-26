@@ -1977,16 +1977,17 @@ def airing_now(event_ids: list, now: datetime, before: timedelta = timedelta(0),
 
 
 def listing_windows(event_ids: list, now: datetime, rules=None) -> dict:
-    """{event id: [(channel id, account id, program start, program stop)]} over the listings a
-    sports channel may play from, on visible channels, each at the times its league's answer gives
-    it (app/sports_times.py), in two queries (app/sports_feed.py). `rules` is a sports_times.Rules
-    the caller already holds, else one is read."""
+    """{event id: [(channel id, account id, program start, program stop, guide start)]} over the
+    listings a sports channel may play from, on visible channels, each at the times its league's
+    answer gives it (app/sports_times.py), and last the start the guide gives the listing, which is
+    what says whether it is the game's own listing (sports_feed.with_the_game). Two queries
+    (app/sports_feed.py). `rules` is a sports_times.Rules the caller already holds, else one is read."""
     out = {}
     if not event_ids:
         return out
-    for event_id, channel_id, account_id, start, stop, _listed in _timed(event_ids, _windows_query(event_ids).all(),
-                                                                         now, rules):
-        out.setdefault(event_id, []).append((channel_id, account_id, start, stop))
+    for event_id, channel_id, account_id, start, stop, listed in _timed(event_ids, _windows_query(event_ids).all(),
+                                                                        now, rules):
+        out.setdefault(event_id, []).append((channel_id, account_id, start, stop, listed))
     return out
 
 

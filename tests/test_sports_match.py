@@ -561,7 +561,7 @@ class GuideStartTests(MatchCase):
         self.run_match()
 
         def starts(now):
-            return sorted({s for _c, _a, s, _t in sports_match.listing_windows([event.id], now)[event.id]})
+            return sorted({row[2] for row in sports_match.listing_windows([event.id], now)[event.id]})
         self.assertEqual(starts(NOW), [KICKOFF])  # a replay is never played (_playable)
         sports_times.set_league(9001, {'go_by': sports_times.GO_GUIDE})
         self.assertEqual(starts(NOW), [KICKOFF - timedelta(minutes=75), KICKOFF - timedelta(minutes=15)])
@@ -683,7 +683,7 @@ class MovedGameTests(MatchCase):
         # Each listing moves by its own gap to TheSportsDB's start, not the game's (dev/changelog/1630).
         self.assertEqual({s for _e, _c, s, _t in playing}, {KICKOFF})
         windows = sports_match.listing_windows([event.id], KICKOFF + timedelta(minutes=10))[event.id]
-        self.assertEqual({s for _c, _a, s, _t in windows}, {KICKOFF})
+        self.assertEqual({row[2] for row in windows}, {KICKOFF})
 
     def test_a_moved_listing_ends_no_earlier_than_listed(self):
         """A game moved earlier that runs long is not cut at the moved end of the network's slot."""

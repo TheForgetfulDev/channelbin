@@ -575,9 +575,8 @@ def _resolve_game(source: Source, cfg: dict, feed_id: int, label: str, now: date
         pane.state = PANE_NOT_LISTED
     elif now < window[0] - before:
         pane.state = PANE_BEFORE
-        coming = sorted((begin, channel_id) for channel_id, _account, begin, _stop
-                        in sports_match.listing_windows([event.id], now).get(event.id, ())
-                        if begin is not None and begin > now)
+        coming = sorted((row[2], row[0]) for row in sports_match.listing_windows([event.id], now).get(event.id, ())
+                        if row[2] is not None and row[2] > now)
         if coming:
             listed = db.session.get(Channel, coming[0][1])
             pane.listed_on = listed.name if listed is not None else ''

@@ -398,6 +398,17 @@ def schedule_recording(app, recording_id: int, start_time: datetime, stop_time: 
     log.info('Scheduled recording %d: start=%s stop=%s', recording_id, start_time, stop_time)
 
 
+def missing_starts(recording_ids) -> set:
+    """The ids among `recording_ids` with no start_<id> job: a SCHEDULED recording in that state
+    will not start on its own. Every wait (a slot, a conversion, a raise) re-arms start_<id>, so
+    a held start still has one; a start in flight has none, and the claim in start_recording()
+    refuses a second start of it. Empty when the scheduler is not live, which could arm nothing.
+    One jobstore read per id."""
+    if not recording_ids or not scheduler_is_live():
+        return set()
+    return {rid for rid in recording_ids if _scheduler.get_job(f'start_{rid}') is None}
+
+
 def unschedule_recording(recording_id: int):
     # A cancel, a delete or an edit ends whatever retry a raised job had armed, and the
     # count with it: a later raise on this id is a first raise again, with its own alert.

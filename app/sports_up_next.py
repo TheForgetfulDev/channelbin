@@ -171,22 +171,37 @@ def delete_for_league(league_id: int):
 # ---------------------------------------------------------------------------
 
 def _games_by_league(league_ids, now: datetime) -> dict:
-    """{league id: [(SportsEvent, its window)]}: each league's games not over, starting within
-    UP_NEXT_DAYS, in start order. One query."""
+    """{league id: [(SportsEvent, its window)]}: each league's followed games not over, starting
+    within UP_NEXT_DAYS, in start order, each at the time its sports channel's block gives it
+    (sports_feed.event_window over its listings). A league followed whole shows all its games, one
+    where only teams are followed shows those teams' games, as a sports channel and
+    sports_feed.followed_coming() do: the switch says the channel "shows the games you follow".
+    Four queries."""
     if not league_ids:
         return {}
+    scope = sports_feed.follow_scope()
     start = sports_feed.event_start()
     events = (SportsEvent.query.filter(SportsEvent.league_id.in_(league_ids),
                                        start > now - sports_feed.MAX_LENGTH,
                                        start < now + timedelta(days=UP_NEXT_DAYS),
                                        SportsEvent.postponed.is_(False))
               .order_by(start, SportsEvent.id).all())
-    out = {}
+    events = [e for e in events if _followed_game(e, scope)]
+    listings = sports_match.listing_windows([e.id for e in events], now) if events else {}
+    timed = []
     for event in events:
-        window = sports_feed.event_window(event)
+        window = sports_feed.event_window(event, listings.get(event.id, ()))
         if window is not None and window[1] > now:
-            out.setdefault(event.league_id, []).append((event, window))
+            timed.append((event, window))
+    out = {}
+    for event, window in sorted(timed, key=lambda p: (p[1][0], p[0].id)):
+        out.setdefault(event.league_id, []).append((event, window))
     return out
+
+
+def _followed_game(event, scope: dict) -> bool:
+    whole, teams = scope.get(event.league_id, (False, frozenset()))
+    return whole or bool({event.home_team_id, event.away_team_id} & teams)
 
 
 def _drawn(chans: list, by_league: dict, followed: list) -> dict:
@@ -213,7 +228,7 @@ def _where(event, start: datetime, carrying: list, listed: list, names: dict, na
         return (f'On {first}' + (f' and {counted(more, "other channel")}' if more else ''),
                 f'{first} +{more}' if more else first)
     nearest = {}
-    for channel_id, _a, begin, _e in sports_feed.with_the_game(listed, start):
+    for channel_id, _a, begin, _e, _listed in sports_feed.with_the_game(listed, event):
         if channel_id in names:
             off = abs(begin - start)
             nearest[channel_id] = min(off, nearest.get(channel_id, off))
@@ -246,7 +261,7 @@ class _Pages:
         self.carriers = sports_feed.carriers(served, events)
         self.listings = sports_match.listing_windows([e.id for e in events], now)
         self.named = sports_feed.name_sources({e.league_id for e in events}, now) if events else {}
-        channel_ids = {c for rows in self.listings.values() for c, _a, _b, _e in rows}
+        channel_ids = {row[0] for rows in self.listings.values() for row in rows}
         self.names = (dict(db.session.query(Channel.id, Channel.name).filter(Channel.id.in_(channel_ids)).all())
                       if channel_ids else {})
 
