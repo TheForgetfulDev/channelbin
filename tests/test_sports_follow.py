@@ -19,7 +19,8 @@ from tests.support.seed import make_account, make_channel, make_epg_entry, make_
 
 from app import db, sports_follow, sports_match, sports_times  # noqa: E402
 from app.database import (  # noqa: E402
-    RECORDING_SPORTS_RETIMED, RECORDING_SPORTS_SECOND, RECORDING_SPORTS_TIME_KEPT, RULE_MATCH_SCHEDULED,
+    RECORDING_SPORTS_RETIMED, RECORDING_SPORTS_SECOND, RECORDING_SPORTS_TIME_KEPT, RECORDING_START_REARMED,
+    RULE_MATCH_SCHEDULED,
     AutoRule, Recording, RecordingEvent, RecordingProfile, RecordingSports, RuleMatch, SportsEvent,
     SportsFollow, SportsLeague, SportsMatch,
 )
@@ -375,6 +376,80 @@ class CoverBothTests(Case):
         return self.t.client.post(f'/recordings/{rid}/cancel-json')
 
 
+class CoverBothNothingLeftTests(Case):
+    """Cover both never writes a second recording that ends before it starts: when nothing of
+    TheSportsDB's window is left before the first recording (it has passed, or what is left lies inside
+    the first's own window), no second is made, or the one there is removed, and the first recording
+    says why once (dev/docs/BUGS.md 2026-11-25 @ 10:44:23 PM)."""
+
+    early = timedelta(hours=2)
+    hours = 1
+
+    def setUp(self):
+        super().setUp()
+        sports_times.set_league(9001, {'go_by': sports_times.GO_BOTH})
+
+    def seconds(self, rid):
+        db.session.expire_all()
+        return Recording.query.filter_by(sports_cover_for_id=rid).all()
+
+    def said(self, rid):
+        return [json.loads(e.extra_data) for e in self.events(rid, RECORDING_SPORTS_SECOND)]
+
+    def test_no_second_is_made_when_thesportsdbs_time_has_passed(self):
+        self.move_tsdb(self.listed - timedelta(hours=5))
+        rid = self.recording()
+        self.assertEqual(self.follow()['added'], 0)
+        self.assertEqual(self.seconds(rid), [])
+        (note,) = self.said(rid)
+        self.assertEqual(note['kind'], sports_follow.SECOND_NOT_MADE)
+        (ev,) = self.events(rid, RECORDING_SPORTS_SECOND)
+        self.assertIn('already passed', ev.detail)
+        self.follow()
+        self.assertEqual(len(self.said(rid)), 1, 'said once, not on every pass')
+
+    def test_a_second_is_still_made_once_the_time_opens_again(self):
+        self.move_tsdb(self.listed - timedelta(hours=5))
+        rid = self.recording()
+        self.follow()
+        self.move_tsdb(self.tsdb)
+        self.assertEqual(self.follow()['added'], 1)
+        self.assertEqual(len(self.seconds(rid)), 1)
+
+    def test_a_second_whose_time_has_passed_is_removed(self):
+        rid = self.recording()
+        self.follow()
+        (second,) = self.seconds(rid)
+        self.move_tsdb(self.listed - timedelta(hours=5))
+        self.assertEqual(self.follow()['removed'], 1)
+        self.assertEqual(self.seconds(rid), [])
+        last = self.said(rid)[-1]
+        self.assertEqual((last['kind'], last['reason']), (sports_follow.SECOND_REMOVED,
+                                                          sports_follow.REMOVED_NOTHING_LEFT))
+        self.follow()
+        self.assertEqual(len(self.said(rid)), 2, 'the removal already said why; no note follows it')
+        self.assertEqual(self.seconds(rid), [])
+
+    def test_no_second_when_what_is_left_lies_inside_the_first_recordings_window(self):
+        """TheSportsDB's padded end is still ahead, but the first recording has started its window."""
+        self.profile.post_padding_minutes = 90
+        db.session.commit()
+        later = self.listed - PRE + timedelta(minutes=1)
+        rid = self.recording(window=(self.listed - PRE, self.stop + timedelta(minutes=90)))
+        out = sports_follow.follow(now=later)
+        self.assertEqual(out['added'], 0)
+        self.assertEqual(self.seconds(rid), [])
+        (ev,) = self.events(rid, RECORDING_SPORTS_SECOND)
+        self.assertIn("inside this recording's own window", ev.detail)
+
+    def test_no_recording_anywhere_ends_before_it_starts(self):
+        self.move_tsdb(self.listed - timedelta(hours=5))
+        self.recording()
+        self.follow()
+        db.session.expire_all()
+        self.assertEqual([r.id for r in Recording.query.all() if r.stop_time <= r.start_time], [])
+
+
 class RecordSaveTests(Case):
     """A league page's Record save: at the times Record worked out, the recording is ChannelBin's to
     move; at times the person set, it is theirs."""
@@ -719,6 +794,116 @@ class HeldSecondTests(Case):
         self.assertEqual(self.window(sid), before)
         self.assertEqual(self.events(sid, RECORDING_SPORTS_RETIMED), [])
 
+    def test_a_held_second_with_no_job_is_armed_again(self):
+        sports_times.set_league(9001, {'go_by': sports_times.GO_BOTH})
+        rid = self.recording()
+        self.follow()
+        db.session.expire_all()
+        (second,) = Recording.query.filter_by(sports_cover_for_id=rid).all()
+        sid, before = second.id, (second.start_time, second.stop_time)
+        self.schedule_recording.reset_mock()
+        with mock.patch('app.scheduler.missing_starts', side_effect=lambda got: {sid} & set(got)):
+            out = sports_follow.follow(now=self.now + timedelta(minutes=10))
+        self.assertEqual((out['moved'], out['armed']), (0, 1))
+        self.assertEqual(self.schedule_recording.call_args.args[1:], (sid, *before))
+        self.assertEqual(len(self.events(sid, RECORDING_START_REARMED)), 1)
+
+
+class UnarmedTests(Case):
+    """A followed recording left SCHEDULED with no start job (its re-arm failed twice) is armed again
+    by a later pass at its own times (dev/docs/BUGS.md 2026-11-25 @ 10:42:07 PM): since a start already
+    passed keeps its time, no move does it by the way."""
+
+    ahead = timedelta(minutes=-10)
+    early = timedelta(0)
+
+    def missing(self, ids):
+        p = mock.patch('app.scheduler.missing_starts', side_effect=lambda got: set(got) & set(ids))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_held_start_with_no_job_is_armed_again_at_its_own_times(self):
+        rid = self.recording()
+        before = self.window(rid)
+        self.missing([rid])
+        out = self.follow()
+        self.assertEqual((out['moved'], out['armed']), (0, 1))
+        self.assertEqual(self.window(rid), before)
+        self.schedule_recording.assert_called_once()
+        self.assertEqual(self.schedule_recording.call_args.args[1:], (rid, *before))
+        (ev,) = self.events(rid, RECORDING_START_REARMED)
+        self.assertIn('nothing armed to start it', ev.detail)
+        self.assertIn('starts now', ev.detail)
+
+    def test_a_rule_recording_with_no_job_is_armed_again(self):
+        rid = self.recording(kind='rule')
+        self.missing([rid])
+        self.assertEqual(self.follow()['armed'], 1)
+        self.assertEqual(self.schedule_recording.call_args.args[1], rid)
+
+    def test_one_still_armed_is_left_alone(self):
+        rid = self.recording()
+        self.missing([])
+        self.assertEqual(self.follow()['armed'], 0)
+        self.schedule_recording.assert_not_called()
+        self.assertEqual(self.events(rid, RECORDING_START_REARMED), [])
+
+    def test_a_failed_arm_says_nothing_and_the_next_pass_tries_again(self):
+        rid = self.recording()
+        self.missing([rid])
+        self.schedule_recording.side_effect = [RuntimeError('jobstore down'), None]
+        with self.assertLogs('app.sports_follow', 'WARNING'):
+            self.assertEqual(self.follow()['armed'], 0)
+        self.assertEqual(self.events(rid, RECORDING_START_REARMED), [])
+        self.assertEqual(self.follow()['armed'], 1)
+        self.assertEqual(len(self.events(rid, RECORDING_START_REARMED)), 1)
+
+    def test_a_jobstore_that_cannot_be_read_does_not_stop_the_moves(self):
+        self.move_tsdb(self.listed + timedelta(hours=1))
+        rid = self.recording()
+        with mock.patch('app.scheduler.missing_starts', side_effect=RuntimeError('unpickle failed')), \
+                self.assertLogs('app.sports_follow', 'WARNING'):
+            out = self.follow()
+        self.assertEqual((out['moved'], out['armed']), (1, 0))
+        self.assertEqual(self.window(rid)[0], self.listed + timedelta(hours=1) - PRE)
+
+    def test_one_armed_again_since_the_pass_began_is_left_alone(self):
+        """The pass asks once before its moves; a start that fired or an edit that re-armed meanwhile
+        has a job again by the time the repair runs."""
+        rid = self.recording()
+        answers = iter([{rid}, set()])
+        with mock.patch('app.scheduler.missing_starts', side_effect=lambda got: next(answers)):
+            self.assertEqual(self.follow()['armed'], 0)
+        self.schedule_recording.assert_not_called()
+        self.assertEqual(self.events(rid, RECORDING_START_REARMED), [])
+
+    def test_a_recording_this_pass_moved_is_not_armed_twice(self):
+        """The move's own re-arm is the arm: the repair is for what no move reaches."""
+        self.move_tsdb(self.listed + timedelta(hours=1))
+        rid = self.recording()
+        self.missing([rid])
+        out = self.follow()
+        self.assertEqual((out['moved'], out['armed']), (1, 0))
+        self.assertEqual(self.schedule_recording.call_count, 1)
+
+
+class MissingStartsTests(unittest.TestCase):
+    """scheduler.missing_starts(): the ids with no start_<id> job, and nothing when no scheduler is
+    live to arm one (dev/docs/BUGS.md 2026-11-25 @ 10:42:07 PM)."""
+
+    def test_names_only_the_ids_with_no_start_job(self):
+        from app import scheduler
+        fake = mock.Mock()
+        fake.get_job.side_effect = lambda job_id: None if job_id == 'start_2' else object()
+        with mock.patch.object(scheduler, '_scheduler', fake), \
+                mock.patch.object(scheduler, 'scheduler_is_live', return_value=True):
+            self.assertEqual(scheduler.missing_starts([1, 2, 3]), {2})
+
+    def test_nothing_when_the_scheduler_is_not_live(self):
+        from app import scheduler
+        with mock.patch.object(scheduler, 'scheduler_is_live', return_value=False):
+            self.assertEqual(scheduler.missing_starts([1, 2]), set())
+
 
 class HookTests(Case):
     def test_a_matcher_run_follows_the_games_times(self):
@@ -860,3 +1045,58 @@ class EditRepadTests(Case):
         for e in (repadded, typed):
             self.assertNotIn(str(start), e.detail)
             self.assertNotIn(str(later), e.detail)
+
+
+class CoverBothRepadTests(Case):
+    """An edit that re-pads a followed recording to a new profile moves its Cover both second to the
+    same padding in the same save, saying it was the padding; before, the second stayed at the old
+    padding and the next pass moved it with an event blaming the game's time (dev/docs/BUGS.md 2026-11-25 @ 10:46:52 PM)."""
+
+    early = timedelta(hours=2)
+    hours = 1
+
+    def setUp(self):
+        super().setUp()
+        sports_times.set_league(9001, {'go_by': sports_times.GO_BOTH})
+        self.wide = RecordingProfile(name='Wide', pre_padding_minutes=30, post_padding_minutes=60)
+        db.session.add(self.wide)
+        db.session.commit()
+        self.wide_id = self.wide.id
+
+    edit = EditRepadTests.edit
+
+    def second(self, rid):
+        db.session.expire_all()
+        (second,) = Recording.query.filter_by(sports_cover_for_id=rid).all()
+        return second
+
+    def test_the_second_moves_with_the_edit_and_the_pass_moves_nothing(self):
+        rid = self.recording()
+        self.follow()
+        sid = self.second(rid).id
+        want = (self.listed - timedelta(minutes=30), self.stop + timedelta(minutes=60))
+        self.schedule_recording.reset_mock()
+        self.edit(rid, *want, self.wide_id)
+        s = self.second(rid)
+        moved = (self.tsdb - timedelta(minutes=30), want[0])
+        self.assertEqual((s.start_time, s.stop_time), moved)
+        self.assertEqual((s.sports_window_start, s.sports_window_stop), moved)
+        (ev,) = self.events(sid, RECORDING_SPORTS_RETIMED)
+        self.assertIn('padding of profile "Wide"', ev.detail)
+        self.assertNotIn('TheSportsDB has', ev.detail)
+        extra = json.loads(ev.extra_data)
+        self.assertEqual((extra['reason'], extra['pre_minutes'], extra['post_minutes']),
+                         (sports_follow.RETIMED_PADDING, 30, 60))
+        self.assertIn(sid, [c.args[1] for c in self.schedule_recording.call_args_list])
+        self.assertEqual(self.follow()['moved'], 0)
+        self.assertEqual(self.window(sid), moved)
+        self.assertEqual(len(self.events(sid, RECORDING_SPORTS_RETIMED)), 1)
+
+    def test_a_typed_window_beside_the_profile_change_leaves_the_second(self):
+        rid = self.recording()
+        self.follow()
+        s = self.second(rid)
+        before = (s.start_time, s.stop_time)
+        self.edit(rid, self.listed - timedelta(minutes=12), self.stop + timedelta(minutes=60), self.wide_id)
+        self.assertEqual(self.window(s.id), before)
+        self.assertEqual(self.events(s.id, RECORDING_SPORTS_RETIMED), [])

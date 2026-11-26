@@ -17,7 +17,8 @@ from datetime import datetime, timedelta
 
 from . import db
 from .database import RULE_MATCH_SCHEDULED, RecordingProfile, RuleMatch
-from .sports_follow import KIND_RECORD, KIND_RULE, edit_window as followed_window, same_minute
+from .sports_follow import (
+    KIND_RECORD, KIND_RULE, edit_window as followed_window, move_second_for_padding, same_minute, second_moves)
 
 #: Made from a listing by the TV Guide, a search or a channel page: nothing stored says whose it is.
 KIND_LISTING = 'listing'
@@ -82,6 +83,7 @@ class Repad:
     post_minutes: int
     profile_name: str
     from_game: bool
+    seconds: tuple = ()  # sports_follow.second_moves(): Cover both seconds moved to the same padding
 
 
 def repad_for_save(rec, profile_id, start, stop, now=None):
@@ -96,15 +98,24 @@ def repad_for_save(rec, profile_id, start, stop, now=None):
     matched = same_minute(want[0], start) and same_minute(want[1], stop)
     pre, post = padding(profile_id)
     p = db.session.get(RecordingProfile, profile_id) if profile_id is not None else None
+    name = p.name if p is not None else None
+    # A window a person typed beside the change is theirs, and the follow pass leaves a first
+    # recording that is not ChannelBin's, and its second, alone.
+    seconds = second_moves(rec.id, (start, stop), (pre, post), now) if matched and win.from_game else ()
     return Repad(win.kind, (start, stop) if matched else want, matched,
                  int(pre.total_seconds() // 60), int(post.total_seconds() // 60),
-                 p.name if p is not None else None, win.from_game)
+                 name, win.from_game, seconds)
 
 
-def apply(r, repad: Repad, old):
+def apply(r, repad: Repad, old) -> list:
     """Inside the edit's write unit, before its commit: move the stored fact that says the window
-    is ChannelBin's from `old` (the times before the edit) to the new profile's window. A fact
-    no longer at `old` was moved since the edit was read and is left to whoever moved it."""
+    is ChannelBin's from `old` (the times before the edit) to the new profile's window, and its
+    Cover both seconds to the same padding. A fact no longer at `old` was moved since the edit was
+    read and is left to whoever moved it. Returns [(second id, (start, stop))] moved, for the caller
+    to re-arm after the commit."""
+    whose = f'profile "{repad.profile_name}"' if repad.profile_name else 'no profile'
+    moved = [(sid, new) for sid, was, new, bump in repad.seconds
+             if move_second_for_padding(sid, r.id, was, new, repad.pre_minutes, repad.post_minutes, whose, bump)]
     if repad.kind == KIND_RULE:
         for m in _ledger(r.id):
             if (m.rec_start_time, m.rec_stop_time) == old:
@@ -112,6 +123,7 @@ def apply(r, repad: Repad, old):
     elif repad.kind == KIND_RECORD:
         if (r.sports_window_start, r.sports_window_stop) == old:
             r.sports_window_start, r.sports_window_stop = repad.window
+    return moved
 
 
 def answer(rec, now=None) -> dict:

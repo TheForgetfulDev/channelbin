@@ -208,6 +208,40 @@ class PagesTests(_Leagues, unittest.TestCase):
         self.assertIn('Nothing in the next 7 days: NFL.', rot.pages[0].words.note)
         self.assertIn('Schedule from TheSportsDB', rot.pages[1].words.note)
 
+    def follow_only_bears(self):
+        """The NHL followed through one team only, with a Bears game and another game that has
+        neither team (dev/docs/BUGS.md 2026-11-25 @ 10:55:33 PM)."""
+        SportsFollow.query.filter_by(league_id=self.nhl.id).delete()
+        db.session.add(SportsFollow(league_id=self.nhl.id, team_tsdb_id=101, rule_id=0))
+        db.session.commit()
+        bears = self.game(self.nhl, 6, 1)
+        other = self.game(self.nhl, 3, 2)
+        other.home_team_id, other.away_team_id = 201, 202
+        other.name = 'Comets vs Panthers'
+        db.session.commit()
+        return bears, other
+
+    def test_a_team_follow_shows_only_that_teams_games_on_everything(self):
+        bears, _other = self.follow_only_bears()
+        rot = self.rotation(un.EVERYTHING)
+        nhl = [p for p in rot.pages if p.words.kicker.startswith('NHL')]
+        self.assertEqual(len(nhl), 1)
+        self.assertEqual(nhl[0].words.headline, nhl[0].game.name)
+        self.assertEqual(nhl[0].later, ())
+        self.assertNotIn('Panthers', nhl[0].game.name)
+
+    def test_a_team_follow_shows_only_that_teams_games_on_its_leagues_channel(self):
+        self.follow_only_bears()
+        rot = self.rotation(self.nhl.id)
+        games = [rot.pages[0].game] + list(rot.pages[0].later)
+        self.assertEqual(len(games), 1)
+        self.assertNotIn('Panthers', games[0].name)
+
+    def test_badges_are_wanted_only_for_the_teams_drawn(self):
+        self.follow_only_bears()
+        un.set_up_next(un.EVERYTHING, True)
+        self.assertEqual(un.team_ids(datetime.utcnow()), {101, 102})
+
     def test_everything_with_nothing_scheduled_says_so(self):
         rot = self.rotation(un.EVERYTHING)
         self.assertEqual(len(rot.pages), 1)

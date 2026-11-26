@@ -34,14 +34,14 @@ one write unit; the start, or a running recording's stop, is re-armed after its 
 """
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from . import db, sports_words
 from .database import (
     REC_STATUS_SCHEDULED, RECORDING_EDITED, RECORDING_SPORTS_RETIMED, RECORDING_SPORTS_SECOND, RECORDING_SPORTS_TIME_KEPT,
-    RECORDING_START_NOT_ARMED, RULE_MATCH_SCHEDULED, WINDOW_OPEN_STATUSES, Recording, RecordingEvent,
+    RECORDING_START_NOT_ARMED, RECORDING_START_REARMED, RULE_MATCH_SCHEDULED, WINDOW_OPEN_STATUSES, Recording, RecordingEvent,
     RecordingProfile, RecordingSports, RuleMatch, SportsEvent, SportsLeague, add_recording_event)
 from .db_utils import retry_on_locked
 from .auto_rules_sports import START_FROM_TSDB
@@ -57,11 +57,17 @@ KIND_SECOND = 'second'  # Cover both's second recording
 SECOND_ADDED = 'added'
 SECOND_MOVED = 'moved'
 SECOND_REMOVED = 'removed'
+SECOND_NOT_MADE = 'not_made'   # nothing of TheSportsDB's time was left to record on its own
+#: SECOND_REMOVED's extra['reason'] when the second's window had nothing left in it.
+REMOVED_NOTHING_LEFT = 'nothing_left'
 
 #: RECORDING_SPORTS_RETIMED's extra['kind']: a SCHEDULED recording's window moved, or a running one's
 #: end moved later.
 RETIMED_MOVED = 'moved'
 RETIMED_EXTENDED = 'extended'
+#: extra['reason'] on a RETIMED_MOVED or SECOND_MOVED event when a person's edit re-padded the first
+#: recording to a new profile, not when the game's time moved.
+RETIMED_PADDING = 'padding'
 #: RECORDING_SPORTS_TIME_KEPT's extra['reason']: a person set the times, the recording was already
 #: under way when the game's time moved, or one of the reasons a recording made on TheSportsDB's
 #: time is not moved to its new one.
@@ -97,6 +103,7 @@ class _Pass:
     now: datetime
     tz: object
     h24: bool
+    armed: set = field(default_factory=set)   # ids this pass re-armed after a move
 
     def clock(self, dt) -> str:
         from .tz_utils import format_local
@@ -175,6 +182,57 @@ def edit_window(recording_id, now=None):
     return kind, owned, game_windows(rec, ctx.games[ctx.game_of[rec.id]], Rules(load_config()), now)[0]
 
 
+def second_moves(recording_id, window, pad, now=None) -> tuple:
+    """((second id, (old start, old stop), (new start, new stop), collision note), ...): where an edit that re-pads a
+    followed recording to `window` at padding `pad` (pre, post) moves its owned Cover both seconds,
+    the place the next pass would move them, so the pass finds nothing to do (app/edit_window.py).
+    A second with nothing left at the new padding is left for the pass to remove, with its reason."""
+    from .config import load_config
+    from .sports_times import Rules
+    now = now or datetime.utcnow()
+    ctx = _Context.read([recording_id], now)
+    rec = next((r for r in ctx.primaries if r.id == recording_id), None)
+    out = []
+    if rec is not None:
+        raw = game_windows(rec, ctx.games[ctx.game_of[rec.id]], Rules(load_config()), now)
+        if len(raw) == 2:
+            apart_from = apart(window, padded(raw, *pad)[1])
+            for s in ctx.seconds.get(rec.id) or []:
+                new = (_start_from_now(apart_from[0], s.start_time, now), apart_from[1])
+                if _owned_second(s) and new[1] > new[0] and new != (s.start_time, s.stop_time):
+                    out.append((s.id, (s.start_time, s.stop_time), new, _collision(s.id, *new, exclude=s.id)))
+    db.session.rollback()
+    return tuple(out)
+
+
+def move_second_for_padding(second_id, primary_id, old, new, pre_minutes, post_minutes, whose, bump='') -> bool:
+    """Inside an edit's write unit, before its commit: move an owned second from `old` to `new`, the
+    padding its first recording was just edited to, and say so on both as a padding change, never as
+    the game's time. The minutes ride on the second's event, as on any window ChannelBin gives it
+    (_stored_padding). False when the second moved since it was read, or is no longer ChannelBin's."""
+    from .tz_utils import format_local
+    s = db.session.get(Recording, second_id, populate_existing=True)
+    if s is None or not _owned_second(s) or (s.start_time, s.stop_time) != old:
+        return False
+
+    def clock(dt):
+        return format_local(dt, 'day_datetime')
+    s.start_time = s.scheduled_start_time = s.sports_window_start = new[0]
+    s.stop_time = s.scheduled_stop_time = s.sports_window_stop = new[1]
+    sentence = f'{clock(new[0])} to {clock(new[1])}, from {clock(old[0])} to {clock(old[1])}'
+    window = {'old_start': iso_seconds_or_none(old[0]), 'old_stop': iso_seconds_or_none(old[1]),
+              'new_start': iso_seconds_or_none(new[0]), 'new_stop': iso_seconds_or_none(new[1])}
+    add_recording_event(second_id, RECORDING_SPORTS_RETIMED,
+                        detail=(f'Moved to the padding of {whose}, which recording #{primary_id} was just '
+                                f'edited to: {sentence}.{bump}'),
+                        extra={'kind': RETIMED_MOVED, 'reason': RETIMED_PADDING, 'pre_minutes': pre_minutes,
+                               'post_minutes': post_minutes, **window})
+    add_recording_event(primary_id, RECORDING_SPORTS_SECOND,
+                        detail=f'The second recording, #{second_id}, moved to the same padding: {sentence}.',
+                        extra={'kind': SECOND_MOVED, 'reason': RETIMED_PADDING, 'second_id': second_id, **window})
+    return True
+
+
 def same_minute(a, b) -> bool:
     """The dialog's pickers hold whole minutes."""
     return a.replace(second=0, microsecond=0) == b.replace(second=0, microsecond=0)
@@ -196,16 +254,17 @@ def apart(first, second) -> tuple:
 
 def follow(recording_ids=None, now: datetime = None) -> dict:
     """Bring every followed recording (or only `recording_ids`) to its game's window. Returns counts
-    {moved, kept, added, removed}. A recording that cannot be brought up to date is logged at ERROR,
+    {moved, kept, added, removed, extended, armed}. A recording that cannot be brought up to date is logged at ERROR,
     which raises an alert naming it, and the rest go on."""
     from .config import load_config
     from .sports_times import Rules
     from .tz_utils import get_display_tz, is_24h
     now = now or datetime.utcnow()
-    counts = {'moved': 0, 'kept': 0, 'added': 0, 'removed': 0, 'extended': 0}
+    counts = {'moved': 0, 'kept': 0, 'added': 0, 'removed': 0, 'extended': 0, 'armed': 0}
     cfg = load_config()
     run = _Pass(rules=Rules(cfg), cfg=cfg, now=now, tz=get_display_tz(), h24=is_24h())
     ctx = _Context.read(recording_ids, now)
+    unarmed = _unarmed(ctx)
     db.session.rollback()   # no read transaction held across the writes below
     for rec in ctx.primaries:
         try:
@@ -243,10 +302,18 @@ def follow(recording_ids=None, now: datetime = None) -> dict:
             db.session.rollback()
             log.error('Recording %d: could not remove a second recording nobody needs', second.id,
                       exc_info=True, extra={'recording_id': second.id})
+    for rid in sorted(unarmed - run.armed):
+        try:
+            if _arm_unarmed(rid, run):
+                counts['armed'] += 1
+        except Exception:
+            db.session.rollback()
+            log.error('Recording %d: has nothing armed to start it and could not be armed again', rid,
+                      exc_info=True, extra={'recording_id': rid})
     if any(counts.values()):
-        log.info('Sports times: moved %d, ended %d under way later, left %d as they were, added %d second '
-                 'and removed %d', counts['moved'], counts['extended'], counts['kept'], counts['added'],
-                 counts['removed'])
+        log.info('Sports times: moved %d, ended %d under way later, left %d as they were, added %d second, '
+                 'removed %d and armed %d again', counts['moved'], counts['extended'], counts['kept'],
+                 counts['added'], counts['removed'], counts['armed'])
     return counts
 
 
@@ -418,21 +485,29 @@ def _follow_one(rec, ctx, run, counts):
     if want != current:
         if _move(rec.id, kind, current, want, pad, game, run, raw):
             counts['moved'] += 1
-            _rearm(rec.id, want[0], want[1], want[0] != current[0])
+            _rearm(rec.id, want[0], want[1], want[0] != current[0], run)
     live = [s for s in seconds if s.status == REC_STATUS_SCHEDULED]
     if len(wins) == 2:
         apart_from = apart(want, wins[1])
         if not seconds:
             target = (max(apart_from[0], run.now), apart_from[1])
-            if not _second_was_removed(rec.id) and _add_second(rec.id, target, pad, game, run, raw):
+            if _second_was_removed(rec.id):
+                return
+            if target[1] <= target[0]:
+                _note_no_second(rec.id, raw[1], _nothing_left_why(wins[1], want, run), game, run)
+            elif _add_second(rec.id, target, pad, game, run, raw):
                 counts['added'] += 1
             return
         for s in live:
             target = (_start_from_now(apart_from[0], s.start_time, run.now), apart_from[1])
-            if _owned_second(s) and (s.start_time, s.stop_time) != target:
+            if _owned_second(s) and target[1] <= target[0]:
+                if _remove_second(s.id, rec.id, _nothing_left_why(wins[1], want, run), run,
+                                  reason=REMOVED_NOTHING_LEFT):
+                    counts['removed'] += 1
+            elif _owned_second(s) and (s.start_time, s.stop_time) != target:
                 if _move_second(s.id, rec.id, (s.start_time, s.stop_time), target, pad, game, run, raw):
                     counts['moved'] += 1
-                    _rearm(s.id, target[0], target[1], target[0] != s.start_time)
+                    _rearm(s.id, target[0], target[1], target[0] != s.start_time, run)
         return
     for s in live:
         if _owned_second(s):
@@ -579,7 +654,7 @@ def _follow_named_scheduled(rec, ctx, run, counts):
         kept('its rule already judged a listing of that title at that start', KEPT_LISTING_THERE)
     elif moved:
         counts['moved'] += 1
-        _rearm(rec.id, want[0], want[1], want[0] != current[0])
+        _rearm(rec.id, want[0], want[1], want[0] != current[0], run)
 
 
 def _kept(event) -> bool:
@@ -889,19 +964,64 @@ def _note_under_way(rec_id, game, run, start, want):
     _write()
 
 
+def _last_second(primary_id):
+    """The extra of the first recording's latest RECORDING_SPORTS_SECOND event: None when it has none,
+    {} when it cannot be read."""
+    last = (RecordingEvent.query.filter_by(recording_id=primary_id, event_type=RECORDING_SPORTS_SECOND)
+            .order_by(RecordingEvent.id.desc()).first())
+    extra = last.extra_data if last is not None else None
+    db.session.rollback()
+    if last is None:
+        return None
+    try:
+        data = json.loads(extra or '{}')
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _second_was_removed(primary_id) -> bool:
     """ChannelBin scheduled a second recording that is gone, and not by ChannelBin: its own removal
     writes SECOND_REMOVED in the delete's commit, so a gone second without one was a person's answer,
-    and it is not made again for this recording."""
-    last = (RecordingEvent.query.filter_by(recording_id=primary_id, event_type=RECORDING_SPORTS_SECOND)
-            .order_by(RecordingEvent.id.desc()).first())
-    db.session.rollback()
-    if last is None:
+    and it is not made again for this recording. A second ChannelBin did not make (SECOND_NOT_MADE)
+    was never there to remove."""
+    last = _last_second(primary_id)
+    return last is not None and last.get('kind') not in (SECOND_REMOVED, SECOND_NOT_MADE)
+
+
+def _nothing_left_why(second, want, run) -> str:
+    """Why the second recording's window, `second` padded, trimmed to before the first recording's
+    window `want` and to now, has nothing in it."""
+    if second[1] <= run.now:
+        return "TheSportsDB's time for it has already passed"
+    return (f"what is left of TheSportsDB's time falls inside this recording's own window, from "
+            f'{run.clock(want[0])}')
+
+
+def _note_no_second(primary_id, raw_second, why, game, run) -> bool:
+    """Say once on the first recording that Cover both's second was not made, because nothing of its
+    window was left. Not written again while it is the latest word on
+    the second, nor after a removal that already said the same."""
+    last = _last_second(primary_id) or {}
+    if last.get('kind') == SECOND_NOT_MADE or (last.get('kind') == SECOND_REMOVED
+                                               and last.get('reason') == REMOVED_NOTHING_LEFT):
         return False
-    try:
-        return json.loads(last.extra_data or '{}').get('kind') != SECOND_REMOVED
-    except ValueError:
+    clock = run.clock
+    detail = (f"Did not schedule a second recording at TheSportsDB's time, {clock(raw_second[0])} to "
+              f'{clock(raw_second[1])}, for the {game.one}: {why}.')
+
+    @retry_on_locked()
+    def _write():
+        if db.session.get(Recording, primary_id) is None:
+            db.session.rollback()
+            return False
+        add_recording_event(primary_id, RECORDING_SPORTS_SECOND, detail=detail,
+                            extra={'kind': SECOND_NOT_MADE, 'start': iso_seconds_or_none(raw_second[0]),
+                                   'stop': iso_seconds_or_none(raw_second[1])})
+        db.session.commit()
         return True
+
+    return _write()
 
 
 def _second_name(name: str) -> str:
@@ -993,7 +1113,7 @@ def _move_second(second_id, primary_id, old, new, pad, game, run, raw) -> bool:
     return _write()
 
 
-def _remove_second(second_id, primary_id, why, run) -> bool:
+def _remove_second(second_id, primary_id, why, run, reason=None) -> bool:
     """Delete a second recording nobody needs, as cancelling any SCHEDULED recording does
     (dev/changelog/814). The first one's SECOND_REMOVED event lands in the delete's own commit, so a
     gone second without one is never ChannelBin's doing (_second_was_removed)."""
@@ -1022,7 +1142,7 @@ def _remove_second(second_id, primary_id, why, run) -> bool:
                 detail=(f'Removed the second recording, #{second_id}, at {clock(when[0])} to {clock(when[1])}: '
                         f'{why}.'),
                 extra={'kind': SECOND_REMOVED, 'second_id': second_id, 'old_start': iso_seconds_or_none(when[0]),
-                       'old_stop': iso_seconds_or_none(when[1])})
+                       'old_stop': iso_seconds_or_none(when[1]), **({'reason': reason} if reason else {})})
         db.session.commit()
         return True
 
@@ -1041,6 +1161,61 @@ def drop_seconds_of(primary_id):
         _remove_second(sid, None, '', None)
 
 
+def _unarmed(ctx) -> set:
+    """The SCHEDULED recordings this pass reads that have no start job (scheduler.missing_starts).
+    Since a start already passed keeps its time (_start_from_now), no move re-arms one of these by
+    the way, so the job itself is what is checked."""
+    from .scheduler import missing_starts
+    seconds = [s.id for group in ctx.seconds.values() for s in group if s.status == REC_STATUS_SCHEDULED]
+    try:
+        return missing_starts([r.id for r in ctx.primaries + ctx.named_scheduled] + seconds)
+    except Exception:
+        # A jobstore that cannot be read must not stop the moves the pass exists for.
+        log.warning('Sports times: could not check which followed recordings have a start armed',
+                    exc_info=True)
+        return set()
+
+
+def _arm_unarmed(rec_id, run) -> bool:
+    """Arm a recording found SCHEDULED with no start job at its own times, and say so on it. A start
+    already passed fires at once, as a restart's sweep starts a missed one. One whose window is over
+    is left as it is: only a restart's sweep ends a missed recording. The job is asked about again
+    here, after the row: the pass's first check is from before its moves, and a start that fired
+    since, or an edit that re-armed it, has a job again or has left SCHEDULED."""
+    from flask import current_app
+    from .routes import recordings as rec_routes
+    from .scheduler import missing_starts
+    rec = db.session.get(Recording, rec_id, populate_existing=True)
+    state = (rec.status, rec.start_time, rec.stop_time) if rec is not None else None
+    db.session.rollback()
+    if state is None or state[0] != REC_STATUS_SCHEDULED or state[2] <= datetime.utcnow():
+        return False
+    if not missing_starts([rec_id]):
+        return False
+    _status, start, stop = state
+    try:
+        rec_routes.schedule_recording(current_app._get_current_object(), rec_id, start, stop)
+    except Exception:
+        log.warning('Recording %d: still has nothing armed to start it; the next sports pass tries again',
+                    rec_id, exc_info=True, extra={'recording_id': rec_id})
+        return False
+    when = 'now, its start time having passed' if start <= run.now else f'at {run.clock(start)}'
+    detail = f'Found with nothing armed to start it, so ChannelBin armed it again: it starts {when}.'
+
+    @retry_on_locked()
+    def _note():
+        if db.session.get(Recording, rec_id) is None:
+            db.session.rollback()
+            return
+        add_recording_event(rec_id, RECORDING_START_REARMED, detail=detail,
+                            extra={'start': iso_seconds_or_none(start), 'stop': iso_seconds_or_none(stop)})
+        db.session.commit()
+
+    _note()
+    log.info('Recording %d: had nothing armed to start it; armed again', rec_id, extra={'recording_id': rec_id})
+    return True
+
+
 def _rearm_stop(rec_id, stop):
     """After a running recording's end moved: its stop job alone, as a resume re-arms it
     (scheduler.reschedule_recording_stop). Left at the old time it would stop the capture there."""
@@ -1055,10 +1230,13 @@ def _rearm_stop(rec_id, stop):
                           'so it may stop at its old end', rec_id, exc_info=True, extra={'recording_id': rec_id})
 
 
-def _rearm(rec_id, start, stop, start_moved):
-    """After a move committed: the re-plan tail a person's edit runs (routes/recordings.py)."""
+def _rearm(rec_id, start, stop, start_moved, run):
+    """After a move committed: the re-plan tail a person's edit runs (routes/recordings.py). Its
+    old jobs come off first, so two failed tries leave nothing armed: the next pass finds that
+    through _unarmed() and arms it again (_arm_unarmed)."""
     from flask import current_app
     from .routes import recordings as rec_routes
+    run.armed.add(rec_id)
     try:
         rec_routes._rearm_replanned(rec_id, start, stop, start_moved)
         return

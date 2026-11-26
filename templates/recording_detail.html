@@ -1279,7 +1279,8 @@
    with the type's plain name and keeps the type itself in small print, since that is what
    Logs and support bundles spell (dev/changelog/1293). #}
 {# RECORDING_START_NOT_ARMED is 'bad': a SCHEDULED recording nothing will start until a
-   restart, and this event is its one lasting surface (dev/changelog/1186).
+   restart, and this event is its one lasting surface (dev/changelog/1186);
+   RECORDING_START_REARMED, its repair by the sports pass, is 'ok' (dev/changelog/1739).
    RECORDING_RULE_PROGRAM_MOVED is 'warn': the guide moved the program and this recording
    stayed where it was (dev/changelog/1188).
    A resume refused is an ERROR alert elsewhere, so 'bad'; a failover, a failed pre-check,
@@ -1312,7 +1313,7 @@
   'SOURCE_DELETED': 'info', 'SOURCE_KEPT': 'info',
   'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad', 'CAPTURE_GAVE_UP': 'bad',
   'CONCATENATION_FAILED': 'bad', 'CONVERSION_FAILED': 'bad',
-  'RECORDING_START_NOT_ARMED': 'bad',
+  'RECORDING_START_NOT_ARMED': 'bad', 'RECORDING_START_REARMED': 'ok',
   'RECORDING_RESUME_REFUSED': 'bad', 'GROUP_FAILOVER': 'warn', 'PRE_CHECK_FAILED': 'warn',
   'RECORDING_STARTED_LATE': 'warn', 'RECORDING_HOST_ROLLED': 'warn', 'RECORDING_LOGIN_REFUSED': 'warn',
   'PROVIDER_STALLS_CORRELATED': 'warn',

@@ -183,6 +183,7 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
         if move_when_full is not _UNSET:
             r.move_when_account_full = move_when_full
         old_start, old_stop = r.start_time, r.stop_time
+        seconds = []
         if name != r.name:
             # A name a person changed is theirs: the join must not fill TheSportsDB fields
             # into it (dev/changelog/1498).
@@ -195,7 +196,7 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
         r.scheduled_stop_time = stop_utc
         if repad is not None:
             from ..edit_window import apply as apply_repad
-            apply_repad(r, repad, (old_start, old_stop))
+            seconds = apply_repad(r, repad, (old_start, old_stop))
         if old_start != start_utc or old_stop != stop_utc:
             # In the display timezone: the recording page shows a detail as written.
             moved = (f'{format_local(old_start)} → {format_local(start_utc)}, '
@@ -233,9 +234,19 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
                     extra={'from_channel_id': old_ch.id if old_ch else None,
                            'to_channel_id': new_ch.id})
         db.session.commit()
-        return old_start != start_utc
+        return old_start != start_utc, seconds
 
-    start_moved = _apply_edit_and_commit()
+    start_moved, seconds = _apply_edit_and_commit()
+    # Cover both seconds the edit moved to the same padding (app/edit_window.py::apply), each on its
+    # own, and before the first: their rows already hold the new times, and a raise re-arming one
+    # must not leave the others on their old jobs.
+    was = {sid: old[0] for sid, old, _new, _bump in (repad.seconds if repad is not None else ())}
+    for second_id, (second_start, second_stop) in seconds:
+        try:
+            _rearm_replanned(second_id, second_start, second_stop, second_start != was.get(second_id))
+        except Exception:
+            log.error('Recording %d: moved with its first recording\'s new padding, but its start could not '
+                      'be re-armed', second_id, exc_info=True, extra={'recording_id': second_id})
     _rearm_replanned(recording_id, start_utc, stop_utc, start_moved)
 
 

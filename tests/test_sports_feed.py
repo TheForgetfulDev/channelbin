@@ -225,6 +225,10 @@ class GuideTests(_Case):
         return self.get('/xmltv.php').get_data(as_text=True)
 
     def test_a_game_is_in_the_guide_at_the_guides_own_time_with_where_it_plays_from(self):
+        """Under Go by the guide. Under Go by TheSportsDB the listing, and so the block, moves to
+        TheSportsDB's time (MovedTimeTests)."""
+        from app import sports_times
+        sports_times.set_league(9001, {'go_by': sports_times.GO_GUIDE})
         row = self.team_on(BEARS)
         start = self.now + timedelta(hours=2)
         e = self.event(BEARS, GULLS, start, venue='Ironvale Dome', city='Ironvale')
@@ -643,6 +647,74 @@ class WindowTests(_Case):
         play = feed.resolve_play(fid)
         self.assertIsNone(play.member)
         self.assertFalse(play.fault)
+
+
+class MovedTimeTests(_Case):
+    """A game the guide lists at 7:00 and TheSportsDB has at 10:00, under Go by TheSportsDB: the play
+    goes by the listing moved to 10:00, and so do the sports channel's guide block, its count of
+    channels, Start broadcast and a tune-in's answer. Before, the block stayed at 7:00 saying no
+    stream was found, Start broadcast was refused as unlisted, and the channel then played the game
+    at 10:00 from that same listing (dev/docs/BUGS.md 2026-11-25 @ 10:54:34 PM)."""
+
+    def setUp(self):
+        super().setUp()
+        from app import sports_times
+        sports_times.set_league(9001, {'go_by': sports_times.GO_TSDB, 'wait_hours': 48})
+        self.fid = feed.SPORTS_FEED_BASE + self.team_on(BEARS).id
+        self.listed = self.now + timedelta(hours=2)
+        self.tsdb = self.listed + timedelta(hours=3)
+        self.e = self.event(BEARS, GULLS, self.tsdb)
+        self.e.guide_start = self.listed
+        self.ch = self.channel('Local 7')
+        self.listing(self.e, self.ch, start=self.listed, hours=3)
+        db.session.commit()
+
+    def test_the_guide_block_starts_where_the_listing_was_moved_and_counts_it(self):
+        xml = self.get('/xmltv.php').get_data(as_text=True)
+        stop = self.tsdb + timedelta(hours=3)
+        self.assertIn(f'<programme start="{self.tsdb:%Y%m%d%H%M%S} +0000" stop="{stop:%Y%m%d%H%M%S} +0000" '
+                      f'channel="{self.fid}"><title>Harborview Gulls at Ironvale Bears</title>', xml)
+        self.assertIn('ChannelBin plays this from the 1 channel whose guide lists it', xml)
+        self.assertNotIn('No stream found yet', xml)
+
+    def test_start_broadcast_is_offered_and_taken(self):
+        resp = self.client.put(f'/api/sports/events/{self.e.id}/live-now', json={'on': True})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        db.session.expire_all()
+        stored = db.session.get(SportsEvent, self.e.id)
+        self.assertEqual(stored.live_now_until, self.tsdb + timedelta(hours=3) + timedelta(hours=2))
+
+    def test_a_tune_in_at_the_guides_time_names_the_moved_time_and_the_play_takes_it_then(self):
+        why = feed.resolve_play(self.fid, now=self.listed).why_none
+        self.assertIn('is on right now. Next: Harborview Gulls at Ironvale Bears', why)
+        self.assertNotIn('no stream is found yet', why)
+        on = feed.resolve_play(self.fid, now=self.tsdb + timedelta(minutes=5))
+        self.assertEqual(on.member.id, self.ch.id)
+
+    def test_the_window_and_the_up_next_page_go_by_the_same_start(self):
+        from app import sports_up_next
+        listings = sports_match.listing_windows([self.e.id], self.now).get(self.e.id, ())
+        self.assertEqual(sports_feed.event_window(self.e, listings), (self.tsdb, self.tsdb + timedelta(hours=3)))
+        ((event, window),) = sports_up_next._games_by_league([self.league.id], self.now)[self.league.id]
+        self.assertEqual(window[0], self.tsdb)
+
+    def test_under_cover_both_the_block_runs_from_the_first_window_to_the_last(self):
+        from app import sports_times
+        sports_times.set_league(9001, {'go_by': sports_times.GO_BOTH, 'wait_hours': 48})
+        SportsMatch.query.delete()
+        self.listing(self.e, self.ch, start=self.listed, hours=1)
+        db.session.commit()
+        listings = sports_match.listing_windows([self.e.id], self.now).get(self.e.id, ())
+        self.assertEqual(len(listings), 2, 'two windows, one at each start')
+        self.assertEqual(sports_feed.event_window(self.e, listings), (self.listed, self.tsdb + timedelta(hours=1)))
+
+    def test_under_the_guide_nothing_moves(self):
+        from app import sports_times
+        sports_times.set_league(9001, {'go_by': sports_times.GO_GUIDE})
+        listings = sports_match.listing_windows([self.e.id], self.now).get(self.e.id, ())
+        self.assertEqual(sports_feed.event_window(self.e, listings), (self.listed, self.listed + timedelta(hours=3)))
+        on = feed.resolve_play(self.fid, now=self.listed + timedelta(minutes=5))
+        self.assertEqual(on.member.id, self.ch.id)
 
 
 class LiveNowTests(_Case):
@@ -1529,7 +1601,7 @@ class MatchReaderTests(_Case):
         db.session.commit()
         self.assertEqual([(ev, ch) for ev, ch, _s, _e in sports_match.airing_now([e.id], self.now)],
                          [(e.id, good.id)])
-        self.assertEqual([c for c, _a, _s, _e in sports_match.listing_windows([e.id], self.now)[e.id]], [good.id])
+        self.assertEqual([row[0] for row in sports_match.listing_windows([e.id], self.now)[e.id]], [good.id])
         self.assertEqual(sports_match.airing_now([], self.now), [])
 
 
