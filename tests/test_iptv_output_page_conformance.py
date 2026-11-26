@@ -79,8 +79,9 @@ class IptvOutputPageConformanceTests(FeedCase):
         self.session(feed.feed_id_for_channel(self.alpha.id))
         html = self.render()
         cards = re.findall(r'<div class="card[^"]*" id="(of-[a-z]+)"', html)
-        self.assertEqual(cards, ['of-connect', 'of-watching', 'of-pip', 'of-channels', 'of-recent',
-                                 'of-accounts', 'of-settings'])
+        # Logins for other users sits under the login it extends (dev/changelog/1760).
+        self.assertEqual(cards, ['of-connect', 'of-logins', 'of-watching', 'of-pip', 'of-channels',
+                                 'of-recent', 'of-accounts', 'of-settings'])
 
     def test_the_picture_in_picture_card_is_a_shared_table_with_its_phone_form(self):
         """Mockup 63, dev/docs/DESIGN-pip-channels.md 12: a table like every other on the page,

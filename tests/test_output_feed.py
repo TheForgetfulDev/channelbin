@@ -1964,7 +1964,7 @@ class MixedModeRouteTests(_Relay):
         html = unescape(self.client.get('/iptv-output').get_data(as_text=True))
         self.assertIn('Through ChannelBin', html)
         self.assertIn('Straight from your IPTV provider', html)
-        self.assertIn('In mixed mode only channel groups, sports channels and Up next channels play through ChannelBin', html)
+        self.assertIn('In mixed mode only channel groups, sports channels, Up next channels and every play on a login for another user go through ChannelBin', html)
         self.assertIn('Recordings leave alone', html)
         self.assertIn('Current streams', html)
         self.assertIn('<option value="mixed" selected>', html)

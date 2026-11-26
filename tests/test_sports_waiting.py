@@ -500,7 +500,7 @@ class RedirectModeWaitingTests(_Waiting):
         self.play()
         html = self.client.get('/iptv-output').get_data(as_text=True)
         self.assertIn('Waiting screen', html)
-        self.assertIn("The plays it can see are its own pictures, a sports channel's waiting screen", html)
+        self.assertIn("The plays it can see are listed here: its own pictures (a sports channel's waiting screen", html)
         self.assertIn('stops when the game comes on', html)
         dash = self.client.get('/').get_data(as_text=True)
         self.assertIn('WAITING SCREEN', dash)

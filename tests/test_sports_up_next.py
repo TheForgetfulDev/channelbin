@@ -380,7 +380,7 @@ class CatalogTests(_Leagues, unittest.TestCase):
         self.assertEqual({r.kind for r in rows}, {feed.KIND_UP_NEXT, feed.KIND_SPORTS})
         fcfg = {'username': 'u', 'password': 'p'}
         for row in rows:
-            self.assertEqual(feed.logo_url(row, 'http://box:5000', fcfg),
+            self.assertEqual(feed.logo_url(row, 'http://box:5000', feed.main_login(fcfg)),
                              f'http://box:5000{feed.OWN_LOGO_PATH}', row.name)
         resp = self.t.client.get(feed.OWN_LOGO_PATH)
         self.assertEqual((resp.status_code, resp.mimetype), (200, 'image/png'))

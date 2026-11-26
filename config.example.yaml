@@ -287,7 +287,7 @@ integrations:
     buffer_mb: 64           # proxy and mixed: the most memory one IPTV player's stream may wait in; it has to hold the
                             # 13 to 29 seconds a provider sends at once when a play starts
     reserve_seconds: 3      # proxy and mixed: how far behind live the IPTV player plays; 0 = pass-through
-    max_viewers: 3          # proxy and mixed: streams relayed at once
+    max_viewers: 3          # streams relayed at once: proxy and mixed, and logins for other users in every mode
     idle_seconds: 30        # proxy and mixed: an IPTV player that read nothing for this long is gone
     max_session_hours: 12   # proxy and mixed: the hard cap on one play
     xmltv_days: 3           # listings depth in xmltv.php

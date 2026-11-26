@@ -3,7 +3,9 @@ Guide (app/output_feed.py, dev/docs/DESIGN-output-feed.md).
 
 Gated per request on `integrations.output_feed.enabled` and the credential pair the client
 sends on every call - in the query for the three `.php` endpoints, in the path for a stream.
-"Disabled", "no credential set" and "wrong credential" all answer the same 401 body, the
+The pair names the main login in Settings or one login for another user
+(output_feed.feed_login_for, dev/changelog/1760), and every URL an answer carries is built from
+that login's own pair. "Disabled", "no credential set" and "wrong credential" all answer the same 401 body, the
 precedent app/routes/ha.py sets; app/auth.py::SELF_GATED_BLUEPRINTS names this blueprint so
 the interactive login gate does not also demand a browser login from an IPTV player. Registered
 always, so turning the feed on needs no restart.
@@ -43,12 +45,14 @@ def _require_credentials():
     args = request.view_args or {}
     username = args.get('username', request.args.get('username'))
     password = args.get('password', request.args.get('password'))
-    if not output_feed.credentials_ok(fcfg, username, password):
+    login = output_feed.feed_login_for(fcfg, username, password)
+    if login is None:
         # One body for every cause, so nothing outside can tell the feed is off from a
-        # wrong password (section 6.1).
+        # wrong password or a login turned off (section 6.1).
         return jsonify({'error': output_feed.AUTH_FAILED_MESSAGE}), 401
     g.cfg = cfg
     g.feed_cfg = fcfg
+    g.feed_login = login
     return None
 
 
@@ -65,11 +69,11 @@ def player_api():
     if not action:
         host, _, port = request.host.partition(':')
         port = port or ('443' if request.scheme == 'https' else '80')
-        return jsonify(output_feed.auth_payload(g.feed_cfg, host, port, request.scheme))
+        return jsonify(output_feed.auth_payload(g.feed_cfg, g.feed_login, host, port, request.scheme))
     if action == _ACTION_CATEGORIES:
         return jsonify(output_feed.category_payload(output_feed.catalog(g.cfg)))
     if action == _ACTION_STREAMS:
-        return jsonify(output_feed.live_streams_payload(output_feed.catalog(g.cfg), _base_url(), g.feed_cfg))
+        return jsonify(output_feed.live_streams_payload(output_feed.catalog(g.cfg), _base_url(), g.feed_login))
     if action in _EMPTY_ACTIONS:
         return jsonify([])
     log.info('Output feed: unknown player_api action %r from %s answered empty', action,
@@ -79,7 +83,7 @@ def player_api():
 
 @output_feed_bp.route('/get.php')
 def get_php():
-    text = output_feed.m3u_text(output_feed.catalog(g.cfg), _base_url(), g.feed_cfg)
+    text = output_feed.m3u_text(output_feed.catalog(g.cfg), _base_url(), g.feed_login)
     return Response(text, mimetype='audio/x-mpegurl',
                     headers={'Content-Disposition': 'attachment; filename="channelbin.m3u"'})
 
@@ -137,11 +141,12 @@ def live(username, password, feed_id):
     # setting off, a reverse proxy in front gives every player its address (dev/changelog/1744).
     player = client if current_app.config.get('BEHIND_PROXY') else ''
     try:
-        if output_feed.relays(g.feed_cfg, feed_id):
-            session = output_feed.start_session(feed_id, client, g.cfg, player=player)
+        if output_feed.relays_for(g.feed_cfg, feed_id, g.feed_login):
+            session = output_feed.start_session(feed_id, client, g.cfg, player=player,
+                                                login=g.feed_login)
         else:
             # A sports channel with nothing on is streamed its waiting screen in this mode too.
-            target, session = output_feed.redirect_play(feed_id, client, g.cfg)
+            target, session = output_feed.redirect_play(feed_id, client, g.cfg, login=g.feed_login)
             if target is not None:
                 return redirect(target, code=302)
     except output_feed.FeedRefused as exc:

@@ -277,15 +277,21 @@ def _seed_pip_feed(n):
 
 def _seed_iptv_output(n):
     """The IPTV Output page at its widest: the guide scope with its sports channels and n
-    picture-in-picture channels, n lines of Recent plays, and n IPTV players watching n different channels (dev/changelog/1526)."""
+    picture-in-picture channels, n lines of Recent plays, n IPTV players watching n different channels
+    (dev/changelog/1526), and n logins for other users, each with a play and a line (dev/changelog/1760)."""
     import time
     import app.output_feed as feed
-    from app.database import FEED_PLAY_ENDED, FEED_PLAY_REFUSED, OutputFeedPlay
+    from app.database import FEED_PLAY_ENDED, FEED_PLAY_REFUSED, OutputFeedLogin, OutputFeedPlay
     _seed_pip_feed(n)
     now = datetime.utcnow()
+    logins = [OutputFeedLogin(name=f'User {i}', username=f'user{i}', password=f'pw{i}', max_streams=2)
+              for i in range(n)]
+    db.session.add_all(logins)
+    db.session.flush()
     watched = Channel.query.filter(Channel.in_guide.is_(True)).order_by(Channel.id).limit(n).all()  # guide-flag-read-ok: seeding the feed's own rows
     for i, ch in enumerate(watched):
-        db.session.add(OutputFeedPlay(
+        login = logins[i % len(logins)]
+        db.session.add(OutputFeedPlay(feed_login=login.username,
             kind=FEED_PLAY_REFUSED if i % 2 else FEED_PLAY_ENDED, at=now - timedelta(minutes=i),
             first_at=now - timedelta(minutes=i + 5), feed_id=feed.feed_id_for_channel(ch.id),
             label=f'channel {ch.id} ({ch.name})', client='192.168.1.23', channel_id=ch.id,
@@ -293,7 +299,8 @@ def _seed_iptv_output(n):
         s = feed.RelaySession(
             id=f'scale-{i}', feed_id=feed.feed_id_for_channel(ch.id), label=f'channel {ch.id} ({ch.name})',
             client=f'192.168.1.{i}', group_id=None, channel_id=ch.id, channel_name=ch.name,
-            account_id=ch.account_id, ring=feed.Ring(1024, 0), started_mono=time.monotonic())
+            account_id=ch.account_id, ring=feed.Ring(1024, 0), started_mono=time.monotonic(),
+            feed_login_id=login.id, feed_login=login.username)
         s.state = feed.STATE_STREAMING
         with feed._lock:
             feed._sessions[s.id] = s
