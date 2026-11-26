@@ -49,7 +49,8 @@ _REQUEST_LINE_RE = re.compile(r'("(?:GET|HEAD|POST) )(/[^\s"]*)')
 
 
 def _mask_request_path(path: str) -> str:
-    path = re.sub(r'(/(?:live|movie|series)/)([^/]+)/([^/]+)(/)', r'\1***/***\4', path)
+    # /logo/<user>/<pass>/<id> is the output feed's own logo route (dev/changelog/1760).
+    path = re.sub(r'(/(?:live|movie|series|logo)/)([^/]+)/([^/]+)(/)', r'\1***/***\4', path)
     return re.sub(r'(?i)((?:username|password|user|pass)=)[^&]+', r'\1***', path)
 
 

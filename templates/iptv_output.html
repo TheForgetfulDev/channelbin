@@ -111,14 +111,47 @@
   </div>
   {% endif %}
 
+  {% if not needs_login %}
+  <div class="card" id="of-logins" data-server="{{ connect.server }}">
+    <div class="card-head"><h2>Logins for other users{% if logins %} <span class="cnt">{{ logins | length }}</span>{% endif %}</h2>
+      <div class="card-head-actions"><button class="btn btn-sm" data-act="login-add" data-password="{{ login_password }}" data-min="{{ login_streams[0] }}" data-max="{{ login_streams[1] }}">{{ icon('add') }}Add a login</button></div></div>
+    <div class="card-body">
+      <p class="card-note">Give someone else their own login to this IPTV output. They type the same server address with their own username and password, and get the same channels and guide. Each login can be turned off or deleted without touching the others or yours. A play on one of these logins always goes through ChannelBin, even in redirect or mixed mode, so your IPTV provider's login is never sent to their player. Their plays count against "IPTV players at once" as well as their own limit.</p>
+      {% if logins %}
+      <div class="table-scroll"><table class="tbl tbl-cards rl-tbl">
+        <thead><tr><th>Name</th><th>Username</th><th>Password</th><th class="tip-plain" data-tip="How many channels this login may play at once, and how many it is playing now.">Streams</th><th>On</th><th></th></tr></thead>
+        <tbody>
+          {% for l in logins %}
+          <tr{{ ' class="of-off"' | safe if not l.on else '' }} data-login="{{ l.id }}" data-name="{{ l.name }}" data-user="{{ l.username }}" data-streams="{{ l.max_streams }}" data-playing="{{ l.playing }}">
+            <td data-label="Name" class="rl-prog"><span class="t">{{ l.name }}</span></td>
+            <td data-label="Username">{{ l.username }}</td>
+            <td data-label="Password"><span data-secret-text="{password}">{{ mask }}</span> <button class="btn btn-sm btn-icon" data-act="login-reveal" aria-label="Show the password">{{ icon('reveal') }}</button></td>
+            <td data-label="Streams">{% if l.playing %}{{ l.playing }} of {{ l.max_streams }} playing{% else %}Up to {{ l.max_streams }}{% endif %}</td>
+            <td data-label="On" class="of-sw">{{ switch('login-on', l.id, l.on, 'Let ' ~ l.name ~ ' log in') }}</td>
+            <td data-label="" class="sp-kebab"><span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
+              <div class="menu pop-left">
+                <button class="menu-item" data-act="login-copy">Copy the details to send</button>
+                <button class="menu-item" data-act="login-edit">Change</button>
+                <button class="menu-item danger" data-act="login-delete">Delete</button>
+              </div></span></td>
+          </tr>
+          {% endfor %}
+        </tbody></table></div>
+      {% else %}
+      <p class="card-note">None yet. Add a login to give someone their own.</p>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
   {% if is_on %}
   <div class="card" id="of-watching">
     <div class="card-head"><h2>Watching now{% if watching %} <span class="cnt">{{ watching | length }}</span>{% endif %}</h2></div>
     <div class="card-body">
       {% if redirect %}
-      <p class="card-note">In redirect mode the IPTV player plays straight from your IPTV provider, so ChannelBin sees each time it tunes in and never when it stops. It cannot say who is watching now. The tune-ins are under Recent plays.{% if watching %} The plays it can see are its own pictures, a sports channel's waiting screen or an Up next channel, listed here, which are ChannelBin's own stream.{% endif %}</p>
+      <p class="card-note">In redirect mode an IPTV player on your login plays straight from your IPTV provider, so ChannelBin sees each time it tunes in and never when it stops. It cannot say who is watching now. The tune-ins are under Recent plays.{% if watching %} The plays it can see are listed here: its own pictures (a sports channel's waiting screen or an Up next channel), and plays on logins for other users, which always go through ChannelBin.{% endif %}</p>
       {% elif mixed %}
-      <p class="card-note">In mixed mode only channel groups, sports channels and Up next channels play through ChannelBin, and those are listed here. Any other channel plays straight from your IPTV provider, so ChannelBin sees it tune in and never sees it stop. Those tune-ins are under Recent plays.</p>
+      <p class="card-note">In mixed mode only channel groups, sports channels, Up next channels and every play on a login for another user go through ChannelBin, and those are listed here. Any other channel plays straight from your IPTV provider, so ChannelBin sees it tune in and never sees it stop. Those tune-ins are under Recent plays.</p>
       {% endif %}
       {% if watching %}
       <div class="table-scroll"><table class="tbl tbl-cards rl-tbl">
@@ -126,7 +159,7 @@
         <tbody>
           {% for s in watching %}
           <tr>
-            <td data-label="IPTV player" class="rl-when"><span class="day">{{ s.client }}</span></td>
+            <td data-label="IPTV player" class="rl-when rl-where"><span class="day">{{ s.client }}</span>{% if s.login %}<span class="via">Login {{ s.login }}</span>{% endif %}</td>
             <td data-label="Channel" class="rl-prog">{% if s.row_url %}<a class="t name-link" href="{{ s.row_url }}">{{ s.name }}</a>{% else %}<span class="t">{{ s.name }}</span>{% endif %}<span class="s">{{ s.kind_text }}</span></td>
             <td data-label="Program" class="rl-prog">{% if s.showing %}<span class="t">The coming games</span>{% elif s.pip %}<span class="t">{{ s.pip.big }}</span><span class="s">and {{ s.pip.small }}</span>{% elif s.on_card %}<span class="t">Nothing set up</span>{% elif s.waiting %}<span class="t">{{ s.waiting_text }}</span>{% elif s.program %}<span class="t">{{ s.program }}</span>{% if s.program_times %}<span class="s">{{ s.program_times }}</span>{% endif %}{% else %}<span class="sp-none">No listing in the guide right now</span>{% endif %}</td>
             <td data-label="Playing from" class="rl-prog of-plays">{% if s.showing %}<span class="t">The Up next picture</span><span class="s tip-plain" data-tip="ChannelBin's own picture of the coming games. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;.">Not counted against the limit</span>{% elif s.on_card %}<span class="t">Its card{% if s.card_text %}: {{ s.card_text }}{% endif %}</span><span class="s tip-plain" data-tip="ChannelBin's own picture saying why nothing is playing. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;. When its picture can play, it comes on here by itself.">Not counted against the limit</span>{% elif s.waiting %}<span class="t">The waiting screen</span><span class="s tip-plain" data-tip="ChannelBin's own picture of what is on next. It uses no connection to your IPTV provider and is not counted against &quot;IPTV players at once&quot;.{% if redirect %} In redirect mode it stops when the game comes on, and the player tunes in again to watch it.{% else %} The game starts here by itself when it comes on.{% endif %}">Not counted against the limit</span>{% elif s.pip_live %}{% for w in s.pip_live %}<span class="s{{ ' text-warning' if w.warn else '' }}"><span class="pip-k">{{ w.label }}</span>{% if w.channel %}<a class="name-link" href="{{ w.channel.url }}">{{ w.channel.name }}</a>{{ acct(w.account) }}{% else %}{{ w.text }}{% endif %}</span>{% endfor %}{% else %}{% if s.pip %}<span class="pip-k">Big</span>{% endif %}<a class="name-link" href="{{ s.channel_url }}">{{ s.channel_name }}</a>{{ acct(s.account) }}{% if s.pip %}<span class="s text-warning"><span class="pip-k">Small</span>Off, so the big picture plays alone. {{ s.combine_off }}</span>{% endif %}{% endif %}{% if s.from_screen %}<span class="s">{{ s.from_screen }}</span>{% endif %}{% if s.moves %}<span class="s tip-plain" data-tip="{{ s.moves_tip }}">Moved to another channel {{ s.moves_text }}</span>{% endif %}{% if s.notes %}<span class="s text-warning">{{ s.notes }}</span>{% endif %}{% if s.reserve_note %}<span class="s text-warning">{{ s.reserve_note }}</span>{% endif %}</td>
@@ -252,7 +285,7 @@
           {% for p in recent.lines %}
           <tr>
             <td data-label="When" class="rl-when"><span class="day">{{ p.when }}</span></td>
-            <td data-label="IPTV player" class="rl-where">{{ p.client }}</td>
+            <td data-label="IPTV player" class="rl-where">{{ p.client }}{% if p.login %}<span class="via">Login {{ p.login }}</span>{% endif %}</td>
             <td data-label="Asked for" class="rl-prog"><span class="t">{{ p.name }}</span></td>
             <td data-label="What happened" class="rl-prog of-plays">
               <span class="badge {{ p.badge[0] }}">{{ p.badge[1] }}</span> {{ p.text }}<span class="s">
@@ -331,7 +364,7 @@
         {{ number_setting('sports_before_minutes', 'Sports channels: start early by (minutes)', 'A sports channel plays the channel listing its game this long before the listing starts, so tuning in early gets the pregame show. A game no guide lists, played from a channel whose name mentions it, starts this long before the time that name gives. 0 starts at the listing.') }}
         {{ number_setting('sports_after_minutes', 'Sports channels: keep playing after (minutes)', 'And this long after the listing ends, because games run long. A game played from a channel\'s name has no listing to run past, so it stops where a recording of it would. 0 stops at the listing\'s end. A play already running is never cut, even when its channel fails and it moves to another one carrying the game.') }}
         {% if relays_some %}
-        {{ number_setting('max_viewers', 'IPTV players at once', 'One more than this is refused, and the refusal says so. ' ~ ('In mixed mode only plays through ChannelBin count: a channel sent straight to your IPTV provider is never seen. ' if mixed else '') ~ 'A player on a sports channel\'s waiting screen is not counted until its game comes on, and one on an Up next channel is not counted at all.') }}
+        {{ number_setting('max_viewers', 'IPTV players at once', 'One more than this is refused, and the refusal says so. ' ~ ('In mixed mode only plays through ChannelBin count: a channel sent straight to your IPTV provider is never seen. ' if mixed else '') ~ ('In redirect mode only plays on logins for other users count: they always go through ChannelBin. ' if redirect else '') ~ 'A player on a sports channel\'s waiting screen is not counted until its game comes on, and one on an Up next channel is not counted at all.') }}
         {{ number_setting('reserve_seconds', 'Seconds behind live', 'How much of the stream ChannelBin holds before the IPTV player gets it. A short dropout plays through without the picture freezing.') }}
         {{ number_setting('idle_seconds', 'Cut when the player reads nothing for (seconds)', 'A player that has stopped reading the stream has usually gone away without saying so. Its connection is freed after this long.') }}
         {{ number_setting('max_session_hours', 'Longest single play (hours)', 'So a player left on a channel for a week does not hold a connection for a week. It can tune in again right away.') }}

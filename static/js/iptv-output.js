@@ -7,7 +7,8 @@
    again on a timer so Watching now and Recent plays keep up while the page is open.
 
    The password is not in the page. The eye and Copy ask /api/settings/reveal for it, the same
-   gated read the Settings page's eye uses.
+   gated read the Settings page's eye uses; a login for another user's comes from its own
+   gated read, /api/iptv-output/logins/<id>/password (dev/changelog/1760).
 
    Three sizes of swap. Turning the output on or off, the login and the mode change which cards
    exist, so they take everything. A switch or a stopped play takes the cards but not Settings,
@@ -15,11 +16,11 @@
    row is never replaced by the save of the one before it. */
 (() => {
   const ALL = ['#of-state', '#of-sections'];
-  const CARDS = ['#of-state', '#of-connect', '#of-watching', '#of-pip', '#of-channels', '#of-recent', '#of-accounts'];
+  const CARDS = ['#of-state', '#of-connect', '#of-logins', '#of-watching', '#of-pip', '#of-channels', '#of-recent', '#of-accounts'];
   const STATE_ONLY = ['#of-state'];
   // What moves on its own. The channel list and the settings rows are left out of the timer,
   // so a search in progress or a number being typed is never replaced under the person.
-  const LIVE = ['#of-state', '#of-watching', '#of-recent', '#of-accounts'];
+  const LIVE = ['#of-state', '#of-logins', '#of-watching', '#of-recent', '#of-accounts'];
   const LIVE_MS = 15 * 1000;
   const PASSWORD_PATH = 'integrations.output_feed.password';
   const FIELD_URL = '/api/settings/field';
@@ -385,6 +386,111 @@
     }
   }
 
+  /* ---- Logins for other users (dev/changelog/1760) -------------------------------------- */
+  const loginPassword = (tr) => jsonFetch(`/api/iptv-output/logins/${tr.dataset.login}/password`)
+    .then((d) => d.password || '');
+  // A username suggested from the name while the person has not typed one of their own: what
+  // login_problem() takes, kept short for a remote.
+  const suggestUser = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 20);
+  const loginCutNote = (n) => (n ? ` ${n === 1 ? 'Its play was' : `Its ${n} plays were`} ended.` : '');
+
+  function openLoginForm(tr) {
+    const editing = Boolean(tr);
+    const btn = $('[data-act="login-add"]');
+    const min = Number(btn.dataset.min);
+    const max = Number(btn.dataset.max);
+    const body = `<div class="of-login"><p>${editing
+      ? 'A new username or password cuts any play on this login now, and its IPTV player is refused until the new one is typed into it.'
+      : 'They type the same server address as you, with this username and password. Short is fine: they are typed with a remote.'}</p>
+      <label for="of-l-name">Who it is for</label>
+      <input class="form-control" id="of-l-name" value="${escHtml(editing ? tr.dataset.name : '')}" autocomplete="off" maxlength="100">
+      <label for="of-l-user">Username</label>
+      <input class="form-control" id="of-l-user" value="${escHtml(editing ? tr.dataset.user : '')}" autocomplete="off" maxlength="60">
+      <label for="of-l-pass">Password</label>
+      <input class="form-control" id="of-l-pass" autocomplete="off" maxlength="60" value="${editing ? '' : escHtml(btn.dataset.password)}"${editing ? ' placeholder="Leave empty to keep the password it has"' : ''}>
+      <label for="of-l-streams">Streams at once</label>
+      <input class="form-control" id="of-l-streams" type="number" min="${min}" max="${max}" value="${editing ? tr.dataset.streams : 1}">
+      <p class="card-note">Letters and numbers only keeps it easy to type on a TV. The password is kept as typed, so this page can show it back to you.</p></div>`;
+    const overlay = buildModal({
+      title: editing ? `Change ${tr.dataset.name}'s login` : 'Add a login for another user',
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn' },
+        { label: editing ? 'Save' : 'Add', class: 'btn btn-primary', onClick: (close) => {
+          const data = {
+            name: $('#of-l-name', overlay).value.trim(),
+            username: $('#of-l-user', overlay).value.trim(),
+            max_streams: Number($('#of-l-streams', overlay).value),
+          };
+          const password = $('#of-l-pass', overlay).value;
+          if (password || !editing) data.password = password;
+          const url = editing ? `/api/iptv-output/logins/${tr.dataset.login}` : '/api/iptv-output/logins';
+          post(url, data).then((d) => {
+            close();
+            return refresh(CARDS).then(() => showToast(editing
+              ? `Saved.${loginCutNote(d.ended)}`
+              : `Login added for ${data.name}. Copy the details to send from its menu.`));
+          }).catch(fail);
+          return false;
+        } },
+      ],
+    });
+    if (!editing) {
+      const name = $('#of-l-name', overlay);
+      const user = $('#of-l-user', overlay);
+      name.addEventListener('input', () => { if (!user.dataset.typed) user.value = suggestUser(name.value); });
+      user.addEventListener('input', () => { user.dataset.typed = '1'; });
+    }
+  }
+
+  async function setLoginOn(input) {
+    const tr = input.closest('tr');
+    const on = input.checked;
+    try {
+      const d = await post(`/api/iptv-output/logins/${tr.dataset.login}`, { enabled: on });
+      await refresh(CARDS);
+      showToast(on ? `${tr.dataset.name} can log in again.` : `${tr.dataset.name} can no longer log in.${loginCutNote(d.ended)}`,
+        { type: !on && d.ended ? 'warning' : 'success' });
+    } catch (err) {
+      input.checked = !on;
+      fail(err);
+    }
+  }
+
+  async function deleteLogin(tr) {
+    const n = Number(tr.dataset.playing) || 0;
+    const ok = await confirmModal({
+      title: `Delete ${tr.dataset.name}'s login?`,
+      message: `The username ${tr.dataset.user} stops working, and its IPTV player is refused the next time it asks for anything.`,
+      consequence: `Its lines in Recent plays stay.${n ? ` ${players(n)} watching on it right now ${n === 1 ? 'is' : 'are'} cut.` : ''} To stop it for a while instead, turn it off.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
+    const d = await jsonFetch(`/api/iptv-output/logins/${tr.dataset.login}`, { method: 'DELETE' });
+    await refresh(CARDS);
+    showToast(`${tr.dataset.name}'s login is deleted.${loginCutNote(d.ended)}`);
+  }
+
+  async function revealLogin(btn) {
+    const tr = btn.closest('tr');
+    const value = $('[data-secret-text]', tr);
+    const shown = btn.dataset.shown === '1';
+    if (value.dataset.masked === undefined) value.dataset.masked = value.textContent;
+    value.textContent = shown ? value.dataset.masked : await loginPassword(tr);
+    btn.dataset.shown = shown ? '' : '1';
+    btn.innerHTML = icon(shown ? 'reveal' : 'conceal');
+    btn.setAttribute('aria-label', `${shown ? 'Show' : 'Hide'} the password`);
+  }
+
+  async function copyLogin(tr) {
+    const password = await loginPassword(tr);
+    const server = $('#of-logins').dataset.server;
+    await copyText(`Server address: ${server}\nUsername: ${tr.dataset.user}\nPassword: ${password}\n`
+      + 'Add it in your IPTV player as an Xtream Codes account.');
+    showToast(`The details for ${tr.dataset.name} are copied. They hold the password, so send them only to that person.`);
+  }
+
   const guarded = (fn) => (...args) => Promise.resolve(fn(...args)).catch(fail);
 
   document.addEventListener('click', (e) => {
@@ -409,6 +515,11 @@
     else if (act === 'pip-swap') guarded(pipSwap)(t.closest('tr'));
     else if (act === 'pip-clear') guarded(pipClear)(t.closest('tr'));
     else if (act === 'pip-remove') guarded(pipRemove)(t.closest('tr'));
+    else if (act === 'login-add') openLoginForm(null);
+    else if (act === 'login-edit') openLoginForm(t.closest('tr'));
+    else if (act === 'login-delete') guarded(deleteLogin)(t.closest('tr'));
+    else if (act === 'login-reveal') guarded(revealLogin)(t);
+    else if (act === 'login-copy') guarded(copyLogin)(t.closest('tr'));
   });
   document.addEventListener('change', (e) => {
     const t = e.target;
@@ -416,6 +527,7 @@
     else if (t.dataset.act === 'account') setAccount(t);
     else if (t.dataset.act === 'held') setHeld(t);
     else if (t.dataset.act === 'pip-twin') pipTwin(t);
+    else if (t.dataset.act === 'login-on') setLoginOn(t);
     else if (t.dataset.settingPath) saveSetting(t);
     else if (t.id === 'of-cat') { view.cat = t.value; view.page = 1; applyFilter(); }
   });

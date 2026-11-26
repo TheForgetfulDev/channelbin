@@ -9,10 +9,11 @@ is here are the actions that route has no shape for.
 import logging
 
 from flask import Blueprint, current_app, jsonify, render_template, request
+from sqlalchemy.exc import IntegrityError
 
 from .. import db, output_feed, output_feed_view, pip_channels
 from ..config import config_write_lock, load_config, load_for_edit, save_config, set_nested
-from ..database import Account
+from ..database import Account, OutputFeedLogin
 from ..db_utils import retry_on_locked
 from ..fmt_utils import counted
 
@@ -317,6 +318,9 @@ def set_login():
                    or output_feed.login_problem('password', password))
         if problem:
             return jsonify({'error': problem}), 400
+        if OutputFeedLogin.query.filter_by(username=username).first() is not None:
+            return jsonify({'error': f'"{username}" is already the username of a login for another '
+                                     f'user. Pick another one.'}), 409
         set_nested(file_cfg, 'integrations.output_feed.username', username)
         set_nested(file_cfg, 'integrations.output_feed.password', password)
         if not had:
@@ -326,3 +330,150 @@ def set_login():
         save_config(file_cfg)
     log.info('IPTV output: login %s', 'changed' if had else 'set')
     return jsonify({'success': True, 'first': not had})
+
+
+# ── Logins for other users (dev/changelog/1760) ──────────────────────────────────────────────
+
+#: A username another save took between this one's check and its commit (the column is unique).
+_TAKEN = 'That username was just taken by another IPTV output login. Pick another one.'
+#: The longest name a login may carry: who it is for, shown only on this page.
+LOGIN_NAME_MAX = 100
+
+
+def _login_fields(data: dict, fcfg: dict, login_id=None) -> tuple:
+    """(fields to write, error) from a create or edit body. Only the keys present are read,
+    so an edit changes what it names and nothing else."""
+    out = {}
+    if 'name' in data:
+        name = str(data.get('name') or '').strip()
+        if not name:
+            return None, 'Give the login a name, so you can tell who it is for.'
+        if len(name) > LOGIN_NAME_MAX:
+            return None, f'The name can be at most {LOGIN_NAME_MAX} characters.'
+        out['name'] = name
+    if 'username' in data:
+        username = str(data.get('username') or '').strip()
+        if not username:
+            return None, 'A username is needed.'
+        problem = output_feed.login_problem('username', username)
+        if problem:
+            return None, problem
+        if output_feed.login_taken(username, fcfg, except_login_id=login_id):
+            return None, f'"{username}" is already in use by another IPTV output login. Pick another one.'
+        out['username'] = username
+    if 'password' in data:
+        password = str(data.get('password') or '')
+        if not password:
+            return None, 'A password is needed.'
+        problem = output_feed.login_problem('password', password)
+        if problem:
+            return None, problem
+        out['password'] = password
+    if 'max_streams' in data:
+        problem = output_feed.max_streams_problem(data.get('max_streams'))
+        if problem:
+            return None, problem
+        out['max_streams'] = int(data.get('max_streams'))
+    if 'enabled' in data:
+        if not isinstance(data.get('enabled'), bool):
+            return None, 'The switch takes true or false.'
+        out['enabled'] = data['enabled']
+    return out, ''
+
+
+@iptv_output_bp.route('/api/iptv-output/logins', methods=['POST'])
+def create_login():
+    """A new login for another user. A blank password is generated."""
+    data = request.get_json(silent=True) or {}
+    if not str(data.get('password') or ''):
+        data['password'] = output_feed.generated_password()
+    for key in ('name', 'username'):
+        data.setdefault(key, '')
+    data.setdefault('max_streams', 1)
+    fields, error = _login_fields(data, output_feed.feed_config(load_config()))
+    if error:
+        return jsonify({'error': error}), 400
+
+    @retry_on_locked()
+    def _create():
+        row = OutputFeedLogin(**fields)
+        db.session.add(row)
+        db.session.commit()
+        return row.id
+
+    try:
+        login_id = _create()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({'error': _TAKEN}), 409
+    log.info('IPTV output: login %s added for another user', fields['username'])
+    return jsonify({'success': True, 'id': login_id})
+
+
+@iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>', methods=['POST'])
+def edit_login(login_id):
+    """Change a login. Turning it off or changing its username or password ends the plays on
+    it, after the commit: an IPTV player holding the old pair is not that login any more."""
+    data = request.get_json(silent=True) or {}
+    fields, error = _login_fields(data, output_feed.feed_config(load_config()), login_id=login_id)
+    if error:
+        return jsonify({'error': error}), 400
+    if not fields:
+        return jsonify({'error': 'Nothing to change'}), 400
+
+    @retry_on_locked()
+    def _edit():
+        row = db.session.get(OutputFeedLogin, login_id)
+        if row is None:
+            return None
+        cut = ((fields.get('enabled') is False and row.enabled)
+               or ('username' in fields and fields['username'] != row.username)
+               or ('password' in fields and fields['password'] != row.password))
+        for key, value in fields.items():
+            setattr(row, key, value)
+        db.session.commit()
+        return cut
+
+    try:
+        cut = _edit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({'error': _TAKEN}), 409
+    if cut is None:
+        return jsonify({'error': 'That login no longer exists'}), 404
+    ended = output_feed.stop_login(login_id) if cut else 0
+    log.info('IPTV output: login %d changed (%s)%s', login_id, ', '.join(sorted(fields)),
+             f', {counted(ended, "play")} ended' if ended else '')
+    return jsonify({'success': True, 'ended': ended})
+
+
+@iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>', methods=['DELETE'])
+def delete_login(login_id):
+    """Delete a login and end its plays. Its lines in Recent plays keep its username."""
+    @retry_on_locked()
+    def _delete():
+        row = db.session.get(OutputFeedLogin, login_id)
+        if row is None:
+            return None
+        username = row.username
+        db.session.delete(row)
+        db.session.commit()
+        return username
+
+    username = _delete()
+    if username is None:
+        return jsonify({'error': 'That login no longer exists'}), 404
+    ended = output_feed.stop_login(login_id)
+    log.info('IPTV output: login %s deleted%s', username,
+             f', {counted(ended, "play")} ended' if ended else '')
+    return jsonify({'success': True, 'ended': ended})
+
+
+@iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>/password')
+def reveal_login_password(login_id):
+    """The password of one login, for the page's eye and Copy buttons: the page's source never
+    holds it, as it never holds the main login's (/api/settings/reveal)."""
+    row = db.session.get(OutputFeedLogin, login_id)
+    if row is None:
+        return jsonify({'error': 'That login no longer exists'}), 404
+    return jsonify({'success': True, 'password': row.password})

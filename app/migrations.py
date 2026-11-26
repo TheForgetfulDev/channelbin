@@ -4124,6 +4124,29 @@ def _m151_epg_source_games(conn, cur):
     conn.commit()
 
 
+def _m152_output_feed_logins(conn, cur):
+    """output_feed_logins: logins for other users on the IPTV output, and
+    output_feed_plays.feed_login, which login a play came in on (dev/changelog/1760). No backfill:
+    every play before this came in on the main login, which is what NULL says. Re-runnable from
+    the top: IF NOT EXISTS, and the ADD COLUMN asks PRAGMA table_info first."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS output_feed_logins (
+            id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            name VARCHAR(100) NOT NULL DEFAULT '',
+            username VARCHAR(60) NOT NULL,
+            password VARCHAR(60) NOT NULL,
+            enabled BOOLEAN NOT NULL DEFAULT 1,
+            max_streams INTEGER NOT NULL DEFAULT 1,
+            created_at DATETIME NOT NULL,
+            UNIQUE (username)
+        );
+    """)
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(output_feed_plays)').fetchall()}
+    if cols and 'feed_login' not in cols:
+        cur.execute('ALTER TABLE output_feed_plays ADD COLUMN feed_login VARCHAR(60)')
+    conn.commit()
+
+
 #: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
 #: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
 #: time; the rebuild test holds step 148's output to this text, and the column list after
@@ -5002,6 +5025,8 @@ SCHEMA_MIGRATIONS = [
     (150, 'epg_sources.expires_on: an expiration date on an EPG source', _m150_epg_source_expiry),
     (151, 'epg_source_games: which followed sports games each EPG source would match',
      _m151_epg_source_games),
+    (152, 'output_feed_logins + output_feed_plays.feed_login: logins for other users on the IPTV '
+          'output', _m152_output_feed_logins),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

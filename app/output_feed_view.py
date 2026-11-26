@@ -21,7 +21,7 @@ from . import output_feed, pip_channels, pip_engine
 from . import db
 from .config import MASK_SENTINEL, PROXY_FIX_ARGS, public_url
 from .database import (FEED_PICTURE_BACK, FEED_PICTURE_STOPPED, FEED_PLAY_ENDED, FEED_PLAY_PICTURE, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED, Account,
-                       EPGEntry, OutputFeedPlay, UserPref)
+                       EPGEntry, OutputFeedLogin, OutputFeedPlay, UserPref)
 from .fmt_utils import counted, fmt_bytes, fmt_duration
 from .tz_utils import day_label, format_local, get_display_tz, is_24h
 
@@ -545,7 +545,7 @@ def _watching(sessions, by_feed: dict, accounts: dict, sports: dict, now, tz, h2
     for s in sorted(sessions, key=lambda x: x.started_at):
         row = by_feed.get(s.feed_id)
         d = s.to_dict()
-        view = {'id': s.id, 'client': s.client, 'name': row.name if row else s.label,
+        view = {'id': s.id, 'client': s.client, 'login': s.feed_login, 'name': row.name if row else s.label,
                 'kind_text': KIND_TEXT[row.kind] if row else '', 'row_url': '',
                 'channel_name': s.channel_name,
                 'channel_url': (url_for('channels.channel_detail', channel_id=s.channel_id)
@@ -695,7 +695,8 @@ def _recent(args, mode: str, by_feed: dict, accounts: dict, now, tz, h24) -> dic
         # column beside it already says which row, in the name the user knows.
         text = (play.message or '').replace(f' for {play.label}', '')
         line = {'kind': play.kind, 'when': f'{day_label(play.at, now, tz)}, {clock(play.at)}',
-                'client': play.client or '-', 'name': row.name if row else play.label,
+                'client': play.client or '-', 'login': play.feed_login or '',
+                'name': row.name if row else play.label,
                 'text': text, 'detail': '', 'played': None}
         if play.kind == FEED_PLAY_ENDED:
             line['badge'] = ('b-abort', 'Ended')
@@ -801,6 +802,19 @@ def _accounts(rows, sessions, accounts: dict, cfg: dict, fcfg: dict) -> list:
     return out
 
 
+def _logins(sessions) -> list:
+    """The Logins for other users card: one query, and each login's live plays counted from
+    the plays already in hand (dev/changelog/1760)."""
+    playing = {}
+    for s in sessions:
+        if s.feed_login_id is not None:
+            playing[s.feed_login_id] = playing.get(s.feed_login_id, 0) + 1
+    return [{'id': row.id, 'name': row.name, 'username': row.username, 'on': row.enabled,
+             'max_streams': row.max_streams, 'playing': playing.get(row.id, 0)}
+            for row in OutputFeedLogin.query.order_by(db.func.lower(OutputFeedLogin.name),
+                                                      OutputFeedLogin.id).all()]
+
+
 def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
     """Everything templates/iptv_output.html draws. `host_url` is the address the page was
     opened on, used only when ChannelBin's own address is not set; `proxy` is proxy_state()."""
@@ -820,8 +834,9 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
     sports, carrying = _sports_programs(rows, now, output_feed.guide_days(fcfg), window[1],
                                         blocked=blocked, allowed=allowed)
     # In redirect mode the plays ChannelBin can see are its own pictures, a sports channel's
-    # waiting screen and an Up next channel, its own stream there too (dev/changelog/1534, 1614).
-    sessions = ([s for s in output_feed.live_sessions() if not redirect or s.own_picture]
+    # waiting screen and an Up next channel, its own stream there too (dev/changelog/1534, 1614),
+    # and every play on a login for another user, which is always relayed (dev/changelog/1760).
+    sessions = ([s for s in output_feed.live_sessions() if output_feed.seen_in_mode(s, mode)]
                 if state == STATE_ON else [])
     watching = {}
     for s in sessions:
@@ -835,16 +850,23 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
              for r in rows]
     address = _address(cfg, host_url)
     max_viewers = int(fcfg.get('max_viewers') or 1)
+    logins = _logins(output_feed.live_sessions() if state == STATE_ON else [])
     return {
         'state': state, 'is_on': state == STATE_ON, 'is_off': state == STATE_OFF,
         'needs_login': state == STATE_SETUP, 'mode': mode, 'redirect': redirect,
-        'mixed': mode == output_feed.MODE_MIXED, 'relays_some': output_feed.relays_some(fcfg),
+        'mixed': mode == output_feed.MODE_MIXED,
+        # A login for another user is relayed in every mode, so with one there is always
+        # something the relay's settings and counts apply to (dev/changelog/1760).
+        'relays_some': output_feed.relays_some(fcfg) or bool(logins),
         'redirects_some': output_feed.redirects_some(fcfg),
         'dormant': state != STATE_ON, 'mask': MASK_SENTINEL, 'bounds': output_feed.SETTING_BOUNDS,
         'address': address, 'proxy': proxy, 'channels_per_page': CHANNELS_PER_PAGE,
         'address_notice': {'hidden': address['state'] == ADDRESS_UNSET and address_notice_hidden(),
                            'pref': ADDRESS_NOTICE_PREF, 'version': ADDRESS_NOTICE_VERSION},
         'connect': _connect(fcfg, address['base']),
+        'logins': logins,
+        'login_password': output_feed.generated_password(),
+        'login_streams': output_feed.MAX_STREAMS_BOUNDS,
         'password_slot': PASSWORD_SLOT,
         'rows': views,
         'categories': sorted({v['category'] for v in views}, key=str.lower),

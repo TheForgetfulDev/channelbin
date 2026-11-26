@@ -406,7 +406,7 @@
           </span>
           <span class="d-cell d-badge">{% if s.showing %}{{ m.status_badge('b-running', 'UP NEXT') }}{% elif s.on_card %}{{ m.status_badge('b-sched', 'CARD') }}{% elif s.waiting %}{{ m.status_badge('b-sched', 'WAITING SCREEN') }}{% endif %}</span>
           <span class="d-cell"><span class="d-k">When</span>{{ s.started_at | local_time_only }}</span>
-          <span class="d-cell"><span class="d-k">IPTV player</span>{{ s.client }}</span>
+          <span class="d-cell"><span class="d-k">IPTV player</span>{{ s.client }}{% if s.feed_login %}, login {{ s.feed_login }}{% endif %}</span>
           <span class="d-cell"></span>
           <span class="c-actions"></span>
         </div>
@@ -419,7 +419,7 @@
           </span>
           <span class="d-cell d-badge">{{ m.status_badge('b-sched', 'REDIRECTED') }}</span>
           <span class="d-cell"><span class="d-k">When</span>{{ r.at | local_time_only }}</span>
-          <span class="d-cell"><span class="d-k">IPTV player</span>{{ r.client }}</span>
+          <span class="d-cell"><span class="d-k">IPTV player</span>{{ r.client }}{% if r.feed_login %}, login {{ r.feed_login }}{% endif %}</span>
           <span class="d-cell"></span>
           <span class="c-actions"></span>
         </div>
@@ -458,7 +458,7 @@
           </span>
           <span class="d-cell"><span class="d-k">Elapsed</span>{{ s.elapsed_seconds | duration }}</span>
           <span class="d-cell"><span class="d-k">Relayed</span>{{ s.bytes_sent | filesize }}</span>
-          <span class="d-cell"><span class="d-k">IPTV player</span>{{ s.client }}</span>
+          <span class="d-cell"><span class="d-k">IPTV player</span>{{ s.client }}{% if s.feed_login %}, login {{ s.feed_login }}{% endif %}</span>
           <span class="c-actions">
             {%- if s.move_offered or s.move_why %}<span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
               <div class="menu pop-left">{% if s.move_offered %}<button class="menu-item" data-act="move-play" data-id="{{ s.session_id }}" data-client="{{ s.client }}" data-name="{{ play_name(s) }}" data-channel="{{ s.channel_name }}">Move to another channel</button>{% else %}<button class="menu-item" disabled>{{ s.move_why }}</button>{% endif %}</div></span>
@@ -476,7 +476,7 @@
           <span class="d-cell d-badge">{{ m.status_badge('b-sched', 'REDIRECTED') }}</span>
           <span class="d-cell"></span>
           <span class="d-cell"></span>
-          <span class="d-cell"><span class="d-k">IPTV player</span>{{ r.client }}</span>
+          <span class="d-cell"><span class="d-k">IPTV player</span>{{ r.client }}{% if r.feed_login %}, login {{ r.feed_login }}{% endif %}</span>
           <span class="c-actions"></span>
         </div>
         {% endfor %}
@@ -497,12 +497,12 @@
           {#- The cells sit under the mode's own column heads, which differ. -#}
           {% if feed.mode == 'redirect' %}
           <span class="d-cell"><span class="d-k">When</span>{{ r.at | local_time_only }}</span>
-          <span class="d-cell"><span class="d-k">IPTV player</span>{{ r.client }}</span>
+          <span class="d-cell"><span class="d-k">IPTV player</span>{{ r.client }}{% if r.feed_login %}, login {{ r.feed_login }}{% endif %}</span>
           <span class="d-cell"></span>
           {% else %}
           <span class="d-cell"></span>
           <span class="d-cell"></span>
-          <span class="d-cell"><span class="d-k">IPTV player</span>{{ r.client }}</span>
+          <span class="d-cell"><span class="d-k">IPTV player</span>{{ r.client }}{% if r.feed_login %}, login {{ r.feed_login }}{% endif %}</span>
           {% endif %}
           <span class="c-actions"></span>
         </div>

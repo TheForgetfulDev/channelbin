@@ -90,6 +90,7 @@ tests/test_output_feed.py:
 
 Nothing here feeds a health score: a viewer is not an observation.
 """
+import contextvars
 import hmac
 import json
 import logging
@@ -163,6 +164,7 @@ REASON_WINDOW_OPENED = 'window_opened'
 REASON_PICTURE_FAILED = 'picture_failed'
 REASON_CARD_FAILED = 'card_failed'
 REASON_REPLACED = 'replaced'
+REASON_LOGIN_OFF = 'login_off'
 
 #: What two of the reasons read as on a sports channel, which has no group.
 SPORTS_REASON_TEXT = {
@@ -194,6 +196,7 @@ REASON_TEXT = {
     REASON_PICTURE_FAILED: 'Cut - the Up next picture stopped playing.',
     REASON_CARD_FAILED: 'Cut - the picture-in-picture card stopped playing.',
     REASON_REPLACED: 'Ended - the same IPTV player tuned in again, to another channel or this one.',
+    REASON_LOGIN_OFF: 'Cut - its IPTV output login was turned off, changed or deleted.',
     REASON_SCREEN_GONE: 'Cut - the sports channel is no longer on the IPTV output.',
     REASON_WINDOW_OPENED: ('Ended - the game came on. In redirect mode ChannelBin cannot tune a player in, '
                            'so the waiting screen stops and the next tune-in gets the game.'),
@@ -321,6 +324,120 @@ def login_problem(label: str, value: str) -> str:
     return ''
 
 
+# ── Logins ─────────────────────────────────────────────────────────────────────────────────
+
+#: The most streams one login for another user may hold at once, and the fewest.
+MAX_STREAMS_BOUNDS = (1, 20)
+#: Characters a generated password is made of: no LOGIN_BREAKERS, and none that read alike on
+#: a TV keyboard (0/O, 1/l/I).
+_PASSWORD_ALPHABET = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+GENERATED_PASSWORD_LENGTH = 12
+
+
+@dataclass(frozen=True)
+class FeedLogin:
+    """Who an IPTV player logged in as: the main login in Settings (`feed_login_id` None) or one
+    OutputFeedLogin row (dev/changelog/1760). Every URL the output serves this player is built
+    from these credentials, never another login's."""
+    username: str
+    password: str
+    feed_login_id: Optional[int] = None
+    name: str = ''
+    # How many plays it may have at once; None is no limit of its own (the main login, which
+    # only the output's own "IPTV players at once" holds).
+    max_streams: Optional[int] = None
+    # How many times stop_login() had run for this login when the gate read it: a play started
+    # on an older count is refused when it registers (_LoginRoom.still_good_locked).
+    generation: int = 0
+
+    @property
+    def is_main(self) -> bool:
+        return self.feed_login_id is None
+
+    @property
+    def log_name(self) -> Optional[str]:
+        """What a line of Recent plays stores in its `feed_login`: the username, None for the main
+        login."""
+        return None if self.is_main else self.username
+
+
+def main_login(fcfg: dict) -> FeedLogin:
+    return FeedLogin(feed_username(fcfg), feed_password(fcfg))
+
+
+def _feed_login_of(row, generation: int = 0) -> FeedLogin:
+    return FeedLogin(row.username, row.password, feed_login_id=row.id, name=row.name or '',
+                     max_streams=max(1, int(row.max_streams or 1)), generation=generation)
+
+
+def _login_generation() -> dict:
+    with _lock:
+        return dict(_login_changes)
+
+
+def feed_login_for(fcfg: dict, username, password) -> Optional[FeedLogin]:
+    """The login an IPTV player's credentials name, or None. None for every cause - the output
+    off, an unknown username, a login turned off, a wrong password - so the caller answers them
+    all alike (section 6.1). A login for another user works whether or not the main login is
+    set. Every path compares a password in constant time; an unknown username still costs the
+    same database lookup a known one does."""
+    if not is_enabled(fcfg):
+        return None
+    if not isinstance(username, str) or not isinstance(password, str):
+        return None
+    if credentials_ok(fcfg, username, password):
+        return main_login(fcfg)
+    from .database import OutputFeedLogin
+    # Read BEFORE the row: a change committed after the row was read moves the count after
+    # this read too, so a play this login starts is refused when it registers (_LoginRoom).
+    generation = _login_generation()
+    row = OutputFeedLogin.query.filter_by(username=username).first()
+    stored = row.password if row is not None and row.enabled else ''
+    if not hmac.compare_digest(stored.encode(), password.encode()) or not stored:
+        return None
+    return _feed_login_of(row, generation.get(row.id, 0))
+
+
+def login_taken(username: str, fcfg: dict, except_login_id: Optional[int] = None) -> bool:
+    """Whether `username` is already the main login's or another login's. Two logins with one
+    username could not be told apart by the gate."""
+    from .database import OutputFeedLogin
+    if username == feed_username(fcfg):
+        return True
+    q = OutputFeedLogin.query.filter_by(username=username)
+    if except_login_id is not None:
+        q = q.filter(OutputFeedLogin.id != except_login_id)
+    return q.first() is not None
+
+
+def generated_password() -> str:
+    return ''.join(secrets.choice(_PASSWORD_ALPHABET) for _ in range(GENERATED_PASSWORD_LENGTH))
+
+
+def max_streams_problem(value) -> str:
+    """Why `value` cannot be a login's stream limit, or ''."""
+    low, high = MAX_STREAMS_BOUNDS
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 'The number of streams at once must be a whole number.'
+    if n < low or n > high:
+        return f'The number of streams at once must be between {low} and {high}.'
+    return ''
+
+
+#: The login the tune-in on this thread came in on, for the lines a refusal or a redirect
+#: writes to Recent plays: every one of those is written inside the tune-in's own call
+#: (start_session, redirect_play), which sets this for its duration.
+_tuning_login: contextvars.ContextVar = contextvars.ContextVar('output_feed_tuning_login',
+                                                              default=None)
+
+
+def _tuning_log_name() -> Optional[str]:
+    login = _tuning_login.get()
+    return login.log_name if login is not None else None
+
+
 #: The lowest and highest value each numeric setting takes. A number outside is moved to the
 #: nearest end by the save, and the page's fields carry the same pair.
 SETTING_BOUNDS = {
@@ -392,6 +509,25 @@ def relays(fcfg: dict, feed_id: int) -> bool:
         return False
     if mode == MODE_MIXED:
         return decode_feed_id(feed_id)[0] != KIND_CHANNEL
+    raise ValueError(f'Unknown feed mode "{mode}"')
+
+
+def relays_for(fcfg: dict, feed_id: int, login: FeedLogin) -> bool:
+    """relays() for one login's tune-in. A login for another user is always relayed, whatever
+    the mode: a redirect sends the player to the provider's own stream URL, which carries the
+    owner's provider username and password, and puts the provider account on that user's
+    address (dev/changelog/1760)."""
+    return not login.is_main or relays(fcfg, feed_id)
+
+
+def seen_in_mode(session: 'RelaySession', mode: str) -> bool:
+    """Whether Watching now lists `session` in `mode`. In redirect mode ChannelBin's own
+    pictures and a login for another user's plays are its own stream; anything else live then
+    is from before a change of mode."""
+    if mode in (MODE_PROXY, MODE_MIXED):
+        return True
+    if mode == MODE_REDIRECT:
+        return session.own_picture or session.feed_login_id is not None
     raise ValueError(f'Unknown feed mode "{mode}"')
 
 
@@ -648,19 +784,18 @@ def _logo_channel_id(channel) -> Optional[int]:
 OWN_LOGO_PATH = '/static/img/logo/channelbin-favicon/android-chrome-512x512.png'
 
 
-def logo_url(row: 'FeedRow', base_url: str, fcfg: dict) -> str:
+def logo_url(row: 'FeedRow', base_url: str, login: FeedLogin) -> str:
     """The logo a row lists: ChannelBin's own for its own channels, else the feed's logo route
     for the row's channel (routes/output_feed.py::logo), which serves the cached copy or fetches
     the provider's for it. Never the provider's URL itself, which may carry credentials, and
     never /api/channels/<id>/logo, which the password gate keeps from an IPTV player
-    (dev/changelog/1618)."""
+    (dev/changelog/1618). The route's address carries `login`'s own credentials (dev/changelog/1760)."""
     if row.kind in (KIND_UP_NEXT, KIND_SPORTS, KIND_PIP):
         return f'{base_url}{OWN_LOGO_PATH}'
     if row.kind in (KIND_CHANNEL, KIND_GROUP):
         if row.logo_channel_id is None:
             return ''
-        return (f'{base_url}/logo/{feed_username(fcfg)}/{feed_password(fcfg)}/'
-                f'{row.logo_channel_id}')
+        return f'{base_url}/logo/{login.username}/{login.password}/{row.logo_channel_id}'
     raise ValueError(f'unknown feed row kind {row.kind!r}')
 
 
@@ -840,7 +975,7 @@ def category_payload(rows) -> list:
             for cid, name in categories(rows)]
 
 
-def live_streams_payload(rows, base_url: str, fcfg: dict) -> list:
+def live_streams_payload(rows, base_url: str, login: FeedLogin) -> list:
     """get_live_streams: what ChannelBin's own XtreamClient reads plus what the measured
     client needs (section 3.4). `direct_source` is empty: the capture showed the client
     ignores it. `epg_channel_id` is the feed id's string, which is what xmltv.php names."""
@@ -849,7 +984,7 @@ def live_streams_payload(rows, base_url: str, fcfg: dict) -> list:
     for row in rows:
         out.append({
             'num': row.num, 'name': row.name, 'stream_type': 'live', 'stream_id': row.feed_id,
-            'stream_icon': logo_url(row, base_url, fcfg),
+            'stream_icon': logo_url(row, base_url, login),
             'epg_channel_id': str(row.feed_id), 'added': '0', 'is_adult': '0',
             'category_id': ids[row.category], 'category_ids': [int(ids[row.category])],
             'custom_sid': '', 'tv_archive': 0, 'direct_source': '', 'tv_archive_duration': 0,
@@ -857,18 +992,24 @@ def live_streams_payload(rows, base_url: str, fcfg: dict) -> list:
     return out
 
 
-def auth_payload(fcfg: dict, host: str, port: str, scheme: str) -> dict:
+def auth_payload(fcfg: dict, login: FeedLogin, host: str, port: str, scheme: str) -> dict:
     """The bare player_api.php answer: what accounts.check_xtream_auth() needs (`auth`,
     `status`, `exp_date`) and a server_info naming the host the request arrived on. Never
-    an account's base_url - the feed's stream endpoint is ChannelBin itself (section 3.5)."""
+    an account's base_url - the feed's stream endpoint is ChannelBin itself (section 3.5).
+    The login and its connection counts are `login`'s: a login for another user is told its
+    own limit and its own plays, the main login the output's (dev/changelog/1760)."""
     now = datetime.utcnow()
+    if login.is_main:
+        active, most = len(live_sessions()), int(fcfg.get('max_viewers') or 1)
+    else:
+        active, most = len(login_plays(login.feed_login_id)), login.max_streams
     return {
         'user_info': {
-            'username': feed_username(fcfg), 'password': feed_password(fcfg),
+            'username': login.username, 'password': login.password,
             'message': 'ChannelBin IPTV output', 'auth': 1, 'status': 'Active',
             'exp_date': str(int((now + timedelta(days=3650)).timestamp())),
-            'is_trial': '0', 'active_cons': str(len(live_sessions())),
-            'created_at': '0', 'max_connections': str(int(fcfg.get('max_viewers') or 1)),
+            'is_trial': '0', 'active_cons': str(active),
+            'created_at': '0', 'max_connections': str(most),
             'allowed_output_formats': ['ts'],
         },
         'server_info': {
@@ -880,21 +1021,21 @@ def auth_payload(fcfg: dict, host: str, port: str, scheme: str) -> dict:
     }
 
 
-def stream_url(base_url: str, fcfg: dict, feed_id: int) -> str:
-    return f'{base_url}/live/{feed_username(fcfg)}/{feed_password(fcfg)}/{feed_id}.ts'
+def stream_url(base_url: str, login: FeedLogin, feed_id: int) -> str:
+    return f'{base_url}/live/{login.username}/{login.password}/{feed_id}.ts'
 
 
-def m3u_text(rows, base_url: str, fcfg: dict) -> str:
+def m3u_text(rows, base_url: str, login: FeedLogin) -> str:
     """get.php as m3u_plus: tvg-id is the feed id string, the URL is the feed's own stream
     URL in every mode - a redirect happens on play, so no provider URL is ever listed."""
     lines = ['#EXTM3U']
     for row in rows:
-        logo = logo_url(row, base_url, fcfg)
+        logo = logo_url(row, base_url, login)
         name = row.name.replace('\n', ' ').replace('"', "'")
         category = row.category.replace('\n', ' ').replace('"', "'")
         lines.append(f'#EXTINF:-1 tvg-id="{row.feed_id}" tvg-name="{name}" tvg-logo="{logo}" '
                      f'group-title="{category}",{name}')
-        lines.append(stream_url(base_url, fcfg, row.feed_id))
+        lines.append(stream_url(base_url, login, row.feed_id))
     return '\n'.join(lines) + '\n'
 
 
@@ -1543,6 +1684,13 @@ class RelaySession:
     # The feed id of the play this one ended when it took over from its player's last one
     # (_take_over), None if it never did.
     replaced_feed_id: Optional[int] = None
+    # The IPTV output login the play came in on (FeedLogin.feed_login_id): None for the main
+    # login, a browser preview and a picture of ChannelBin's own. Never read as the player's
+    # address - two users behind one address are two logins - and never the seat holder id
+    # some functions call `viewer_id` (dev/changelog/1760).
+    feed_login_id: Optional[int] = None
+    # That login's username as it was, for Watching now and Recent plays; '' for the main one.
+    feed_login: str = ''
     last_recheck_mono: float = 0.0
     _reserve_short_logged: bool = False
     _finishing: bool = False
@@ -1630,7 +1778,8 @@ class RelaySession:
         now = time.monotonic()
         return {
             'session_id': self.id, 'feed_id': self.feed_id, 'label': self.label,
-            'client': self.client, 'group_id': self.group_id, 'channel_id': self.channel_id,
+            'client': self.client, 'feed_login': self.feed_login,
+            'group_id': self.group_id, 'channel_id': self.channel_id,
             'event_id': self.event_id,
             'channel_name': self.channel_name, 'account_id': self.account_id,
             'state': self.state, 'reason': self.reason, 'reason_text': self.reason_text(),
@@ -1687,7 +1836,12 @@ _sessions: dict = {}          # session id -> RelaySession, live ones and the la
 #: reaped, preempted and stopped as plays are, listed and counted nowhere.
 _internal: dict = {}
 _redirects: list = []         # the last _KEEP_ENDED redirect-mode plays, oldest first
-_refused: dict = {}           # (feed id, message) -> the last _KEEP_ENDED refused plays
+_refused: dict = {}           # (feed id, message, login) -> the last _KEEP_ENDED refused plays
+#: Login id -> its tune-ins between their stream-limit check and their play's registration
+#: (_LoginRoom), counted with its live plays so two at once cannot both pass the check.
+_login_starting: dict = {}
+#: Login id -> how many times stop_login() has run for it (FeedLogin.generation).
+_login_changes: dict = {}
 _reaper: Optional[threading.Thread] = None
 _play_queue: list = []        # lines of Recent plays waiting for the writer thread
 _log_writer: Optional[threading.Thread] = None
@@ -1720,17 +1874,18 @@ def recent_refused() -> list:
 
 
 def _note_refused(feed_id: int, label: str, client: str, message: str) -> None:
+    login = _tuning_log_name()
     with _lock:
-        row = _refused.get((feed_id, message))
+        row = _refused.get((feed_id, message, login))
         if row is None:
-            row = _refused[(feed_id, message)] = {
+            row = _refused[(feed_id, message, login)] = {
                 'feed_id': feed_id, 'label': label, 'message': message, 'count': 0,
-                'first_at': datetime.utcnow()}
+                'feed_login': login or '', 'first_at': datetime.utcnow()}
         row.update(at=datetime.utcnow(), client=client, count=row['count'] + 1)
         for key in sorted(_refused, key=lambda k: _refused[k]['at'])[:-_KEEP_ENDED]:
             del _refused[key]
     _queue_play(None, {'kind': FEED_PLAY_REFUSED, 'at': datetime.utcnow(), 'feed_id': feed_id,
-                       'label': label, 'client': client, 'message': message})
+                       'label': label, 'client': client, 'message': message, 'feed_login': login})
 
 
 def _refuse_nothing_on(play: Play, client: str):
@@ -1776,24 +1931,134 @@ def _refuse(feed_id: int, label: str, message: str, status: int, source_tail: st
 
 
 def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
-                  player: str = '') -> RelaySession:
+                  player: str = '', login: Optional[FeedLogin] = None) -> RelaySession:
     """Start relaying `feed_id` to one IPTV player. Raises FeedRefused with a user-facing message:
-    404 for an id the feed does not serve, 503 at the viewer cap, 409 when nothing is
-    playable (a blocked account, the allowlist, the connection limit) and 500 when ffmpeg
-    could not start. Requires an app context; the returned session is registered and reaped.
-    `preview` is a browser preview's play (RelaySession.preview), in every mode. `player` is
-    RelaySession.player: the address when it names one IPTV player, else ''.
+    404 for an id the feed does not serve, 503 at the viewer cap or the login's own stream
+    limit, 409 when nothing is playable (a blocked account, the allowlist, the connection
+    limit) and 500 when ffmpeg could not start. Requires an app context; the returned session
+    is registered and reaped. `preview` is a browser preview's play (RelaySession.preview), in
+    every mode. `player` is RelaySession.player: the address when it names one IPTV player,
+    else ''. `login` is the login the player came in on, None for the main one.
     """
-    session = _start_session(feed_id, client, cfg, preview, player)
-    if player and not session.player:
-        # A waiting screen, card or Up next picture: built without it, and the play a later
-        # channel change from this player leaves all the same.
+    room = _LoginRoom(login) if login is not None and not login.is_main else None
+    token = _tuning_login.set(login)
+    try:
+        session = _start_session(feed_id, client, cfg, preview, player, login, room)
+        gone = False
         with _lock:
-            session.player = player
+            if player and not session.player:
+                # A waiting screen, card or Up next picture: built without it, and the play a
+                # later channel change from this player leaves all the same.
+                session.player = player
+            if room is not None:
+                if session.feed_login_id is None:
+                    session.feed_login_id, session.feed_login = login.feed_login_id, login.username
+                if session.replaced_feed_id is None:
+                    session.replaced_feed_id = room.replaced_feed_id
+                gone = not room.still_good_locked()
+        if gone:
+            # The login was turned off, changed or deleted while this play was starting.
+            _finish(session, REASON_LOGIN_OFF)
+            raise FeedRefused(AUTH_FAILED_MESSAGE, 401)
+    finally:
+        # After the play carries its login, so its count never dips between the two.
+        if room is not None:
+            room.release()
+        _tuning_login.reset(token)
     return session
 
 
-def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str) -> RelaySession:
+class _LoginRoom:
+    """One tune-in's place under its login's stream limit (FeedLogin.max_streams), taken under
+    the one lock with the count of the login's live plays and given back once the play is
+    registered or refused - the check-then-act shape .claude/rules/background-jobs.md names,
+    closed the way _claim_slot closes it for the output's own cap."""
+
+    def __init__(self, login: FeedLogin):
+        self.login = login
+        self.held = False
+        # The feed id of the play this tune-in ended to take its place, for the new play's
+        # replaced_feed_id: the guard _leaving_play_of reads against two players behind one
+        # address cutting each other on every retry (dev/changelog/1744).
+        self.replaced_feed_id: Optional[int] = None
+
+    def still_good_locked(self) -> bool:
+        """Whether the login is still what the gate read: no stop_login() has run for it since.
+        Under _lock, at the moment the play takes the login's name, which is the moment
+        stop_login() could start finding it."""
+        return _login_changes.get(self.login.feed_login_id, 0) == self.login.generation
+
+    def claim(self, play: 'Play', client: str, player: str, alert: bool) -> None:
+        """Take the place, or raise FeedRefused (503) naming the login's limit. A full limit
+        is asked again until SWITCH_GRACE_SECONDS, after ending the play this player is
+        changing channel from when it can be told (_leaving_play_of), as the output's own cap
+        is: an IPTV player asks for the new channel before it closes the old one."""
+        login_id, most = self.login.feed_login_id, self.login.max_streams
+        deadline = time.monotonic() + SWITCH_GRACE_SECONDS
+        asked = False
+        while True:
+            with _lock:
+                if len(_login_plays_locked(login_id)) + _login_starting.get(login_id, 0) < most:
+                    _login_starting[login_id] = _login_starting.get(login_id, 0) + 1
+                    self.held = True
+                    return
+            if time.monotonic() >= deadline:
+                break
+            if not asked:
+                asked = True
+                # Every live play counts against the limit, a waiting screen's included, so any
+                # of them is the one a player can be leaving.
+                old = _leaving_play_of(player, login_id, play.feed_id, counted_only=False)
+                if old is not None and _finish(old, REASON_REPLACED):
+                    self.replaced_feed_id = old.feed_id
+                    log.info('Viewer from %s: %s ended %s, the play the same IPTV player on login '
+                             '%s is changing channel from', client, play.label, old.id,
+                             self.login.username)
+                    continue
+            time.sleep(_SWITCH_POLL)
+        _refuse(play.feed_id, play.label,
+                f'The IPTV output login "{self.login.username}" is already playing as many streams '
+                f'as it may at once ({counted(most, "stream")}). Stop one on that login\'s IPTV player, '
+                f'or raise its limit under Logins for other users on the IPTV Output page.',
+                503, f'login-{login_id}', client, alert=alert)
+
+    def release(self) -> None:
+        if not self.held:
+            return
+        with _lock:
+            left = _login_starting.get(self.login.feed_login_id, 0) - 1
+            if left > 0:
+                _login_starting[self.login.feed_login_id] = left
+            else:
+                _login_starting.pop(self.login.feed_login_id, None)
+        self.held = False
+
+
+def _login_plays_locked(login_id: int) -> list:
+    return [s for s in _sessions.values()
+            if s.live and not s.internal and not s.preview and s.feed_login_id == login_id]
+
+
+def login_plays(login_id: int) -> list:
+    """The live plays that came in on login `login_id`: what its stream limit counts and what
+    player_api.php reports as its active connections."""
+    with _lock:
+        return _login_plays_locked(login_id)
+
+
+def stop_login(login_id: int, reason: str = REASON_LOGIN_OFF) -> int:
+    """End every live play that came in on login `login_id`, by name. How many it ended.
+    Called after the commit that turned the login off, changed it or deleted it, never
+    inside it. The count it moves, in the same lock as the list it takes, refuses a play the
+    gate let in before the commit and that registers after this list (_LoginRoom)."""
+    with _lock:
+        _login_changes[login_id] = _login_changes.get(login_id, 0) + 1
+        live = _login_plays_locked(login_id)
+    return sum(1 for s in live if _finish(s, reason))
+
+
+def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str,
+                   login: Optional[FeedLogin] = None, room: Optional[_LoginRoom] = None) -> RelaySession:
     from flask import current_app
     from .config import load_config
 
@@ -1802,13 +2067,17 @@ def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str) -
     play = resolve_play(feed_id, cfg, preview=preview)
     if play is None:
         raise FeedRefused('No such channel on the IPTV output', 404)
+    if room is not None:
+        room.claim(play, client, player, alert=not preview)
+    login_id = login.feed_login_id if login is not None else None
+    login_name = login.username if login is not None and not login.is_main else ''
     if play.up_next is not None:
         return start_showing(play, client, cfg)
     combine_off = ''
     if play.pip is not None and play.pip.set_up:
         device, combine_off = _pip_engine().gpu_state(cfg)
         if device:
-            session = _start_combined(play, client, cfg, device, player)
+            session = _start_combined(play, client, cfg, device, player, login_id, login_name)
             if session is not None:
                 return session
             # Neither picture can play right now, or no slot is free: the card says which.
@@ -1844,7 +2113,7 @@ def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str) -
         pip_row_id=play.pip.row_id if play.pip is not None else None,
         # A set-up picture-in-picture channel reaching here plays its big picture alone, a
         # plain stream copy on one connection: nothing can combine the two (section 7.3).
-        combine_off=combine_off, player=player,
+        combine_off=combine_off, player=player, feed_login_id=login_id, feed_login=login_name,
     )
     deadline = time.monotonic() + SWITCH_GRACE_SECONDS
     if not _claim_slot(session, cap, deadline):
@@ -1872,8 +2141,8 @@ def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str) -
             return start_card(play, client, cfg, held=_screen_mod().HELD_NO_CONNECTION)
         return start_waiting(play, client, cfg, held=_screen_mod().HELD_NO_CONNECTION)
     _ensure_reaper()
-    log.info('Viewer %s from %s: %s playing channel %d (%s) on account %d%s%s', session.id,
-             client, session.label, session.channel_id, session.channel_name, session.account_id,
+    log.info('Viewer %s from %s%s: %s playing channel %d (%s) on account %d%s%s', session.id,
+             client, f' on login {session.feed_login}' if session.feed_login else '', session.label, session.channel_id, session.channel_name, session.account_id,
              f' ({play.note})' if play.note else '', f' Why this channel: {play.picked}' if play.picked else '')
     return session
 
@@ -1915,17 +2184,30 @@ def _leaving_play(session: RelaySession) -> Optional[RelaySession]:
     channel that play took over from. That last is what a second player behind one address
     does when it tunes back in to the channel it was cut from, and ending the play that cut it
     would start the two cutting each other on every retry; a person flipping back to the last
-    channel waits as any tune-in did before (dev/changelog/1744)."""
-    if not session.player or session.preview or session.internal:
+    channel waits as any tune-in did before (dev/changelog/1744). Only a play on the same login
+    is the same player's: two users behind one address are two logins (dev/changelog/1760)."""
+    if session.preview or session.internal:
+        return None
+    return _leaving_play_of(session.player, session.feed_login_id, session.feed_id, exclude=session)
+
+
+def _leaving_play_of(player: str, login_id: Optional[int], feed_id: int,
+                     exclude: Optional[RelaySession] = None,
+                     counted_only: bool = True) -> Optional[RelaySession]:
+    """_leaving_play for a tune-in that may not have a session yet: the one other live play of
+    `player` on login `login_id`, under the same conditions. `counted_only` False also hands
+    over a play the output's cap does not count (a waiting screen, a card, an Up next
+    picture), for a login's own limit, which counts every play."""
+    if not player:
         return None
     with _lock:
         mine = [s for s in _sessions.values()
-                if s is not session and s.live and not s.internal and not s.preview
-                and s.player == session.player]
-    if len(mine) != 1 or not mine[0].counted:
+                if s is not exclude and s.live and not s.internal and not s.preview
+                and s.player == player and s.feed_login_id == login_id]
+    if len(mine) != 1 or (counted_only and not mine[0].counted):
         return None
     old = mine[0]
-    if old.replaced_feed_id is not None and old.replaced_feed_id == session.feed_id:
+    if old.replaced_feed_id is not None and old.replaced_feed_id == feed_id:
         return None
     return old
 
@@ -1952,8 +2234,8 @@ def _take_over(session: RelaySession, account_id: Optional[int] = None) -> bool:
     return True
 
 
-def _start_combined(play: Play, client: str, cfg: dict, device: str,
-                    player: str = '') -> Optional[RelaySession]:
+def _start_combined(play: Play, client: str, cfg: dict, device: str, player: str = '',
+                    login_id: Optional[int] = None, login: str = '') -> Optional[RelaySession]:
     """Start `play`, a set-up picture-in-picture channel's, on its two pictures combined
     (app/pip_engine.py). The session holds no seat and names no channel: its pictures do. None,
     with nothing registered or held, when no slot is free or neither picture can play right
@@ -1968,7 +2250,7 @@ def _start_combined(play: Play, client: str, cfg: dict, device: str,
         ring=Ring(int(fcfg.get('buffer_mb') or 64) * 1024 * 1024, float(fcfg.get('reserve_seconds') or 0)),
         **_session_limits(cfg, fcfg), started_mono=time.monotonic(), fails_over=True,
         app=current_app._get_current_object(), preview=play.preview, pip_row_id=tuned.row_id,
-        player=player)
+        player=player, feed_login_id=login_id, feed_login=login)
     cap = int(fcfg.get('max_viewers') or 1)
     if not _claim_slot(session, cap, time.monotonic() + SWITCH_GRACE_SECONDS):
         return None
@@ -2344,6 +2626,7 @@ def _finish(session: RelaySession, reason: str, detail: str = '') -> bool:
         _queue_play(session.app, {
             'kind': FEED_PLAY_ENDED, 'at': session.ended_at, 'first_at': session.started_at,
             'feed_id': session.feed_id, 'label': session.label, 'client': session.client,
+            'feed_login': session.feed_login or None,
             # A play that only ever watched a sports channel's waiting screen played that, and
             # an Up next channel's play only ever plays its picture.
             'channel_id': session.channel_id, 'channel_name': pictures or session.channel_name or (
@@ -2674,7 +2957,7 @@ def _write_plays(batch: list) -> None:
                 # Re-read inside the retried unit: a rolled-back session forgets the bump.
                 last = (OutputFeedPlay.query
                         .filter_by(kind=FEED_PLAY_REFUSED, feed_id=entry['feed_id'],
-                                   message=entry['message'])
+                                   message=entry['message'], feed_login=entry.get('feed_login'))
                         .filter(OutputFeedPlay.at >= at - REFUSAL_RUN_GAP)
                         .order_by(OutputFeedPlay.at.desc()).first())
                 if last is not None:
@@ -3393,13 +3676,15 @@ def _screen_mod():
     return sports_screen
 
 
-def _screen_of(play: Play, cfg: dict, held: str = None):
-    """The waiting screen `play` shows now. A few queries (sports_screen.screen_for)."""
+def _screen_of(play: Play, cfg: dict, held: str = None, other_login: bool = False):
+    """The waiting screen `play` shows now. A few queries (sports_screen.screen_for).
+    `other_login` is a play on a login for another user, which is always relayed (relays_for)."""
     fcfg = feed_config(cfg)
     before, _after = sports_window(fcfg)
     # The screen's words follow how this play is delivered, so mixed mode's sports channel,
     # which is relayed, says the game starts by itself.
-    mode = MODE_PROXY if play.preview or relays(fcfg, play.feed_id) else MODE_REDIRECT
+    mode = (MODE_PROXY if play.preview or other_login or relays(fcfg, play.feed_id)
+            else MODE_REDIRECT)
     return _screen_mod().screen_for(play.served, play.found, datetime.utcnow(), cfg, mode=mode,
                                     before_minutes=int(before.total_seconds() // 60), held=held,
                                     slots=int(fcfg.get('max_viewers') or 1))
@@ -3469,7 +3754,8 @@ def start_waiting(play: Play, client: str, cfg: dict, held: str = None) -> Relay
     fcfg = feed_config(cfg)
     row_id = play.served.row.id
     try:
-        screen = _screen_of(play, cfg, held)
+        tuning = _tuning_login.get()
+        screen = _screen_of(play, cfg, held, other_login=tuning is not None and not tuning.is_main)
         path, still = _clip_for(cfg, row_id, screen)
     except ss.ClipFailed as exc:
         from .sports_feed import event_word
@@ -3771,7 +4057,8 @@ def _recheck_locked(session: RelaySession) -> None:
         _finish(session, REASON_SCREEN_GONE)
         return
     held = None
-    if play.member is not None and not session.preview and not relays(fcfg, session.feed_id):
+    if (play.member is not None and not session.preview and session.feed_login_id is None
+            and not relays(fcfg, session.feed_id)):
         # A redirected play cannot put the game on in place: ChannelBin never sends a provider
         # stream through itself for it. The stream ends, and the player's next tune-in is the
         # 302 to the game (section 5.1).
@@ -3792,7 +4079,7 @@ def _recheck_locked(session: RelaySession) -> None:
                              body=f'An IPTV player on the waiting screen of {play.label} was cut: {detail}.',
                              source=source)
         return
-    screen = _screen_of(play, cfg, held)
+    screen = _screen_of(play, cfg, held, other_login=session.feed_login_id is not None)
     if ss.clip_key(screen) == session.screen_key:
         return
     try:
@@ -4187,19 +4474,24 @@ def _to_card_now(session: RelaySession) -> None:
 
 # ── Redirect mode ──────────────────────────────────────────────────────────────────────────
 
-def redirect_play(feed_id: int, client: str, cfg=None) -> tuple:
+def redirect_play(feed_id: int, client: str, cfg=None, login: Optional[FeedLogin] = None) -> tuple:
     """Redirect mode's answer to a tune-in: (provider URL, None) to send the player to, or
     (None, session) for a sports channel with nothing to play, whose waiting screen is
     ChannelBin's own bytes and so is streamed in this mode too: it never takes a seat and never
     sends a provider login to the player (dev/changelog/1534). It ends when its game's window
     opens (REASON_WINDOW_OPENED), and the next tune-in is the 302. Requires an app context.
-    Raises FeedRefused as redirect_target() does."""
+    Raises FeedRefused as redirect_target() does. Only the main login is ever redirected
+    (relays_for); `login` names it on the lines this writes."""
     from .config import load_config
     cfg = cfg or load_config()
-    play = resolve_play(feed_id, cfg)
-    if play is not None and play.sports and play.member is None and not play.fault:
-        return None, start_waiting(play, client, cfg)
-    return redirect_target(feed_id, client, cfg, play=play), None
+    token = _tuning_login.set(login)
+    try:
+        play = resolve_play(feed_id, cfg)
+        if play is not None and play.sports and play.member is None and not play.fault:
+            return None, start_waiting(play, client, cfg)
+        return redirect_target(feed_id, client, cfg, play=play), None
+    finally:
+        _tuning_login.reset(token)
 
 
 def redirect_target(feed_id: int, client: str, cfg=None, play: Play = None) -> str:
@@ -4218,13 +4510,14 @@ def redirect_target(feed_id: int, client: str, cfg=None, play: Play = None) -> s
     member = play.member
     # A redirect is one moment, so its record may say where that moment fell (play.note).
     label = f'{play.label} ({play.note})' if play.note else play.label
+    login = _tuning_log_name()
     with _lock:
         _redirects.append({'at': datetime.utcnow(), 'feed_id': feed_id, 'label': label,
-                           'client': client, 'channel_id': member.id,
+                           'client': client, 'feed_login': login or '', 'channel_id': member.id,
                            'channel_name': member.name, 'account_id': member.account_id})
         del _redirects[:-_KEEP_ENDED]
     _queue_play(None, {'kind': FEED_PLAY_REDIRECTED, 'at': datetime.utcnow(), 'feed_id': feed_id,
-                       'label': label, 'client': client, 'channel_id': member.id,
+                       'label': label, 'client': client, 'feed_login': login, 'channel_id': member.id,
                        'channel_name': member.name, 'account_id': member.account_id})
     log.info('Viewer from %s: %s redirected to channel %d (%s) on account %d', client,
              label, member.id, member.name, member.account_id)
@@ -4283,6 +4576,8 @@ def reset_for_tests():
         _sessions.clear()
         _internal.clear()
         _refused.clear()
+        _login_starting.clear()
+        _login_changes.clear()
         del _redirects[:]
     discard_play_log()
     _last_prune_mono = None

@@ -3969,6 +3969,33 @@ class OutputFeedPlay(db.Model):
     # NULL is a refused or redirected play, or one written before the split was kept
     # (dev/changelog/1676). Read by account_stats._fold_plays().
     account_seconds = db.Column(db.Text)
+    # Which IPTV output login the play came in on: the OutputFeedLogin username as it was at
+    # the time, kept after the login is renamed or deleted. NULL is the main login in Settings
+    # (dev/changelog/1760).
+    feed_login   = db.Column(db.String(60))
+
+
+class OutputFeedLogin(db.Model):
+    """A login for someone other than the owner on the IPTV output (app/output_feed.py,
+    dev/changelog/1760). Every login gets the same output as the main one in Settings; this row
+    says who may log in, whether they may right now, and how many streams they may hold at once.
+
+    The password is plaintext for the reason dev/docs/DESIGN-output-feed.md 6.2 measured: an
+    IPTV player sends it on every request, and a person types it into a TV with a remote, so it
+    has to be readable back. It never reaches a page's source; the IPTV Output page reads it
+    through its own reveal route. A username is unique here and never equal to the main login's
+    (output_feed.login_taken)."""
+    __tablename__ = 'output_feed_logins'
+    # AUTOINCREMENT: an id is never reused, so a play or a count kept in memory for a deleted
+    # login can never be read as a later login's (output_feed._login_changes).
+    __table_args__ = ({'sqlite_autoincrement': True},)
+    id          = db.Column(db.Integer, primary_key=True)
+    name        = db.Column(db.String(100), nullable=False, default='', server_default=db.text("''"))
+    username    = db.Column(db.String(60), nullable=False, unique=True)
+    password    = db.Column(db.String(60), nullable=False)
+    enabled     = db.Column(db.Boolean, nullable=False, default=True, server_default=db.text('1'))
+    max_streams = db.Column(db.Integer, nullable=False, default=1, server_default=db.text('1'))
+    created_at  = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
 class SportsTeam(db.Model):
