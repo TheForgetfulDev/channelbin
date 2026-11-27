@@ -444,7 +444,8 @@ Two related notes:
   Forwarding it verbatim lets a caller present a fresh address per attempt and never trip the
   lockout. The Test button under the switch tells you which yours does. With the switch off, every
   request through a proxy looks like one IP instead, so a single attacker can lock the whole LAN
-  out of signing in for 15 minutes. Neither weakens the password itself; both are worth getting right before relying on the
+  out of signing in, for 5 minutes at first and for up to a day at a time if they keep at it.
+  Neither weakens the password itself; both are worth getting right before relying on the
   lockout as more than a speed bump.
 - **A port that believes a proxy believes whoever connects to it**, unless "Reverse proxy
   addresses" (`flask.trusted_proxies`) names the proxy. With the switch on and that list empty,
@@ -452,6 +453,12 @@ Two related notes:
   `X-Forwarded-For` with every wrong password and is never locked out. So leave the web UI's
   switch off if you open ChannelBin straight at home, or list the address your proxy connects
   from (the Test names it). The Readiness page says when a port has been reached that way.
+- **Each lockout is longer than the last.** 5 wrong passwords in 15 minutes lock an IP out for
+  5 minutes. If the same IP is locked out again, that lockout is 15 minutes, then 30 minutes,
+  1 hour, 6 hours, 12 hours, and 24 hours every time after that. Signing in with the right
+  password once a lockout has ended, or 24 hours with no new lockout, starts the IP again at
+  5 minutes. The count is kept in memory, so restarting ChannelBin ends every lockout and
+  forgets every step: that is the way back in if you are the one locked out.
 - **An IPv6 address is counted by its /64.** One home connection is handed that whole range, so
   the lockout treats it as one visitor; an IPv4 address is counted by itself.
 - **`auth.cookie_secure`** is the switch for an always-HTTPS deployment (e.g. behind a
@@ -708,10 +715,14 @@ plain 404 there, so a mistake in the proxy cannot expose the web UI. On the publ
 - A play that cannot start tells the player only what kind of problem it is, like "Nothing can
   play this channel right now", never the reason written for you. The same goes for a login for
   another user on either port. The whole reason is in Recent plays and the log.
-- An address that gets the login wrong 10 times in 15 minutes is refused for the rest of those
-  15 minutes, even with the right password. This counts on the main port too. The Logins card
-  lists any address locked out now, with a button to let them try again. An IPv6 address is
-  counted by its /64, the whole range one home is given.
+- An address that gets the login wrong 10 times in 15 minutes is locked out for 5 minutes, even
+  with the right password. Each lockout of the same address is longer than its last: 15
+  minutes, 30 minutes, 1 hour, 6 hours, 12 hours, then 24 hours every time after that. After 24
+  hours with no new lockout an address starts again at 5 minutes, and so does every address
+  when ChannelBin restarts. This counts on the main port too. The Logins card lists each address
+  locked out now, until when, and a button beside it that lets that one address try again and
+  forgets its past lockouts. An IPv6 address is counted by its /64, the whole range one home
+  is given.
 - 30 or more wrong logins a minute, from every address together, shows on the Logins card and
   in the log as someone guessing. It is only an alarm: nobody is refused because of it.
 

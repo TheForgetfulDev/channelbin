@@ -166,16 +166,16 @@ class LockoutTests(FeedCase):
         resp = self.get('/player_api.php')
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.get_json()['error'], feed.AUTH_FAILED_MESSAGE)
-        self.assertEqual([ip for ip, _ in feed.login_failures.locked_out()], ['127.0.0.1'])
+        self.assertEqual([l.address for l in feed.login_failures.locked_out()], ['127.0.0.1'])
 
     def test_the_page_lists_a_lockout_and_clears_it(self):
         for _ in range(feed.LOGIN_MAX_FAILURES):
             self.wrong()
         page = self.client.get('/iptv-output').get_data(as_text=True)
         self.assertIn('id="of-lockouts"', page)
-        self.assertIn('127.0.0.1 until', page)
-        resp = self.client.post('/api/iptv-output/lockouts/clear')
-        self.assertEqual(resp.get_json(), {'success': True, 'cleared': 1})
+        self.assertIn('127.0.0.1 is locked out until', page)
+        resp = self.client.post('/api/iptv-output/lockouts/clear', json={'address': '127.0.0.1'})
+        self.assertEqual(resp.get_json(), {'success': True, 'cleared': True})
         self.assertEqual(self.get('/player_api.php').status_code, 200)
         self.assertNotIn('id="of-lockouts"', self.client.get('/iptv-output').get_data(as_text=True))
 

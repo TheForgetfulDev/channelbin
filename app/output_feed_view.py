@@ -22,7 +22,8 @@ from . import db
 from .config import MASK_SENTINEL, PROXY_FIX_ARGS, public_url
 from .database import (FEED_PICTURE_BACK, FEED_PICTURE_STOPPED, FEED_PLAY_ENDED, FEED_PLAY_PICTURE, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED, Account,
                        EPGEntry, OutputFeedLogin, OutputFeedPlay, UserPref)
-from .fmt_utils import counted, fmt_bytes, fmt_duration, join_labels
+from .auth import lockout_words, steps_words
+from .fmt_utils import counted, fmt_bytes, fmt_duration, join_labels, length_words
 from .tz_utils import day_label, format_local, get_display_tz, is_24h
 
 log = logging.getLogger(__name__)
@@ -916,6 +917,8 @@ def _public(fcfg: dict, connect_server: str, tz, h24) -> dict:
     listener = public_listener.status()
     url = output_feed.feed_public_url(fcfg)
     state = listener['state']
+    now = datetime.utcnow()
+    locked = output_feed.login_failures.locked_out()
     set_port = public_listener.public_port(fcfg)
     serving = state == public_listener.STATE_SERVING
     if serving:
@@ -933,13 +936,27 @@ def _public(fcfg: dict, connect_server: str, tz, h24) -> dict:
         # port is open and that address is set, else the one in the Connect card.
         'server': url if url and serving else connect_server,
         'suggested': output_feed.SUGGESTED_PUBLIC_PORT,
-        'lockouts': [{'address': ip, 'until': format_local(until, 'clock', tz=tz, h24=h24)}
-                     for ip, until in output_feed.login_failures.locked_out()],
-        'lockout_minutes': output_feed.LOGIN_LOCKOUT_WINDOW.seconds // 60,
+        'lockouts': [{'address': found.address, 'until': _until(found.until, now, tz, h24),
+                      'words': lockout_words(found)} for found in locked[:LOCKOUTS_SHOWN]],
+        'lockouts_more': max(0, len(locked) - LOCKOUTS_SHOWN),
+        'lockout_steps': steps_words(output_feed.login_failures.steps),
+        'lockout_forget': length_words(output_feed.login_failures.forget),
         'lockout_tries': output_feed.LOGIN_MAX_FAILURES,
         'alarm': _login_alarm(tz, h24),
         'proxy': _public_proxy(),
     }
+
+
+#: Locked-out addresses the Logins card lists, soonest to end first. The tracker can hold
+#: auth.MAX_TRACKED_IPS of them under a flood, and the card says how many it left out.
+LOCKOUTS_SHOWN = 20
+
+
+def _until(when, now, tz, h24) -> str:
+    """'9:40 PM', or '9:40 PM tomorrow' when a lockout ends on another day."""
+    clock = format_local(when, 'clock', tz=tz, h24=h24)
+    day = day_label(when, now, tz)
+    return clock if day == 'Today' else f'{clock} {day.lower() if day == "Tomorrow" else day}'
 
 
 def _login_alarm(tz, h24) -> dict:

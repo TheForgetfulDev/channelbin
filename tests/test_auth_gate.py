@@ -45,8 +45,8 @@ class _ConfigSandbox(ConfigSandbox):
         super().setUp()
         # The failed-attempt tracker is module-level state shared across every test in
         # the process (nothing else in the app touches it) - reset per test for isolation.
-        authmod.web_login.failures.clear()
-        self.addCleanup(authmod.web_login.failures.clear)
+        authmod.web_login.reset()
+        self.addCleanup(authmod.web_login.reset)
 
 
 
@@ -536,6 +536,19 @@ class LockoutTests(_ConfigSandbox):
         alert = Alert.query.filter_by(alert_type='AUTH_LOGIN_LOCKOUT').first()
         self.assertIsNotNone(alert)
         self.assertEqual(alert.severity, 'WARN')
+        self.assertIn('5 minutes, its first lockout', alert.body)
+
+    def test_a_right_password_after_a_lockout_ends_forgets_its_steps(self):
+        for _ in range(5):
+            authmod.record_failure('127.0.0.1')
+        times, until = authmod.web_login.lockouts['127.0.0.1']
+        self.assertEqual(times, 1)
+        # The lockout is over, its step still remembered.
+        authmod.web_login.lockouts['127.0.0.1'] = (times, datetime.utcnow() - timedelta(seconds=1))
+        tok = csrf_field(self.client.get('/login').get_data(as_text=True))
+        r = self.client.post('/login', data={'password': PASSWORD, 'csrf_token': tok})
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(authmod.web_login.lockouts, {})
 
 
 class PasswordEndpointTests(_ConfigSandbox):

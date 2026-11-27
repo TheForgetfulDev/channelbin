@@ -611,12 +611,13 @@
     }));
   }
 
-  async function clearLockouts() {
-    const d = await post('/api/iptv-output/lockouts/clear');
+  async function clearLockout(btn) {
+    const address = btn.dataset.address;
+    const d = await post('/api/iptv-output/lockouts/clear', { address });
     await refresh(CARDS);
     showToast(d.cleared
-      ? 'They can try again now. A player still holding a wrong password is locked out again after a few more tries.'
-      : 'Nothing was locked out any more.');
+      ? `${address} can try again now. A player still holding a wrong password is locked out again after a few more tries.`
+      : `${address} was not locked out any more.`);
   }
 
   const guarded = (fn) => (...args) => Promise.resolve(fn(...args)).catch(fail);
@@ -650,7 +651,7 @@
     else if (act === 'login-copy') guarded(copyLogin)(t.closest('tr'));
     else if (act === 'login-channels') guarded(chooseChannels)(t.closest('tr'));
     else if (act === 'login-accounts') guarded(chooseAccounts)(t.closest('tr'));
-    else if (act === 'lockouts-clear') guarded(clearLockouts)();
+    else if (act === 'lockout-clear') guarded(clearLockout)(t);
   });
   document.addEventListener('change', (e) => {
     const t = e.target;

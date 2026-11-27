@@ -508,11 +508,12 @@ def play_accounts(fcfg: dict, accounts: Optional[frozenset]) -> Optional[frozens
     return accounts if accounts is not None else allowed_account_ids(fcfg)
 
 
-#: Wrong logins from one address before it is refused, and for how long. Its own counter, never
-#: the web login's (app/auth.py::web_login), so a lockout here never locks anyone out of
+#: Wrong logins from one address, inside the window, before it is refused. Its own counter,
+#: never the web login's (app/auth.py::web_login), so a lockout here never locks anyone out of
 #: ChannelBin's own pages. Higher than the web login's 5 because an IPTV player holding an old
-#: password asks for the guide, the channel list and a logo per channel in one burst; 10 a
-#: quarter hour is still far too slow to guess a generated password (dev/changelog/1761).
+#: password asks for the guide, the channel list and a logo per channel in one burst
+#: (dev/changelog/1761). How long a lockout lasts is auth.LOCKOUT_STEPS, longer each time
+#: (dev/changelog/1774).
 LOGIN_MAX_FAILURES = 10
 LOGIN_LOCKOUT_WINDOW = timedelta(minutes=15)
 #: Wrong logins a minute, from every address together, at which the output says someone is
