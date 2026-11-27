@@ -181,8 +181,8 @@ def live(username, password, feed_id):
     """Play one feed id: a relayed MPEG-TS body when the mode relays it (proxy mode, and a
     group or sports channel in mixed mode) and for every play on the public port or a login for
     another user, a 302 to the member's provider URL otherwise, and
-    a sports channel's waiting screen in every mode when it has nothing to play. Every refusal
-    names its reason in the body."""
+    a sports channel's waiting screen in every mode when it has nothing to play. A refusal's body
+    names its whole reason to the main login at home, and its kind only to everyone else."""
     client = request.remote_addr or ''
     # The address names one player only when this request's reverse proxy was believed and
     # put the player's own there: otherwise a proxy in front gives every player its address
@@ -199,7 +199,11 @@ def live(username, password, feed_id):
             if target is not None:
                 return redirect(target, code=302)
     except output_feed.FeedRefused as exc:
-        return jsonify({'error': exc.message}), exc.status
+        # The full sentence is written for the owner and names their pages, settings and
+        # folders; a player outside their home is told only what kind of refusal it is. The
+        # whole reason is in Recent plays and the log either way (dev/changelog/1770).
+        outside = public or not g.feed_login.is_main
+        return jsonify({'error': exc.short_message if outside else exc.message}), exc.status
     # The body runs after this request has ended, outside any request or app context, so
     # the stream holds no database session and no pool connection for as long as the IPTV player
     # watches. Everything it needs is on the session object.

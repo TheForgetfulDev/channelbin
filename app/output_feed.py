@@ -1428,13 +1428,34 @@ def _up_next_programs(row, now: datetime, days: int):
 
 # ── Picking what a feed id plays ───────────────────────────────────────────────────────────
 
+#: What a refused play tells a player that is not the owner's own at home - one on the public
+#: port or on a login for another user - by HTTP status. `FeedRefused.message` is written for the
+#: owner (page and setting names, how the guide matched a game, a folder path), so it stays in
+#: Recent plays, the alert and the log, and only the owner's own player at home is sent it
+#: (dev/changelog/1770).
+SHORT_REFUSALS = {
+    401: AUTH_FAILED_MESSAGE,
+    404: 'No such channel on the IPTV output',
+    409: 'Nothing can play this channel right now. Try again later.',
+    500: 'This channel could not be started. Try again in a moment.',
+    503: 'No room for another play right now. Try again later.',
+}
+#: For a status SHORT_REFUSALS does not name: still says nothing about the owner's setup.
+SHORT_REFUSAL_OTHER = 'The IPTV output could not play this channel.'
+
+
 class FeedRefused(Exception):
-    """A play could not start; `message` is user-facing prose, `status` the HTTP code."""
+    """A play could not start; `message` is user-facing prose written for the owner, `status`
+    the HTTP code, and `short_message` what a player outside the owner's own home is told."""
 
     def __init__(self, message: str, status: int = 409):
         super().__init__(message)
         self.message = message
         self.status = status
+
+    @property
+    def short_message(self) -> str:
+        return SHORT_REFUSALS.get(self.status, SHORT_REFUSAL_OTHER)
 
 
 @dataclass
