@@ -1381,6 +1381,29 @@ class AccountsListLabelTests(unittest.TestCase):
         self.assertNotIn('>EPG<', head)
 
 
+class KebabMenuFontTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-27: the account page's Hosts, Logins and EPG kebabs sit in a
+    `.tbl .num` cell, whose monospace font and tabular figures the open menu inherited."""
+
+    def setUp(self):
+        with open(os.path.join(REPO, 'static', 'css', 'style.css')) as fh:
+            self.css = fh.read()
+
+    def test_a_menu_sets_its_own_font(self):
+        base = re.search(r'^\.menu \{(.*?)\}', self.css, re.S | re.M)
+        self.assertIsNotNone(base)
+        self.assertIn('font-family: var(--font)', base.group(1))
+        self.assertIn('font-variant-numeric: normal', base.group(1))
+
+    def test_the_cell_it_sits_in_is_still_monospace(self):
+        # The premise: if `.tbl .num` stops being monospace this guard can go with it.
+        num = re.search(r'^\.tbl \.num \{(.*?)\}', self.css, re.S | re.M)
+        self.assertIn('var(--font-mono)', num.group(1))
+        with open(os.path.join(REPO, 'templates', 'account_detail.html')) as fh:
+            html = fh.read()
+        self.assertRegex(html, r'<td class="num">\s*<span class="menu-wrap">')
+
+
 if __name__ == '__main__':
     unittest.main()
 
