@@ -1568,7 +1568,8 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
         stream_url = normalize_url(ch.stream_url, ch.account, cfg)
         # The seat run_channel_test() took may be on one of the account's listed logins;
         # the test is launched with that login's credentials (app/account_links.py).
-        stream_url, _login_id = render_held_login(stream_url, ch.account_id, 'test', channel_id)
+        stream_url, _login_id, test_host_login_id = render_held_login(
+            stream_url, ch.account_id, 'test', channel_id)
         with _lock:
             # Overrides the raw value _run_channel_loop set before this test started -
             # this is the URL actually handed to ffmpeg below, so the live status/log
@@ -1762,7 +1763,8 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
                 # there, so asking on every attempt costs nothing; this test still fails on
                 # the host it opened, and the next one opens on the rolled URL.
                 if exit_code_before_kill is not None and is_resolution_failure('\n'.join(stderr_buf)):
-                    roll_host_for_channel(channel_id, trigger=f'Health check of channel {channel_id}')
+                    roll_host_for_channel(channel_id, trigger=f'Health check of channel {channel_id}',
+                                          host_login_id=test_host_login_id)
                 # Likewise a refusal of the login this test's seat is on: stamped so the
                 # next capture on the account takes a seat on another login.
                 if exit_code_before_kill is not None and is_credential_refusal('\n'.join(stderr_buf)):

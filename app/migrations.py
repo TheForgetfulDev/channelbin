@@ -4167,6 +4167,32 @@ def _m154_output_feed_login_accounts(conn, cur):
         cur.execute('ALTER TABLE output_feed_logins ADD COLUMN accounts TEXT')
     conn.commit()
 
+
+def _m155_login_hosts(conn, cur):
+    """login_hosts: the host names of the reseller who sold a login, which a stream seated on
+    that login is launched on (DESIGN-account-providers.md §14, dev/changelog/1778).
+
+    No backfill and no obligation to register (dev/changelog/686): an account's hosts stay on
+    the account, and a login with no rows here uses them exactly as before. Putting a host on
+    a login is always the user's act. CREATE TABLE IF NOT EXISTS, so re-runnable."""
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS login_hosts (
+            id                 INTEGER PRIMARY KEY,
+            login_id           INTEGER NOT NULL REFERENCES logins(id),
+            host               VARCHAR(255) NOT NULL,
+            position           INTEGER NOT NULL DEFAULT 0,
+            is_active          BOOLEAN NOT NULL DEFAULT 0,
+            activated_at       DATETIME,
+            enabled            BOOLEAN NOT NULL DEFAULT 1,
+            switched_at        DATETIME,
+            last_resolved_at   DATETIME,
+            last_resolve_error VARCHAR(255),
+            created_at         DATETIME NOT NULL,
+            CONSTRAINT uq_login_hosts_login_host UNIQUE (login_id, host)
+        )
+    ''')
+    conn.commit()
+
 #: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
 #: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
 #: time; the rebuild test holds step 148's output to this text, and the column list after
@@ -5051,6 +5077,7 @@ SCHEMA_MIGRATIONS = [
      _m153_output_feed_login_lineup),
     (154, 'output_feed_logins.accounts: the IPTV accounts each login for another user plays from',
      _m154_output_feed_login_accounts),
+    (155, 'login_hosts: the hosts of the reseller who sold a login', _m155_login_hosts),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

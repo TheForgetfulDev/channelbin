@@ -48,7 +48,7 @@
             {% for lg in a.logins %}
             <span class="menu-wrap">
               <button class="chip{% if lg.shared %} active{% endif %}" data-menu data-sheet
-                      aria-label="Login {{ lg.name }} on {{ a.name }}">login: {{ lg.name }}{% if lg.shared %} (shared){% endif %} {{ icon('dropdown') }}</button>
+                      aria-label="Login {{ lg.name }} on {{ a.name }}">login: {{ lg.name }}{% if lg.shared %} (shared){% endif %}{% if lg.active_host %} on {{ lg.active_host }}{% endif %} {{ icon('dropdown') }}</button>
               <div class="menu">
                 {% for t in lg.share_targets %}
                 <button class="menu-item" data-act="prov-share" data-login-id="{{ lg.id }}" data-login="{{ lg.name }}" data-account-id="{{ t.id }}">Share with {{ t.name }}</button>

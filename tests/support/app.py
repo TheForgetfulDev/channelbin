@@ -453,6 +453,7 @@ def reset_module_globals():
     # A roll attempt recorded by one module's stall test puts the next module's roll inside
     # the cooldown, so its resolution failure rolls nothing.
     account_links._last_roll_attempt.clear()
+    account_links._last_login_roll_attempt.clear()
     # The host-check line and its pacing: a module that queued checks would hand the next
     # one a busy line and a gap still to wait out.
     import app.host_checks as host_checks

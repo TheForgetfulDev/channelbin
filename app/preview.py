@@ -338,6 +338,9 @@ class PreviewSession:
     # here because the seat is released before the start failure's stderr is read, and a
     # credential refusal has to be stamped on the login that was actually sent.
     login_id: Optional[int] = None
+    # The login whose own host list the launch was rendered from (None: the account's), which
+    # a resolution failure rolls (DESIGN-account-providers.md §14.6).
+    host_login_id: Optional[int] = None
     source: str = SOURCE_CHANNEL
     # File sessions: the recording, the file (never sent to the browser) and where in it this
     # session was started. source_done records that ffmpeg reached the end of the file and
@@ -579,8 +582,8 @@ def _launch(channel_id: int, purpose: str, reencode: bool = False) -> PreviewSes
     # The seat just taken may be on one of the account's listed logins: the capture is
     # launched with that login's credentials, never the URL's own, so the seat and the
     # credentials the provider sees are the same login (app/account_links.py).
-    launch_url, session.login_id = render_held_login(channel.stream_url, channel.account_id,
-                                                     'preview', session.id)
+    launch_url, session.login_id, session.host_login_id = render_held_login(
+        channel.stream_url, channel.account_id, 'preview', session.id)
 
     def command(gpu_decode, start_number=0):
         return build_preview_cmd(cfg, launch_url, session.dir,
@@ -1589,7 +1592,8 @@ def _roll_if_unresolved(session: PreviewSession, tail: str) -> None:
     with session.app.app_context():
         if unresolved:
             roll_host_for_channel(session.channel_id,
-                                  trigger=f'Preview of {session.channel_name}')
+                                  trigger=f'Preview of {session.channel_name}',
+                                  host_login_id=session.host_login_id)
         if refused:
             note_refusal_for_holder('preview', session.id,
                                     trigger=f'Preview of {session.channel_name}',

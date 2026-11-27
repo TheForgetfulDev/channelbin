@@ -111,7 +111,7 @@ class EverySwitchOnChangesNothingTests(_Case):
         self.assertFalse(connlim.try_acquire(self.acc_id, 'recording', 12),
                          'still one seat: the account\'s own Max connections')
         self.assertEqual(links.render_held_login(url, self.acc_id, 'recording', 11),
-                         (url, login.id))
+                         (url, login.id, None))
 
     def test_a_second_listing_changes_nothing(self):
         self._list_playlist()
@@ -151,7 +151,7 @@ class LoginSwitchTests(_Case):
                          'the playlist\'s login is off, so only one seat is left')
         self.assertEqual(connlim.held_login_id('recording', 11), self.mine)
         url = self._urls()[0]
-        launch, _ = links.render_held_login(url, self.acc_id, 'recording', 11)
+        launch, _, _ = links.render_held_login(url, self.acc_id, 'recording', 11)
         self.assertEqual(launch, f'http://{PLAYLIST_HOST}/tom_main/tompw/1')
         self.assertNotIn(PLAYLIST_PAIR[0], launch)
 

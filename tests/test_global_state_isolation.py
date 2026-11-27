@@ -54,7 +54,7 @@ APP_DIR = os.path.join(REPO, 'app')
 # imported so the two lists have to be edited together and a silent drop on one side is a
 # red test rather than a no-op.
 RESET = {
-    'app/account_links.py': {'_last_roll_attempt'},
+    'app/account_links.py': {'_last_roll_attempt', '_last_login_roll_attempt'},
     'app/host_checks.py': {'_triggers', '_current', '_next_at', '_next_at_utc',
                            '_worker', '_finished', '_spacing_seen'},
     'app/account_stats.py': {'_catch_up'},

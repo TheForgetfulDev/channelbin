@@ -2396,6 +2396,41 @@ class AccountLogin(db.Model):
     switched_at = db.Column(db.DateTime)   # naive UTC
 
 
+class LoginHost(db.Model):
+    """A host name of the reseller who sold one login (DESIGN-account-providers.md §14). A
+    stream seated on a login that lists any is launched on that login's active host, on
+    every account holding the login; a login with none uses the account's hosts, exactly as
+    before this table existed. A table of its own rather than a `login_id` on
+    `account_hosts`: `AccountHost.is_active` means "the host this account's stored URLs
+    carry", and a login's host is never stored on a URL.
+
+    The list is the user's and only `app/account_links.py` adds, removes or switches a row
+    (CLAUDE.md, participation-switch rule); no sync and no migration writes one. `enabled`
+    is per login, not per account holding it. `is_active` / `activated_at` are state the app
+    writes (the roll, Make active, a switch handing the role on), at most one active per
+    login, always one that is on unless every host on the login is off.
+    """
+    __tablename__ = 'login_hosts'
+    __table_args__ = (db.UniqueConstraint('login_id', 'host', name='uq_login_hosts_login_host'),)
+
+    id                 = db.Column(db.Integer, primary_key=True)
+    # No index of its own: the UNIQUE (login_id, host) index leads on login_id.
+    login_id           = db.Column(db.Integer, db.ForeignKey('logins.id'), nullable=False)
+    #: `name[:port]`, spelled as AccountHost.host.
+    host               = db.Column(db.String(255), nullable=False)
+    position           = db.Column(db.Integer, nullable=False, default=0,
+                                   server_default=db.text('0'))
+    is_active          = db.Column(db.Boolean, nullable=False, default=False,
+                                   server_default=db.text('0'))
+    activated_at       = db.Column(db.DateTime)   # naive UTC, display only
+    enabled            = db.Column(db.Boolean, nullable=False, default=True,
+                                   server_default=db.text('1'))
+    switched_at        = db.Column(db.DateTime)   # naive UTC, display only
+    last_resolved_at   = db.Column(db.DateTime)   # naive UTC
+    last_resolve_error = db.Column(db.String(255))
+    created_at         = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
 # ── Channel group format strategy ─────────────────────────────────────────────
 #
 # ChannelGroup.format_strategy - one standing setting deciding which format the group

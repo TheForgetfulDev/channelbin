@@ -2028,6 +2028,9 @@ class RelaySession:
     preempted: bool = False
     preempted_by: Optional[int] = None
     login_id: Optional[int] = None
+    # The login whose own host list the launch was rendered from (None: the account's), which
+    # a resolution failure rolls (DESIGN-account-providers.md §14.6).
+    host_login_id: Optional[int] = None
     # The game a sports channel's play is, which a failover is held to; None for anything else.
     event_id: Optional[int] = None
     # Whether another channel can take over when the one playing dies: a group, a sports channel.
@@ -2964,8 +2967,8 @@ def _launch(session: RelaySession, member, cfg, first: bool = True,
         _finish(session, REASON_PREEMPTED,
                 detail=f'a recording took the connection as the play was moving to "{member.name}"')
         raise FeedRefused(REASON_TEXT[REASON_PREEMPTED], 409)
-    launch_url, session.login_id = render_held_login(member.stream_url, member.account_id,
-                                                     'viewer', session.id)
+    launch_url, session.login_id, session.host_login_id = render_held_login(
+        member.stream_url, member.account_id, 'viewer', session.id)
     cfg = cfg or load_config()
     # Asked of the member being launched, never carried over from the play's first one: a
     # failover and a game put on from the waiting screen get that channel's own answer.
@@ -3878,17 +3881,38 @@ def _check(session: RelaySession) -> None:
     rc = proc.poll() if proc is not None else None
     if rc is not None:
         tail = mask_creds_in_text(read_stderr_tail(session.stderr_path))
+        _roll_if_unresolved(session, tail)
         _member_died(session, REASON_FFMPEG_EXITED,
                      f'ffmpeg exited with code {rc}' + (f': {tail}' if tail else ''))
         return
     if state == STATE_STARTING:
         if now - session.launched_mono > CONNECT_TIMEOUT_SECONDS:
             tail = mask_creds_in_text(read_stderr_tail(session.stderr_path))
+            _roll_if_unresolved(session, tail)
             _member_died(session, REASON_CONNECT_TIMEOUT, tail)
         return
     if session.last_data_mono is not None and now - session.last_data_mono > session.stall_timeout:
         _member_died(session, REASON_FFMPEG_EXITED,
                      f'no data for {session.stall_timeout:.0f}s')
+
+
+def _roll_if_unresolved(session: RelaySession, tail: Optional[str]) -> None:
+    """The relay's ffmpeg died and its stderr says the stream host did not resolve: roll the
+    list the launch was rendered from - the login's own, or the account's - as the recorder,
+    the channel test and the preview do (DESIGN-account-providers.md §14.6). On a thread of
+    its own, because the roll looks host names up and the reaper serves every play. Never
+    raises: a diagnostic must not harm the stream it diagnoses."""
+    from .account_links import is_resolution_failure, roll_host_for_channel
+    if session.app is None or session.channel_id is None or not is_resolution_failure(tail):
+        return
+    app, channel_id, host_login_id = session.app, session.channel_id, session.host_login_id
+    trigger = f'IPTV output play of {session.channel_name}'
+
+    def _roll():
+        with app.app_context():
+            roll_host_for_channel(channel_id, trigger=trigger, host_login_id=host_login_id)
+
+    threading.Thread(target=_roll, name=f'relay-roll-{session.id}', daemon=True).start()
 
 
 def _member_died(session: RelaySession, reason: str, detail: str) -> None:
@@ -5102,7 +5126,15 @@ def redirect_target(feed_id: int, client: str, cfg=None, play: Play = None) -> s
                        'channel_name': member.name, 'account_id': member.account_id})
     log.info('Viewer from %s: %s redirected to channel %d (%s) on account %d', client,
              label, member.id, member.name, member.account_id)
-    return member.stream_url
+    # What the channel page's Copy hands out: the host and credentials the next stream on the
+    # account would be launched with, never the stored URL's playlist host and login when the
+    # user turned them off (DESIGN-account-providers.md §14.4). The stored URL, byte for byte,
+    # for an account that lists no host and no login (next_stream() answers None).
+    from .account_links import next_stream, next_stream_url
+    if member.account is None:
+        return member.stream_url
+    return next_stream_url(member.stream_url, member.account_id,
+                           next_stream(member.account, cfg)) or member.stream_url
 
 
 # ── Surfaces ───────────────────────────────────────────────────────────────────────────────

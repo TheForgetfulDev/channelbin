@@ -65,7 +65,7 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta
-from typing import Iterable, Optional
+from typing import Iterable, NamedTuple, Optional
 
 from sqlalchemy import or_, update
 
@@ -525,6 +525,7 @@ def _release_sync_listed(login, account_id: int) -> None:
     else:
         from .account_blocks import drop_login_blocks
         drop_login_blocks([login.id])
+        drop_login_hosts([login.id])
         db.session.delete(login)
 
 
@@ -726,14 +727,440 @@ def delete_hosts_for_account(account_id: int) -> int:
     return AccountHost.query.filter_by(account_id=account_id).delete(synchronize_session=False)
 
 
+# ── A login's own hosts (DESIGN-account-providers.md §14, dev/changelog/1778) ─────────────
+#
+# A login belongs to one reseller, so the hosts it may be dialed on are a fact about the
+# login. A stream seated on a login that lists any goes out on the login's active host, on
+# every account holding it (render_held_login()); a login with none uses the account's hosts.
+# The list is never written by a sync or a migration, and never touches an account's stored
+# URLs: a login's host is rendered at launch only.
+
+# login_id -> monotonic time of the last roll attempt on that login's list, so a flapping
+# resolver on one reseller's hosts cannot hold back a roll on another's (§14.6).
+_last_login_roll_attempt: dict = {}
+
+
+def login_hosts_for_logins(login_ids: Iterable[int]) -> dict:
+    """{login_id: [LoginHost, ...] in position order} for the pages, one query."""
+    from .database import LoginHost
+    ids = {i for i in login_ids if i is not None}
+    out: dict = {i: [] for i in ids}
+    if not ids:
+        return out
+    for row in (LoginHost.query.filter(LoginHost.login_id.in_(ids))
+                .order_by(LoginHost.login_id, LoginHost.position, LoginHost.id).all()):
+        out[row.login_id].append(row)
+    return out
+
+
+def login_host_state(login_ids: Iterable[int]) -> dict:
+    """{login_id: True when at least one of its own hosts is on, False when every one is off}
+    for the logins among `login_ids` that list hosts; a login listing none is absent, which
+    means "uses the account's hosts". One grouped query."""
+    from sqlalchemy import case, func
+    from .database import LoginHost
+    ids = {i for i in login_ids if i is not None}
+    if not ids:
+        return {}
+    on = func.sum(case((LoginHost.enabled.is_(True), 1), else_=0))
+    return {lid: bool(n_on) for lid, n_on in (db.session.query(LoginHost.login_id, on)
+                                              .filter(LoginHost.login_id.in_(ids))
+                                              .group_by(LoginHost.login_id).all())}
+
+
+def login_host_names(account_ids: Optional[Iterable[int]] = None) -> list:
+    """Every host name on the own lists of the logins `account_ids` hold (every login when
+    None), once each, in a stable order - what a check of those accounts also covers."""
+    from .database import AccountLogin, LoginHost
+    q = db.session.query(LoginHost.host)
+    if account_ids is not None:
+        ids = {a for a in account_ids if a is not None}
+        if not ids:
+            return []
+        q = q.join(AccountLogin, AccountLogin.login_id == LoginHost.login_id).filter(
+            AccountLogin.account_id.in_(ids))
+    return list(dict.fromkeys(h for (h,) in q.order_by(LoginHost.login_id, LoginHost.position,
+                                                        LoginHost.id).all()))
+
+
+def login_has_no_host_on(account_id: int, login_id: int) -> bool:
+    """True when every host `login_id` would use on `account_id` is off: its own list when
+    it has one, the account's when it has none (§14.5). The one test that sizes the login's
+    pool at 0 and that moves a running recording off it at its next segment."""
+    state = login_host_state([login_id])
+    if login_id in state:
+        return not state[login_id]
+    return account_id in hosts_all_off([account_id])
+
+
+def _login_host_rows(login_id: int) -> list:
+    from .database import LoginHost
+    return (LoginHost.query.filter_by(login_id=login_id)
+            .order_by(LoginHost.position, LoginHost.id).all())
+
+
+def _stamp_login_rows(verdicts: dict) -> None:
+    """{host: (ok, error)} onto every login's own row carrying the name: the lookup's
+    stamps, as on the account rows."""
+    from .database import LoginHost
+    if not verdicts:
+        return
+
+    @retry_on_locked()
+    def _stamp_and_commit():
+        now = datetime.utcnow()
+        for row in LoginHost.query.filter(LoginHost.host.in_(list(verdicts))).all():
+            ok, error = verdicts[row.host]
+            if ok:
+                row.last_resolved_at = now
+                row.last_resolve_error = None
+            else:
+                row.last_resolve_error = (error or 'did not resolve')[:255]
+        db.session.commit()
+
+    _stamp_and_commit()
+
+
+def _login_or_raise(login_id: int):
+    from .database import Login
+    row = db.session.get(Login, login_id)
+    if row is None:
+        raise LookupError('Login not found.')
+    return row
+
+
+def add_login_host(login_id: int, raw_host: str):
+    """Append a host to a login's own list; the first one added becomes the login's active
+    host. The list is the login's, so it reaches every account holding it. Returns the new
+    row. Raises LookupError, or ValueError for a bad name or one already on the login."""
+    from .database import LoginHost
+    host = normalize_host(raw_host)
+
+    @retry_on_locked()
+    def _add_and_commit():
+        login = _login_or_raise(login_id)
+        rows = _login_host_rows(login_id)
+        if any(r.host == host for r in rows):
+            raise ValueError(f'{host} is already on login "{login.name}".')
+        now = datetime.utcnow()
+        first_on = not any(r.is_active and r.enabled for r in rows)
+        row = LoginHost(login_id=login_id, host=host,
+                        position=max((r.position for r in rows), default=-1) + 1,
+                        is_active=first_on, activated_at=now if first_on and rows else None,
+                        created_at=now)
+        if first_on:
+            for r in rows:
+                r.is_active = False
+        db.session.add(row)
+        db.session.commit()
+        return row, login.name
+
+    row, name = _add_and_commit()
+    _clear_login_rolled_alert(login_id)
+    log.info('Login %d ("%s"): host %s added to its own list', login_id, name, host)
+    return row
+
+
+def copy_account_hosts_to_login(account_id: int, login_id: int) -> list:
+    """Add the hosts on `account_id`'s list that are turned on to `login_id`'s own list, in
+    the account's order, skipping any already there - for the direct account whose reseller's
+    hosts are already typed on the account (§14.9). The account's list is left as it is.
+    Returns the host names added. Raises LookupError for a login the account does not hold."""
+    from .database import AccountHost, AccountLogin, LoginHost
+
+    @retry_on_locked()
+    def _copy_and_commit():
+        if db.session.get(AccountLogin, (account_id, login_id)) is None:
+            raise LookupError('Login not found.')
+        login = _login_or_raise(login_id)
+        rows = _login_host_rows(login_id)
+        have = {r.host for r in rows}
+        now = datetime.utcnow()
+        position = max((r.position for r in rows), default=-1) + 1
+        need_active = not any(r.is_active and r.enabled for r in rows)
+        added = []
+        for src in (AccountHost.query.filter_by(account_id=account_id, enabled=True)
+                    .order_by(AccountHost.position, AccountHost.id).all()):
+            if src.host in have:
+                continue
+            db.session.add(LoginHost(login_id=login_id, host=src.host, position=position,
+                                     is_active=need_active and not added, created_at=now))
+            position += 1
+            added.append(src.host)
+        if added and need_active:
+            for r in rows:
+                r.is_active = False
+        db.session.commit()
+        return added, login.name
+
+    added, name = _copy_and_commit()
+    if added:
+        _clear_login_rolled_alert(login_id)
+        log.info('Login %d ("%s"): %d host(s) copied from account %d: %s', login_id, name,
+                 len(added), account_id, ', '.join(added))
+    return added
+
+
+def remove_login_host(login_id: int, host_id: int) -> str:
+    """Take a host off a login's own list. Removing the active one hands the role to the
+    next host that is on; removing the last one puts the login back on the account's hosts.
+    Returns the host name. Raises LookupError."""
+
+    @retry_on_locked()
+    def _remove_and_commit():
+        rows = _login_host_rows(login_id)
+        row = next((r for r in rows if r.id == host_id), None)
+        if row is None:
+            raise LookupError('Host not found.')
+        target = None
+        if row.is_active:
+            target = _next_on_host(rows, row) or next((r for r in rows if r is not row), None)
+        if target is not None:
+            target.is_active = True
+            target.activated_at = datetime.utcnow()
+        name = row.host
+        db.session.delete(row)
+        db.session.commit()
+        return name
+
+    name = _remove_and_commit()
+    _clear_login_rolled_alert(login_id)
+    log.info('Login %d: host %s removed from its own list', login_id, name)
+    return name
+
+
+def set_login_host_active(login_id: int, host_id: int) -> str:
+    """Make one of a login's own hosts its active one, by hand. Streams already running move
+    at their next segment; no stored URL changes. Returns the host. Raises LookupError, or
+    ValueError for a host that is off."""
+
+    @retry_on_locked()
+    def _activate_and_commit():
+        rows = _login_host_rows(login_id)
+        row = next((r for r in rows if r.id == host_id), None)
+        if row is None:
+            raise LookupError('Host not found.')
+        if not row.enabled:
+            raise ValueError(f'{row.host} is turned off. Turn it on first.')
+        if not row.is_active:
+            for r in rows:
+                r.is_active = False
+            row.is_active = True
+            row.activated_at = datetime.utcnow()
+            db.session.commit()
+        return row.host
+
+    host = _activate_and_commit()
+    _clear_login_rolled_alert(login_id)
+    log.info('Login %d: host %s made active by hand', login_id, host)
+    return host
+
+
+def set_login_host_enabled(login_id: int, host_id: int, enabled: bool) -> dict:
+    """The user's switch on one of a login's own hosts - per login, so it holds on every
+    account holding the login (§14.12). Turning the active one off hands the role to the next
+    host that is on; turning one on while none is active makes it active. With every host on
+    the login off, the login takes no new seat anywhere (login_seats_for_accounts()). Returns
+    {'host', 'enabled', 'active'}. Raises LookupError."""
+    enabled = bool(enabled)
+
+    @retry_on_locked()
+    def _switch_and_commit():
+        rows = _login_host_rows(login_id)
+        row = next((r for r in rows if r.id == host_id), None)
+        if row is None:
+            raise LookupError('Host not found.')
+        active = next((r for r in rows if r.is_active and r.enabled), None)
+        if row.enabled != enabled:
+            now = datetime.utcnow()
+            row.enabled = enabled
+            row.switched_at = now
+            target = None
+            if not enabled and row.is_active:
+                # With no other host on, the role stays on this one (§14.3): the login then
+                # takes no new seat, and a seat kept through the switch is not moved onto the
+                # account's host.
+                target = _next_on_host(rows, row)
+            elif enabled and active is None:
+                target = row
+            if target is not None:
+                for r in rows:
+                    r.is_active = r is target
+                target.activated_at = now
+            db.session.commit()
+            active = next((r for r in rows if r.is_active and r.enabled), None)
+        return {'host': row.host, 'enabled': enabled, 'active': active.host if active else None}
+
+    out = _switch_and_commit()
+    _clear_login_rolled_alert(login_id)
+    log.info('Login %d: host %s turned %s', login_id, out['host'], 'on' if enabled else 'off')
+    return out
+
+
+def drop_login_hosts(login_ids: Iterable[int]) -> int:
+    """Inside the caller's unit (no commit): everything a login's own hosts made, for logins
+    being deleted - the rows, the standing LOGIN_HOST_ROLLED alert, the in-memory roll stamp.
+    The one teardown every path that deletes a Login row calls (§14.8), so a fifth delete path
+    cannot forget a piece. host_checks is keyed by name and needs nothing. Returns the rows
+    deleted."""
+    from .alerts import LOGIN_HOST_ROLLED, mark_cleared
+    from .database import Alert, LoginHost
+    ids = [i for i in login_ids if i is not None]
+    if not ids:
+        return 0
+    mark_cleared(Alert.query.filter(Alert.alert_type == LOGIN_HOST_ROLLED,
+                                    Alert.source.in_([_login_alert_source(i) for i in ids]),
+                                    Alert.dismissed_at.is_(None)).all())
+    for i in ids:
+        _last_login_roll_attempt.pop(i, None)
+    return LoginHost.query.filter(LoginHost.login_id.in_(ids)).delete(synchronize_session=False)
+
+
+def _login_alert_source(login_id: int) -> str:
+    return f'login:{login_id}:host-rolled'
+
+
+def _clear_login_rolled_alert(login_id: int) -> None:
+    from .alerts import LOGIN_HOST_ROLLED, dismiss_open_alerts
+    dismiss_open_alerts(LOGIN_HOST_ROLLED, _login_alert_source(login_id))
+
+
+def roll_login_host(login_id: int, trigger: str, recording_id: Optional[int] = None,
+                    cfg: Optional[dict] = None) -> Optional[dict]:
+    """Move a login onto the next host on its own list that is on and resolves, because the
+    active one stopped resolving (§14.6). One row written: no channel and no account URL
+    moves. Same order as the account's roll (§4.4), its own cooldown per login, and no repair
+    branch - a login has no stored URLs to strand. Returns {'login_id', 'old_host', 'host'}
+    when it rolled, else None."""
+    from .alerts import LOGIN_HOST_ROLLED
+    from .config import load_config
+    from .database import Account, AccountLogin, Alert, Login
+    cfg = cfg or load_config()
+    cooldown = timedelta(minutes=float((cfg.get('hosts') or {}).get('roll_cooldown_minutes', 10)))
+    login = db.session.get(Login, login_id)
+    if login is None:
+        return None
+    rows = [r for r in _login_host_rows(login_id) if r.enabled]
+    active = next((r for r in rows if r.is_active), None)
+    if len(rows) < 2 or active is None:
+        return None
+    now = datetime.utcnow()
+    standing = (Alert.query.filter(Alert.alert_type == LOGIN_HOST_ROLLED,
+                                   Alert.source == _login_alert_source(login_id),
+                                   Alert.dismissed_at.is_(None),
+                                   Alert.created_at > now - cooldown).first())
+    if standing is not None:
+        log.info('Login %d: %s - a roll was recorded inside the %s cooldown; not rolling',
+                 login_id, trigger, cooldown)
+        return None
+    with _attempt_lock:
+        last = _last_login_roll_attempt.get(login_id)
+        mono = time.monotonic()
+        if last is not None and mono - last < cooldown.total_seconds():
+            return None
+        _last_login_roll_attempt[login_id] = mono
+    from .host_checks import rank
+    idx = rows.index(active)
+    ranks = rank([r.host for r in rows])
+    order = sorted(rows[idx + 1:] + rows[:idx], key=lambda r: ranks.get(r.host, 1)) + [active]
+    chosen, verdicts = None, {}
+    for row in order:
+        ok, error = resolve_host(row.host)
+        verdicts[row.host] = (ok, error)
+        if ok:
+            chosen = row
+            break
+    if chosen is not None and chosen is not active and active.host not in verdicts:
+        verdicts[active.host] = (False, f'did not resolve (reported by {trigger})')
+    # Every row carrying a name it looked up, an account's included, and a lookup row each,
+    # as the account's roll does.
+    for host, (ok, error) in verdicts.items():
+        stamp_lookup(host, ok, error)
+    from .host_checks import record_lookups
+    record_lookups({h: (ok, err, None) for h, (ok, err) in verdicts.items()}, 'roll')
+    holders = [name for (name,) in db.session.query(Account.name)
+               .join(AccountLogin, AccountLogin.account_id == Account.id)
+               .filter(AccountLogin.login_id == login_id).order_by(Account.name).all()]
+    from .accounts import _raise_or_resolve_standing_alert
+    if chosen is None:
+        _raise_or_resolve_standing_alert(
+            LOGIN_HOST_ROLLED, source=_login_alert_source(login_id), active=True,
+            title=f'Login "{login.name}": every host on its list failed to resolve',
+            body=(f'{trigger} failed because {active.host} did not resolve, and none of the '
+                  f'other hosts on login "{login.name}" resolves either: '
+                  + '; '.join(f'{h} ({v[1]})' for h, v in verdicts.items() if h != active.host)
+                  + f'. {active.host} is still its active host.'))
+        return None
+    if chosen is active:
+        log.info('Login %d: %s - active host %s resolves; not rolling', login_id, trigger,
+                 active.host)
+        return None
+
+    @retry_on_locked()
+    def _move_and_commit():
+        fresh = _login_host_rows(login_id)
+        for r in fresh:
+            r.is_active = r.id == chosen.id
+            if r.id == chosen.id:
+                r.activated_at = datetime.utcnow()
+        db.session.commit()
+
+    _move_and_commit()
+    old, new = active.host, chosen.host
+    # What it did not do: an account holding the login whose own sync address is on the host
+    # that just failed keeps it. Rolling an account's list from a login's failure would be the
+    # app deciding the two lists are one.
+    stranded = [a.name for a in (Account.query.join(AccountLogin, AccountLogin.account_id == Account.id)
+                                 .filter(AccountLogin.login_id == login_id).order_by(Account.name).all())
+                if any(host_of(getattr(a, col)) == old for col in ('base_url', 'm3u_url', 'epg_url'))]
+    rec = f' Recording {recording_id} triggered it.' if recording_id is not None else ''
+    _raise_or_resolve_standing_alert(
+        LOGIN_HOST_ROLLED, source=_login_alert_source(login_id), active=True,
+        title=f'Login "{login.name}": {old} stopped resolving; now using {new}',
+        body=(f'{trigger} failed because {old} did not resolve.{rec} Streams on '
+              f'{_join(holders)} that use this login go out on {new} from their next '
+              f'segment.'
+              + ''.join(f' {n}\'s own address is still on {old}. If its syncs fail, make {new} '
+                        f'active on its Hosts card.' for n in stranded)))
+    log.warning('Login %d ("%s"): %s - %s stopped resolving; now using %s', login_id,
+                login.name, trigger, old, new)
+    if recording_id is not None:
+        _log_login_recording_roll(recording_id, login.name, old, new)
+    return {'login_id': login_id, 'old_host': old, 'host': new}
+
+
+def _join(names: list) -> str:
+    from .fmt_utils import join_labels
+    return join_labels(names)
+
+
+def _log_login_recording_roll(recording_id: int, login_name: str, old: str, new: str) -> None:
+    from .database import RECORDING_HOST_ROLLED, add_recording_event
+    detail = (f'The stream host {old} on login "{login_name}" stopped resolving; the login now '
+              f'uses {new}. The next segment records from it.')
+
+    @retry_on_locked()
+    def _log_and_commit():
+        add_recording_event(recording_id, RECORDING_HOST_ROLLED, detail=detail,
+                            extra={'old_host': old, 'new_host': new, 'login': login_name})
+        db.session.commit()
+
+    _log_and_commit()
+
+
 # ── The roll ────────────────────────────────────────────────────────────────────────────
 
 def roll_host_for_channel(channel_id: int, trigger: str,
-                          recording_id: Optional[int] = None) -> Optional[dict]:
-    """`roll_host()` for the account `channel_id` belongs to. Never raises: it is called
-    from the capture path's failure handling, and a diagnostic must not harm the capture
-    it is diagnosing (CLAUDE.md)."""
+                          recording_id: Optional[int] = None,
+                          host_login_id: Optional[int] = None) -> Optional[dict]:
+    """Roll the list the failed launch was rendered from (§14.6): `host_login_id`'s own list
+    when render_held_login() said the launch went out on it, else `roll_host()` for the
+    account `channel_id` belongs to. Never raises: it is called from the capture path's
+    failure handling, and a diagnostic must not harm the capture it is diagnosing
+    (CLAUDE.md)."""
     try:
+        if host_login_id is not None:
+            return roll_login_host(host_login_id, trigger, recording_id=recording_id)
         from .database import Channel
         account_id = db.session.query(Channel.account_id).filter(
             Channel.id == channel_id).scalar()
@@ -1051,14 +1478,15 @@ def _stamp_resolve_verdicts(verdicts: dict, trigger: str = 'roll',
 
 
 def stamp_lookup(host: str, ok: bool, error: Optional[str]) -> None:
-    """A full check looked `host` up: stamp every row listing that name, as the lookup-only
-    probe does (app/host_checks.py)."""
-    from .database import AccountHost
+    """A full check looked `host` up: stamp every row listing that name, an account's or a
+    login's own, as the lookup-only probe does (app/host_checks.py)."""
+    from .database import AccountHost, LoginHost
 
     @retry_on_locked()
     def _stamp_and_commit():
         now = datetime.utcnow()
-        for row in AccountHost.query.filter_by(host=host).all():
+        for row in (AccountHost.query.filter_by(host=host).all()
+                    + LoginHost.query.filter_by(host=host).all()):
             if ok:
                 row.last_resolved_at = now
                 row.last_resolve_error = None
@@ -1086,10 +1514,13 @@ def check_hosts(account_ids: Optional[Iterable[int]] = None, app=None) -> dict:
             return {'checked': 0, 'failed': 0, 'accounts': 0}
         q = q.filter(AccountHost.account_id.in_(ids))
     rows = q.order_by(AccountHost.account_id, AccountHost.position).all()
+    # The hosts on the logins those accounts hold join the check by name, once each, and
+    # never with a login presented to them (DESIGN-account-providers.md §14.7).
+    login_names = [h for h in login_host_names(account_ids) if h not in {r.host for r in rows}]
     mode = (load_config().get('hosts') or {}).get('scheduled_check', 'lookup')
     if mode == 'full' and app is not None:
         from .host_checks import TRIGGER_SCHEDULED, request
-        result = request(app, [row.host for row in rows], TRIGGER_SCHEDULED)
+        result = request(app, [row.host for row in rows] + login_names, TRIGGER_SCHEDULED)
         log.info('Host check (full): %d host(s) put in line, %d left out as checked in the last '
                  '10 minutes', len(result['added']), len(result['recent']))
         return {'checked': 0, 'failed': 0, 'accounts': len({row.account_id for row in rows}),
@@ -1103,6 +1534,16 @@ def check_hosts(account_ids: Optional[Iterable[int]] = None, app=None) -> dict:
         verdicts[row.id] = resolve_host(row.host)
         ms[row.id] = round((time.perf_counter() - started) * 1000)
     _stamp_resolve_verdicts(verdicts, 'scheduled', ms)
+    # A name on both kinds of list was looked up once above; its login rows get the same
+    # verdict (§14.7).
+    _stamp_login_rows({row.host: verdicts[row.id] for row in rows})
+    for host in login_names:
+        ok, error = resolve_host(host)
+        verdicts[f'login:{host}'] = (ok, error)
+        stamp_lookup(host, ok, error)
+    if login_names:
+        from .host_checks import record_lookups
+        record_lookups({h: verdicts[f'login:{h}'] + (None,) for h in login_names}, 'scheduled')
     failed = sum(1 for ok, _ in verdicts.values() if not ok)
     accounts = len({row.account_id for row in rows})
     if failed:
@@ -1110,7 +1551,7 @@ def check_hosts(account_ids: Optional[Iterable[int]] = None, app=None) -> dict:
                     failed, len(rows), accounts)
     else:
         log.info('Host check: %d listed hosts on %d accounts resolve', len(rows), accounts)
-    return {'checked': len(rows), 'failed': failed, 'accounts': accounts}
+    return {'checked': len(rows) + len(login_names), 'failed': failed, 'accounts': accounts}
 
 
 # ── The alert ───────────────────────────────────────────────────────────────────────────
@@ -1198,8 +1639,13 @@ def login_seats_for_accounts(account_ids: Iterable[int], cfg: Optional[dict] = N
             .filter(AccountLogin.account_id.in_(ids))
             .order_by(AccountLogin.account_id, AccountLogin.position, Login.id).all())
     default = None
+    # The hosts a login would use (§14.5): its own list when it has one, else the account's.
+    # A login with every one of those off takes no new seat, like a login turned off.
+    own = login_host_state({r[1] for r in rows}) if rows else {}
+    acct_off = hosts_all_off(ids) if rows else set()
     for account_id, login_id, seats, refused_at, enabled, owner_max in rows:
-        if not enabled:
+        no_host = (not own[login_id]) if login_id in own else account_id in acct_off
+        if not enabled or no_host:
             seats = 0
         elif seats is None:
             if owner_max is None and default is None:
@@ -1263,28 +1709,53 @@ def logins_all_off(account_ids: Iterable[int]) -> set:
             if not n_on}
 
 
-#: unusable_reasons()'s two answers: what is turned off on an account that can stream nothing.
+#: unusable_reasons()'s answers: what is turned off on an account that can stream nothing.
 UNUSABLE_HOSTS = 'hosts'
 UNUSABLE_LOGINS = 'logins'
+#: Every login that is on would use only hosts that are off - its own list, or the account's
+#: for a login with none - while at least one of them lists hosts of its own (§14.5).
+UNUSABLE_LOGIN_HOSTS = 'login_hosts'
 
 
 def unusable_reasons(account_ids: Iterable[int]) -> dict:
-    """{account_id: UNUSABLE_HOSTS | UNUSABLE_LOGINS} for the accounts among `account_ids`
-    that cannot take a new stream because the user turned every host, or every login, off.
-    Hosts are named first: with no host on, which login is on does not matter. Two queries."""
+    """{account_id: UNUSABLE_*} for the accounts among `account_ids` that cannot take a new
+    stream because of the user's switches, asked in this order so exactly one applies
+    (DESIGN-account-providers.md §14.5): every login off; every host on the account off with
+    no login that is on bringing hosts of its own (an account with no logins included);
+    anything else with no pool left. A fixed handful of queries."""
+    from .database import AccountLogin
     ids = {a for a in account_ids if a is not None}
-    hosts = hosts_all_off(ids)
-    out = {a: UNUSABLE_HOSTS for a in hosts}
-    out.update({a: UNUSABLE_LOGINS for a in logins_all_off(ids - hosts)})
+    out = {a: UNUSABLE_LOGINS for a in logins_all_off(ids)}
+    rest = ids - set(out)
+    if not rest:
+        return out
+    acct_off = hosts_all_off(rest)
+    on_logins: dict = {}
+    for aid, lid in (db.session.query(AccountLogin.account_id, AccountLogin.login_id)
+                     .filter(AccountLogin.account_id.in_(rest),
+                             AccountLogin.enabled.is_(True)).all()):
+        on_logins.setdefault(aid, []).append(lid)
+    own = login_host_state({lid for lids in on_logins.values() for lid in lids})
+    for aid in rest:
+        lids = on_logins.get(aid, [])
+        if aid in acct_off and not any(lid in own for lid in lids):
+            out[aid] = UNUSABLE_HOSTS
+        elif lids and not any(own[lid] if lid in own else aid not in acct_off for lid in lids):
+            out[aid] = UNUSABLE_LOGIN_HOSTS
     return out
 
 
 def describe_unusable(account_name: str, which: str, capital: bool = False) -> str:
-    """The one phrase every surface uses for an account with every host or every login off.
-    `capital` for the start of a sentence."""
-    noun = 'host' if which == UNUSABLE_HOSTS else 'login'
+    """The one phrase every surface uses for an account that can stream nothing because of
+    its switches. `capital` for the start of a sentence."""
     head = 'Every' if capital else 'every'
-    return f'{head} {noun} on account "{account_name}" is turned off'
+    if which == UNUSABLE_HOSTS:
+        return f'{head} host on account "{account_name}" is turned off'
+    if which == UNUSABLE_LOGINS:
+        return f'{head} login on account "{account_name}" is turned off'
+    if which == UNUSABLE_LOGIN_HOSTS:
+        return f'{head} host the logins on account "{account_name}" would use is turned off'
+    raise ValueError(f'unknown unusable reason {which!r}')
 
 
 def unusable_reason(account_id: int, account_name: str, capital: bool = False) -> Optional[str]:
@@ -1319,7 +1790,7 @@ def playlist_rows_off(account_ids: Iterable[int]) -> dict:
 
 
 #: next_stream()'s answers: a seat is free; every seat is taken; the account is blocked; the
-#: user turned every host or every login off.
+#: user's switches leave nothing that can stream (unusable_reasons()).
 NEXT_FREE, NEXT_FULL, NEXT_BLOCKED, NEXT_UNUSABLE = 'free', 'full', 'blocked', 'unusable'
 
 
@@ -1362,23 +1833,47 @@ def next_stream(account, cfg: Optional[dict] = None) -> Optional[dict]:
         # login is off.
         enabled = {lid for lid, on in db.session.query(AccountLogin.login_id, AccountLogin.enabled)
                    .filter(AccountLogin.account_id == account.id).all() if on}
-        on = [lg for lg in logins if lg.id in enabled]
+        own = login_host_state(enabled)
+        acct_off = account.id in hosts_all_off([account.id])
+        on = [lg for lg in logins if lg.id in enabled
+              and (own[lg.id] if lg.id in own else not acct_off)]
         blocked_ids = {b.login_id for b in login_blocks_at(None, enabled)} if on else set()
         free_of_block = [lg for lg in on if lg.id not in blocked_ids]
+        copy = next(iter(free_of_block), None)
         out.update(state=NEXT_BLOCKED if blocked else NEXT_FULL, reason=blocked,
-                   copy_login=next(iter(free_of_block), None))
+                   copy_login=copy)
+        if copy is not None and not unlisted:
+            out['host'] = _login_host_for(copy.id, out['host'])
         return out
     out['login'] = out['copy_login'] = next((lg for lg in logins if lg.id == login_id), None)
+    if out['login'] is not None and not unlisted:
+        # A login with hosts of its own goes out on its active one (§14.4). Streams on a host
+        # neither list names go out where they are, as the launch sends them.
+        out['host'] = _login_host_for(out['login'].id, out['host'])
     return out
 
 
+def _login_host_for(login_id: int, fallback: Optional[str]) -> Optional[str]:
+    """The login's active own host, or `fallback` for a login listing none (or none on)."""
+    from .database import LoginHost
+    host = (db.session.query(LoginHost.host)
+            .filter(LoginHost.login_id == login_id, LoginHost.is_active.is_(True),
+                    LoginHost.enabled.is_(True)).scalar())
+    return host or fallback
+
+
 def next_stream_url(url: Optional[str], account_id: int, nxt: Optional[dict]) -> Optional[str]:
-    """`url` (a channel's stored stream URL, already on the active host) with the credentials
-    of next_stream()'s `copy_login` rendered in, as a launch would render them - what the
-    channel page's Copy hands out. `url` unchanged when there is none."""
+    """`url` (a channel's stored stream URL, already on the account's active host) put on
+    next_stream()'s `copy_login`'s own active host when it lists hosts, then with its
+    credentials rendered in - the same host-then-credentials steps as a launch
+    (render_held_login()), so what the channel page shows and Copy hands out, and what the
+    output feed's redirect answers, is what the next stream would be launched with. `url`
+    unchanged when there is no such login."""
     if not url or not nxt or nxt.get('copy_login') is None:
         return url
-    return render_login(url, logins_for_account(account_id), nxt['copy_login'])
+    login = nxt['copy_login']
+    rendered, _ = _render_login_host(url, account_id, login.id)
+    return render_login(rendered, logins_for_account(account_id), login)
 
 
 def login_enabled(account_id: int, login_id: int) -> bool:
@@ -1401,21 +1896,62 @@ def is_refused_now(last_refused_at: Optional[datetime], now: datetime, cooldown:
     return last_refused_at is not None and now - last_refused_at < cooldown
 
 
-def render_held_login(url: str, account_id: int, holder_kind: str, holder_id) -> tuple[str, Optional[int]]:
-    """(the capture URL for `holder`, the login id it is seated on). The one call a launch
-    site makes: asks the connection counter which login the holder's seat is on, and renders
-    that login's credentials into `url` when it is one. (url, None) - no query at all - for
-    a holder on an account with no logins, so the no-list account launches exactly today's
-    URL."""
+class HeldLaunch(NamedTuple):
+    """What render_held_login() hands a launch site: the URL to launch, the login the
+    holder's seat is on (None for an account with no logins), and the login whose own host
+    list the URL was rendered from (None when it went out on the account's hosts, or as
+    stored). The roll reads `host_login_id`, so the roll and the render cannot disagree
+    about whose host a launch was on (DESIGN-account-providers.md §14.6)."""
+    url: str
+    login_id: Optional[int]
+    host_login_id: Optional[int]
+
+
+def render_held_login(url: str, account_id: int, holder_kind: str, holder_id) -> HeldLaunch:
+    """The capture URL for `holder`. The one call every launch site makes: asks the
+    connection counter which login the holder's seat is on, puts the URL on that login's
+    active host when the login lists hosts of its own (§14.4) and renders its credentials.
+
+    1. No seat on a login (an account with no logins): the URL untouched, no query at all.
+    2. A seat on a login the account no longer holds: the URL untouched - a login's host is
+       rendered only together with its credentials.
+    3. A login listing no hosts: its credentials, the host as stored (the account's), as
+       before login_hosts existed - one indexed read of login_hosts is the only new work.
+    4. A login listing hosts: the URL's host swapped for the login's active host when the
+       URL's own host is on the account's list or on the login's, then its credentials. A
+       login whose hosts are all off (a seat kept through the switch) stays on the off host
+       that holds the active role."""
     from . import connection_limits as connlim
     login_id = connlim.held_login_id(holder_kind, holder_id)
     if login_id is None:
-        return url, None
+        return HeldLaunch(url, None, None)
     logins = logins_for_account(account_id)
     login = next((lg for lg in logins if lg.id == login_id), None)
     if login is None:
-        return url, login_id
-    return render_login(url, logins, login), login_id
+        return HeldLaunch(url, login_id, None)
+    rendered, host_login_id = _render_login_host(url, account_id, login_id)
+    return HeldLaunch(render_login(rendered, logins, login), login_id, host_login_id)
+
+
+def _render_login_host(url: Optional[str], account_id: int, login_id: int) -> tuple:
+    """(`url` on `login_id`'s active host, login_id) when the login lists hosts and one is
+    the active one; (url, None) otherwise. Shared by the launch and the channel page's Copy."""
+    from .database import LoginHost
+    rows = (db.session.query(LoginHost.host, LoginHost.is_active)
+            .filter(LoginHost.login_id == login_id).all())
+    if not rows:
+        return url, None
+    # The active row even when it is off: with every host on a login off, the role stays on
+    # one of them (§14.3), and a seat kept through the switch still goes out on the login's
+    # reseller, never on the account's host with this login's credentials.
+    active = next((h for h, is_active in rows if is_active), None) or rows[0][0]
+    account_hosts, _ = host_list(account_id)
+    listed = frozenset(h for h, _a in rows) | account_hosts
+    if host_of(url) not in listed:
+        # Rule 4's condition: a URL on a host neither list names goes out as it is, and a
+        # failure on it is no reason to roll the login's list.
+        return url, None
+    return render_host(url, listed, active), login_id
 
 
 # ── Logins: the writer ──────────────────────────────────────────────────────────────────
@@ -1596,6 +2132,7 @@ def remove_login(account_id: int, login_id: int) -> str:
         if not still_held:
             from .account_blocks import drop_login_blocks
             drop_login_blocks([login_id])
+            drop_login_hosts([login_id])
             db.session.delete(row)
         db.session.commit()
         return name
@@ -1685,6 +2222,7 @@ def delete_logins_for_account(account_id: int) -> int:
         return 0
     from .account_blocks import drop_login_blocks
     drop_login_blocks(orphans)
+    drop_login_hosts(orphans)
     return Login.query.filter(Login.id.in_(orphans)).delete(synchronize_session=False)
 
 
@@ -2127,6 +2665,11 @@ def share_login(login_id: int, account_id: int):
                     or_(LoginBlock.stop_time.is_(None), LoginBlock.stop_time > now)).first():
                 raise ValueError(f'{target.name}\'s own login {twin.username} is blocked. '
                                  f'Unblock it first, then share this one.')
+            if login_host_state([twin.id]):
+                # A user's list is never dropped inside another action (§14.8).
+                raise ValueError(f'{target.name}\'s own login {twin.username} lists hosts of '
+                                 f'its own. Remove its hosts, or add them to the login being '
+                                 f'shared, then share this one.')
         if login.playlist_account_id is None and any(
                 lg.name.lower() == login.name.lower() and lg.playlist_account_id is None
                 for lg in existing):
@@ -2141,6 +2684,7 @@ def share_login(login_id: int, account_id: int):
             db.session.flush()
             from .account_blocks import drop_login_blocks
             drop_login_blocks([twin.id])
+            drop_login_hosts([twin.id])
             db.session.delete(twin)
             db.session.add(row)
         else:

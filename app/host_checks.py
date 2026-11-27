@@ -449,16 +449,25 @@ def cleanup_old_checks(app=None) -> int:
 
 def streaming_hosts() -> set:
     """The host names something is streaming from right now: the active host of every
-    account holding a connection. Advisory, like every connection_limits count."""
-    from .connection_limits import holder_counts
-    from .database import AccountHost
+    account holding a connection, and the active own host of every login with a seat held
+    (DESIGN-account-providers.md §14.7). Advisory, like every connection_limits count: an
+    account whose streams are all on logins with hosts of their own still has its own active
+    host skipped, the safe side of an advisory answer."""
+    from .connection_limits import holder_counts, login_pool_counts
+    from .database import AccountHost, LoginHost
+    out = set()
     busy = [a for a, n in holder_counts().items() if n]
-    if not busy:
-        return set()
-    rows = (db.session.query(AccountHost.host)
-            .filter(AccountHost.account_id.in_(busy), AccountHost.is_active.is_(True),
-                    AccountHost.enabled.is_(True)).all())
-    return {h for (h,) in rows}
+    if busy:
+        out |= {h for (h,) in (db.session.query(AccountHost.host)
+                               .filter(AccountHost.account_id.in_(busy),
+                                       AccountHost.is_active.is_(True),
+                                       AccountHost.enabled.is_(True)).all())}
+    own = (db.session.query(LoginHost.login_id, LoginHost.host)
+           .filter(LoginHost.is_active.is_(True), LoginHost.enabled.is_(True)).all())
+    if own:
+        held = login_pool_counts([lid for lid, _h in own])
+        out |= {h for lid, h in own if held.get(lid)}
+    return out
 
 
 def scheme_for(host: str) -> str:
@@ -466,9 +475,14 @@ def scheme_for(host: str) -> str:
     whose URLs were all rewritten onto the active one - of those on the active host of an
     account listing it, the scheme render_host() would keep if it became active
     (dev/changelog/1733). A few indexed queries over the channels of those accounts."""
-    from .database import AccountHost, Channel
+    from .database import AccountHost, AccountLogin, Channel, LoginHost
     account_ids = [a for (a,) in db.session.query(AccountHost.account_id)
                    .filter(AccountHost.host == host).all()]
+    # A login's own host is dialed with the scheme of the stream URLs of the accounts holding
+    # the login (§14.7).
+    account_ids += [a for (a,) in db.session.query(AccountLogin.account_id)
+                    .join(LoginHost, LoginHost.login_id == AccountLogin.login_id)
+                    .filter(LoginHost.host == host).all()]
     if not account_ids:
         return 'http'
 

@@ -130,7 +130,7 @@ def _stream_url_view(channel, cfg) -> dict:
     playlist's host after a host swap, and a shape the stored URL may not have, beside a Copy
     that handed out the stored one (dev/docs/BUGS.md 2026-11-21). The raw-form path stays only
     as the fallback for a URL whose credentials mask_creds() cannot find in place."""
-    from ..account_links import (host_list, next_stream, next_stream_url, playlist_rows_off,
+    from ..account_links import (host_of, next_stream, next_stream_url, playlist_rows_off,
                                  render_host, url_pair)
     from ..url_utils import mask_creds
     from .recordings import mask_creds_filter
@@ -139,9 +139,11 @@ def _stream_url_view(channel, cfg) -> dict:
     copy_url = next_stream_url(channel.stream_url, channel.account_id, nxt)
     shown = mask_creds(copy_url)
     if shown == copy_url and url_pair(copy_url) is not None:
-        hosts, active = host_list(account.id) if account is not None else (frozenset(), None)
-        shown = render_host(mask_creds_filter(channel.stream_url, channel.raw_stream_url, account),
-                            hosts, active)
+        # Put on Copy's own host, never re-derived from the account's list, so the shown URL
+        # and Copy cannot differ when a login brings its own hosts (dev/changelog/1778).
+        masked = mask_creds_filter(channel.stream_url, channel.raw_stream_url, account)
+        own = host_of(masked)
+        shown = render_host(masked, frozenset([own]) if own else frozenset(), host_of(copy_url))
     off = playlist_rows_off([account.id]).get(account.id) if account is not None else None
     return {
         'shown': shown,

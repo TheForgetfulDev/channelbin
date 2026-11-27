@@ -37,7 +37,7 @@ from tests.support.search import unfolded_query  # noqa: E402
 from app import account_links, db  # noqa: E402
 from app.database import (Account, AccountHost, AccountLogin, AccountSyncLog, Alert, Channel, ChannelEvent,  # noqa: E402
                           ChannelGroup, ChannelHideRule, HealthCheckProfile,
-                          IgnoredAlertPattern, Login, OnDemandTestJob, Recording, RecordingEvent,
+                          IgnoredAlertPattern, Login, LoginHost, OnDemandTestJob, Recording, RecordingEvent,
                           RecordingProfile, RecordingSegment, Tag, TagPattern,
                           CHANNEL_ADDED_TO_GUIDE, CHANNEL_FAILOVER_HEALTH_OBSERVATION,
                           HIDE_TARGET_NAME_GLOB,
@@ -846,6 +846,13 @@ def _seed_account_history(n):
         db.session.add(login)
         db.session.flush()
         db.session.add(AccountLogin(account_id=acc.id, login_id=login.id, position=i))
+        # Two own hosts on every other login (dev/changelog/1778), so the Hosts line, the
+        # dialog's template and its verdicts grow with the seed too.
+        if i % 2 == 0:
+            for n in range(2):
+                db.session.add(LoginHost(login_id=login.id, host=f'l{i}-{n}.scaling.example',
+                                         position=n, is_active=(n == 0),
+                                         created_at=datetime.utcnow()))
         db.session.add(AccountSyncLog(
             account_id=acc.id,
             started_at=datetime.utcnow() - timedelta(minutes=i + 1),
