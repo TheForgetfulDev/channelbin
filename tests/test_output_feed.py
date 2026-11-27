@@ -186,6 +186,28 @@ class AccessLogMaskingTests(unittest.TestCase):
         line = '"GET /api/channels/14 HTTP/1.1" 200 -'
         self.assertEqual(mask_creds_in_text(line), line)
 
+    def test_the_pair_is_masked_whatever_the_method_and_wherever_the_path_is_logged(self):
+        """dev/docs/BUGS.md 2026-11-26: only a GET, HEAD or POST request line was masked, so a
+        browser-based player's OPTIONS preflight, Flask's line for an unhandled error in a
+        feed view and the server's line for a request it could not parse each put a working
+        username and password in the log."""
+        from app.url_utils import mask_creds_in_text
+        for line in ('"OPTIONS /live/tv/tv-secret/14.ts HTTP/1.1" 200 -',
+                     '"PUT /logo/tv/tv-secret/14 HTTP/1.1" 405 -',
+                     '"GET /LIVE/tv/tv-secret/14.ts HTTP/1.1" 404 -',
+                     '"GET /live/tv/tv-secret HTTP/1.1" 404 -',
+                     'Exception on /live/tv/tv-secret/14.ts [GET]',
+                     'Exception on /logo/tv/tv-secret/14 [GET]',
+                     "code 400, message Bad request syntax ('GET /live/tv/tv-secret/14.ts')",
+                     '"OPTIONS /player_api.php?username=tv&password=tv-secret HTTP/1.1" 200 -'):
+            masked = mask_creds_in_text(line)
+            self.assertNotIn('tv-secret', masked, line)
+            self.assertIn('***', masked, line)
+        # ChannelBin's own logo sits under a folder named logo and is not a login.
+        for line in ('"GET /static/img/logo/channelbin-favicon/android-chrome-512x512.png HTTP/1.1" 200 -',
+                     'Exception on /api/recordings/5 [POST]'):
+            self.assertEqual(mask_creds_in_text(line), line)
+
 
 class GateTests(unittest.TestCase):
     ENDPOINTS = ('/player_api.php', '/get.php', '/xmltv.php')

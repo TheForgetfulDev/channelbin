@@ -44,13 +44,20 @@ _TARGET_ORIGIN = 'http://request-target.invalid'
 
 # The request line werkzeug's access log prints: `"GET /live/u/p/7.ts HTTP/1.1"`. The output
 # feed (app/routes/output_feed.py) takes its credentials in that path and in the query of its
-# `.php` endpoints, so a request line is the one place a bare path carries them.
-_REQUEST_LINE_RE = re.compile(r'("(?:GET|HEAD|POST) )(/[^\s"]*)')
+# `.php` endpoints, so a request line is the one place a bare path carries them. Any method:
+# a browser-based player's CORS preflight is `"OPTIONS /live/u/p/7.ts`, with the real pair.
+# Either quote: the server's line for a request it could not parse wraps it in single ones.
+_REQUEST_LINE_RE = re.compile(r'''(["'][A-Z]+ )(/[^\s"']*)''')
+# And the line Flask logs for an unhandled error in a view: `Exception on /live/u/p/7.ts [GET]`.
+_EXCEPTION_ON_RE = re.compile(r'(Exception on )(/\S*)(?= \[)')
+# /logo/<user>/<pass>/<id> is the output feed's own logo route (dev/changelog/1760). Anchored
+# to the start of the path, so /static/img/logo/... is left alone; the pair is masked with or
+# without anything after it, in any case of the prefix.
+_FEED_PATH_PAIR_RE = re.compile(r'(?i)^(/+(?:live|movie|series|logo)/)[^/?]+/[^/?]+')
 
 
 def _mask_request_path(path: str) -> str:
-    # /logo/<user>/<pass>/<id> is the output feed's own logo route (dev/changelog/1760).
-    path = re.sub(r'(/(?:live|movie|series|logo)/)([^/]+)/([^/]+)(/)', r'\1***/***\4', path)
+    path = _FEED_PATH_PAIR_RE.sub(r'\1***/***', path)
     return re.sub(r'(?i)((?:username|password|user|pass)=)[^&]+', r'\1***', path)
 
 
@@ -93,11 +100,13 @@ def mask_creds_in_text(text):
         text = _REQUEST_TARGET_RE.sub(
             lambda m: m.group(1) + mask_creds(_TARGET_ORIGIN + m.group(2))[len(_TARGET_ORIGIN):],
             text)
-    if '"GET /' in text or '"HEAD /' in text or '"POST /' in text:
-        # An access-log request line. Only the two credential shapes an Xtream path can
-        # carry are masked, never the bare <a>/<b>/<id> rule: that one is anchored to a whole
-        # URL and would eat every three-segment page path in the log.
+    if ' /' in text:
+        # An access-log request line, or Flask's line for an unhandled error. Only the two
+        # credential shapes an Xtream path can carry are masked, never the bare <a>/<b>/<id>
+        # rule: that one is anchored to a whole URL and would eat every three-segment page
+        # path in the log.
         text = _REQUEST_LINE_RE.sub(lambda m: m.group(1) + _mask_request_path(m.group(2)), text)
+        text = _EXCEPTION_ON_RE.sub(lambda m: m.group(1) + _mask_request_path(m.group(2)), text)
     if '://' not in text:
         return text
 

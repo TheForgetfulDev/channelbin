@@ -53,6 +53,18 @@ class AllowlistTests(_PublicCase):
             self.assertEqual(self.public_get(target).status_code, 200, target)
         self.assertEqual(self.public_get(feed.OWN_LOGO_PATH).status_code, 200)
 
+    def test_an_id_too_long_for_the_database_is_no_channel_not_an_error(self):
+        """dev/docs/BUGS.md 2026-11-26: an id past SQLite's largest integer raised in the
+        query, a 500 whose log line carried the address, login included."""
+        huge = '9' * 26
+        for path in (f'/live/{USER}/{PASS}/{huge}.ts', f'/live/{USER}/{PASS}/{huge}',
+                     f'/logo/{USER}/{PASS}/{huge}'):
+            for client in (self.public, self.t.client):
+                resp = client.get(path)
+                self.assertEqual(resp.status_code, 404, path)
+                self.assertEqual(json.loads(resp.get_data())['error'],
+                                 'No such channel on the IPTV output')
+
     def test_a_wrong_login_on_the_public_port_is_the_feeds_401_not_a_404(self):
         resp = self.public_get('/player_api.php?username=x&password=y')
         self.assertEqual(resp.status_code, 401)
