@@ -122,4 +122,20 @@ for name in names:
 print('run_tests.sh: python packages -', ', '.join(found))
 PY
 
+# One suite at a time on a box. A run takes every core, so two at once each take twice as long
+# and gain nothing, and both runs' timing records stop being comparable with the history. Several
+# checkouts of the repo (worktrees) can each start one, so the lock lives outside any of them;
+# a second run waits and says whose run it is waiting on. The lock is held by the exec'd
+# Python below for the whole run (fd 9 is inherited). No flock (macOS): no lock, as before.
+if command -v flock >/dev/null 2>&1 && [ "${CHANNELBIN_SUITE_LOCK:-}" != "off" ]; then
+    lock="${CHANNELBIN_SUITE_LOCK:-${TMPDIR:-/tmp}/channelbin-suite.lock}"
+    exec 9>>"$lock"
+    if ! flock -n 9; then
+        echo "run_tests.sh: another suite is running ($(cat "$lock.holder" 2>/dev/null || echo 'holder unknown')) - waiting for it to finish..." >&2
+        flock 9
+        echo "run_tests.sh: the other suite finished; starting." >&2
+    fi
+    echo "pid $$ in $(pwd), started $(date '+%Y-%m-%d %H:%M:%S')" > "$lock.holder"
+fi
+
 exec python3 -m tests.support.timing "$@"
