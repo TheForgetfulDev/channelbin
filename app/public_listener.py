@@ -72,7 +72,8 @@ def public_host(fcfg: dict) -> str:
 
 class FeedOnly:
     """The WSGI app the public port serves: `flask_app` behind the allowlist. It calls the
-    Flask app itself, so `app.wsgi_app` and the ProxyFix around it still apply."""
+    Flask app itself, so `app.wsgi_app` and the proxy decision around it (app/proxy_trust.py,
+    which reads PUBLIC_ENVIRON_KEY) still apply."""
 
     def __init__(self, flask_app):
         self.flask_app = flask_app

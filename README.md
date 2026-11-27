@@ -377,7 +377,9 @@ ever set. The table below is only the handful people change first.
 | `flask.port` | 5000 | Web UI port. config.yaml only: a wrong one leaves Settings unreachable to undo it |
 | `flask.host` | `0.0.0.0` | Bind address, see below. config.yaml only, for the same reason; not ChannelBin's address |
 | `flask.public_url` | none | ChannelBin's address (Settings, System): the server address IPTV Output shows and the start of push-notification links. Never where it listens |
-| `flask.behind_proxy` | False | "Behind a reverse proxy" (Settings, System), with a Test of your proxy under the switch; restart required |
+| `flask.behind_proxy` | False | "The web UI is behind a reverse proxy" (Settings, System), with a Test of your proxy under the switch. The web UI's port only; restart required |
+| `flask.trusted_proxies` | `[]` | "Reverse proxy addresses" (Settings, System): the addresses or ranges your proxy connects from. With any listed, a proxy is believed only from them, on both ports; restart required |
+| `integrations.output_feed.public_behind_proxy` | False | "The public port is behind a reverse proxy" (Settings, IPTV output). The public port only; restart required |
 | `integrations.output_feed.public_port` | 0 | Off at 0. A second port answering only the IPTV output, for a reverse proxy to put on the internet ([Sharing the IPTV output over the internet](#sharing-the-iptv-output-over-the-internet)); restart required |
 | `ffmpeg.extra_input_args` | `[]` | Extra ffmpeg arguments before `-i` |
 
@@ -434,8 +436,9 @@ Two related notes:
 - **Rotating `flask.secret_key`** (or deleting `instance/secret_key` so a new one is generated)
   invalidates every existing session cookie - it signs everyone, on every device, out at once.
   That is a legitimate way to force a re-login everywhere, not just an auth-gate detail.
-- **Lockout counts by client IP**, which is only the real visitor when "Behind a reverse proxy"
-  (Settings, System; `flask.behind_proxy`) is on *and* your reverse proxy appends to
+- **Lockout counts by client IP**, which is only the real visitor when "The web UI is behind a
+  reverse proxy" (Settings, System; `flask.behind_proxy`) is on, your proxy is in "Reverse proxy
+  addresses" if that list holds anything, *and* your reverse proxy appends to
   `X-Forwarded-For` rather than passing the client's own copy through (nginx:
   `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`, not `$http_x_forwarded_for`).
   Forwarding it verbatim lets a caller present a fresh address per attempt and never trip the
@@ -443,6 +446,14 @@ Two related notes:
   request through a proxy looks like one IP instead, so a single attacker can lock the whole LAN
   out of signing in for 15 minutes. Neither weakens the password itself; both are worth getting right before relying on the
   lockout as more than a speed bump.
+- **A port that believes a proxy believes whoever connects to it**, unless "Reverse proxy
+  addresses" (`flask.trusted_proxies`) names the proxy. With the switch on and that list empty,
+  anyone who reaches the port without going through the proxy can send a made-up
+  `X-Forwarded-For` with every wrong password and is never locked out. So leave the web UI's
+  switch off if you open ChannelBin straight at home, or list the address your proxy connects
+  from (the Test names it). The Readiness page says when a port has been reached that way.
+- **An IPv6 address is counted by its /64.** One home connection is handed that whole range, so
+  the lockout treats it as one visitor; an IPv4 address is counted by itself.
 - **`auth.cookie_secure`** is the switch for an always-HTTPS deployment (e.g. behind a
   TLS-terminating reverse proxy). Leave it `false` on a plain-HTTP LAN setup - a `Secure` cookie
   is never sent over plain HTTP, so turning this on without HTTPS in front of the app locks
@@ -696,7 +707,10 @@ plain 404 there, so a mistake in the proxy cannot expose the web UI. On the publ
   username and password never reach a player outside your home.
 - An address that gets the login wrong 10 times in 15 minutes is refused for the rest of those
   15 minutes, even with the right password. This counts on the main port too. The Logins card
-  lists any address locked out now, with a button to let them try again.
+  lists any address locked out now, with a button to let them try again. An IPv6 address is
+  counted by its /64, the whole range one home is given.
+- 30 or more wrong logins a minute, from every address together, shows on the Logins card and
+  in the log as someone guessing. It is only an alarm: nobody is refused because of it.
 
 Steps:
 
@@ -705,8 +719,15 @@ Steps:
    scanners try first. Set **Address for people outside your network** to the address your
    proxy answers on, like `https://tv.example.com`; the Logins card copies it into the
    details you send each person.
-2. In Settings, System, turn on **Behind a reverse proxy** (`flask.behind_proxy`). Without it
-   every player looks like the proxy, so a few wrong passwords from anyone lock everyone out.
+2. In Settings, IPTV output, turn on **The public port is behind a reverse proxy**
+   (`integrations.output_feed.public_behind_proxy`). Without it every player looks like the
+   proxy, so a few wrong passwords from anyone lock everyone out. This switch is the public
+   port's own: "The web UI is behind a reverse proxy" (`flask.behind_proxy`) covers the web UI's
+   port only, and stays off if you open ChannelBin's pages straight at home. Then, under System,
+   put the address your proxy connects from in **Reverse proxy addresses**
+   (`flask.trusted_proxies`), like `192.168.1.10`. ChannelBin then believes only the proxy.
+   Without it, anything that reaches the public port without going through the proxy can send
+   a different made-up address with every wrong password and is never locked out.
 3. In Docker, the port has to be mapped. `docker-compose.example.yml` and the Unraid template
    both map 38517 already (nothing listens on it until the public port is set). With
    `docker run`, add `-p 38517:38517`, or `-p 127.0.0.1:38517:38517` when the proxy runs on the
@@ -745,10 +766,10 @@ Steps:
 
 6. **Players connect to the proxy, and only the proxy connects to the public port.** The server
    address people type is the proxy's (`https://tv.example.com`, port 443), so on your router
-   forward only the proxy's port, never the public port itself. With
-   "Behind a reverse proxy" on, ChannelBin believes the address the proxy says a player has; a
-   player reaching the public port directly could claim any address it likes and get past the
-   wrong-login lockout.
+   forward only the proxy's port, never the public port itself. ChannelBin believes the address
+   the proxy says a player has. With **Reverse proxy addresses** filled in, a player reaching
+   the public port directly is not believed and is counted by its own address. With it empty,
+   that player could claim a new address with every wrong password and never be locked out.
 7. Your own login (the one in the Connect card) works on the public port too. If you will use it
    from outside, change it to a long password; the logins for other users get a 12-character
    generated one.

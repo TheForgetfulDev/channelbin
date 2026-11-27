@@ -234,8 +234,9 @@ class ReadinessTests(FeedCase):
     def check(self, status, behind_proxy=True, **over):
         from app import readiness
         self.t.sandbox_config(feed_cfg(**over))
-        self.t.app.config['BEHIND_PROXY'] = behind_proxy
-        self.addCleanup(self.t.app.config.pop, 'BEHIND_PROXY', None)
+        from app import proxy_trust
+        self.t.app.config[proxy_trust.CONFIG_KEY] = proxy_trust.Policy(public=behind_proxy)
+        self.addCleanup(self.t.app.config.pop, proxy_trust.CONFIG_KEY, None)
         with mock.patch.object(public_listener, 'status', return_value=status):
             ctx = readiness.Context()
             return readiness._check_output_feed(ctx)
@@ -255,7 +256,7 @@ class ReadinessTests(FeedCase):
         r = self.check(self.serving(), behind_proxy=False, public_port=38517,
                        public_url='https://tv.example.com')
         self.assertEqual(r.status, PROBLEM)
-        self.assertIn('Behind a reverse proxy', r.found)
+        self.assertIn('The public port is behind a reverse proxy', r.found)
 
     def test_a_port_set_but_not_open_waits_for_a_restart(self):
         from app.readiness import ATTENTION

@@ -826,6 +826,22 @@
       + 'ChannelBin believes only the last, the one your nearest proxy added, so if another proxy sits '
       + 'in front of it (Cloudflare, say), visitors show as that proxy\'s address.'
     : '');
+  // Whether "Reverse proxy addresses" (flask.trusted_proxies) would believe this proxy.
+  const proxyListLine = (plain) => {
+    if (!plain.proxied || !plain.peer) return '';
+    if (plain.list_restart) {
+      return ` Your proxy connects to ChannelBin from ${plain.peer}. "Reverse proxy addresses" was changed `
+        + 'and waits for a restart, so this cannot say yet whether the new list has it.';
+    }
+    if (!plain.list_set) {
+      return ` Your proxy connects to ChannelBin from ${plain.peer}. Put that in "Reverse proxy addresses" `
+        + 'and ChannelBin believes only it.';
+    }
+    return plain.listed
+      ? ` Your proxy connects from ${plain.peer}, which is in "Reverse proxy addresses".`
+      : ` Your proxy connects from ${plain.peer}, which is not in "Reverse proxy addresses", so ChannelBin `
+        + 'ignores what it says and sees every visitor as the proxy. Add it to the list and restart.';
+  };
   const proxyBtn = $('#proxy-check-btn');
   const proxyOut = $('#proxy-check-result');
   const showProxy = (tone, text) => {
@@ -843,7 +859,7 @@
         : null;
       const verdict = proxyVerdict(plain, probe);
       showProxy(PROXY_TONE[verdict],
-        `${proxyText(verdict, plain, probe)} ${proxySwitchLine(plain, verdict)}${proxyHops(plain)}`);
+        `${proxyText(verdict, plain, probe)} ${proxySwitchLine(plain, verdict)}${proxyListLine(plain)}${proxyHops(plain)}`);
     } catch (err) {
       showProxy('warn', `The test could not run: ${err.message || 'no answer from ChannelBin'}.`);
     } finally {

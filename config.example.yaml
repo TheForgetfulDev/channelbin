@@ -16,7 +16,7 @@
 # logging.file, which appear below as commented-out examples because their defaults
 # are paths derived from wherever the app is installed.
 
-config_version: 9
+config_version: 10
 
 recording:
   # Where segments, the in-progress file and the finished recording are written.
@@ -243,7 +243,8 @@ flask:
   host: 0.0.0.0                         # reachable from every device on your LAN (see README); not ChannelBin's address - that is public_url
   debug: false
   secret_key: change-me-in-production   # left as-is → a generated key in instance/secret_key is used
-  behind_proxy: false                   # Settings > System > "Behind a reverse proxy": true when you reach ChannelBin through one (trusts X-Forwarded-*); restart required
+  behind_proxy: false                   # Settings > System > "The web UI is behind a reverse proxy": true when you reach ChannelBin's pages through one (trusts X-Forwarded-* on the web UI's port only); restart required
+  trusted_proxies: []                   # Settings > System > "Reverse proxy addresses": the addresses or ranges your proxy connects from, like 192.168.1.10 or 172.18.0.0/16. With any listed, forwarded headers are believed only from them, on both ports; restart required
   public_url: ''                        # Settings > System > "ChannelBin's address", whole: https://channelbin.example.com or http://192.168.1.1:5000 - the server address the IPTV Output page shows, and links in push notifications. Never where ChannelBin listens
 
 # An optional password gate over the whole app: every page and API endpoint requires
@@ -296,6 +297,8 @@ integrations:
     public_port: 0          # a second port answering only the IPTV output, for a reverse proxy to put
                             # on the internet (README); 0 = off, 38517 suggested; restart required
     public_host: 0.0.0.0    # where the public port listens
+    public_behind_proxy: false  # true when a reverse proxy is in front of the public port (trusts its
+                            # X-Forwarded-*); separate from flask.behind_proxy; restart required
     public_url: ''          # the address people outside your network use, like https://tv.example.com
 
 database:

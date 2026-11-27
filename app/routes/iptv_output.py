@@ -12,7 +12,7 @@ import logging
 from flask import Blueprint, current_app, jsonify, render_template, request
 from sqlalchemy.exc import IntegrityError
 
-from .. import db, output_feed, output_feed_view, pip_channels
+from .. import db, output_feed, output_feed_view, pip_channels, proxy_trust
 from ..config import config_write_lock, load_config, load_for_edit, save_config, set_nested
 from ..database import Account, OutputFeedLogin
 from ..db_utils import retry_on_locked
@@ -26,7 +26,8 @@ iptv_output_bp = Blueprint('iptv_output', __name__)
 def page():
     cfg = load_config()
     proxy = output_feed_view.proxy_state(cfg, request.headers,
-                                         bool(current_app.config.get('BEHIND_PROXY')))
+                                         proxy_trust.wired(current_app).web,
+                                         proxy_trust.is_trusted(request))
     return render_template('iptv_output.html',
                            **output_feed_view.page_context(cfg, request.host_url,
                                                            request.args, proxy))

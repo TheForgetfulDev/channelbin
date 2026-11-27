@@ -389,6 +389,7 @@ def reset_module_globals():
     import app.admission as admission
     import app.auth as auth
     import app.public_listener as public_listener
+    import app.proxy_trust as proxy_trust
     import app.channel_search as channel_search
     import app.channel_tester as channel_tester
     import app.concatenator as concatenator
@@ -416,6 +417,8 @@ def reset_module_globals():
     scheduler._stopping = False
     # A run abandoned mid-flight leaves its admission ticket held, and the next module's
     # sync or maintenance job is then refused by a blocker that no longer exists.
+    # What each port heard from a reverse proxy is the readiness check's input.
+    proxy_trust.reset_for_tests()
     admission.reset_for_tests()
     # A catch-up left running is a live thread into a torn-down app, and a failed one's
     # error would show as a notice on the next module's Accounts pages.

@@ -5,7 +5,7 @@ from flask import (Blueprint, current_app, redirect, render_template, request,
                    session, url_for)
 from werkzeug.security import check_password_hash
 
-from ..auth import (MAX_FAILURES, clear_session, client_ip, gate_active, check_lockout,
+from ..auth import (MAX_FAILURES, clear_session, client_ip, gate_active, check_lockout, lockout_key,
                     is_authenticated, password_epoch, record_failure, record_success,
                     validate_next)
 from ..tz_utils import format_local
@@ -80,9 +80,11 @@ def login():
             title='Login lockout: too many failed attempts',
             body=('IP %s was locked out after %d failed login attempts. Locked out '
                  'until %s. Behind a reverse proxy, the IP is the visitor\'s own only when '
-                 '"Behind a reverse proxy" is on in Settings (System) - otherwise every '
-                 'visit through the proxy looks like one IP.'
-                 % (ip, MAX_FAILURES, format_local(unlock_at))),
+                 '"The web UI is behind a reverse proxy" is on in Settings (System) and the '
+                 'proxy is in "Reverse proxy addresses" or that list is empty - otherwise '
+                 'every visit through the proxy looks like one IP. An IPv6 address is counted '
+                 'by its /64.'
+                 % (lockout_key(ip), MAX_FAILURES, format_local(unlock_at))),
             source='auth',
         )
         error = 'Too many failed attempts. Try again after %s.' % format_local(unlock_at)

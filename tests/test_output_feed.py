@@ -2085,7 +2085,8 @@ class ChannelChangeTakeOverTests(_Relay):
 
     def setUp(self):
         super().setUp()
-        self.t.app.config['BEHIND_PROXY'] = True
+        from app import proxy_trust
+        self.t.app.config[proxy_trust.CONFIG_KEY] = proxy_trust.Policy(web=True)
 
     def _play_from(self, address, feed_id, expect=200):
         resp = self.client.get(f'/live/{USER}/{PASS}/{feed_id}.ts',
@@ -2158,7 +2159,8 @@ class ChannelChangeTakeOverTests(_Relay):
         self.assertTrue(old.live)
 
     def test_without_behind_proxy_the_address_names_no_player_and_the_old_play_is_waited_for(self):
-        self.t.app.config.pop('BEHIND_PROXY', None)
+        from app import proxy_trust
+        self.t.app.config[proxy_trust.CONFIG_KEY] = proxy_trust.Policy()
         self.t.sandbox_config(_feed_cfg(max_viewers=1))
         ch, ch2 = self._two_channels()
         self._read(self._play_from('10.0.0.5', feed.feed_id_for_channel(ch.id)))

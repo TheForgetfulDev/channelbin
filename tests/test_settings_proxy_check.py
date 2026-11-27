@@ -113,7 +113,8 @@ class ProxyCheckWhileWiredTests(_Case):
     OVERRIDES = {'flask': {'behind_proxy': True}}
 
     def test_the_app_is_wired(self):
-        self.assertTrue(self.t.app.config.get('BEHIND_PROXY'))
+        from app import proxy_trust
+        self.assertTrue(proxy_trust.wired(self.t.app).web)
 
     def test_direct_is_the_real_peer_and_would_is_what_proxyfix_made(self):
         d = self.check({'X-Forwarded-For': '192.168.1.50', 'X-Forwarded-Proto': 'https',

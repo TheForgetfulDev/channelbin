@@ -14,10 +14,10 @@ import logging
 from datetime import datetime, timedelta
 from urllib.parse import quote, urlsplit
 
-from flask import url_for
+from flask import current_app, url_for
 
 from . import connection_limits as connlim
-from . import output_feed, pip_channels, pip_engine, public_listener
+from . import output_feed, pip_channels, pip_engine, proxy_trust, public_listener
 from . import db
 from .config import MASK_SENTINEL, PROXY_FIX_ARGS, public_url
 from .database import (FEED_PICTURE_BACK, FEED_PICTURE_STOPPED, FEED_PLAY_ENDED, FEED_PLAY_PICTURE, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED, Account,
@@ -52,6 +52,11 @@ ADDRESS_NOTICE_VERSION = 1
 
 PROXY_UNSEEN = 'unseen'       # a reverse proxy's headers arrive and flask.behind_proxy is off
 PROXY_RESTART = 'restart'     # it was turned on and waits for a restart
+PROXY_UNLISTED = 'unlisted'   # it is on, and the proxy is not in flask.trusted_proxies
+#: Whose word the public port takes for a player's address (_public_proxy).
+PUBLIC_PROXY_OFF = 'off'        # nobody's: every player is the proxy's address
+PUBLIC_PROXY_ANY = 'any'        # any caller that sends a proxy's headers
+PUBLIC_PROXY_LISTED = 'listed'  # only a peer in flask.trusted_proxies
 #: The headers a reverse proxy adds to what it passes on.
 _PROXY_HEADERS = ('X-Forwarded-For', 'X-Forwarded-Proto', 'X-Forwarded-Host', 'X-Real-IP',
                   'Forwarded')
@@ -123,15 +128,18 @@ def _address(cfg: dict, host_url: str) -> dict:
     return {'state': state, 'base': base}
 
 
-def proxy_state(cfg: dict, headers, wired: bool) -> str:
-    """'' when ChannelBin sees its visitors as they are, else why it does not. `headers` are
-    the page request's own and `wired` is whether this process trusts a proxy's headers
-    (app.config['BEHIND_PROXY']). With a proxy in front and the setting off, every request
-    looks like the proxy's: http where the visitor typed https, and the proxy's address for
-    every IPTV player. The headers are only looked for here, never believed: believing them
-    is what the setting turns on (app/config.py)."""
-    if wired or not any(headers.get(name) for name in _PROXY_HEADERS):
+def proxy_state(cfg: dict, headers, wired: bool, trusted: bool) -> str:
+    """'' when ChannelBin sees this page's visitor as they are, else why it does not. The page
+    is on the web UI's port, so this is about that port only. `headers` are the page request's
+    own, `wired` is whether this process believes a proxy on the web UI's port
+    (proxy_trust.wired(app).web) and `trusted` whether this request's headers were believed
+    (proxy_trust.is_trusted). With a proxy in front and not believed, every request looks like
+    the proxy's: http where the visitor typed https, and the proxy's address for every IPTV
+    player. The headers are only looked for here, never believed."""
+    if trusted or not any(headers.get(name) for name in _PROXY_HEADERS):
         return ''
+    if wired:
+        return PROXY_UNLISTED
     return PROXY_RESTART if (cfg.get('flask') or {}).get('behind_proxy') else PROXY_UNSEEN
 
 
@@ -140,8 +148,8 @@ def _forwarded_for(value) -> list:
 
 
 def proxy_check(environ, probe: bool) -> dict:
-    """What a request arrived with and what flask.behind_proxy would make of it, for the
-    Settings page's proxy check. Only the proxy headers are reported, never any other.
+    """What a request arrived with and what believing its proxy would make of it, for the
+    Settings page's proxy check, which is a check of the web UI's port. Only the proxy headers are reported, never any other.
 
     Read from the request as it arrived: with the setting already on, ProxyFix has rewritten
     the environ and kept the originals under 'werkzeug.proxy_fix.orig', which are put back
@@ -929,7 +937,36 @@ def _public(fcfg: dict, connect_server: str, tz, h24) -> dict:
                      for ip, until in output_feed.login_failures.locked_out()],
         'lockout_minutes': output_feed.LOGIN_LOCKOUT_WINDOW.seconds // 60,
         'lockout_tries': output_feed.LOGIN_MAX_FAILURES,
+        'alarm': _login_alarm(tz, h24),
+        'proxy': _public_proxy(),
     }
+
+
+def _login_alarm(tz, h24) -> dict:
+    """The wrong-login alarm for the Logins card (auth.FailureTracker.alarm): going on now, or
+    when it last was. Memory only."""
+    alarm = output_feed.login_failures.alarm()
+    return {
+        'active': alarm['active'], 'count': alarm['count'], 'addresses': alarm['addresses'],
+        'peak': alarm['peak'], 'per_minute': output_feed.LOGIN_ALARM_PER_MINUTE,
+        'first': format_local(alarm['first'], 'clock', tz=tz, h24=h24) if alarm['first'] else '',
+        'last': format_local(alarm['last'], 'clock', tz=tz, h24=h24) if alarm['last'] else '',
+    }
+
+
+def _public_proxy() -> dict:
+    """Whose word the public port takes for a player's address, and who it last heard from
+    (app/proxy_trust.py): 'say' is one of PUBLIC_PROXY_*. Memory only."""
+    policy = proxy_trust.wired(current_app)
+    seen = proxy_trust.seen(proxy_trust.PORT_PUBLIC)
+    if not policy.public:
+        say = PUBLIC_PROXY_OFF
+    elif policy.networks:
+        say = PUBLIC_PROXY_LISTED
+    else:
+        say = PUBLIC_PROXY_ANY
+    return {'say': say, 'listed': len(policy.networks), 'believed': seen['believed_peer'],
+            'direct': seen['direct_peer'], 'ignored': seen['ignored_recent']}
 
 
 def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
