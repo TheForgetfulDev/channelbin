@@ -99,6 +99,17 @@ def _require_credentials():
     return None
 
 
+@output_feed_bp.after_app_request
+def _forget_kept_answers(response):
+    """Whatever the owner changes in the web UI - a switch, a login, the output's accounts, a
+    sports or picture-in-picture channel, a group, the guide - reaches the next ask of the
+    channel list or guide at once rather than up to a minute later (output_feed.kept_answer).
+    After the request, so after its commit. An IPTV player only ever GETs."""
+    if request.method not in ('GET', 'HEAD', 'OPTIONS') and response.status_code < 400:
+        output_feed.forget_answers()
+    return response
+
+
 def _base_url() -> str:
     """The origin the request arrived on, which is the origin every served URL names.
     With the request's reverse proxy believed (app/proxy_trust.py) this is the externally
@@ -113,11 +124,17 @@ def player_api():
         host, _, port = request.host.partition(':')
         port = port or ('443' if request.scheme == 'https' else '80')
         return jsonify(output_feed.auth_payload(g.feed_cfg, g.feed_login, host, port, request.scheme))
+    login = g.feed_login
     if action == _ACTION_CATEGORIES:
-        return jsonify(output_feed.category_payload(output_feed.catalog(g.cfg, login=g.feed_login)))
+        return jsonify(output_feed.kept_answer(
+            ('categories',) + output_feed.login_key(login),
+            lambda: output_feed.category_payload(output_feed.catalog(g.cfg, login=login))))
     if action == _ACTION_STREAMS:
-        return jsonify(output_feed.live_streams_payload(output_feed.catalog(g.cfg, login=g.feed_login),
-                                                        _base_url(), g.feed_login))
+        base = _base_url()
+        return jsonify(output_feed.kept_answer(
+            ('streams', base, login.username, login.password) + output_feed.login_key(login),
+            lambda: output_feed.live_streams_payload(output_feed.catalog(g.cfg, login=login),
+                                                     base, login)))
     if action in _EMPTY_ACTIONS:
         return jsonify([])
     log.info('Output feed: unknown player_api action %r from %s answered empty', action,
@@ -127,17 +144,26 @@ def player_api():
 
 @output_feed_bp.route('/get.php')
 def get_php():
-    text = output_feed.m3u_text(output_feed.catalog(g.cfg, login=g.feed_login), _base_url(), g.feed_login)
+    login, base = g.feed_login, _base_url()
+    text = output_feed.kept_answer(
+        ('m3u', base, login.username, login.password) + output_feed.login_key(login),
+        lambda: output_feed.m3u_text(output_feed.catalog(g.cfg, login=login), base, login))
     return Response(text, mimetype='audio/x-mpegurl',
                     headers={'Content-Disposition': 'attachment; filename="channelbin.m3u"'})
 
 
 @output_feed_bp.route('/xmltv.php')
 def xmltv():
-    rows = output_feed.catalog(g.cfg, login=g.feed_login)
-    # Built whole inside the request: the generator reads the database, and a body
-    # streamed after the request ends has no session to read it with.
-    body = ''.join(output_feed.xmltv_lines(rows, g.cfg, accounts=g.feed_login.accounts))
+    login = g.feed_login
+
+    def build():
+        # Built whole inside the request: the generator reads the database, and a body
+        # streamed after the request ends has no session to read it with.
+        rows = output_feed.catalog(g.cfg, login=login)
+        return ''.join(output_feed.xmltv_lines(rows, g.cfg, accounts=login.accounts))
+
+    # No URL in it, so every login with the same lineup and accounts shares one.
+    body = output_feed.kept_answer(('xmltv',) + output_feed.login_key(login), build)
     return Response(body, mimetype='application/xml')
 
 
@@ -182,7 +208,13 @@ def live(username, password, feed_id):
     group or sports channel in mixed mode) and for every play on the public port or a login for
     another user, a 302 to the member's provider URL otherwise, and
     a sports channel's waiting screen in every mode when it has nothing to play. A refusal's body
-    names its whole reason to the main login at home, and its kind only to everyone else."""
+    names its whole reason to the main login at home, and its kind only to everyone else.
+    A HEAD is answered without starting a play (output_feed.head_status)."""
+    if request.method == 'HEAD':
+        status = output_feed.head_status(feed_id, g.cfg, g.feed_login)
+        if status != 200:
+            return jsonify({'error': output_feed.SHORT_REFUSALS[status]}), status
+        return Response(b'', mimetype='video/mp2t', headers={'Cache-Control': 'no-cache'})
     client = request.remote_addr or ''
     # The address names one player only when this request's reverse proxy was believed and
     # put the player's own there: otherwise a proxy in front gives every player its address

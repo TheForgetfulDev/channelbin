@@ -208,6 +208,31 @@ class AccessLogMaskingTests(unittest.TestCase):
                      'Exception on /api/recordings/5 [POST]'):
             self.assertEqual(mask_creds_in_text(line), line)
 
+    def test_the_pair_is_masked_on_a_line_werkzeug_colors(self):
+        """dev/docs/BUGS.md 2026-11-27 @ 08:49:39 AM: werkzeug wraps the request line of every
+        answer but a 200 in an ANSI color code, so a redirect-mode play's 302, a wrong login's
+        401 and a 404 logged the username and password the player sent. The record is built as
+        werkzeug's own log_request() builds it, through the filter on the log handlers."""
+        import logging
+
+        from werkzeug.serving import _ansi_style
+
+        from app.url_utils import CredentialMaskingFilter
+        styles = {'302': ('green',), '304': ('cyan',), '404': ('yellow',),
+                  '401': ('bold', 'red'), '500': ('bold', 'magenta')}
+        for code, style in styles.items():
+            for path in ('/live/tv/tv-secret/14.ts', '/logo/tv/tv-secret/14',
+                         '/player_api.php?username=tv&password=tv-secret'):
+                with self.subTest(code=code, path=path):
+                    msg = _ansi_style(f'GET {path} HTTP/1.1', *style)
+                    self.assertIn('\x1b[', msg)
+                    record = logging.LogRecord('werkzeug', logging.INFO, __file__, 1,
+                                               '"%s" %s %s', (msg, code, '-'), None)
+                    CredentialMaskingFilter().filter(record)
+                    line = record.getMessage()
+                    self.assertNotIn('tv-secret', line)
+                    self.assertIn('***', line)
+
 
 class GateTests(unittest.TestCase):
     ENDPOINTS = ('/player_api.php', '/get.php', '/xmltv.php')

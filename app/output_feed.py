@@ -1426,6 +1426,80 @@ def _up_next_programs(row, now: datetime, days: int):
         start = stop
 
 
+# ── Answers kept for a minute ──────────────────────────────────────────────────────────────
+
+#: How long a catalog or guide answer is handed out again before it is built anew. xmltv.php
+#: on prod's 7-day guide took 1.3 s of the app's own CPU per ask, and eight at once took over
+#: 30 s each and slowed every page (dev/changelog/1772); a player fetches it every few hours, so
+#: an answer up to a minute old costs it nothing.
+ANSWER_KEEP_SECONDS = 60.0
+
+#: The most answers kept at once, the oldest dropped first. A key carries the address asked on,
+#: which a caller chooses, so without it a loop that changes the address would keep one more
+#: answer each ask for a minute.
+MAX_KEPT_ANSWERS = 64
+
+_answers_lock = threading.Lock()
+#: key -> (time.monotonic() it was built, the answer)
+_answers: dict = {}
+#: key -> the lock its one build at a time holds, so asks that arrive together wait for one
+#: build instead of each making their own.
+_answer_builds: dict = {}
+#: How many times forget_answers() has run: a build that started before the last one read the
+#: database as it was before the change, and is handed to its own ask but not kept.
+_answers_generation = 0
+
+
+def kept_answer(key: tuple, build):
+    """`build()`'s answer for `key`, built at most once a ANSWER_KEEP_SECONDS. `key` must name
+    everything the answer depends on that differs between asks - the login's lineup and
+    accounts, and for an answer carrying URLs the address and the login's own pair - so two
+    asks share an answer only when it would come out the same. What every login shares is
+    dropped by forget_answers() when the owner changes something, and is otherwise at most
+    ANSWER_KEEP_SECONDS old (a guide import). An answer that raised is not kept."""
+    with _answers_lock:
+        hit = _answers.get(key)
+        if hit is not None and time.monotonic() - hit[0] < ANSWER_KEEP_SECONDS:
+            return hit[1]
+        gate = _answer_builds.setdefault(key, threading.Lock())
+    with gate:
+        with _answers_lock:
+            hit = _answers.get(key)
+            if hit is not None and time.monotonic() - hit[0] < ANSWER_KEEP_SECONDS:
+                return hit[1]
+            generation = _answers_generation
+        value = build()
+        now = time.monotonic()
+        with _answers_lock:
+            for old in [k for k, (built, _) in _answers.items() if now - built >= ANSWER_KEEP_SECONDS]:
+                del _answers[old]
+            if generation == _answers_generation:
+                _answers[key] = (now, value)
+            for old in sorted(_answers, key=lambda k: _answers[k][0])[:max(0, len(_answers) - MAX_KEPT_ANSWERS)]:
+                del _answers[old]
+            # A gate nobody holds whose answer is gone; one taken by an ask that has not locked
+            # it yet costs at worst a second build of the same answer.
+            for old in [k for k, lock in _answer_builds.items()
+                        if k not in _answers and k != key and not lock.locked()]:
+                del _answer_builds[old]
+        return value
+
+
+def forget_answers() -> None:
+    """Drop every kept answer, so the next ask of each is built from the database as it is, and
+    keep none whose build was already under way."""
+    global _answers_generation
+    with _answers_lock:
+        _answers.clear()
+        _answers_generation += 1
+
+
+def login_key(login: FeedLogin) -> tuple:
+    """What a catalog answer depends on about the login that asked: its lineup and accounts.
+    The main login and every login nobody narrowed share one key."""
+    return (login.lineup, login.accounts)
+
+
 # ── Picking what a feed id plays ───────────────────────────────────────────────────────────
 
 #: What a refused play tells a player that is not the owner's own at home - one on the public
@@ -3322,6 +3396,7 @@ def set_on_output(kind: str, row_id: int, on: bool):
         if bool(row.on_output) == on:
             return row, False
         row.on_output = on
+        forget_answers()
         return row, True
     if kind == KIND_CHANNEL:
         row = db.session.get(Channel, row_id)
@@ -3335,6 +3410,10 @@ def set_on_output(kind: str, row_id: int, on: bool):
     if bool(row.on_output) == on:
         return row, False
     row.on_output = on
+    # A player that refreshes to check the switch sees it at once. The route's commit is
+    # followed by a second forget (routes/output_feed.py::_forget_kept_answers), so an ask
+    # built between here and the commit is not kept either.
+    forget_answers()
     detail = ('Put back on the IPTV output by hand' if on
               else 'Taken off the IPTV output by hand. It stays in the TV Guide')
     extra = json.dumps({'on_output': on, 'source': 'user'})
@@ -4950,6 +5029,26 @@ def _to_card_now(session: RelaySession) -> None:
 
 # ── Redirect mode ──────────────────────────────────────────────────────────────────────────
 
+def head_status(feed_id: int, cfg, login: FeedLogin) -> int:
+    """What a HEAD on a stream address answers: the status a GET would begin with as far as it
+    can be told without starting anything - 404 for an id `login` does not get, 409 when nothing
+    could start (a row taken off the output, a channel outside the login's own accounts, a group
+    or game with nothing playable), else 200. It starts nothing - no ffmpeg, no seat, no viewer
+    slot, no line in Recent plays - because a HEAD reads no body: answered as a GET, a play held a
+    provider connection for the idle timeout with nobody reading (dev/changelog/1772). A GET
+    the HEAD answered 200 may still be refused (a full slot, a busy account): that is only known
+    by starting it. Follows _start_session()'s order of refusals. Requires an app context."""
+    play = resolve_play(feed_id, cfg, accounts=login.accounts)
+    if play is None or not login.offers(feed_id):
+        return 404
+    if play.member is None and play.own_accounts:
+        return 409
+    if (play.member is not None or play.up_next is not None or play.pip is not None
+            or (play.sports and not play.fault)):
+        return 200
+    return 409
+
+
 def redirect_play(feed_id: int, client: str, cfg=None, login: Optional[FeedLogin] = None) -> tuple:
     """Redirect mode's answer to a tune-in: (provider URL, None) to send the player to, or
     (None, session) for a sports channel with nothing to play, whose waiting screen is
@@ -5073,3 +5172,6 @@ def reset_for_tests():
     discard_play_log()
     _last_prune_mono = None
     login_failures.reset()
+    forget_answers()
+    with _answers_lock:
+        _answer_builds.clear()
