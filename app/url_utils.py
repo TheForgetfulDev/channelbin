@@ -47,7 +47,9 @@ _TARGET_ORIGIN = 'http://request-target.invalid'
 # `.php` endpoints, so a request line is the one place a bare path carries them. Any method:
 # a browser-based player's CORS preflight is `"OPTIONS /live/u/p/7.ts`, with the real pair.
 # Either quote: the server's line for a request it could not parse wraps it in single ones.
-_REQUEST_LINE_RE = re.compile(r'''(["'][A-Z]+ )(/[^\s"']*)''')
+# And with or without color: werkzeug wraps every line but a 200's in an ANSI code, so a
+# redirect, a refusal or a 404 reads `"\x1b[33mHEAD /live/...` (dev/changelog/1773).
+_REQUEST_LINE_RE = re.compile(r'''(["'](?:\x1b\[[0-9;]*m)*[A-Z]+ )(/[^\s"']*)''')
 # And the line Flask logs for an unhandled error in a view: `Exception on /live/u/p/7.ts [GET]`.
 _EXCEPTION_ON_RE = re.compile(r'(Exception on )(/\S*)(?= \[)')
 # /logo/<user>/<pass>/<id> is the output feed's own logo route (dev/changelog/1760). Anchored

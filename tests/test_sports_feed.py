@@ -100,6 +100,10 @@ class _Case(unittest.TestCase):
     def get(self, path, **params):
         params.setdefault('username', USER)
         params.setdefault('password', PASS)
+        # These tests change the sports tables directly, not through a request, so nothing
+        # drops the answers the output keeps for a minute (output_feed.kept_answer,
+        # dev/changelog/1772); each ask here reads the tables as they are now.
+        feed.forget_answers()
         return self.client.get(f'{path}?' + '&'.join(f'{k}={v}' for k, v in params.items()))
 
     def play(self, feed_id):
