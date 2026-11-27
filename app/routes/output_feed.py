@@ -38,6 +38,11 @@ _EMPTY_ACTIONS = frozenset({'get_vod_categories', 'get_vod_streams', 'get_series
                             'get_short_epg', 'get_simple_data_table'})
 
 
+#: The largest id a stream or logo address may name: SQLite's own largest integer. A longer
+#: number is no channel, and binding it to a query raises instead of finding nothing.
+_MAX_ID = 2 ** 63 - 1
+
+
 @output_feed_bp.before_request
 def _require_credentials():
     cfg = load_config()
@@ -65,6 +70,8 @@ def _require_credentials():
     # A right login never clears the address's count, as the web login's does: there one
     # password opens the door, here many logins share it, and knowing your own says nothing
     # about anyone else's. The count only ages out.
+    if max(args.get('feed_id', 0), args.get('channel_id', 0)) > _MAX_ID:
+        return jsonify({'error': 'No such channel on the IPTV output'}), 404
     g.cfg = cfg
     g.feed_cfg = fcfg
     g.feed_login = login
