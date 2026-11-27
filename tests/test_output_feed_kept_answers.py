@@ -101,7 +101,8 @@ class KeptAnswerRouteTests(FeedCase):
             self.get('/xmltv.php')
             self.assertEqual(catalog.call_count, 1, 'a refused request dropped them')
             # A change that does not go through the output switch at all.
-            self.assertEqual(self.client.post('/api/iptv-output/lockouts/clear').status_code, 200)
+            self.assertEqual(self.client.post('/api/iptv-output/lockouts/clear',
+                                              json={'address': '192.0.2.1'}).status_code, 200)
             self.get('/xmltv.php')
         self.assertEqual(catalog.call_count, 2)
 

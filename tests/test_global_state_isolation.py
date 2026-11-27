@@ -203,11 +203,15 @@ class ResetRestoresPristineStateTests(unittest.TestCase):
         from app import output_feed
         auth.web_login.failures['127.0.0.1'] = ['x'] * 50
         output_feed.login_failures.failures['127.0.0.1'] = ['x'] * 50
+        auth.web_login.lockouts['127.0.0.1'] = (3, None)
+        output_feed.login_failures.lockouts['127.0.0.1'] = (3, None)
         self.t = make_test_app()
         self.assertEqual(auth.web_login.failures, {},
                          'leaked failure counts can lock the next module out of every login')
         self.assertEqual(output_feed.login_failures.failures, {},
                          'leaked failure counts can lock the next module out of the IPTV output')
+        self.assertEqual((auth.web_login.lockouts, output_feed.login_failures.lockouts), ({}, {}),
+                         'a leaked lockout step makes the next module\'s lockouts longer')
 
     def test_a_restart_required_latch_does_not_survive_into_the_next_app(self):
         cfgmod.set_restart_needed(True)

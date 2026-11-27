@@ -13,6 +13,7 @@ from flask import Blueprint, current_app, jsonify, render_template, request
 from sqlalchemy.exc import IntegrityError
 
 from .. import db, output_feed, output_feed_view, pip_channels, proxy_trust
+from ..auth import lockout_key
 from ..config import config_write_lock, load_config, load_for_edit, save_config, set_nested
 from ..database import Account, OutputFeedLogin
 from ..db_utils import retry_on_locked
@@ -197,12 +198,18 @@ def pip_remove(row_id):
 
 
 @iptv_output_bp.route('/api/iptv-output/lockouts/clear', methods=['POST'])
-def clear_lockouts():
-    """Let every address locked out of the IPTV output after wrong logins try again now
-    (output_feed.login_failures, dev/changelog/1761)."""
-    cleared = output_feed.login_failures.clear()
-    log.info('IPTV output: wrong-login lockouts cleared from the IPTV Output page (%s)',
-             counted(cleared, 'address', 'addresses'))
+def clear_lockout():
+    """Let one address locked out of the IPTV output after wrong logins try again now, and
+    forget how many times it has been locked out. One address a call, never every one
+    (output_feed.login_failures, dev/changelog/1774)."""
+    address = (request.get_json(silent=True) or {}).get('address')
+    if not isinstance(address, str) or not address.strip():
+        return jsonify({'error': 'Say which address to let back in'}), 400
+    address = address.strip()
+    cleared = output_feed.login_failures.clear(address)
+    if cleared:
+        log.info('IPTV output: the wrong-login lockout of %s was cleared from the IPTV Output '
+                 'page, with its count of past lockouts', lockout_key(address))
     return jsonify({'success': True, 'cleared': cleared})
 
 

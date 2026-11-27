@@ -5,9 +5,9 @@ from flask import (Blueprint, current_app, redirect, render_template, request,
                    session, url_for)
 from werkzeug.security import check_password_hash
 
-from ..auth import (MAX_FAILURES, clear_session, client_ip, gate_active, check_lockout, lockout_key,
-                    is_authenticated, password_epoch, record_failure, record_success,
-                    validate_next)
+from ..auth import (MAX_FAILURES, clear_session, client_ip, current_lockout, gate_active,
+                    check_lockout, lockout_key, lockout_words, is_authenticated, password_epoch,
+                    record_failure, record_success, steps_words, validate_next)
 from ..tz_utils import format_local
 
 log = logging.getLogger(__name__)
@@ -73,18 +73,22 @@ def login():
     just_locked = record_failure(ip)
     log.warning('Failed login attempt from %s', ip)
     if just_locked:
-        unlock_at = check_lockout(ip)
+        found = current_lockout(ip)
+        unlock_at = found.until if found else datetime.utcnow()
         from ..alerts import create_alert
         create_alert(
             'AUTH_LOGIN_LOCKOUT',
             title='Login lockout: too many failed attempts',
             body=('IP %s was locked out after %d failed login attempts. Locked out '
-                 'until %s. Behind a reverse proxy, the IP is the visitor\'s own only when '
+                 'until %s (%s). Each lockout of one IP is longer than its last: %s. A right '
+                 'password after a lockout ends, 24 hours with no new lockout, or a restart '
+                 'starts it again at the first. Behind a reverse proxy, the IP is the visitor\'s own only when '
                  '"The web UI is behind a reverse proxy" is on in Settings (System) and the '
                  'proxy is in "Reverse proxy addresses" or that list is empty - otherwise '
                  'every visit through the proxy looks like one IP. An IPv6 address is counted '
                  'by its /64.'
-                 % (lockout_key(ip), MAX_FAILURES, format_local(unlock_at))),
+                 % (lockout_key(ip), MAX_FAILURES, format_local(unlock_at),
+                    lockout_words(found) if found else 'already over', steps_words())),
             source='auth',
         )
         error = 'Too many failed attempts. Try again after %s.' % format_local(unlock_at)

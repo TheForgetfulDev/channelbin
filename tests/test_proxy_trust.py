@@ -48,7 +48,7 @@ class _TrustCase(FeedCase):
         return client.get(path, headers=headers, environ_base={'REMOTE_ADDR': peer})
 
     def locked(self):
-        return [key for key, _until in feed.login_failures.locked_out()]
+        return [found.address for found in feed.login_failures.locked_out()]
 
 
 class PerPortTests(_TrustCase):
@@ -59,7 +59,7 @@ class PerPortTests(_TrustCase):
         for n in range(feed.LOGIN_MAX_FAILURES):
             self.assertEqual(self.ask(self.client, WRONG, forwarded=f'203.0.113.{n}').status_code, 401)
         self.assertEqual(self.locked(), ['10.0.0.9'])
-        self.assertEqual(len(feed.login_failures.failures), 1)
+        self.assertEqual(len(feed.login_failures.lockouts), 1)
         self.assertEqual(self.ask(self.client, RIGHT, forwarded='203.0.113.200').status_code, 401)
 
     def test_the_proxy_on_the_public_port_is_believed(self):
@@ -219,14 +219,14 @@ class LockoutKeyTests(unittest.TestCase):
         for n in range(10):
             tracker.record_failure(f'2001:db8:1:2::{n + 1:x}')
         self.assertIsNotNone(tracker.check_lockout('2001:db8:1:2:ffff:ffff:ffff:ffff'))
-        self.assertEqual([key for key, _ in tracker.locked_out()], ['2001:db8:1:2::/64'])
+        self.assertEqual([found.address for found in tracker.locked_out()], ['2001:db8:1:2::/64'])
         self.assertIsNone(tracker.check_lockout('2001:db8:1:3::1'))
 
     def test_a_mapped_ipv4_address_is_the_ipv4(self):
         tracker = self.tracker()
         for n in range(10):
             tracker.record_failure('::ffff:203.0.113.9' if n % 2 else '203.0.113.9')
-        self.assertEqual([key for key, _ in tracker.locked_out()], ['203.0.113.9'])
+        self.assertEqual([found.address for found in tracker.locked_out()], ['203.0.113.9'])
         self.assertIsNotNone(tracker.check_lockout('::ffff:203.0.113.9'))
         self.assertIsNone(tracker.check_lockout('203.0.113.10'))
 
@@ -293,11 +293,10 @@ class AlarmTests(_TrustCase):
     def test_the_web_login_has_no_alarm(self):
         self.assertEqual(auth.web_login.alarm_max, 0)
 
-    def test_clearing_the_lockouts_forgets_the_alarm(self):
+    def test_letting_one_address_back_in_leaves_the_alarm(self):
         self.flood(feed.LOGIN_ALARM_PER_MINUTE)
-        feed.login_failures.clear()
-        alarm = feed.login_failures.alarm()
-        self.assertEqual((alarm['active'], alarm['last']), (False, None))
+        feed.login_failures.clear('198.51.0.1')
+        self.assertTrue(feed.login_failures.alarm()['active'])
 
 
 class MigrationTests(unittest.TestCase):

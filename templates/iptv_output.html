@@ -147,7 +147,15 @@
       <p class="card-note" id="of-login-alarm">Wrong logins came in fast enough to look like guessing ({{ public.alarm.per_minute }} or more a minute, {{ public.alarm.peak }} at most) from {{ public.alarm.first }} to {{ public.alarm.last }}. It has stopped. Nobody was refused for it alone.</p>
       {% endif %}
       {% if public.lockouts %}
-      <div class="notice notice-warn notice-act" id="of-lockouts"><div><strong>{{ public.lockouts | length }} address{{ '' if public.lockouts | length == 1 else 'es' }} {{ 'is' if public.lockouts | length == 1 else 'are' }} locked out after {{ public.lockout_tries }} wrong logins:</strong> {% for l in public.lockouts %}{{ l.address }} until {{ l.until }}{{ ', ' if not loop.last else '' }}{% endfor %}. Every request from {{ 'it' if public.lockouts | length == 1 else 'them' }} is refused, even with the right password, for {{ public.lockout_minutes }} minutes after the first wrong one. An address ending in /64 is one home's whole range of IPv6 addresses, counted as one. An IPTV player still holding an old password does this by itself.</div><button class="btn btn-sm" data-act="lockouts-clear">Let them try now</button></div>
+      <div id="of-lockouts">
+        {% for l in public.lockouts %}
+        <div class="notice notice-warn notice-act"><div><strong>{{ l.address }} is locked out until {{ l.until }}</strong> after {{ public.lockout_tries }} wrong logins: {{ l.words }}. Every request from it is refused until then, even with the right password.</div><button class="btn btn-sm" data-act="lockout-clear" data-address="{{ l.address }}" data-tip="Lets this address try again now and forgets how many times it has been locked out, so its next lockout is the shortest one. Nobody else's lockout changes.">Let it try now</button></div>
+        {% endfor %}
+        {% if public.lockouts_more %}
+        <div class="notice notice-warn"><div><strong>{{ public.lockouts_more }} more address{{ '' if public.lockouts_more == 1 else 'es' }} {{ 'is' if public.lockouts_more == 1 else 'are' }} locked out</strong> and not listed here: these are the {{ public.lockouts | length }} whose lockouts end soonest. The rest take their place as these end. Restarting ChannelBin ends every lockout at once.</div></div>
+        {% endif %}
+        <p class="card-note">Each lockout of one address is longer than its last: {{ public.lockout_steps }}. An address starts again at the shortest after {{ public.lockout_forget }} with no new lockout, or when ChannelBin restarts. An address ending in /64 is one home's whole range of IPv6 addresses, counted as one. An IPTV player still holding an old password does this by itself, and keeps doing it until its password is fixed.</p>
+      </div>
       {% endif %}
       {% if logins %}
       <div class="table-scroll"><table class="tbl tbl-cards rl-tbl">

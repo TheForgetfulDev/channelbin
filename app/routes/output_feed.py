@@ -22,7 +22,7 @@ import os
 from flask import Blueprint, Response, g, jsonify, redirect, request, send_from_directory
 
 from .. import output_feed, proxy_trust, public_listener
-from ..auth import lockout_key
+from ..auth import lockout_key, lockout_words
 from ..config import load_config
 from ..fmt_utils import counted
 
@@ -53,9 +53,11 @@ def _wrong_login(address: str, username):
         whose = ('the player\'s own address' if proxy_trust.is_trusted(request) else
                  'the address that connected to ChannelBin, which is a reverse proxy\'s if one '
                  'is in front and has not been declared in Settings')
-        log.warning('IPTV output: %s is locked out for %d minutes after %d wrong logins (user %r, '
-                    'on %s). That is %s.', lockout_key(address),
-                    output_feed.LOGIN_LOCKOUT_WINDOW.seconds // 60,
+        found = output_feed.login_failures.lockout(address)
+        log.warning('IPTV output: %s is locked out for %s after %d wrong logins (user %r, on '
+                    '%s). Each lockout of one address is longer than its last. That is %s.',
+                    lockout_key(address),
+                    lockout_words(found) if found else 'a moment',
                     output_feed.LOGIN_MAX_FAILURES, str(username or '')[:output_feed.LOGIN_MAX],
                     proxy_trust.PORT_NAMES[port], whose)
     alarm = output_feed.login_failures.take_alarm_notice()
