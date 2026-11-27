@@ -216,6 +216,7 @@
   <strong>{{ icon('warning') }} Nothing on this account can stream</strong><br>
   {% if unusable == UNUSABLE.HOSTS %}Every host on it is turned off. Turn one on, or add one, on the Hosts card.
   {% elif unusable == UNUSABLE.LOGINS %}Every login on it is turned off. Turn one on, or add one, on the Logins card.
+  {% elif unusable == UNUSABLE.LOGIN_HOSTS %}Every host the logins on it would use is turned off. Turn one on in a login's Hosts..., or a host on the Hosts card for the logins that use this account's hosts.
   {% else %}{{ unusable }}{% endif %}
   Recordings, health checks and previews on it don't start until then.
 </div>
@@ -224,7 +225,8 @@
 <div class="notice notice-info" id="acct-switches">
   <strong>Streams skip the playlist's {{ 'host and login' if both else ('host' if playlist_host_off else 'login') }}</strong><br>
   The playlist says to use {% if playlist_host_off %}host <code>{{ playlist_host_off.host }}</code>{% endif %}{% if both %} and {% endif %}{% if playlist_login_off %}login <code>{{ playlist_login_off.username }}</code>{% endif %}.
-  {{ 'Both are' if both else 'It is' }} turned off below, so ChannelBin uses the other {{ 'hosts and logins' if both else ('hosts' if playlist_host_off else 'logins') }} listed here instead.
+  {% if playlist_host_off and not (hosts | selectattr('enabled') | list) %}{{ 'Both are' if both else 'It is' }} turned off below, so ChannelBin uses the other logins listed here instead, each on its own hosts.
+  {% else %}{{ 'Both are' if both else 'It is' }} turned off below, so ChannelBin uses the other {{ 'hosts and logins' if both else ('hosts' if playlist_host_off else 'logins') }} listed here instead.{% endif %}
 </div>
 {% endif %}
 {# The active host did not answer at its last full check (app/host_checks.py,
@@ -412,6 +414,13 @@
       <p class="card-note">No stream URLs yet. The host shows here after the first sync.</p>
       {% else %}
       <p class="card-note">{% if hosts %}Streams use the active host. If it stops resolving, ChannelBin moves to the next host that's turned on, picks one that answered at its last check first, and an alert says so. A check looks each name up, connects, and asks the server for an answer, without logging in. Turn off any host you don't want used, including the one from the playlist.{% else %}Add the other hosts your reseller gave you, and ChannelBin swaps to one that works when this one stops resolving.{% endif %}</p>
+      {% set own_host_logins = logins | selectattr('hosts') | map(attribute='name') | list %}
+      {% if own_host_logins %}
+      <p class="card-note" data-own-hosts>{{ own_host_logins | length }} login{{ ' uses its' if own_host_logins | length == 1 else 's use their' }} own hosts instead: {{ own_host_logins | join(', ') }}.</p>
+      {% if hosts and not (hosts | selectattr('enabled') | list) and (logins | selectattr('enabled') | selectattr('active_host') | list) %}
+      <p class="card-note" data-all-off-fine>Every host here is off. Streams go out on each login's own hosts.</p>
+      {% endif %}
+      {% endif %}
       {% if host_progress %}
       <div class="notice notice-info" data-host-progress>
         <strong>{{ host_progress.title }}</strong><br>
@@ -505,7 +514,7 @@
       </div>
     </div>
     <div class="card-body" id="acct-logins-body">
-      <p class="card-note">{% if logins %}Each login is good for its seats, so two logins means two streams at once. Recordings, health checks and previews take a seat on the first login that's turned on, isn't blocked and has one free. {% if logins_on > 1 %}A login the server refuses is skipped for a while, and an alert says so.{% else %}If the server refuses it, an alert says so, and with no other login to take over, captures keep trying it.{% endif %} Turn off any login you don't want used, including the one from the playlist.{% else %}Add another login to run more streams at once or keep a spare.{% endif %}</p>
+      <p class="card-note">{% if logins %}Each login is good for its seats, so two logins means two streams at once. Recordings, health checks and previews take a seat on the first login that's turned on, isn't blocked and has one free. {% if logins_on > 1 %}A login the server refuses is skipped for a while, and an alert says so.{% else %}If the server refuses it, an alert says so, and with no other login to take over, captures keep trying it.{% endif %} A login that lists hosts of its own streams on those; one that lists none uses this account's. Turn off any login you don't want used, including the one from the playlist.{% else %}Add another login to run more streams at once or keep a spare.{% endif %}</p>
       <div class="table-scroll">
         <table class="tbl tbl-cards">
           <thead><tr><th>Login</th><th>Use</th><th>Seats</th><th>Refused</th><th></th></tr></thead>
@@ -518,11 +527,19 @@
               {% endif %}
               {% if lg.playlist_of %}<div class="text-faint small">From {{ lg.playlist_of }}'s playlist</div>{% endif %}
               {% if lg.shared_with %}<div class="small">Shared with {{ lg.shared_with | join(', ') }}</div>{% endif %}
-              {% if own_login and own_login.same_as == lg.id %}<div class="text-faint small">The account's own login, {{ 'which syncs still use' if not lg.enabled else 'also used by syncs' }}</div>{% endif %}</td>
+              {% if own_login and own_login.same_as == lg.id %}<div class="text-faint small">The account's own login, {{ 'which syncs still use' if not lg.enabled else 'also used by syncs' }}</div>{% endif %}
+              {# Where its streams go (DESIGN-account-providers.md §14.9, dev/changelog/1778). #}
+              {% if not lg.hosts %}<div class="text-faint small">Uses this account's hosts</div>
+              {% elif lg.active_host %}<div class="small">Hosts: <code>{{ lg.active_host }}</code> (active){% if lg.hosts | length > 1 %} and {{ lg.hosts | length - 1 }} more{% endif %}</div>
+              {% else %}<div class="small text-warning">Hosts: {{ lg.hosts | length }}, all off</div>
+              {% endif %}
+              <template data-login-hosts="{{ lg.id }}">{% include '_login_hosts_dialog.html' %}</template></td>
             <td data-label="Use"><label class="switch" aria-label="Use login {{ lg.username }}"><input type="checkbox" data-switch="login" data-login-id="{{ lg.id }}"{% if lg.enabled %} checked{% endif %}><span class="knob"></span></label></td>
             <td data-label="Seats">
               {% if not lg.enabled %}<span class="text-faint">Off</span>{% if lg.switched_at %}<div class="text-faint small">since {{ lg.switched_at | local_time }}</div>{% endif %}{% if lg.held %}<div class="text-faint small">{{ lg.holders }} still on it</div>{% endif %}
               {% elif lg.blocked %}<span class="text-warning">Blocked until {{ lg.blocked.stop_label }}</span>{% if lg.held %}<div class="text-faint small">{{ lg.holders }} still on it</div>{% endif %}
+              {% elif lg.no_host == 'own' %}<span class="text-warning tip-plain" data-tip="No hosts on.&#10;Every host on this login's own list is off, so it takes no new stream, on any account that holds it. Turn one on with Hosts... in its menu.">No hosts on</span>{% if lg.held %}<div class="text-faint small">{{ lg.holders }} still on it</div>{% endif %}
+              {% elif lg.no_host == 'account' %}<span class="text-warning tip-plain" data-tip="No hosts on.&#10;This login uses this account's hosts, and every one is off, so it takes no new stream here. Give it hosts of its own with Hosts... in its menu, or turn on a host on the Hosts card.">No hosts on</span>{% if lg.held %}<div class="text-faint small">{{ lg.holders }} still on it</div>{% endif %}
               {% else %}{{ lg.held }} of {{ lg.max_connections }} in use{% if lg.holders %}<div class="text-faint small">{{ lg.holders }}</div>{% endif %}
               {% endif %}</td>
             <td data-label="Refused">
@@ -539,6 +556,8 @@
                   {% else %}
                   <button class="menu-item" data-act="login-edit" data-login-id="{{ lg.id }}" data-shared-with="{{ lg.shared_with | join(', ') }}">Edit</button>
                   {% endif %}
+                  <button class="menu-item" data-act="login-hosts" data-login-id="{{ lg.id }}" data-login="{{ lg.name }}"
+                          data-tip="The host names of the reseller who sold this login. Its streams go out on them, on every account that holds it.">Hosts&hellip;</button>
                   <button class="menu-item" data-act="login-move" data-login-id="{{ lg.id }}" data-direction="up"{% if lg.first %} disabled{% endif %}>Move up</button>
                   <button class="menu-item" data-act="login-move" data-login-id="{{ lg.id }}" data-direction="down"{% if lg.last %} disabled{% endif %}>Move down</button>
                   {% if lg.blocked %}

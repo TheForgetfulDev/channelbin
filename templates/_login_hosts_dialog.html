@@ -1,0 +1,63 @@
+{# The body of a login's Hosts dialog (DESIGN-account-providers.md §14.9, dev/changelog/1778),
+   rendered inside the login's row as a <template> so the page's refresh brings a fresh copy and
+   account-detail.js refills the open dialog from it. Needs `lg` (a login_views() row), `hosts`
+   (the account's host_views()) and `account`. Every switch writes at once, like the Hosts
+   card's, so the dialog has only Close. #}
+{%- import '_macros.html' as m %}
+{%- set copyable = hosts | selectattr('enabled') | rejectattr('host', 'in', lg.hosts | map(attribute='host') | list) | list %}
+{%- if lg.shared_with %}
+<div class="notice notice-info"><strong>Also used by {{ lg.shared_with | join(', ') }}</strong><br>
+  This list belongs to the login, so a change here reaches every account that holds it.</div>
+{%- endif %}
+<p class="card-note">Streams seated on this login go out on its active host, with its username and password. If that host stops resolving, ChannelBin moves to the next one here that's turned on, and an alert says so. With no hosts listed, the login uses the hosts of the account it streams for. A check looks a name up and asks it for an answer, without logging in.</p>
+{%- if lg.hosts %}
+<div class="table-scroll">
+  <table class="tbl">
+    <thead><tr><th>Host</th><th>Use</th><th>Answers</th><th></th></tr></thead>
+    <tbody>
+    {%- for h in lg.hosts %}
+    <tr data-login-host-row="{{ h.id }}">
+      <td><code>{{ h.host }}</code>
+        <div class="small">{% if not h.enabled %}<span class="text-faint">Off{% if h.switched_at %} since {{ h.switched_at | local_time }}{% endif %}</span>
+          {% elif h.is_active %}{{ m.status_badge('b-done', 'Active') }}{% if h.activated_at %} <span class="text-faint">since {{ h.activated_at | local_time }}</span>{% endif %}
+          {% else %}<span class="text-faint">Standby</span>{% endif %}</div></td>
+      <td><label class="switch" aria-label="Use host {{ h.host }} on login {{ lg.name }}"><input type="checkbox" data-switch="lhost" data-login-id="{{ lg.id }}" data-host-id="{{ h.id }}"{% if h.enabled %} checked{% endif %}><span class="knob"></span></label></td>
+      <td>
+        {%- if h.queue == 'checking' %}<span class="badge b-auto">Checking</span>
+        {%- elif h.queue == 'waiting' %}<span class="badge b-auto">Waiting</span>
+        {%- elif h.check %}<span class="badge {{ h.check.badge }} tip-plain" data-tip="{{ h.check.tip }}">{{ h.check.label }}</span>
+          <div class="small">{{ h.check.line }}</div><div class="text-faint small">{{ 'looked up' if h.check.from_lookup else 'checked' }} {{ h.check.at | local_time }}</div>
+        {%- elif h.lookup %}<span class="text-faint">Not tested yet</span><div class="text-faint small">{% if h.lookup.ok %}resolves{% else %}doesn't resolve: {{ h.lookup.error }}{% endif %}</div>
+        {%- else %}<span class="text-faint">Not checked yet</span>{% endif %}</td>
+      <td class="num">
+        <span class="menu-wrap">
+          <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ h.host }}">{{ icon('more') }}</button>
+          <div class="menu">
+            {% if h.queue %}<button class="menu-item" disabled>Check now (already in line)</button>
+            {% else %}<button class="menu-item" data-act="lhost-check" data-host-id="{{ h.id }}">Check now</button>{% endif %}
+            <button class="menu-item" data-act="lhost-activate" data-host-id="{{ h.id }}"{% if h.is_active or not h.enabled %} disabled{% endif %}
+                    data-tip="{% if not h.enabled %}Turned off. Turn it on to make it active.{% else %}Streams on this login go out on this host from their next segment.{% endif %}">Make active</button>
+            <div class="sep"></div>
+            <button class="menu-item danger" data-act="lhost-remove" data-host-id="{{ h.id }}" data-host="{{ h.host }}"
+                    data-last="{{ '1' if lg.hosts | length == 1 else '' }}" data-shared-with="{{ lg.shared_with | join(', ') }}">Remove</button>
+          </div>
+        </span>
+      </td>
+    </tr>
+    {%- endfor %}
+    </tbody>
+  </table>
+</div>
+{%- else %}
+<p class="text-faint">No hosts of its own yet. Streams on this login use the hosts of whichever account they are for{% if hosts %}; on {{ account.name }} that is {% set act = hosts | selectattr('is_active') | selectattr('enabled') | first %}{% if act %}<code>{{ act.host }}</code>{% else %}none, because every host here is off{% endif %}{% endif %}.</p>
+{%- endif %}
+<div class="gd-field stack">
+  <div class="gd-field-left"><div class="gd-field-lbl">Add a host</div>
+    <div class="gd-field-meta">A host name the reseller who sold this login gave you, with a port if it has one, like <code>tv1.reseller.example:8080</code>.</div></div>
+  <div class="gd-field-ctl"><input type="text" class="lhost-input" autocomplete="off" spellcheck="false" aria-label="Host name">
+    <button type="button" class="btn btn-sm" data-act="lhost-add">Add</button></div>
+</div>
+<div class="card-head-actions">
+  <button type="button" class="btn btn-sm" data-act="lhost-copy"{% if not copyable %} disabled{% endif %}
+          data-tip="{% if copyable %}Adds {{ copyable | map(attribute='host') | join(', ') }} to this login, in this account's order. This account's own list stays as it is.{% elif hosts | selectattr('enabled') | list %}Every host on this account that is on is already on this login.{% else %}Every host on this account is off, so there is nothing to copy.{% endif %}">Copy from this account's hosts</button>
+</div>

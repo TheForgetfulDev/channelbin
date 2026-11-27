@@ -23,6 +23,7 @@ Runs against a throwaway temp SQLite DB - never the live dvr.db.
   python3 -m unittest tests.test_account_logins
 """
 import os
+import re
 import sys
 import unittest
 from datetime import datetime, timedelta
@@ -189,16 +190,16 @@ class SeatTests(_Case):
         connlim.try_acquire(self.acc_id, 'preview', 'sess-1')
         url = 'http://h1.harbor.example/live/main/pw1/1.ts'
         self.assertEqual(links.render_held_login(url, self.acc_id, 'test', 501),
-                         (url, main))
+                         (url, main, None))
         self.assertEqual(links.render_held_login(url, self.acc_id, 'preview', 'sess-1'),
-                         ('http://h1.harbor.example/live/spare/pw2/1.ts', spare))
+                         ('http://h1.harbor.example/live/spare/pw2/1.ts', spare, None))
 
     def test_unlisted_credentials_launch_as_is_and_the_seat_still_counts(self):
         main, spare = self._list(('main', 'main', 'pw1', 1), ('spare', 'spare', 'pw2', 1))
         connlim.try_acquire(self.acc_id, 'recording', 11)
         connlim.try_acquire(self.acc_id, 'recording', 12)
         url = 'http://cdn.other.example/live/zz/yy/5.ts'
-        rendered, login_id = links.render_held_login(url, self.acc_id, 'recording', 12)
+        rendered, login_id, _ = links.render_held_login(url, self.acc_id, 'recording', 12)
         self.assertEqual(rendered, url)
         self.assertEqual(login_id, spare)
         self.assertFalse(connlim.try_acquire(self.acc_id, 'recording', 13))
@@ -223,7 +224,7 @@ class SeatTests(_Case):
                         'the held seat is still this account\'s - idempotent, not a second seat')
         self.assertEqual(connlim.holder_counts(), {self.acc_id: 2})
         url = 'http://h1.harbor.example/live/main/pw1/1.ts'
-        self.assertEqual(links.render_held_login(url, self.acc_id, 'recording', 12), (url, spare))
+        self.assertEqual(links.render_held_login(url, self.acc_id, 'recording', 12), (url, spare, None))
         connlim.release(self.acc_id, 'recording', 11)
         connlim.release(self.acc_id, 'recording', 12)
         self.assertEqual(connlim._holders, {})
@@ -678,10 +679,21 @@ class HookPresenceTests(unittest.TestCase):
                 src = fh.read()
             self.assertIn('is_credential_refusal(', src, rel)
             self.assertIn('note_refusal_for_holder(', src, rel)
-        for rel in ('app/recorder.py', 'app/channel_tester.py', 'app/preview.py'):
+        for rel in ('app/recorder.py', 'app/channel_tester.py', 'app/preview.py',
+                    'app/output_feed.py'):
             with open(os.path.join(root, rel), encoding='utf-8') as fh:
                 src = fh.read()
             self.assertIn('render_held_login(', src, rel)
+        # A resolution failure rolls the list the launch was rendered from: every call to the
+        # roll hands it the launch's own answer (dev/changelog/1778).
+        for rel in ('app/watchdog.py', 'app/channel_tester.py', 'app/preview.py',
+                    'app/output_feed.py'):
+            with open(os.path.join(root, rel), encoding='utf-8') as fh:
+                src = fh.read()
+            calls = re.findall(r'roll_host_for_channel\((.*?)\)\n', src, re.S)
+            self.assertTrue(calls, rel)
+            for call in calls:
+                self.assertIn('host_login_id=', call, rel)
 
 
 if __name__ == '__main__':

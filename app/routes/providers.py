@@ -13,8 +13,8 @@ from flask import Blueprint, current_app, jsonify, request
 
 from .. import db
 from ..account_links import (configured_seats, create_provider_full, delete_provider_full,
-                             hosts_for_accounts, logins_for_accounts, move_account_provider,
-                             rename_provider, share_login, unshare_login)
+                             hosts_for_accounts, login_hosts_for_logins, logins_for_accounts,
+                             move_account_provider, rename_provider, share_login, unshare_login)
 from ..database import Account, EpgSource, Login, Provider
 from ..db_utils import retry_on_locked
 from ..epg_sources import REFRESH_HOURS_CHOICES
@@ -61,6 +61,9 @@ def providers_section(accounts) -> dict | None:
     hosts_by_account = hosts_for_accounts(ids)
     holders = _holders_by_login(logins_by_account)
     counts = connlim.login_pool_counts(holders)
+    # A login's own active host, which its streams go out on (DESIGN-account-providers.md
+    # §14.9); one query for every login on the page.
+    own_hosts = login_hosts_for_logins(holders)
     from ..epg_sources import provider_lists_view
     from ..tz_utils import format_local, get_display_tz, is_24h
     tz, h24 = get_display_tz(), is_24h()
@@ -83,6 +86,8 @@ def providers_section(accounts) -> dict | None:
                 chips.append({
                     'id': lg.id, 'name': lg.name,
                     'shared': bool(with_ids),
+                    'active_host': next((h.host for h in own_hosts.get(lg.id, [])
+                                         if h.is_active and h.enabled), None),
                     'share_targets': [{'id': m.id, 'name': m.name} for m in members
                                       if m.id != a.id and m.id not in holders.get(lg.id, [])],
                 })

@@ -369,7 +369,8 @@ def create_app(config_overrides=None, start_scheduler=True):
         FREE=_links.NEXT_FREE, FULL=_links.NEXT_FULL, BLOCKED=_links.NEXT_BLOCKED,
         UNUSABLE=_links.NEXT_UNUSABLE)
     app.jinja_env.globals['UNUSABLE'] = SimpleNamespace(
-        HOSTS=_links.UNUSABLE_HOSTS, LOGINS=_links.UNUSABLE_LOGINS)
+        HOSTS=_links.UNUSABLE_HOSTS, LOGINS=_links.UNUSABLE_LOGINS,
+        LOGIN_HOSTS=_links.UNUSABLE_LOGIN_HOSTS)
     # The one way a template draws an icon (app/icons.py). Pure: a dict lookup and
     # url_for, so it is safe inside a `{% for %}`.
     from .icons import ICONS as _ICONS, SPRITE as _ICON_SPRITE, make_jinja_icon

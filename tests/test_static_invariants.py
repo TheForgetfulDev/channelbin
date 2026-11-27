@@ -1724,6 +1724,41 @@ class EpgKeyWriteBypassTests(unittest.TestCase):
             'not that column:\n' + '\n'.join(offenders))
 
 
+class LoginHostWriteBypassTests(unittest.TestCase):
+    """A login's own host list (`login_hosts`, DESIGN-account-providers.md §14.3,
+    dev/changelog/1778) is written by `app/account_links.py` and by nothing else: no sync, no
+    migration and no other module adds, removes or switches a row. Unlike `account_hosts`,
+    `is_active` is in the pattern too - the module hands the active role on with every switch
+    and removal, and a second writer is how a login ends up with two active hosts or none.
+    app/ only. Escape hatch: `# login-host-write-ok: <reason>`."""
+
+    _MARKER = 'login-host-write-ok'
+    _CANONICAL_FILE = 'app/account_links.py'
+    _PATTERN = re.compile(r'(?<!class )\bLoginHost\(|\bLoginHost\.query\b.*\.delete\(|'
+                          r'\.(?:host|position|enabled|is_active|switched_at)\s*=(?!=)')
+
+    def test_the_login_host_list_has_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            source = _read(path)
+            if 'LoginHost' not in source or _rel(path) in (self._CANONICAL_FILE,
+                                                             'app/database.py'):
+                continue
+            raw_lines = source.splitlines()
+            code_lines = _mask_comments_and_strings(source).splitlines()
+            for i, line in enumerate(code_lines):
+                if self._PATTERN.search(line) and not _marked_at(raw_lines, i, self._MARKER):
+                    offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(offenders, [], 'login_hosts written outside app/account_links.py:\n'
+                         + '\n'.join(offenders))
+
+    def test_the_scan_would_catch_a_second_writer(self):
+        for line in ('row = LoginHost(login_id=1, host=h)',
+                     'LoginHost.query.filter_by(login_id=lid).delete()',
+                     'row.is_active = True', 'row.enabled = False'):
+            self.assertRegex(line, self._PATTERN)
+
+
 class AccountHostWriteBypassTests(unittest.TestCase):
     """An account's host list is written by `app/account_links.py` and by nothing else.
 

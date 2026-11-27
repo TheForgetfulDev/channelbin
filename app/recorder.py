@@ -127,6 +127,11 @@ class RecordingState:
     # the capture is the only one that stops an ffmpeg or launches the next segment, so a
     # switch cannot race the watchdog's own failover or block check (dev/changelog/1254).
     move_request: Optional['MoveRequest'] = None
+    # The login whose own host list the running segment was launched on, or None for the
+    # account's hosts (account_links.render_held_login()). The watchdog's roll reads it, so a
+    # resolution failure rolls the list the failed launch used (DESIGN-account-providers.md
+    # §14.6).
+    host_login_id: Optional[int] = None
 
 
 @dataclass
@@ -2464,12 +2469,27 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
         # only. An account with no login list pays nothing here: the holder is in its own
         # pool and the URL passes through untouched.
         launch_url = rec.url
+        host_login_id = None
         if channel is not None:
             from . import connection_limits as connlim
             from .account_links import render_held_login
             connlim.reseat_before_relaunch(channel.account_id, 'recording', recording_id)
-            launch_url, _login_id = render_held_login(rec.url, channel.account_id,
-                                                      'recording', recording_id)
+            held = render_held_login(rec.url, channel.account_id, 'recording', recording_id)
+            launch_url, host_login_id = held.url, held.host_login_id
+        # Said on the segment's start event when the launch went out on a login's own host,
+        # so the recording's page answers "which host was this on" (§14.4).
+        launched_on = None
+        if host_login_id is not None:
+            from .account_links import host_of
+            if host_of(launch_url) != host_of(rec.url):
+                from .database import Login
+                lg = db.session.get(Login, host_login_id)
+                launched_on = (host_of(launch_url), lg.name if lg is not None else str(host_login_id))
+        # Whose host list this segment went out on, for the watchdog's roll (§14.6): kept
+        # beside the segment it launched, never re-derived from the seat afterward.
+        live = get_state(recording_id)
+        if live is not None:
+            live.host_login_id = host_login_id
         hls_variant = _hls_variant_for(get_state(recording_id), launch_url, cfg, recording_id)
         cmd = build_capture_cmd(cfg, launch_url, seg_path, segment_duration,
                                 pace_realtime=pace, keep_video_track=True,
@@ -2548,6 +2568,8 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
             elif hls_variant and not hls_variant.offered:
                 detail += (', recording the first quality its playlist lists, since the '
                            'playlist could not be read to choose one')
+            if launched_on is not None:
+                detail += f', on host {launched_on[0]}, login "{launched_on[1]}"\'s own'
             # The version that captured it, which a support bundle built after an upgrade
             # cannot tell from its own. Segment 1 only: every extra_data renders as a
             # disclosure in the event log, and one per reconnect is clutter

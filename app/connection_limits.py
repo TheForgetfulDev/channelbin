@@ -164,10 +164,11 @@ def _usable_limits(account, default_max_connections: int, taken: dict,
     which is what turns every acquire on it into the refusal its caller already handles
     (dev/changelog/1151) - and a login it shares answers 0 for the sibling too.
 
-    A login turned off on the account answers 0 already (its seats are 0 in `seats`), and an
-    account in `hosts_off` - every host it lists turned off - answers 0 on every pool: no
-    stream may go out on a host the user turned off (dev/changelog/1670). A holder already
-    seated keeps its seat either way; only a new one is refused."""
+    A login turned off on the account, or one whose hosts are all off, answers 0 already (its
+    seats are 0 in `seats`), and an account in `hosts_off` - every host it lists turned off,
+    holding no login - answers 0 on its one pool: no stream may go out on a host the user
+    turned off (dev/changelog/1670, 1778). A holder already seated keeps its seat either way;
+    only a new one is refused."""
     from .account_blocks import effective_limit
     if seats:
         pools = [(login_pool(lid), s, refused) for lid, s, refused in seats]
@@ -187,8 +188,20 @@ def _seats_now(account_ids, cfg=None) -> dict:
 
 
 def _hosts_off(account_ids) -> frozenset:
+    """The accounts among `account_ids` with every host off that hold NO login: their one
+    pool is the account's and it would go out on those hosts. An account holding logins is
+    left out on purpose: login_seats_for_accounts() already sizes each login's pool at 0 when
+    the hosts it would use are off, and a login with hosts of its own still streams when the
+    account's are all off (DESIGN-account-providers.md §14.5)."""
+    from . import db
     from .account_links import hosts_all_off
-    return frozenset(hosts_all_off(account_ids))
+    from .database import AccountLogin
+    off = hosts_all_off(account_ids)
+    if not off:
+        return frozenset()
+    holding = {aid for (aid,) in db.session.query(AccountLogin.account_id)
+               .filter(AccountLogin.account_id.in_(off)).distinct().all()}
+    return frozenset(off - holding)
 
 
 def _refused(refused_at, now, cooldown) -> bool:
@@ -373,10 +386,11 @@ def reseat_before_relaunch(account_id: int, holder_kind: str, holder_id) -> Opti
     being cut off by a switch. Returns the login id the holder is seated on afterward, or None
     when it holds no login seat. A third reason, on the same terms: the user blocked the
     login since (dev/changelog/1672) - the TV it was blocked for wants the seat, and a stream
-    already running keeps going when no other login has one."""
+    already running keeps going when no other login has one. A fourth, the same way: every
+    host the login would use is off (account_links.login_has_no_host_on(), §14.5)."""
     from . import db
     from .account_blocks import login_blocks_at
-    from .account_links import login_enabled, refusal_cooldown
+    from .account_links import login_enabled, login_has_no_host_on, refusal_cooldown
     from .config import load_config
     from .database import Account
     key = (holder_kind, holder_id)
@@ -391,6 +405,7 @@ def reseat_before_relaunch(account_id: int, holder_kind: str, holder_id) -> Opti
     seats = all_seats.get(account_id, [])
     hosts_off = _hosts_off([account_id])
     current_off = not login_enabled(account_id, seated[1][1])
+    current_no_host = login_has_no_host_on(account_id, seated[1][1])
     current_blocked = bool(login_blocks_at(login_ids=[seated[1][1]]))
     taken = _pool_taken_plan([account_id], all_seats, cfg, holder_kind)
     with _lock:
@@ -405,7 +420,7 @@ def reseat_before_relaunch(account_id: int, holder_kind: str, holder_id) -> Opti
         now = datetime.utcnow()
         mine = next(((pool, refused) for pool, _, refused in pools if pool == current), None)
         refused_now = mine is not None and _refused(mine[1], now, cooldown)
-        if not refused_now and not current_off and not current_blocked:
+        if not refused_now and not current_off and not current_blocked and not current_no_host:
             return current[1]
         for pool, limit, refused in pools:
             if pool == current or _refused(refused, now, cooldown):
@@ -417,7 +432,7 @@ def reseat_before_relaunch(account_id: int, holder_kind: str, holder_id) -> Opti
                 _holders[pool].append(key)
                 _seat_of[key] = (account_id, pool)
                 why = ('refused' if refused_now else 'turned-off' if current_off
-                       else 'blocked')
+                       else 'blocked' if current_blocked else 'no-host-on')
                 log.info('%s %s: moved from %s login %d to login %d on account %d',
                          holder_kind, holder_id, why,
                          current[1], pool[1], account_id)

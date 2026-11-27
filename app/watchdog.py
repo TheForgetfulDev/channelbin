@@ -1027,7 +1027,8 @@ class WatchdogThread(threading.Thread):
                             roll_host_for_channel(
                                 seg_channel_id,
                                 trigger=f'Recording {self.recording_id} (segment {seg_num})',
-                                recording_id=self.recording_id)
+                                recording_id=self.recording_id,
+                                host_login_id=getattr(self.state, 'host_login_id', None))
                         # The one failure that moves a recording between the account's
                         # listed logins: the server refused the credentials. Stamped on
                         # the login this recording's seat is on; the relaunch below

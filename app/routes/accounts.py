@@ -17,11 +17,15 @@ from ..accounts import (NORM_DISABLED, NORM_HLS, NORM_MODES, NORM_MPEGTS, NORM_M
                         update_source_stale_alert)
 from .. import account_stats_view
 from ..fmt_utils import iso_or_none, plural
-from ..account_links import (add_host, add_login, configured_seats, delete_hosts_for_account,
-                             delete_logins_for_account, host_list, hosts_for_accounts,
-                             is_refused_now, logins_for_accounts, move_login, next_stream,
+from ..account_links import (add_host, add_login, add_login_host, configured_seats,
+                             copy_account_hosts_to_login, delete_hosts_for_account,
+                             delete_logins_for_account, host_list, hosts_all_off,
+                             hosts_for_accounts, is_refused_now, login_host_names,
+                             login_hosts_for_logins,
+                             logins_for_accounts, move_login, next_stream, normalize_host,
                              playlist_rows_off, refusal_cooldown, remove_host, remove_login,
-                             render_host, set_active_host, set_host_enabled, set_login_enabled,
+                             remove_login_host, render_host, set_active_host, set_host_enabled,
+                             set_login_enabled, set_login_host_active, set_login_host_enabled,
                              unusable_reasons, update_login)
 from ..account_stats import WINDOWS, today_local, windowed_stats
 from ..channel_groups import clear_guide_listings_pins_on, report_orphaned_guide_groups
@@ -287,7 +291,13 @@ def host_views(account_id):
     (host_checks.describe(), which names every status), or None when no full check has run -
     then `lookup` says what the last lookup found, if anything did. `queue` is 'checking',
     'waiting' or None, from the one host-check line."""
-    rows = hosts_for_accounts([account_id]).get(account_id, [])
+    return _host_row_views(hosts_for_accounts([account_id]).get(account_id, []))
+
+
+def _host_row_views(rows):
+    """host_views() over any host rows: an account's (AccountHost) or a login's own
+    (LoginHost, which has no `from_playlist`). Checks are keyed by host name, so a name on
+    both kinds of list reads the same verdict (DESIGN-account-providers.md §14.7)."""
     latest = host_checks.latest_for_hosts(r.host for r in rows)
     line = host_checks.status()
     floor = datetime.utcnow() - host_checks.REPEAT_FLOOR
@@ -317,7 +327,7 @@ def host_views(account_id):
             'is_active': row.is_active,
             'activated_at': row.activated_at,
             'enabled': row.enabled,
-            'from_playlist': row.from_playlist,
+            'from_playlist': getattr(row, 'from_playlist', False),
             'switched_at': row.switched_at,
             'check': dict(host_checks.describe(verdict), at=verdict.checked_at,
                           from_lookup=verdict.kind == HOST_PROBE_LOOKUP) if verdict else None,
@@ -416,8 +426,20 @@ def login_views(account_id, cfg):
     own_pair = db.session.query(Account.username, Account.password).filter(
         Account.id == account_id).first()
     blocks = login_block_views([row.id for row in rows])
+    # Each login's own hosts (DESIGN-account-providers.md §14.9), one query for the rows and
+    # one batch of check verdicts for every name on every login.
+    own_rows = login_hosts_for_logins([row.id for row in rows])
+    own_views = _host_row_views([h for lid in own_rows for h in own_rows[lid]])
+    by_login, cursor = {}, 0
+    for lid in own_rows:
+        n = len(own_rows[lid])
+        by_login[lid] = own_views[cursor:cursor + n]
+        cursor += n
+    account_hosts_off = account_id in hosts_all_off([account_id])
     out = []
     for i, row in enumerate(rows):
+        own = by_login.get(row.id, [])
+        active_own = next((h for h in own if h['is_active'] and h['enabled']), None)
         out.append({
             'id': row.id,
             'name': row.name,
@@ -446,6 +468,13 @@ def login_views(account_id, cfg):
             'last_refused_detail': row.last_refused_detail,
             'first': i == 0,
             'last': i == len(rows) - 1,
+            'hosts': own,
+            'active_host': active_own['host'] if active_own else None,
+            # Why the login takes no new seat over its hosts, every state named: 'own' (its
+            # own hosts are all off), 'account' (it lists none and the account's are all
+            # off), or None (it has a host to go out on).
+            'no_host': ('own' if own and active_own is None
+                        else 'account' if not own and account_hosts_off else None),
         })
     return out
 
@@ -1531,6 +1560,9 @@ def check_account_hosts_api(account_id):
     if err:
         return err
     hosts = [r.host for r in hosts_for_accounts([account_id]).get(account_id, [])]
+    # And the hosts of the logins it holds, by name, once each (DESIGN-account-providers.md
+    # §14.7).
+    hosts += [h for h in login_host_names([account_id]) if h not in hosts]
     result = host_checks.request(current_app._get_current_object(), hosts)
     return jsonify({'success': True, 'queued': len(result['added']),
                     'message': host_checks.request_message(result, account.name)})
@@ -1542,6 +1574,7 @@ def check_all_hosts_api():
     from ..database import AccountHost
     hosts = [h for (h,) in db.session.query(AccountHost.host).order_by(
         AccountHost.account_id, AccountHost.position, AccountHost.id).all()]
+    hosts += [h for h in login_host_names() if h not in hosts]
     result = host_checks.request(current_app._get_current_object(), hosts)
     return jsonify({'success': True, 'queued': len(result['added']),
                     'message': host_checks.request_message(result, 'any account')})
@@ -1594,13 +1627,161 @@ def add_login_api(account_id):
     if err:
         return err
     data = request.get_json(silent=True) or {}
+    # The login's own hosts, given where the login is typed (dev/changelog/1778): every name
+    # is checked before the login exists, so a bad name adds no login.
+    raw_hosts = data.get('hosts') or []
+    if isinstance(raw_hosts, str):
+        raw_hosts = raw_hosts.splitlines()
     try:
+        hosts = list(dict.fromkeys(normalize_host(str(h)) for h in raw_hosts if str(h).strip()))
         row = add_login(account_id, *_login_fields(data))
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
-    return jsonify({'success': True, 'login_id': row.id,
-                    'message': (f'Login "{row.name}" added to {account.name} with '
-                                f'{row.max_connections} {plural(row.max_connections, "seat")}.')})
+    for host in hosts:
+        add_login_host(row.id, host)
+    message = (f'Login "{row.name}" added to {account.name} with {row.max_connections} '
+               f'{plural(row.max_connections, "seat")}.')
+    if hosts:
+        message += (f' Its streams go out on {hosts[0]}' + (f', with {len(hosts) - 1} more '
+                    f'{plural(len(hosts) - 1, "host")} to fall back on' if len(hosts) > 1 else '')
+                    + '.')
+    return jsonify({'success': True, 'login_id': row.id, 'message': message})
+
+
+def _login_on_account(account_id, login_id):
+    """(account, error response) for a login `account_id` holds; a login another account
+    holds is not reachable through this account's URL."""
+    account, err = _json_account(account_id)
+    if err:
+        return None, err
+    if db.session.get(AccountLogin, (account_id, login_id)) is None:
+        return None, (jsonify({'error': 'Login not found.'}), 404)
+    return account, None
+
+
+def _also_used_by(account_id, login_id):
+    names = [n for (n,) in db.session.query(Account.name)
+             .join(AccountLogin, AccountLogin.account_id == Account.id)
+             .filter(AccountLogin.login_id == login_id, Account.id != account_id)
+             .order_by(Account.name).all()]
+    if not names:
+        return ''
+    return (f' The change reaches {", ".join(names)} too, which '
+            f'{"uses" if len(names) == 1 else "use"} this login.')
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/hosts', methods=['POST'])
+def add_login_host_api(account_id, login_id):
+    """Add a host to a login's own list (DESIGN-account-providers.md §14). Body: `host`."""
+    account, err = _login_on_account(account_id, login_id)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    try:
+        row = add_login_host(login_id, str(data.get('host') or ''))
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    message = f'{row.host} added.' + (' Streams on this login go out on it.' if row.is_active else '')
+    return jsonify({'success': True, 'host_id': row.id,
+                    'message': message + _also_used_by(account_id, login_id)})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/hosts/copy', methods=['POST'])
+def copy_login_hosts_api(account_id, login_id):
+    """Copy from this account's hosts: the account's hosts that are on, onto the login."""
+    account, err = _login_on_account(account_id, login_id)
+    if err:
+        return err
+    try:
+        added = copy_account_hosts_to_login(account_id, login_id)
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    if not added:
+        return jsonify({'success': True, 'added': [],
+                        'message': f'Nothing to copy: every host on {account.name} that is on is '
+                                   f'already on this login.'})
+    return jsonify({'success': True, 'added': added,
+                    'message': (f'Copied {len(added)} {plural(len(added), "host")} from '
+                                f'{account.name}. Its own list stays as it is.'
+                                + _also_used_by(account_id, login_id))})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/hosts/<int:host_id>',
+                   methods=['DELETE'])
+def remove_login_host_api(account_id, login_id, host_id):
+    account, err = _login_on_account(account_id, login_id)
+    if err:
+        return err
+    try:
+        name = remove_login_host(login_id, host_id)
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    left = login_hosts_for_logins([login_id])[login_id]
+    message = f'{name} removed.' + ('' if left else ' This login now uses the hosts of the '
+                                                     'account it streams for.')
+    return jsonify({'success': True, 'message': message + _also_used_by(account_id, login_id)})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/hosts/<int:host_id>/activate',
+                   methods=['POST'])
+def activate_login_host_api(account_id, login_id, host_id):
+    account, err = _login_on_account(account_id, login_id)
+    if err:
+        return err
+    try:
+        host = set_login_host_active(login_id, host_id)
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 409
+    return jsonify({'success': True,
+                    'message': (f'Streams on this login now go out on {host}, from their next '
+                                f'segment.' + _also_used_by(account_id, login_id))})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/hosts/<int:host_id>/enabled',
+                   methods=['POST'])
+def login_host_enabled_api(account_id, login_id, host_id):
+    """The Use switch on one of a login's own hosts - per login, so on every account holding
+    it. Body: `enabled`, true or false."""
+    account, err = _login_on_account(account_id, login_id)
+    if err:
+        return err
+    enabled = _switch_value(request.get_json(silent=True) or {})
+    if enabled is None:
+        return jsonify({'error': 'Send "enabled" as true or false.'}), 400
+    try:
+        out = set_login_host_enabled(login_id, host_id, enabled)
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    if enabled:
+        message = f'{out["host"]} turned on.'
+    else:
+        message = (f'{out["host"]} turned off. Streams already running keep going; new ones '
+                   f'won\'t use it.')
+        message += (f' Streams on this login now go out on {out["active"]}.' if out['active']
+                    else ' No other host on this login is on, so it takes no new stream.')
+    return jsonify({'success': True, 'message': message + _also_used_by(account_id, login_id),
+                    **out})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/hosts/<int:host_id>/check',
+                   methods=['POST'])
+def check_login_host_api(account_id, login_id, host_id):
+    """Check now on one of a login's hosts: the same full check, in the same one line, as a
+    host on the Hosts card. No login is ever sent."""
+    from ..database import LoginHost
+    account, err = _login_on_account(account_id, login_id)
+    if err:
+        return err
+    row = db.session.get(LoginHost, host_id)
+    if row is None or row.login_id != login_id:
+        return jsonify({'error': 'Host not found.'}), 404
+    result = host_checks.request(current_app._get_current_object(), [row.host])
+    return jsonify({'success': True, 'queued': len(result['added']),
+                    'message': host_checks.request_message(result, account.name)})
 
 
 @accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>', methods=['POST'])

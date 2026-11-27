@@ -59,6 +59,12 @@ SCHEDULER_PASS_FAILED = 'SCHEDULER_PASS_FAILED'
 #: account next syncs on the new host or the user edits the list (dev/changelog/1168).
 ACCOUNT_HOST_ROLLED = 'ACCOUNT_HOST_ROLLED'
 
+#: A capture failed because the active host on a LOGIN's own list stopped resolving, and the
+#: login rolled onto its next host - or could not (DESIGN-account-providers.md §14.6,
+#: dev/changelog/1778). Not ACCOUNT_HOST_ROLLED: no account's stored URLs moved. Keyed on the
+#: login; cleared when the login's host list is edited or another host is made active.
+LOGIN_HOST_ROLLED = 'LOGIN_HOST_ROLLED'
+
 #: The account's active stream host did not answer at its last full check (app/host_checks.py,
 #: dev/changelog/1674). Named because host_checks raises and clears it by type, per account.
 ACCOUNT_HOST_NOT_ANSWERING = 'ACCOUNT_HOST_NOT_ANSWERING'
@@ -316,6 +322,12 @@ ALERT_TYPES = {
     # the user editing the host list, dismisses it.
     ACCOUNT_HOST_ROLLED: {
         'label': 'Account Stream Host Rolled', 'severity': 'WARN', 'self_clearing': True},
+    # The same for a login's own host list (dev/changelog/1778): streams seated on the login
+    # go out on the new host from their next segment, on every account holding it. Cleared
+    # when the user edits the login's list or makes another of its hosts active; a sync
+    # proves nothing about a login's host, so it does not clear it.
+    LOGIN_HOST_ROLLED: {
+        'label': 'Login Stream Host Rolled', 'severity': 'WARN', 'self_clearing': True},
     # The active host did not answer at its last full check (dev/changelog/1674). WARN, not
     # ERROR: streams still use it, and a host is swapped only when it stops resolving, so this
     # is the user's cue to Make active another one. Self-clearing: the next full check that

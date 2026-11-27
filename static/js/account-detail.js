@@ -332,7 +332,19 @@
         meta: 'How many streams this login may have open at once. Pre-filled from what the ' +
           'provider reports for the account, or the account\'s own limit.',
         control: '<input type="number" id="login-seats" min="1" step="1">',
-      });
+      }) +
+      // A login's own hosts (DESIGN-account-providers.md §14, dev/changelog/1778): given where
+      // the login is typed, so the two are connected in one place. Edited afterward with
+      // Hosts... on the login's row, where each one has its switch.
+      (edit
+        ? '<p class="card-note">This login\'s own hosts are on its row: Hosts... in its menu.</p>'
+        : fieldRow({
+          label: 'Hosts', stack: true,
+          meta: 'Optional. The host names of the reseller who sold this login, one per line, ' +
+            'like <code>tv1.reseller.example:8080</code>. Its streams go out on the first one ' +
+            'and fall back to the next. Leave empty to use this account\'s hosts.',
+          control: '<textarea id="login-hosts" rows="3" autocomplete="off" spellcheck="false"></textarea>',
+        }));
     const $f = (id) => body.querySelector(`#${id}`);
     if (edit) {
       $f('login-name').value = existing.name || '';
@@ -357,6 +369,7 @@
               password: $f('login-pass').value,
               max_connections: $f('login-seats').value,
             };
+            if (!edit) payload.hosts = $f('login-hosts').value.split('\n').map((h) => h.trim()).filter(Boolean);
             if (!payload.name) { showToast('Give the login a name.', { type: 'error' }); return false; }
             if (!payload.username) { showToast('Enter the username.', { type: 'error' }); return false; }
             if (!edit && !payload.password) { showToast('Enter the password.', { type: 'error' }); return false; }
@@ -386,6 +399,65 @@
         openLoginDialog(login, null, el.dataset.sharedWith || '');
       })
       .catch((e) => showToast(e.message || 'Request failed.', { type: 'error' }));
+  }
+
+  // ── A login's own hosts (DESIGN-account-providers.md §14.9) ────────────
+  // The dialog's body is server-rendered: each login row carries a <template> with its list,
+  // inside the Logins card's live region, so the page's refresh brings a fresh copy and the
+  // open dialog is refilled from it. No second renderer of the list in this file.
+  let hostsDialog = null;   // { loginId, body }
+  const loginHostUrl = (loginId, hostId) =>
+    `${loginUrl(loginId)}/hosts${hostId ? `/${hostId}` : ''}`;
+
+  function fillHostsDialog() {
+    if (!hostsDialog) return;
+    const tpl = document.querySelector(`template[data-login-hosts="${hostsDialog.loginId}"]`);
+    if (!tpl) { hostsDialog.close(); return; }
+    const typed = hostsDialog.body.querySelector('.lhost-input');
+    const keep = typed ? typed.value : '';
+    hostsDialog.body.innerHTML = tpl.innerHTML;
+    const again = hostsDialog.body.querySelector('.lhost-input');
+    if (again) again.value = keep;
+  }
+
+  function hostsDialogAction(promise) {
+    return promise.then(() => refresh()).then(fillHostsDialog).catch(() => {});
+  }
+
+  function openLoginHosts(el) {
+    const body = document.createElement('div');
+    const modal = buildModal({
+      title: `Hosts for login ${el.dataset.login || ''}`,
+      body,
+      panelClass: 'modal-wide',
+      footer: [{ label: 'Close', class: 'btn' }],
+      onClose: () => { hostsDialog = null; },
+    });
+    hostsDialog = { loginId: el.dataset.loginId, body, close: () => modal.closeModal() };
+    fillHostsDialog();
+  }
+
+  function addLoginHost() {
+    const input = hostsDialog && hostsDialog.body.querySelector('.lhost-input');
+    const host = input ? input.value.trim() : '';
+    if (!host) { showToast('Enter a host name.', { type: 'error' }); return; }
+    hostsDialogAction(post(loginHostUrl(hostsDialog.loginId), { method: 'POST', body: JSON.stringify({ host }) })
+      .then((res) => { input.value = ''; return res; }));
+  }
+
+  function confirmRemoveLoginHost(el) {
+    const last = el.dataset.last === '1';
+    confirmModal({
+      title: 'Remove host',
+      message: `Remove ${el.dataset.host} from this login's hosts?`,
+      consequence: (el.dataset.sharedWith ? `It goes from ${el.dataset.sharedWith} too, which uses this login. ` : '') +
+        (last ? 'It is the last one, so this login goes back to the hosts of the account it streams for.' : ''),
+      confirmLabel: 'Remove',
+      danger: true,
+    }).then((ok) => {
+      if (!ok) return;
+      hostsDialogAction(post(loginHostUrl(hostsDialog.loginId, el.dataset.hostId), { method: 'DELETE' }));
+    });
   }
 
   function moveLogin(el) {
@@ -463,16 +535,18 @@
   document.addEventListener('change', (e) => {
     const input = e.target.closest('input[data-switch]');
     if (!input) return;
-    const url = input.dataset.switch === 'host'
-      ? `${hostUrl(input.dataset.hostId)}/enabled`
-      : `${loginUrl(input.dataset.loginId)}/enabled`;
+    const kind = input.dataset.switch;
+    const url = kind === 'host' ? `${hostUrl(input.dataset.hostId)}/enabled`
+      : kind === 'lhost' ? `${loginHostUrl(input.dataset.loginId, input.dataset.hostId)}/enabled`
+        : `${loginUrl(input.dataset.loginId)}/enabled`;
     const wanted = input.checked;
     input.disabled = true;
     // Reverted only when the POST itself fails: a refresh that fails after a saved flip must
     // not put the switch back over what the server now holds.
     post(url, { method: 'POST', body: JSON.stringify({ enabled: wanted }) })
       .then(() => { input.disabled = false; return refresh(); },
-        () => { input.checked = !wanted; input.disabled = false; });
+        () => { input.checked = !wanted; input.disabled = false; })
+      .then(fillHostsDialog);
   });
 
   // ── EPG sources (DESIGN-epg-sources.md §9.2) ────────────────────────────
@@ -848,6 +922,12 @@
       .then(() => refresh()),
     'hosts-check-stop': () => post('/api/accounts/hosts/check/stop', { method: 'POST' })
       .then(() => refresh()),
+    'login-hosts': openLoginHosts,
+    'lhost-add': addLoginHost,
+    'lhost-copy': () => hostsDialogAction(post(`${loginHostUrl(hostsDialog.loginId)}/copy`, { method: 'POST' })),
+    'lhost-check': (el) => hostsDialogAction(post(`${loginHostUrl(hostsDialog.loginId, el.dataset.hostId)}/check`, { method: 'POST' })),
+    'lhost-activate': (el) => hostsDialogAction(post(`${loginHostUrl(hostsDialog.loginId, el.dataset.hostId)}/activate`, { method: 'POST' })),
+    'lhost-remove': confirmRemoveLoginHost,
     'login-add': openAddLogin,
     'login-edit': openEditLogin,
     'login-move': moveLogin,
