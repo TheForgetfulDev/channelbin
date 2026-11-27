@@ -705,6 +705,9 @@ plain 404 there, so a mistake in the proxy cannot expose the web UI. On the publ
 
 - Every play goes through ChannelBin, even in Redirect or Mixed mode, so your IPTV provider's
   username and password never reach a player outside your home.
+- A play that cannot start tells the player only what kind of problem it is, like "Nothing can
+  play this channel right now", never the reason written for you. The same goes for a login for
+  another user on either port. The whole reason is in Recent plays and the log.
 - An address that gets the login wrong 10 times in 15 minutes is refused for the rest of those
   15 minutes, even with the right password. This counts on the main port too. The Logins card
   lists any address locked out now, with a button to let them try again. An IPv6 address is
@@ -854,8 +857,9 @@ If you are sending a pull request, see [CONTRIBUTING.md](CONTRIBUTING.md) for th
 convention and the versioning and tagging policy.
 
 For a diagnostic dump that is safe to share, use **Settings > Backup & Restore > Support Bundle** -
-it redacts credentials and URLs on the way out, so you can attach it to an issue without leaking
-your provider details.
+it redacts credentials and URLs on the way out, and takes the IPTV output's login names and every
+internet address out of every line, so you can attach it to an issue without leaking your provider
+details or anyone's home address.
 
 ## Architecture, briefly
 

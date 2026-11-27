@@ -551,10 +551,13 @@ class LineupPlayTests(_LineupCase):
         self.set_lineup([self.fid_beta])
         resp = self.client.get(f'/live/{FRIEND}/{FRIEND_PASS}/{self.fid_alpha}.ts')
         self.assertEqual(resp.status_code, 404)
-        self.assertIn(f'IPTV output login "{FRIEND}"', resp.get_json()['error'])
+        # The player is told the kind; the owner's Recent plays keeps the name
+        # (dev/changelog/1770).
+        self.assertEqual(resp.get_json()['error'], feed.SHORT_REFUSALS[404])
         feed.flush_play_log()
         line = OutputFeedPlay.query.filter_by(kind=FEED_PLAY_REFUSED).one()
         self.assertEqual((line.feed_id, line.feed_login), (self.fid_alpha, FRIEND))
+        self.assertIn(f'IPTV output login "{FRIEND}"', line.message)
 
     def test_a_channel_in_the_lineup_gets_past_it(self):
         self.set_lineup([self.fid_beta])
@@ -730,7 +733,10 @@ class AccountsPlayTests(_AccountsCase):
         self.set_accounts([self.other.id])
         resp = self.client.get(f'/live/{FRIEND}/{FRIEND_PASS}/{self.fid_alpha}.ts')
         self.assertEqual(resp.status_code, 409)
-        self.assertIn("this IPTV output login's own accounts", resp.get_json()['error'])
+        self.assertEqual(resp.get_json()['error'], feed.SHORT_REFUSALS[409])
+        feed.flush_play_log()
+        line = OutputFeedPlay.query.filter_by(kind=FEED_PLAY_REFUSED).one()
+        self.assertIn("this IPTV output login's own accounts", line.message)
 
     def test_a_group_is_walked_over_its_accounts_alone(self):
         """Every re-ask of a play (a failover, a move, a seat walk) goes through _resolve_again,
@@ -796,11 +802,11 @@ class AccountsPlayTests(_AccountsCase):
         for _ in range(2):
             resp = self.client.get(f'/live/{FRIEND}/{FRIEND_PASS}/{self.fid_alpha}.ts')
             self.assertEqual(resp.status_code, 409)
-        self.assertIn(f'IPTV output login "{FRIEND}"', resp.get_json()['error'])
         self.assertEqual(Alert.query.count(), 0)
         feed.flush_play_log()
         line = OutputFeedPlay.query.filter_by(kind=FEED_PLAY_REFUSED).one()
         self.assertEqual((line.feed_id, line.feed_login, line.count), (self.fid_alpha, FRIEND, 2))
+        self.assertIn(f'IPTV output login "{FRIEND}"', line.message)
 
     def test_a_picture_in_picture_channel_is_refused_by_name(self):
         from app import pip_channels
@@ -816,7 +822,9 @@ class AccountsPlayTests(_AccountsCase):
         self.set_accounts([self.account.id])
         resp = self.client.get(f'/live/{FRIEND}/{FRIEND_PASS}/{fid}.ts')
         self.assertEqual(resp.status_code, 409)
-        self.assertIn('shared by everyone watching', resp.get_json()['error'])
+        feed.flush_play_log()
+        line = OutputFeedPlay.query.filter_by(kind=FEED_PLAY_REFUSED).one()
+        self.assertIn('shared by everyone watching', line.message)
 
     def test_a_waiting_screen_carries_its_logins_accounts(self):
         """Built before start_session() puts the login on the play, so the first recheck of a

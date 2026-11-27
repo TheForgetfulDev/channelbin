@@ -27,7 +27,9 @@ names are additionally swept out of every other string in the bundle, because ~2
 types title themselves f'{account.name}: ...'. A user who does not consider that
 identity sensitive can opt in to real names (include_names=True); meta.json always
 states which mode produced the bundle and what the residual limits are. The OS username
-in a home-directory path is swept in both modes (dev/changelog/1397).
+in a home-directory path is swept in both modes (dev/changelog/1397), and so are the IPTV
+output's login usernames and every internet (non-private) address (dev/changelog/1770): a
+friend's login and home address never help a diagnosis, and a bundle may be posted publicly.
 
 How much a table ships is decided by what its size tracks (dev/changelog/841). A table
 that grows with the user's own activity ships whole - every row of it is something that
@@ -46,6 +48,7 @@ had left when it died. Both are best-effort by construction - a stat on a dead n
 mount and a /proc read on a non-Linux host must degrade to a stated gap, never to a
 failed export.
 """
+import ipaddress
 import json
 import logging
 import os
@@ -250,6 +253,49 @@ _HOME_DIR_RE = re.compile(r'(/home|/Users)/(?!' + re.escape(HOME_USER_PSEUDONYM)
                           + r')([^/\s\'"<>()\[\]:,;]+)')
 
 
+# Candidates only: each is parsed by ipaddress before anything is masked, so a timestamp
+# (21:56:54) or a version (Chrome/120.0.0.0, kept by the '/' guard) passes untouched.
+_IPV4_RE = re.compile(r'(?<![\w./-])(?:\d{1,3}\.){3}\d{1,3}(?![\w-]|\.\d)')
+_IPV6_RE = re.compile(r'(?<![\w:.])(?=[0-9A-Fa-f:.]*:[0-9A-Fa-f]*:)[0-9A-Fa-f:.]{2,}(?![\w:])')
+
+
+# Where a log line names an IPTV output login: after ' on login ' (every Viewer line,
+# output_feed._on_login) and in the IPTV Output page's own lines about a login. Matched in
+# context so a name too short or too plain to sweep everywhere is still swept here, and read
+# from the log tail itself so a login deleted before the play log kept its name is found too.
+_LOGIN_IN_LINE_RES = (
+    re.compile(r'(\bon login )(\S+?)([:,.)]?)(?=[\s"\']|$)'),
+    re.compile(r'(IPTV output: login )(\S+?)( (?:added for another user|deleted|now gets |'
+               r'now plays from |has an? ))'),
+)
+
+
+def _login_pseudonyms(cfg, log_text=''):
+    """(username, pseudonym) for every IPTV output login a bundle may name: the main login,
+    each login for another user by its id, and a former login's name that output_feed_plays
+    or a line of `log_text` still carries, since its old lines are still in the log."""
+    from .database import OutputFeedLogin, OutputFeedPlay
+    from .output_feed import feed_config, feed_username
+    pairs = []
+    main = feed_username(feed_config(cfg))
+    if main:
+        pairs.append((main, '<main login>'))
+    known = {main}
+    for row in OutputFeedLogin.query.order_by(OutputFeedLogin.id).all():
+        pairs.append((row.username, f'<login {row.id}>'))
+        known.add(row.username)
+    former = {name for (name,) in db.session.query(OutputFeedPlay.feed_login)
+              .filter(OutputFeedPlay.feed_login.isnot(None)).distinct()}
+    for pattern in _LOGIN_IN_LINE_RES:
+        # A bare number after 'on login' is an id in another module's line, never a name read
+        # back from a line ChannelBin wrote about a login.
+        former |= {m.group(2) for m in pattern.finditer(log_text or '')
+                   if not m.group(2).isdecimal()}
+    pairs.extend((name, f'<former login {n}>')
+                 for n, name in enumerate(sorted(former - known), start=1))
+    return pairs
+
+
 class _Sanitizer:
     """The one text transform every string in the bundle passes through: URL redaction,
     plus - unless the user opted into real names - substitution of every account name
@@ -274,12 +320,40 @@ class _Sanitizer:
     # counted and disclosed in meta.json instead of swept. Its column is still
     # pseudonymized - only the free-text sweep skips it.
     MIN_SWEEPABLE_LEN = 4
+    MIN_LOGIN_SWEEPABLE_LEN = 3
 
-    def __init__(self, accounts, include_names=False):
+    def __init__(self, accounts, include_names=False, logins=()):
+        """`logins` is (username, pseudonym) pairs from _login_pseudonyms(): swept in both
+        modes, since the names opt-in is for the provider's identity and a login's username is
+        a person's."""
         self.include_names = include_names
         self.swept = 0
         self.skipped_short = 0
         self.home_dirs_swept = 0
+        self.logins_swept = 0
+        self.logins_context_only = 0
+        self._addresses = {}
+        self._login_names = {}
+        login_pairs = []
+        for username, pseudo in logins:
+            username = (username or '').strip()
+            if not username:
+                continue
+            self._login_names[username] = pseudo
+            # Swept everywhere only as a whole word, so 'dave' does not carve 'davenport'; that
+            # makes three characters enough, where an account name's substring sweep needs four.
+            # A name of only digits would match every equal number, a JSON value's included.
+            if len(username) < self.MIN_LOGIN_SWEEPABLE_LEN or username.isdecimal():
+                self.logins_context_only += 1
+                continue
+            login_pairs.append((username, pseudo))
+        # A username may start or end with punctuation, where a word boundary never matches.
+        self._login_pairs = [
+            (re.compile(('(?<!\\w)' if name[0].isalnum() or name[0] == '_' else '')
+                        + re.escape(name)
+                        + ('(?!\\w)' if name[-1].isalnum() or name[-1] == '_' else ''),
+                        re.IGNORECASE), pseudo)
+            for name, pseudo in sorted(login_pairs, key=lambda p: -len(p[0]))]
         self._pseudonyms = {}
         pairs = []
         for acct in accounts:
@@ -296,22 +370,70 @@ class _Sanitizer:
         self._pairs = [(re.compile(re.escape(name), re.IGNORECASE), pseudo)
                        for name, pseudo in sorted(pairs, key=lambda p: -len(p[0]))]
 
+    def _login_in_line(self, match):
+        pseudo = self._login_names.get(match.group(2))
+        if pseudo is None:
+            return match.group(0)
+        self.logins_swept += 1
+        return match.group(1) + pseudo + match.group(3)
+
+    def _address(self, match):
+        """An internet address becomes '<address N>', the same N for the same address
+        throughout the bundle, so a reader can still follow one player. A home-network,
+        loopback or other non-public address is kept: it helps a diagnosis and identifies
+        nobody. A trailing dot or colon is a sentence's, not the address's."""
+        text = match.group(0)
+        bare = text.rstrip('.')
+        try:
+            ip = ipaddress.ip_address(bare)
+        except ValueError:
+            # 'from 2607:f8b0::200e: Alpha playing' - the colon after it is the sentence's.
+            if not bare.endswith(':'):
+                return text
+            bare = bare[:-1]
+            try:
+                ip = ipaddress.ip_address(bare)
+            except ValueError:
+                return text
+        mapped = getattr(ip, 'ipv4_mapped', None)
+        if mapped is not None:
+            ip = mapped
+        if not ip.is_global:
+            return text
+        key = str(ip)
+        if key not in self._addresses:
+            self._addresses[key] = f'<address {len(self._addresses) + 1}>'
+        return self._addresses[key] + text[len(bare):]
+
+    @property
+    def addresses_masked(self):
+        """How many different internet addresses were masked."""
+        return len(self._addresses)
+
     def account_name(self, acct):
         return acct.name if self.include_names else self._pseudonyms.get(
             acct.id, f'account {acct.id}')
 
     def text(self, value):
-        """Redact URLs, sweep home-directory usernames, then sweep account names. Safe to
-        run twice: every step is idempotent, so the belt-and-braces pass over serialized
-        output is a no-op.
+        """Redact URLs, sweep home-directory usernames, mask internet addresses, sweep the
+        IPTV output's login usernames, then sweep account names. Safe to run twice: every
+        step is idempotent, so the belt-and-braces pass over serialized output is a no-op.
 
-        The home-directory sweep runs in both modes. The names opt-in is for the provider's
-        identity, which can matter to a diagnosis; the OS username never does."""
+        Every sweep but the account names' runs in both modes. The names opt-in is for the
+        provider's identity, which can matter to a diagnosis; the OS username, a friend's
+        login and a player's home address never do."""
         out = redact_urls_in_text(value)
         if not out:
             return out
         out, count = _HOME_DIR_RE.subn(r'\1/' + HOME_USER_PSEUDONYM, out)
         self.home_dirs_swept += count
+        out = _IPV4_RE.sub(self._address, out)
+        out = _IPV6_RE.sub(self._address, out)
+        for pattern in _LOGIN_IN_LINE_RES:
+            out = pattern.sub(self._login_in_line, out)
+        for pattern, pseudo in self._login_pairs:
+            out, count = pattern.subn(lambda m, p=pseudo: p, out)
+            self.logins_swept += count
         if self.include_names:
             return out
         for pattern, pseudo in self._pairs:
@@ -704,6 +826,23 @@ def _redaction_disclosure(sanitizer):
         'home_directory_note': (
             f'The user name in every /home/<name> or /Users/<name> path is replaced with '
             f'{HOME_USER_PSEUDONYM}, in both modes. The rest of each path is kept.'),
+        'iptv_output_login_usernames_swept': sanitizer.logins_swept,
+        'iptv_output_login_usernames_swept_only_where_a_line_names_a_login':
+            sanitizer.logins_context_only,
+        'iptv_output_login_note': (
+            'Every IPTV output login username (integrations.output_feed.username, '
+            'output_feed_logins.username, and a former login\'s name that '
+            'output_feed_plays.feed_login or a log line still carries) is replaced as a whole '
+            'word wherever it appears, in both modes: <main login>, <login N> by the login\'s '
+            f'id, <former login N>. A username shorter than {sanitizer.MIN_LOGIN_SWEEPABLE_LEN} '
+            'characters or made only of digits would match ordinary words and numbers, so it is '
+            'replaced only where a line names it as a login ("on login <name>"), and counted '
+            'above. A username someone typed wrongly is not a login, and is not swept.'),
+        'internet_addresses_masked': sanitizer.addresses_masked,
+        'internet_address_note': (
+            'Every public internet address (an IPTV player\'s, a provider server\'s) is replaced '
+            'with <address N>, the same N for the same address throughout the bundle, in both '
+            'modes. Home-network, loopback and other non-public addresses are kept.'),
     }
     if sanitizer.include_names:
         return {
@@ -895,12 +1034,31 @@ def build_support_bundle(include_names: bool = False) -> bytes:
     # this pass exists to remove, while still looking complete. Failing closed is the
     # right direction when the two trade off.
     try:
-        sanitizer = _Sanitizer(Account.query.all(), include_names=include_names)
+        account_rows = Account.query.all()
     except Exception as exc:
         log.error('Support bundle: cannot read accounts, refusing to build: %s', exc)
         raise RuntimeError(
             'Support bundle export failed: the account list could not be read, so '
             f'account names could not be removed from the bundle ({exc})') from exc
+    # Read before the sanitizer, since a former login's name is read back from its lines.
+    # Losing it costs only dvr.log, as it always has.
+    log_tail = log_tail_error = None
+    try:
+        log_tail = _build_log_tail()
+    except Exception as exc:
+        log.error('Support bundle: dvr.log failed: %s', exc)
+        log_tail_error = exc
+    # Fatal for the same reason as the accounts: a friend's login in a posted bundle is the
+    # leak this sweep exists to stop (dev/changelog/1770).
+    try:
+        logins = _login_pseudonyms(load_config(), log_tail or '')
+    except Exception as exc:
+        log.error('Support bundle: cannot read the IPTV output logins, refusing to build: %s',
+                  exc)
+        raise RuntimeError(
+            'Support bundle export failed: the IPTV output logins could not be read, so '
+            f'their usernames could not be removed from the bundle ({exc})') from exc
+    sanitizer = _Sanitizer(account_rows, include_names=include_names, logins=logins)
 
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
 
@@ -938,11 +1096,14 @@ def build_support_bundle(include_names: bool = False) -> bytes:
             log.error('Support bundle: config.yaml failed: %s', exc)
             errors['config.yaml'] = str(exc)
 
-        try:
-            _write_text('dvr.log', _build_log_tail())
-        except Exception as exc:
-            log.error('Support bundle: dvr.log failed: %s', exc)
-            errors['dvr.log'] = str(exc)
+        if log_tail_error is not None:
+            errors['dvr.log'] = str(log_tail_error)
+        else:
+            try:
+                _write_text('dvr.log', log_tail)
+            except Exception as exc:
+                log.error('Support bundle: dvr.log failed: %s', exc)
+                errors['dvr.log'] = str(exc)
 
         try:
             accounts = [_account_to_dict(a, sanitizer) for a in Account.query.all()]

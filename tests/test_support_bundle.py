@@ -998,6 +998,106 @@ class HomeDirectorySweepTests(_BundleTestCase):
         self.assertEqual(s.home_dirs_swept, 1)
 
 
+class OutputLoginAndAddressSweepTests(_BundleTestCase):
+    """dev/docs/BUGS.md 2026-11-26 @ 10:45:57 PM - every Viewer line in dvr.log reads
+    'from <address> on login <username>', and the bundle's log tail kept both: a bundle posted
+    on a public issue named the owner's friends' logins and their home addresses. The
+    sanitizer knew only account names (dev/changelog/1770)."""
+
+    MAIN, FRIEND, FORMER, BRIEF = 'quillmain', 'zanzibarfriend', 'oldpal99', 'brieflypal'
+    KIM, JO, NUMERIC = 'kim', 'jo', '4417'
+    PLAYER, OTHER = '73.21.140.9', '2607:f8b0:4005:80b::200e'
+
+    def _bundle(self, include_names=False):
+        from app.database import FEED_PLAY_REFUSED, OutputFeedLogin, OutputFeedPlay
+        self.set_config({'integrations': {'output_feed': {'username': self.MAIN,
+                                                          'buffer_mb': 4417}}})
+        for name in (self.FRIEND, self.KIM, self.JO, self.NUMERIC):
+            db.session.add(OutputFeedLogin(name=name, username=name, password='couch42x',
+                                           max_streams=1))
+        now = datetime(2026, 11, 26, 21, 0)
+        db.session.add(OutputFeedPlay(kind=FEED_PLAY_REFUSED, at=now, first_at=now, feed_id=7,
+                                      feed_login=self.FORMER, message='refused'))
+        db.session.commit()
+        line = '2026-11-26 21:00:0{} INFO [app.output_feed] '
+        with open(self.log_path, 'w') as fh:
+            fh.write('\n'.join([
+                line.format(1) + f'Viewer from {self.PLAYER} on login {self.FRIEND} started '
+                'channel 7',
+                # The usual Viewer line: a colon straight after the address and the login.
+                line.format(2) + f'Viewer 12 from {self.OTHER} on login {self.FORMER}: Alpha '
+                'playing channel 8',
+                line.format(3) + f"IPTV output: {self.PLAYER} is locked out for 15 minutes "
+                f"after 10 wrong logins (user '{self.MAIN}', on the public port)",
+                line.format(4) + 'Viewer from 192.168.1.40 started channel 9 '
+                '(agent Chrome/120.0.0.0)',
+                # Named only here: added and deleted before it ever played.
+                line.format(5) + f'IPTV output: login {self.BRIEF} added for another user',
+                line.format(6) + f'Viewer from 192.168.1.41 on login {self.JO}: Beta playing',
+                line.format(7) + f'Viewer from 192.168.1.42 on login {self.NUMERIC}: Beta '
+                'playing channel 4417',
+                line.format(8) + f'Viewer from {self.OTHER}: Gamma ended, kim and jo watched',
+            ]) + '\n')
+        return sb.build_support_bundle(include_names=include_names)
+
+    def _clear(self):
+        from app.database import OutputFeedLogin, OutputFeedPlay
+        OutputFeedLogin.query.delete()
+        OutputFeedPlay.query.delete()
+        db.session.commit()
+
+    def test_unreadable_logins_abort_the_export_rather_than_leaking(self):
+        with patch.object(sb, '_login_pseudonyms', side_effect=RuntimeError('logins boom')):
+            with self.assertRaises(RuntimeError) as ctx:
+                sb.build_support_bundle()
+        self.assertIn('usernames could not be removed', str(ctx.exception))
+
+    def test_login_usernames_and_internet_addresses_never_ship(self):
+        for include_names in (False, True):
+            with self.subTest(include_names=include_names):
+                content = _all_decompressed_content(self._bundle(include_names))
+                self._clear()
+                for leaked in (self.MAIN, self.FRIEND, self.FORMER, self.BRIEF, self.PLAYER,
+                               self.OTHER, f'on login {self.JO}', f'on login {self.NUMERIC}'):
+                    self.assertNotIn(leaked.encode(), content, leaked)
+
+    def test_the_log_still_reads_and_follows_one_player(self):
+        tail = _unzip(self._bundle()).read('dvr.log').decode()
+        self.assertIn('Viewer from <address 1> on login <login ', tail)
+        self.assertIn('Viewer 12 from <address 2> on login <former login 2>: Alpha playing', tail)
+        self.assertIn('IPTV output: login <former login 1> added for another user', tail)
+        self.assertIn("IPTV output: <address 1> is locked out", tail)
+        self.assertIn("(user '<main login>',", tail)
+        self.assertIn('Viewer from <address 2>: Gamma ended', tail)
+        # A home address, a timestamp and a version number are not addresses to hide.
+        self.assertIn('Viewer from 192.168.1.40 started channel 9 (agent Chrome/120.0.0.0)', tail)
+        self.assertIn('2026-11-26 21:00:01 INFO', tail)
+
+    def test_a_short_or_numeric_username_is_swept_only_where_a_line_names_it(self):
+        tail = _unzip(self._bundle()).read('dvr.log').decode()
+        self.assertRegex(tail, r'on login <login \d+>: Beta playing\n')
+        self.assertRegex(tail, r'on login <login \d+>: Beta playing channel 4417\n')
+        # Three characters is a whole word to sweep; two is not, and a number stays a number.
+        self.assertRegex(tail, r'<login \d+> and jo watched')
+
+    def test_a_numeric_username_leaves_the_json_whole(self):
+        config = json.loads(_unzip(self._bundle()).read('config.yaml'))
+        self.assertEqual(config['integrations']['output_feed']['buffer_mb'], 4417)
+
+    def test_meta_says_what_was_swept_and_what_was_skipped(self):
+        redactions = json.loads(_unzip(self._bundle()).read('meta.json'))['redactions']
+        self.assertGreaterEqual(redactions['iptv_output_login_usernames_swept'], 6)
+        self.assertEqual(
+            redactions['iptv_output_login_usernames_swept_only_where_a_line_names_a_login'], 2)
+        self.assertIn('output_feed_logins.username', redactions['iptv_output_login_note'])
+        self.assertEqual(redactions['internet_addresses_masked'], 2)
+        self.assertIn('<address N>', redactions['internet_address_note'])
+
+    def test_the_main_login_in_config_is_swept_too(self):
+        config = json.loads(_unzip(self._bundle()).read('config.yaml'))
+        self.assertEqual(config['integrations']['output_feed']['username'], '<main login>')
+
+
 class PartialFailureTests(_BundleTestCase):
     """DESIGN-secrets.md §7's explicit observability requirement: a failed table is
     recorded inside the bundle and logged, never a silent gap; total failure raises
