@@ -1124,6 +1124,9 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   position: absolute; top: calc(100% + 5px); right: 0; min-width: 170px; padding: 5px;
   background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
   box-shadow: var(--shadow-pop); display: none; z-index: 160; text-align: left;
+  /* A kebab sits in a table's last cell, which is often `.tbl .num` (monospace, tabular
+     figures); the menu inherits from it unless it says otherwise (dev/docs/BUGS.md 2026-11-27). */
+  font-family: var(--font); font-variant-numeric: normal;
 }
 .menu.open { display: block; }
 .menu a, .menu button.menu-item {
