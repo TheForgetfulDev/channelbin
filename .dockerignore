@@ -70,6 +70,7 @@ playwright.config.ts
 
 # --- Git, lint and editor ---
 .git/
+.gitattributes
 .gitignore
 .gitignore.public
 .publishignore
