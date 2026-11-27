@@ -199,13 +199,12 @@ def create_app(config_overrides=None, start_scheduler=True):
         flash(message, 'error')
         return redirect(request.referrer or url_for('dashboard.dashboard'))
 
-    if cfg['flask'].get('behind_proxy'):
-        from werkzeug.middleware.proxy_fix import ProxyFix
-        from .config import PROXY_FIX_ARGS
-        app.wsgi_app = ProxyFix(app.wsgi_app, **PROXY_FIX_ARGS)
-        # What this process is doing, as against what config.yaml says now: the key is read
-        # here once, so a page asking "are the proxy's headers trusted" asks this.
-        app.config['BEHIND_PROXY'] = True
+    # Always wrapped: whether a request's forwarded headers are believed is decided per
+    # request, by its port and its peer. The policy is what this process is doing, as against
+    # what config.yaml says now: read here once, so a page asking "is a proxy believed" asks it.
+    from . import proxy_trust
+    app.config[proxy_trust.CONFIG_KEY] = proxy_trust.policy_from(cfg)
+    app.wsgi_app = proxy_trust.ProxyTrust(app.wsgi_app, app)
 
     db.init_app(app)
 

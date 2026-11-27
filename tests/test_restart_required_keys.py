@@ -168,7 +168,7 @@ class SettingsSystemCardTests(ConfigSandbox):
 
     def test_the_system_card_shows_behind_proxy(self):
         self.assertIn('data-path="flask.behind_proxy"', self.html)
-        self.assertIn('Behind a reverse proxy', self.html)
+        self.assertIn('The web UI is behind a reverse proxy', self.html)
 
     def test_it_renders_the_live_value(self):
         row = self.html.split('data-path="flask.behind_proxy"', 1)[1].split('</label>', 1)[0]

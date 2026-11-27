@@ -19,10 +19,12 @@ calls get.php, and builds `/live/<user>/<pass>/<id>.ts` against the address it w
 import logging
 import os
 
-from flask import Blueprint, Response, current_app, g, jsonify, redirect, request, send_from_directory
+from flask import Blueprint, Response, g, jsonify, redirect, request, send_from_directory
 
-from .. import output_feed, public_listener
+from .. import output_feed, proxy_trust, public_listener
+from ..auth import lockout_key
 from ..config import load_config
+from ..fmt_utils import counted
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +45,29 @@ _EMPTY_ACTIONS = frozenset({'get_vod_categories', 'get_vod_streams', 'get_series
 _MAX_ID = 2 ** 63 - 1
 
 
+def _wrong_login(address: str, username):
+    """Count a wrong login against `address`, and log the lockout or the alarm it trips."""
+    port = (proxy_trust.PORT_PUBLIC if public_listener.is_public(request)
+            else proxy_trust.PORT_WEB)
+    if output_feed.login_failures.record_failure(address):
+        whose = ('the player\'s own address' if proxy_trust.is_trusted(request) else
+                 'the address that connected to ChannelBin, which is a reverse proxy\'s if one '
+                 'is in front and has not been declared in Settings')
+        log.warning('IPTV output: %s is locked out for %d minutes after %d wrong logins (user %r, '
+                    'on %s). That is %s.', lockout_key(address),
+                    output_feed.LOGIN_LOCKOUT_WINDOW.seconds // 60,
+                    output_feed.LOGIN_MAX_FAILURES, str(username or '')[:output_feed.LOGIN_MAX],
+                    proxy_trust.PORT_NAMES[port], whose)
+    alarm = output_feed.login_failures.take_alarm_notice()
+    if alarm is not None:
+        log.warning('IPTV output: %d wrong logins in the last minute from %s. Someone is guessing '
+                    'logins. Nobody is refused for this alone: each address is still locked out '
+                    'after %d wrong logins, and a right login still works. The IPTV Output page '
+                    'shows it while it lasts.', alarm['count'],
+                    counted(alarm['addresses'], 'address', 'addresses'),
+                    output_feed.LOGIN_MAX_FAILURES)
+
+
 @output_feed_bp.before_request
 def _require_credentials():
     cfg = load_config()
@@ -60,12 +85,8 @@ def _require_credentials():
         return refused
     login = output_feed.feed_login_for(fcfg, username, password)
     if login is None:
-        if output_feed.is_enabled(fcfg) and output_feed.login_failures.record_failure(address):
-            log.warning('IPTV output: %s is locked out for %d minutes after %d wrong logins '
-                        '(user %r). Behind a reverse proxy this is the visitor\'s own address only '
-                        'when "Behind a reverse proxy" is on.', address,
-                        output_feed.LOGIN_LOCKOUT_WINDOW.seconds // 60,
-                        output_feed.LOGIN_MAX_FAILURES, str(username or '')[:output_feed.LOGIN_MAX])
+        if output_feed.is_enabled(fcfg):
+            _wrong_login(address, username)
         return refused
     # A right login never clears the address's count, as the web login's does: there one
     # password opens the door, here many logins share it, and knowing your own says nothing
@@ -80,8 +101,8 @@ def _require_credentials():
 
 def _base_url() -> str:
     """The origin the request arrived on, which is the origin every served URL names.
-    `flask.behind_proxy` wires ProxyFix, so this is the externally reachable one when the
-    user has set it (section 3.5)."""
+    With the request's reverse proxy believed (app/proxy_trust.py) this is the externally
+    reachable one (section 3.5)."""
     return request.host_url.rstrip('/')
 
 
@@ -163,9 +184,10 @@ def live(username, password, feed_id):
     a sports channel's waiting screen in every mode when it has nothing to play. Every refusal
     names its reason in the body."""
     client = request.remote_addr or ''
-    # The address names one player only when ProxyFix put the player's own there: with the
-    # setting off, a reverse proxy in front gives every player its address (dev/changelog/1744).
-    player = client if current_app.config.get('BEHIND_PROXY') else ''
+    # The address names one player only when this request's reverse proxy was believed and
+    # put the player's own there: otherwise a proxy in front gives every player its address
+    # (dev/changelog/1744, 1769).
+    player = client if proxy_trust.is_trusted(request) else ''
     public = public_listener.is_public(request)
     try:
         if output_feed.relays_for(g.feed_cfg, feed_id, g.feed_login, public=public):

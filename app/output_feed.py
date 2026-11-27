@@ -515,7 +515,13 @@ def play_accounts(fcfg: dict, accounts: Optional[frozenset]) -> Optional[frozens
 #: quarter hour is still far too slow to guess a generated password (dev/changelog/1761).
 LOGIN_MAX_FAILURES = 10
 LOGIN_LOCKOUT_WINDOW = timedelta(minutes=15)
-login_failures = FailureTracker(LOGIN_MAX_FAILURES, LOGIN_LOCKOUT_WINDOW)
+#: Wrong logins a minute, from every address together, at which the output says someone is
+#: guessing. An alarm only: nobody is refused by it (FailureTracker). One player holding an old
+#: password stops at LOGIN_MAX_FAILURES, so this many takes several addresses at once
+#: (dev/changelog/1769).
+LOGIN_ALARM_PER_MINUTE = 30
+login_failures = FailureTracker(LOGIN_MAX_FAILURES, LOGIN_LOCKOUT_WINDOW,
+                                alarm_max=LOGIN_ALARM_PER_MINUTE)
 
 
 def feed_login_for(fcfg: dict, username, password) -> Optional[FeedLogin]:
@@ -1962,8 +1968,8 @@ class RelaySession:
     # resolves with resolve_play(preview=True), relays in every mode because it cannot tune in
     # again, and raises no alert when refused - the preview names the refusal itself.
     preview: bool = False
-    # The IPTV player's address when it names one player - flask.behind_proxy is on, so the
-    # address is the player's and not a reverse proxy's - else ''. Only ever compared with
+    # The IPTV player's address when it names one player - the request's reverse proxy was
+    # believed (app/proxy_trust.py), so the address is the player's and not a proxy's - else ''. Only ever compared with
     # another play's, to tell the play a player is changing channel from (_take_over).
     player: str = ''
     # The feed id of the play this one ended when it took over from its player's last one

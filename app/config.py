@@ -57,9 +57,9 @@ DEFAULT_XTREAM_DUMP_DIR = 'instance/xtream-dumps'
 # own sandboxed path (tests/support/app.py overrides flask.pidfile_path per TestApp).
 DEFAULT_PIDFILE_PATH = 'instance/channelbin.pid'
 
-# How flask.behind_proxy wraps the app (app/__init__.py): one proxy in front, whose
-# X-Forwarded-For / -Proto / -Host are believed and nothing further back. The Settings page's
-# proxy check runs ProxyFix with the same arguments to say what turning it on would do.
+# How a believed reverse proxy's headers are applied (app/proxy_trust.py): one proxy in front,
+# whose X-Forwarded-For / -Proto / -Host are believed and nothing further back. The Settings
+# page's proxy check runs ProxyFix with the same arguments to say what turning it on would do.
 PROXY_FIX_ARGS = {'x_for': 1, 'x_proto': 1, 'x_host': 1}
 
 # Fields that require a service restart to take effect (running code only reads these at
@@ -78,14 +78,16 @@ RESTART_REQUIRED_KEYS = {
     # create_app(), so an unflagged write reports success and silently does nothing. The
     # GUI shows them read-only, but for flask.behind_proxy, a switch on the System card
     # (routes/settings.py GUI_FLASK_KEYS); serve_mockups is raw-YAML-only; the config.yaml
-    # tab writes them all. behind_proxy wires ProxyFix and serve_mockups registers a
-    # blueprint; neither is re-read per request (dev/changelog/586). flask.public_url is not
-    # here: it is read per use (config.public_url()).
+    # tab writes them all. behind_proxy and trusted_proxies become the proxy policy
+    # (app/proxy_trust.py) and serve_mockups registers a blueprint; none is re-read per
+    # request (dev/changelog/586). flask.public_url is not here: it is read per use
+    # (config.public_url()).
     'flask.port',
     'flask.host',
     'flask.debug',
     'flask.secret_key',
     'flask.behind_proxy',
+    'flask.trusted_proxies',
     'flask.serve_mockups',
     # Resolved into app.config['PIDFILE_PATH'] once at create_app() time; init_scheduler()
     # reads it from app.config, never a fresh load_config().
@@ -120,6 +122,8 @@ RESTART_REQUIRED_KEYS = {
     # dev/changelog/1761). Every other output_feed key is read per request.
     'integrations.output_feed.public_port',
     'integrations.output_feed.public_host',
+    # Part of the proxy policy, read once at create_app() (app/proxy_trust.py).
+    'integrations.output_feed.public_behind_proxy',
     # display.nav_poll_interval_seconds is deliberately NOT here, despite looking like a
     # sibling of the create_app()-time keys above: it's read inside inject_globals(), a
     # @app.context_processor that calls load_config() fresh on every request, so it
@@ -503,10 +507,15 @@ _DEFAULTS = {
         'host': '0.0.0.0',
         'debug': False,
         'secret_key': 'change-me-in-production',
-        # True = trust X-Forwarded-For/-Proto/-Host from a reverse proxy (ProxyFix).
-        # Must stay False when no proxy fronts the app - otherwise any client can
-        # spoof its own scheme/host/IP via those headers.
+        # True = the web UI's port believes X-Forwarded-For/-Proto/-Host from a reverse proxy
+        # (app/proxy_trust.py). Must stay False when no proxy fronts that port - otherwise
+        # any client can spoof its own scheme/host/IP via those headers. The IPTV output's
+        # public port has its own switch, integrations.output_feed.public_behind_proxy.
         'behind_proxy': False,
+        # The addresses or CIDR ranges a reverse proxy connects from. Holding any, forwarded
+        # headers are believed only from a peer on it, on either port; empty believes any
+        # peer on a port whose switch is on (dev/changelog/1769).
+        'trusted_proxies': [],
         # True = serve the gitignored dev/mockups/ folder at /mockups/ (a dev-only
         # convenience for reviewing static UI mockups in the browser). Stays False on
         # any shared/proxied deploy; the route is not registered at all when False.
@@ -576,6 +585,10 @@ _DEFAULTS = {
             # relayed whatever `mode` says. Restart required.
             'public_port': 0,
             'public_host': '0.0.0.0',
+            # True = the public port believes its reverse proxy's forwarded headers, apart
+            # from flask.behind_proxy, which is the web UI's port only (app/proxy_trust.py,
+            # dev/changelog/1769). Restart required.
+            'public_behind_proxy': False,
             # The address people outside the home network type as the server: the reverse
             # proxy's, whole, like https://tv.example.com. Only handed out (the Logins card's
             # details to send, the readiness check), never where anything listens.
@@ -1714,6 +1727,24 @@ def _cfg_m009_public_url(cfg: dict) -> dict:
     return cfg
 
 
+def _cfg_m010_public_behind_proxy(cfg: dict) -> dict:
+    """flask.behind_proxy used to cover both ports. It is the web UI's port only now, so a
+    config that had it on with a public port set gets the public port's own switch turned on:
+    the proxy in front of that port goes on being believed (dev/changelog/1769). A value
+    already written under the new key wins."""
+    flask_cfg = cfg.get('flask')
+    feed = (cfg.get('integrations') or {}).get('output_feed') if isinstance(
+        cfg.get('integrations'), dict) else None
+    if not isinstance(flask_cfg, dict) or not isinstance(feed, dict):
+        return cfg
+    if flask_cfg.get('behind_proxy') and feed.get('public_port') and 'public_behind_proxy' not in feed:
+        feed['public_behind_proxy'] = True
+        log.info('config migration: flask.behind_proxy was on with a public port set, so '
+                 'integrations.output_feed.public_behind_proxy is now on too. flask.behind_proxy '
+                 'covers the web UI\'s port only from here on')
+    return cfg
+
+
 def public_url_problem(value) -> str:
     """Why `value` cannot be `flask.public_url`, or ''. Blank is allowed and means unset.
     The address starts every link in a push notification and is typed into an IPTV player
@@ -1756,6 +1787,8 @@ CONFIG_MIGRATIONS = [
      _cfg_m008_drop_index_janitor_grace),
     (9, 'notifications.base_url -> flask.public_url, ChannelBin\'s own address',
      _cfg_m009_public_url),
+    (10, 'the IPTV output\'s public port gets its own "behind a reverse proxy" switch',
+     _cfg_m010_public_behind_proxy),
 ]
 
 CURRENT_CONFIG_VERSION = CONFIG_MIGRATIONS[-1][0]

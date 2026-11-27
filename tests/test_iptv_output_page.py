@@ -140,7 +140,7 @@ class BehindProxyTests(_PageCase):
     def test_a_proxy_the_app_was_not_told_about_is_named_with_the_fix(self):
         connect = _region(self.proxied_page(), 'of-connect')
         self.assertIn('behind a reverse proxy and has not been told so', connect)
-        self.assertIn('turn on "Behind a reverse proxy" in Settings', connect)
+        self.assertIn('turn on "The web UI is behind a reverse proxy" in Settings', connect)
         self.assertIn('q=flask.behind_proxy', connect)
         # Named, never believed: the address is still the one the app itself can vouch for.
         self.assertIn('http://localhost', connect)
@@ -150,7 +150,8 @@ class BehindProxyTests(_PageCase):
         self.assertNotIn('reverse proxy', _region(self.page(), 'of-connect'))
 
     def test_a_proxy_the_app_trusts_is_not_a_problem(self):
-        self.t.app.config['BEHIND_PROXY'] = True
+        from app import proxy_trust
+        self.t.app.config[proxy_trust.CONFIG_KEY] = proxy_trust.Policy(web=True)
         self.assertNotIn('reverse proxy', _region(self.proxied_page(), 'of-connect'))
 
     def test_turned_on_in_the_file_and_not_restarted_says_restart(self):
@@ -160,12 +161,15 @@ class BehindProxyTests(_PageCase):
         self.assertNotIn('has not been told so', connect)
 
     def test_the_app_factory_records_that_it_trusts_the_proxy(self):
-        self.assertFalse(self.t.app.config.get('BEHIND_PROXY'))
-        self.assertEqual(view.proxy_state({}, self.PROXIED, True), '')
-        self.assertEqual(view.proxy_state({}, self.PROXIED, False), view.PROXY_UNSEEN)
-        self.assertEqual(view.proxy_state({'flask': {'behind_proxy': True}}, self.PROXIED, False),
-                         view.PROXY_RESTART)
-        self.assertEqual(view.proxy_state({}, {}, False), '')
+        from app import proxy_trust
+        self.assertFalse(proxy_trust.wired(self.t.app).web)
+        self.assertEqual(view.proxy_state({}, self.PROXIED, True, True), '')
+        self.assertEqual(view.proxy_state({}, self.PROXIED, False, False), view.PROXY_UNSEEN)
+        self.assertEqual(view.proxy_state({'flask': {'behind_proxy': True}}, self.PROXIED, False,
+                                          False), view.PROXY_RESTART)
+        # On, and this request's proxy was not believed: it is not on the list.
+        self.assertEqual(view.proxy_state({}, self.PROXIED, True, False), view.PROXY_UNLISTED)
+        self.assertEqual(view.proxy_state({}, {}, False, False), '')
 
 
 class AddressSettingTests(_PageCase):

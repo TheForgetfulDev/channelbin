@@ -11,11 +11,15 @@ written - is gated by construction, not by a decorator someone has to remember t
 """
 import hashlib
 import hmac
+import ipaddress
 import logging
 import threading
+from collections import deque
 from datetime import datetime, timedelta
 
 from flask import current_app, g, jsonify, redirect, request, session, url_for
+
+from .proxy_trust import parse_address
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +45,7 @@ GATE_INERT_SOURCE = 'auth-gate'
 MAX_FAILURES = 5
 LOCKOUT_WINDOW = timedelta(minutes=15)
 # Hard ceiling on distinct IPs tracked at once. The tracker is keyed on an address the
-# client can influence whenever flask.behind_proxy is on and the proxy forwards an
+# client can influence whenever a reverse proxy is believed (app/proxy_trust.py) and it forwards an
 # attacker-supplied X-Forwarded-For unchanged (nginx's proxy_add_x_forwarded_for appends
 # and is safe; passing $http_x_forwarded_for through is not), so without a ceiling one
 # client could grow this dict without limit - on a box with no swap, that is the whole
@@ -172,23 +176,53 @@ def clear_session():
     g.pop(field_name, None)
 
 
+def lockout_key(address: str) -> str:
+    """What a wrong login from `address` is counted against: an IPv4 address itself, an
+    IPv4-mapped IPv6 address as that IPv4, and any other IPv6 address as its /64, since one
+    home connection is handed a whole /64 and a caller could otherwise take a new address for
+    every few guesses (dev/changelog/1769). Text that is no address is its own key."""
+    ip = parse_address(address)
+    if ip is None:
+        return str(address)
+    if ip.version == 6:
+        return str(ipaddress.ip_network((int(ip) >> 64 << 64, 64)))
+    return str(ip)
+
+
 class FailureTracker:
     """Wrong-password counts per address, and the lockout they trip: `max_failures` inside
     `window` locks an address out until the oldest of them is `window` old.
 
-    In memory, reset on process restart, and only as meaningful as request.remote_addr - which
-    is the single real client only when flask.behind_proxy is on (ProxyFix); otherwise every
-    proxied request looks like one address. A brute-force speed bump, not a durable audit log,
-    so neither limitation is a defect here. One instance per door, so a lockout at one never
-    locks anyone out of another: the web login's is `web_login` below, the IPTV output's is
-    output_feed.login_failures (dev/changelog/1761)."""
+    Every address is counted under lockout_key(), applied here at record and at check, so a
+    caller never spells the key itself. In memory, reset on process restart, and only as
+    meaningful as request.remote_addr - which is the single real client only when the
+    request's reverse proxy was believed (app/proxy_trust.py); otherwise every proxied request
+    looks like one address. A brute-force speed bump, not a durable audit log, so neither
+    limitation is a defect here. One instance per door, so a lockout at one never locks anyone
+    out of another: the web login's is `web_login` below, the IPTV output's is
+    output_feed.login_failures (dev/changelog/1761).
 
-    def __init__(self, max_failures: int, window: timedelta, max_tracked: int = MAX_TRACKED_IPS):
+    `alarm_max` wrong logins from everywhere inside `alarm_window` is an alarm and nothing
+    else: it refuses nobody and changes no count. A limit across addresses that never refuses
+    a right password cannot slow guessing, and one that does would let anyone lock every user
+    out, so what it buys is the owner being told (dev/changelog/1769)."""
+
+    def __init__(self, max_failures: int, window: timedelta, max_tracked: int = MAX_TRACKED_IPS,
+                 alarm_max: int = 0, alarm_window: timedelta = timedelta(minutes=1)):
         self.max_failures = max_failures
         self.window = window
         self.max_tracked = max_tracked
-        # {address: [failure datetimes]}
+        self.alarm_max = alarm_max
+        self.alarm_window = alarm_window
+        # {lockout key: [failure datetimes]}
         self.failures = {}
+        # (time, key) of the latest wrong logins from everywhere, for the alarm. Bounded, so
+        # past its length the count reads "at least".
+        self._recent = deque(maxlen=max(1, alarm_max) * 20)
+        self._alarm_first = None    # when the alarm running now first tripped
+        self._alarm_last = None     # the last wrong login counted while it was tripped
+        self._alarm_peak = 0
+        self._alarm_logged = None   # when take_alarm_notice() last handed one out
         self._lock = threading.Lock()
 
     def _prune_locked(self, now):
@@ -207,37 +241,79 @@ class FailureTracker:
 
     def check_lockout(self, ip: str):
         """Return the UTC unlock time if `ip` is currently locked out, else None."""
+        key = lockout_key(ip)
         now = datetime.utcnow()
         with self._lock:
-            times = [t for t in self.failures.get(ip, []) if now - t < self.window]
+            times = [t for t in self.failures.get(key, []) if now - t < self.window]
             if times:
-                self.failures[ip] = times
+                self.failures[key] = times
             else:
                 # Never write an empty list back: every GET /login called through here, so
                 # storing one entry per address that merely loaded the page grew this dict
                 # without bound for the life of the process (dev/changelog/487).
-                self.failures.pop(ip, None)
+                self.failures.pop(key, None)
             self._prune_locked(now)
             if len(times) >= self.max_failures:
                 return times[0] + self.window
         return None
 
+    def _recent_locked(self, now) -> list:
+        while self._recent and now - self._recent[0][0] >= self.alarm_window:
+            self._recent.popleft()
+        return list(self._recent)
+
     def record_failure(self, ip: str) -> bool:
         """Record a failed attempt. Returns True if this attempt just tripped the lockout."""
+        key = lockout_key(ip)
         now = datetime.utcnow()
         with self._lock:
-            times = [t for t in self.failures.get(ip, []) if now - t < self.window]
+            times = [t for t in self.failures.get(key, []) if now - t < self.window]
             times.append(now)
-            self.failures[ip] = times
+            self.failures[key] = times
             self._prune_locked(now)
+            if self.alarm_max:
+                self._recent.append((now, key))
+                count = len(self._recent_locked(now))
+                if count >= self.alarm_max:
+                    if self._alarm_first is None or now - self._alarm_last >= self.alarm_window:
+                        # A new alarm, and so a new line in the log.
+                        self._alarm_first, self._alarm_peak, self._alarm_logged = now, 0, None
+                    self._alarm_last = now
+                    self._alarm_peak = max(self._alarm_peak, count)
             return len(times) == self.max_failures
 
     def record_success(self, ip: str):
         with self._lock:
-            self.failures.pop(ip, None)
+            self.failures.pop(lockout_key(ip), None)
+
+    def alarm(self) -> dict:
+        """The wrong-login alarm: {'active', 'count' and 'addresses' inside the alarm window
+        now, 'first' and 'last' (UTC) of the latest time it tripped or None, 'peak'}."""
+        now = datetime.utcnow()
+        with self._lock:
+            recent = self._recent_locked(now)
+            return {
+                'active': bool(self.alarm_max) and len(recent) >= self.alarm_max,
+                'count': len(recent), 'addresses': len({key for _t, key in recent}),
+                'first': self._alarm_first, 'last': self._alarm_last, 'peak': self._alarm_peak,
+            }
+
+    def take_alarm_notice(self, every: timedelta = timedelta(minutes=10)):
+        """alarm() when it is tripped and has not been handed out inside `every`, else None:
+        the caller's cue to log it once, not once per wrong login."""
+        state = self.alarm()
+        if not state['active']:
+            return None
+        with self._lock:
+            now = datetime.utcnow()
+            if self._alarm_logged is not None and now - self._alarm_logged < every:
+                return None
+            self._alarm_logged = now
+        return state
 
     def locked_out(self) -> list:
-        """[(address, unlock time)] for every address locked out now, soonest unlock first."""
+        """[(address, unlock time)] for every address locked out now, soonest unlock first.
+        An IPv6 address is its /64 (lockout_key)."""
         now = datetime.utcnow()
         out = []
         with self._lock:
@@ -255,9 +331,12 @@ class FailureTracker:
         return n
 
     def reset(self):
-        """Forget every count. tests/support/app.py, and clear()."""
+        """Forget every count and the alarm. tests/support/app.py, and clear()."""
         with self._lock:
             self.failures.clear()
+            self._recent.clear()
+            self._alarm_first = self._alarm_last = self._alarm_logged = None
+            self._alarm_peak = 0
 
 
 web_login = FailureTracker(MAX_FAILURES, LOCKOUT_WINDOW)

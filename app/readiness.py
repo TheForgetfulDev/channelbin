@@ -241,6 +241,10 @@ class Context:
         from .output_feed import readiness_facts
         self.feed = readiness_facts(self.cfg)
         self.auth_cfg = current_app.config.get('AUTH') or {}
+        # The policy this process runs and what each port has heard: memory only.
+        from . import proxy_trust
+        self.proxy_policy = proxy_trust.wired(current_app)
+        self.proxy_seen = {port: proxy_trust.seen(port) for port in proxy_trust.PORTS}
         self.docker = bool(os.environ.get('CHANNELBIN_DOCKER'))
 
         self.scheduler_jobs = None
@@ -623,7 +627,7 @@ def _check_output_feed(ctx):
         return Result(PROBLEM, tested,
                       'The IPTV output is on but has no username or password, so every request '
                       'is refused', detail=detail)
-    public = _output_public_port(feed, tested, detail)
+    public = _output_public_port(feed, tested, detail, ctx.proxy_policy)
     if public is not None and public.status == PROBLEM:
         return public
     if not feed['reserve_fits']:
@@ -659,10 +663,9 @@ def _check_output_feed(ctx):
     return Result(READY, tested, summary, detail=detail)
 
 
-def _output_public_port(feed, tested, detail):
+def _output_public_port(feed, tested, detail, proxy_policy):
     """The IPTV output's public port (app/public_listener.py, dev/changelog/1761): None when
     there is nothing to say, else the Result to report."""
-    from flask import current_app
     from .public_listener import STATE_FAILED, STATE_OFF, STATE_SERVING
     want = feed['public_port']
     listener = feed['listener']
@@ -686,19 +689,104 @@ def _output_public_port(feed, tested, detail):
         return None
     if state != STATE_SERVING:
         raise ValueError(f'Unknown public port state "{state}"')
-    if not current_app.config.get('BEHIND_PROXY'):
+    if not proxy_policy.public:
         return Result(PROBLEM, tested,
-                      f'The public port {want} is open but "Behind a reverse proxy" is off (or '
-                      f'waits for a restart), so ChannelBin sees the proxy in place of every IPTV '
-                      f'player: a few wrong passwords from anyone lock everyone out, and every '
-                      f'play is listed under the proxy\'s address. Turn it on in Settings and '
-                      f'restart', detail=detail)
+                      f'The public port {want} is open but "The public port is behind a reverse '
+                      f'proxy" is off (or waits for a restart), so ChannelBin sees the proxy in '
+                      f'place of every IPTV player: a few wrong passwords from anyone lock '
+                      f'everyone out, and every play is listed under the proxy\'s address. Turn '
+                      f'it on in Settings, IPTV output, and restart. The switch for the web UI\'s '
+                      f'port does not cover this one', detail=detail)
     if not feed['public_url']:
         return Result(ATTENTION, tested,
                       f'The public port {want} is open, but the address people outside your '
                       f'network use is not set, so the details the IPTV Output page copies for '
                       f'them name this one. Set it under Settings, IPTV output', detail=detail)
     return None
+
+
+def _peer_name(ctx, peer: str) -> str:
+    """`peer` as a readiness line names it. An address off the home network is not spelled in
+    the support bundle's evaluation: there it may be a stranger's or a friend's."""
+    from .proxy_trust import parse_address
+    ip = parse_address(peer)
+    if ctx.pseudonymize and (ip is None or not (ip.is_private or ip.is_loopback)):
+        return 'an address outside your network'
+    return peer
+
+
+def _sentence(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
+_PROXY_GUESSING = ('can send a different made-up address with every wrong password, so the '
+                   'wrong-login lockout never stops them and they can go on guessing passwords '
+                   'for as long as they like')
+
+
+def _check_proxy_trust(ctx):
+    """Whose word each port takes for a visitor's address (app/proxy_trust.py,
+    dev/changelog/1769): a proxy's headers ignored because it is not on the list, a port that
+    believes any caller and has been reached without the proxy, and a list left empty."""
+    from .proxy_trust import PORT_NAMES, PORT_PUBLIC, PORT_WEB, PORTS
+    from .public_listener import STATE_SERVING
+    tested = ('Read which ports believe a reverse proxy, and looked at who has connected to '
+              'them since ChannelBin started')
+    policy = ctx.proxy_policy
+    open_ports = {PORT_WEB: True,
+                  PORT_PUBLIC: ctx.feed['listener']['state'] == STATE_SERVING}
+    ports = [port for port in PORTS if policy.switched(port) and open_ports[port]]
+    if not ports:
+        return Result(NOTHING, tested, 'No port is set to believe a reverse proxy')
+    for port in ports:
+        seen = ctx.proxy_seen[port]
+        if seen['ignored_recent']:
+            peer = _peer_name(ctx, seen['ignored_recent'])
+            return Result(ATTENTION, tested,
+                          f'{_sentence(PORT_NAMES[port])} got requests from {peer} carrying a '
+                          f'reverse proxy\'s headers, but {peer} is not in "Reverse proxy '
+                          f'addresses", so the headers were ignored. If that is your proxy, '
+                          f'everyone who comes through it looks like one visitor: one person\'s '
+                          f'wrong passwords lock all of them out, and every IPTV player is listed '
+                          f'under the proxy\'s address. Add it to the list in Settings and '
+                          f'restart. If it is not your proxy, nothing is wrong: it was not '
+                          f'believed, and this goes away an hour after its last request')
+    names = ' and '.join(PORT_NAMES[port] for port in ports)
+    if policy.networks:
+        n = len(policy.networks)
+        return Result(READY, tested,
+                      f'A reverse proxy is believed on {names}, and only from what is in '
+                      f'"Reverse proxy addresses" ({n} {plural(n, "entry", "entries")})')
+    web_off = (' If no proxy is in front of the web UI, turn "The web UI is behind a reverse '
+               'proxy" off instead')
+    for port in ports:
+        seen = ctx.proxy_seen[port]
+        if seen['direct_peer']:
+            peer = _peer_name(ctx, seen['direct_peer'])
+            return Result(PROBLEM if port == PORT_PUBLIC else ATTENTION, tested,
+                          f'{_sentence(PORT_NAMES[port])} was reached straight from {peer}, '
+                          f'with no reverse proxy in between, and it believes any caller that '
+                          f'says it is one. Anyone who can reach the port that way '
+                          f'{_PROXY_GUESSING}. Put the address your proxy connects from in '
+                          f'"Reverse proxy addresses" in Settings and restart, and ChannelBin '
+                          f'believes only the proxy.' + (web_off if port == PORT_WEB else ''))
+    believed = [ctx.proxy_seen[port]['believed_peer'] for port in ports
+                if ctx.proxy_seen[port]['believed_peer']]
+    # Never "your proxy": with no list, any caller that sent the headers was believed.
+    detail = (f'The last caller that sent a reverse proxy\'s headers connected from '
+              f'{_peer_name(ctx, believed[0])}. List that address only if you know it is where '
+              f'your proxy connects from; the Test under the switch in Settings, opened through '
+              f'your proxy, says which address that is.' if believed else
+              'Nothing has come through a proxy since ChannelBin started. The Test under the '
+              'switch in Settings, opened through your proxy, says which address it connects from.')
+    verb = 'believes' if len(ports) == 1 else 'believe'
+    return Result(ATTENTION, tested,
+                  f'"Reverse proxy addresses" is empty, so {names} {verb} any caller that says '
+                  f'it is a reverse proxy. If the port can be reached without going through '
+                  f'your proxy, from another device on your network or by a router forwarding '
+                  f'straight to it, that caller {_PROXY_GUESSING}. List the address your proxy '
+                  f'connects from, in Settings, and restart.'
+                  + (web_off if PORT_WEB in ports else ''), detail=detail)
 
 
 def _check_accounts_any(ctx):
@@ -1024,6 +1112,12 @@ CHECKS = (
     Check('auth_gate', 'machine', 'The login gate does what you asked', 'the login gate', CHEAP,
           'Login is on but no password is stored, so every page is open to anyone.',
           Link('Settings', 'settings.settings', 'auth.enabled'), False, _check_auth_gate),
+    Check('proxy_trust', 'machine', 'ChannelBin knows who each visitor is', 'the reverse proxy settings',
+          CHEAP,
+          'Someone can get around the wrong-login lockout by making up an address for every '
+          'guess, or everyone who comes through your reverse proxy is locked out together.',
+          Link('Settings', 'settings.settings', 'flask.trusted_proxies'), True,
+          _check_proxy_trust),
     Check('output_feed', 'machine', 'The IPTV output can serve an IPTV player', 'the IPTV output',
           CHEAP,
           'An IPTV player that added ChannelBin as an account sees no channels, or is refused on '
@@ -1140,7 +1234,7 @@ CAPABILITIES = (
     Capability('files', 'Save thumbnails, screenshots, backups and diagnostics',
                _cap('storage_images', 'storage_dirs')),
     Capability('safe', 'Keep the database safe and the login working',
-               _cap('db_local', 'db_write', 'secret_key', 'auth_gate')),
+               _cap('db_local', 'db_write', 'secret_key', 'auth_gate', 'proxy_trust')),
     Capability('clear', 'See every error', _cap('alerts_unread')),
     Capability('tv', 'Watch your channels and groups from a third-party IPTV player',
                _cap('output_feed', 'gpu_overlay')),

@@ -49,7 +49,7 @@ SETTINGS_VIEW_PREF = 'settings_show_advanced'
 # port, host or secret key can leave the page unreachable or every session signed out, with
 # no page left to undo it from - so they are changed in config.yaml, and this route refuses
 # them whatever posts them (dev/changelog/1648).
-GUI_FLASK_KEYS = frozenset({'flask.public_url', 'flask.behind_proxy'})
+GUI_FLASK_KEYS = frozenset({'flask.public_url', 'flask.behind_proxy', 'flask.trusted_proxies'})
 
 
 def _page_size_choice(value):
@@ -122,6 +122,10 @@ def _raw_yaml_problems(text):
             refuse('integrations.output_feed.public_port', problem)
     if public_url_problem(feed_block.get('public_url')):
         refuse('integrations.output_feed.public_url', public_url_problem(feed_block.get('public_url')))
+    flask_raw = data.get('flask') if isinstance(data.get('flask'), dict) else {}
+    from ..proxy_trust import proxies_problem
+    if proxies_problem(flask_raw.get('trusted_proxies')):
+        refuse('flask.trusted_proxies', proxies_problem(flask_raw.get('trusted_proxies')))
     search = data.get('search') if isinstance(data.get('search'), dict) else {}
     page_size = search.get('page_size')
     if page_size is not None and _page_size_choice(page_size) is None:
@@ -319,14 +323,23 @@ def api_settings_get():
 @settings_bp.route('/api/settings/proxy-check')
 def api_settings_proxy_check():
     """What this request arrived with from a reverse proxy, for the check beside the
-    "Behind a reverse proxy" switch. Read-only, and only the proxy headers are echoed.
+    "The web UI is behind a reverse proxy" switch. Read-only, and only the proxy headers are echoed.
     `?probe=1` says the page planted output_feed_view.PROXY_PROBE_ADDRESS in
     X-Forwarded-For; static/js/settings.js asks once without it and once with it."""
     from .. import output_feed_view
+    from .. import proxy_trust
     facts = output_feed_view.proxy_check(request.environ, request.args.get('probe') == '1')
+    policy = proxy_trust.wired(current_app)
     return jsonify({'success': True, **facts,
                     'configured': bool((load_config().get('flask') or {}).get('behind_proxy')),
-                    'wired': bool(current_app.config.get('BEHIND_PROXY')),
+                    'wired': policy.web,
+                    # The address the proxy (or, with none, the browser) connected from, and
+                    # whether "Reverse proxy addresses" would believe it.
+                    'peer': facts['direct']['client'],
+                    'list_set': bool(policy.networks),
+                    'listed': policy.listed(facts['direct']['client'] or ''),
+                    # The list was saved and this process still runs the old one.
+                    'list_restart': proxy_trust.policy_from(load_config()).networks != policy.networks,
                     'planted': output_feed_view.PROXY_PROBE_ADDRESS})
 
 
@@ -343,6 +356,13 @@ def api_settings_field():
         return jsonify({'error': f'{path} is changed in config.yaml only'}), 400
     if path == 'flask.behind_proxy' and not isinstance(value, bool):
         return jsonify({'error': 'Say whether ChannelBin is behind a reverse proxy'}), 400
+    if path == 'flask.trusted_proxies':
+        from ..proxy_trust import proxies_problem
+        value = [str(v).strip() for v in (value or []) if str(v).strip()] if isinstance(
+            value, (list, tuple)) else value
+        problem = proxies_problem(value)
+        if problem:
+            return jsonify({'error': problem}), 400
 
     # These new numeric settings drive supervised-conversion loops/timeouts; a negative or
     # absurd value would misbehave. Coerce to a non-negative int, and cap the poll interval
@@ -582,6 +602,9 @@ def api_settings_field():
                 problem, value = output_feed.public_port_problem(value, cfg)
                 if problem:
                     return jsonify({'error': problem}), 400
+            if leaf == 'public_behind_proxy' and not isinstance(value, bool):
+                return jsonify({'error': 'Say whether the public port is behind a reverse '
+                                         'proxy'}), 400
             if leaf == 'public_host':
                 # Where the public port listens, like flask.host: changed in config.yaml only.
                 return jsonify({'error': f'{path} is changed in config.yaml only'}), 400
