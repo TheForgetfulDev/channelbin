@@ -5,6 +5,68 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.51.0 - 2026-11-26
+
+The IPTV output can be shared: logins for other people, each with its own channels and
+accounts, and a port that serves only the output so a reverse proxy can put it on the
+internet. Also fixes to recording starts, connection counts and sports.
+
+**Added**
+
+- The IPTV output can have logins for other users, on a new card on the IPTV Output page.
+  Each gets a name, a username, a generated password, an on/off switch and a limit on streams
+  at once. Their plays always go through ChannelBin, so your IPTV provider's login never
+  reaches their player, and Watching now, Recent plays, the Dashboard and the log name the
+  login each play came in on.
+- A login for another user can get every channel on the output or only the channels you pick
+  for it. Its player lists just those, numbered from 1, with a guide for just those, and
+  taking a channel out of the list ends their play of it.
+- A login for another user can be tied to IPTV accounts of its own. Its player lists only the
+  channels on those accounts, and failover and every other change of channel stay on them. A
+  recording still takes the connection from any of these plays.
+- ChannelBin can open a second port that answers the IPTV output and nothing else, so a
+  reverse proxy can put the output on the internet while every page, setting and the API stay
+  on your home network. Every play on that port is relayed. The README has nginx and Caddy
+  examples.
+- The IPTV output's login locks an address out after repeated wrong passwords, on both ports,
+  and the IPTV Output page lists locked-out addresses with a button to clear them.
+
+**Changed**
+
+- The example compose file and the Unraid template map the IPTV output's public port (38517)
+  by default. Nothing listens on it until the public port is set in Settings.
+
+**Fixed**
+
+- After a restart, a recording that moves to another account keeps its connection counted,
+  and no longer gets a "Start deferred" note while it is recording. (#125)
+- An account no longer reads as full with nothing using it until ChannelBin restarts. (#126)
+- A scheduled recording whose start could not be set up is set up again, by the sports check
+  for a followed game and by a new check every five minutes for everything else, instead of
+  waiting for a restart. The new check is on the Jobs page as Recording Start Check. (#127)
+- A scheduled game on a group of local stations names a station showing that game, not a
+  different one. (#128)
+- Changing a running recording's end time logs the old and new times in your timezone, not
+  UTC. (#129)
+- The Dashboard's Watching now card names each play by its channel's name, as the IPTV Output
+  page does, instead of an internal label. (#124)
+- With "Behind a reverse proxy" on, an IPTV player changing channel on a full output ends its
+  own old play and starts the new one at once, instead of waiting on a player that holds the
+  old connection open.
+- After a restart during a game, a sports channel also tries the channels whose listing of the
+  game has just ended, instead of giving up when the few still listing it are down.
+- When the guide and TheSportsDB list a game at different times and the sports channels go by
+  TheSportsDB, the sports channel's guide, Start broadcast and the Up next pages follow the
+  time the game actually plays.
+- A league followed only through a team shows only that team's games on the Up next channels.
+- Cover both no longer schedules a second recording that ends before it starts when nothing of
+  the game's window is left before the first recording.
+- Changing a followed recording to a profile with different padding moves its Cover both
+  second recording to the same padding.
+- A Supercars race listing that numbers the race by its place in the weekend ("Race 3")
+  instead of the season matches that race.
+- The IPTV output's channel logo address no longer writes its login into the access log.
+
 ## 0.50.0 - 2026-11-25
 
 Lots of EPG source changes and fixes: guides that continue into the next source, sources a
