@@ -110,7 +110,9 @@ from . import connection_limits as connlim
 from .auth import FailureTracker
 from .database import FEED_PLAY_ENDED, FEED_PLAY_REDIRECTED, FEED_PLAY_REFUSED
 from .fmt_utils import counted, fmt_bytes, fmt_duration, iso_or_none
-from .proc_utils import build_relay_cmd, build_screen_play_cmd, read_stderr_tail, terminate_or_kill
+from .proc_utils import (SlowDeliveryCheck, build_relay_cmd, build_screen_play_cmd,
+                         read_capture_content_position, read_stderr_tail, slow_delivery_detail,
+                         slow_delivery_settings, terminate_or_kill)
 from .url_utils import mask_creds_in_text
 
 log = logging.getLogger(__name__)
@@ -149,6 +151,12 @@ REASON_MAX_DURATION = 'max_duration'
 REASON_PREEMPTED = 'preempted'
 REASON_FFMPEG_EXITED = 'ffmpeg_exited'
 REASON_CONNECT_TIMEOUT = 'connect_timeout'
+# The two ways a channel that was playing stops delivering without ffmpeg exiting: nothing at
+# all for watchdog.stall_timeout_seconds, or too little program for its time across
+# watchdog.slow_delivery_window_seconds - the same two a recording's watchdog judges, through
+# the same proc_utils.SlowDeliveryCheck (dev/changelog/1799).
+REASON_NO_DATA = 'no_data'
+REASON_TOO_SLOW = 'too_slow'
 REASON_LAUNCH_FAILED = 'launch_failed'
 REASON_FAILED_OVER = 'failed_over'
 REASON_MOVED_FOR_RECORDING = 'moved_for_recording'
@@ -185,6 +193,8 @@ REASON_TEXT = {
     REASON_PREEMPTED: 'Cut - a recording needed this connection.',
     REASON_FFMPEG_EXITED: 'The stream ended or dropped.',
     REASON_CONNECT_TIMEOUT: 'Could not connect - the stream sent nothing in time.',
+    REASON_NO_DATA: 'The stream stopped sending.',
+    REASON_TOO_SLOW: 'The stream slowed to a trickle - too little of the program was arriving to play.',
     REASON_LAUNCH_FAILED: 'Could not start.',
     REASON_FAILED_OVER: 'Moved to another channel in the group.',
     REASON_MOVED_FOR_RECORDING: 'Moved to another channel - a recording needed the connection.',
@@ -227,6 +237,8 @@ PREVIEW_CLIENT = 'ChannelBin preview'
 #: How long a session may take to its first byte before it ends REASON_CONNECT_TIMEOUT -
 #: the same window the preview gives a channel (preview.connect_timeout_seconds' default).
 CONNECT_TIMEOUT_SECONDS = 20.0
+#: How often the reaper reads a playing channel's content position for the slow-delivery check.
+SLOW_SAMPLE_SECONDS = 2.0
 #: Bytes per second of reserve the settings validation assumes, a typical HD stream at
 #: 8 Mbps (design doc section 4.3). The ring must hold the reserve with room to spare.
 RESERVE_BYTES_PER_SECOND = 1_000_000
@@ -2070,6 +2082,12 @@ class RelaySession:
     idle_timeout: float = 30.0
     max_seconds: float = 12 * 3600
     stall_timeout: float = 30.0
+    # watchdog.slow_delivery_*; each adopted ffmpeg gets a fresh SlowDeliveryCheck from them, so
+    # a new connection's window always refills from scratch (_adopt).
+    slow_ratio: float = 0.0
+    slow_window: float = 60.0
+    slow_delivery: Optional[SlowDeliveryCheck] = field(default=None, repr=False)
+    slow_read_mono: float = 0.0
     pace_realtime: bool = False
     proc: Optional[subprocess.Popen] = field(default=None, repr=False)
     stderr_path: str = ''
@@ -2917,6 +2935,8 @@ def _session_limits(cfg: dict, fcfg: dict) -> dict:
     return {'idle_timeout': float(fcfg.get('idle_seconds') or 30),
             'max_seconds': float(fcfg.get('max_session_hours') or 12) * 3600,
             'stall_timeout': float((cfg.get('watchdog') or {}).get('stall_timeout_seconds') or 30),
+            'slow_ratio': slow_delivery_settings(cfg)[0],
+            'slow_window': slow_delivery_settings(cfg)[1],
             'reserve_seconds': float(fcfg.get('reserve_seconds') or 0)}
 
 
@@ -3115,6 +3135,8 @@ def _adopt(session: RelaySession, proc: subprocess.Popen,
             session.proc = proc
             session.reader = reader
             session.launched_mono = time.monotonic()
+            session.slow_delivery = SlowDeliveryCheck(session.slow_ratio, session.slow_window)
+            session.slow_read_mono = 0.0
             _close_phase_locked(session)
             if account_id is not None:
                 session._phase = (proc, account_id, session.launched_mono)
@@ -3977,8 +3999,24 @@ def _check(session: RelaySession) -> None:
             _member_died(session, REASON_CONNECT_TIMEOUT, tail)
         return
     if session.last_data_mono is not None and now - session.last_data_mono > session.stall_timeout:
-        _member_died(session, REASON_FFMPEG_EXITED,
-                     f'no data for {session.stall_timeout:.0f}s')
+        _member_died(session, REASON_NO_DATA, f'no data for {session.stall_timeout:.0f}s')
+        return
+    ratio = _slow_verdict(session, now)
+    if ratio is not None:
+        _member_died(session, REASON_TOO_SLOW,
+                     slow_delivery_detail(ratio, session.slow_delivery.window_seconds))
+
+
+def _slow_verdict(session: RelaySession, now: float) -> Optional[float]:
+    """The ratio a playing channel has delivered at across a full window, when that is under
+    watchdog.slow_delivery_ratio; else None. Reads the play's stderr spool at most every
+    SLOW_SAMPLE_SECONDS: the reaper serves every play every _REAP_INTERVAL, and a bounded tail
+    read per play per tick buys nothing a sample every few seconds does not."""
+    check = session.slow_delivery
+    if check is None or not check.enabled or now - session.slow_read_mono < SLOW_SAMPLE_SECONDS:
+        return None
+    session.slow_read_mono = now
+    return check.update(read_capture_content_position(session.stderr_path), now)
 
 
 def _roll_if_unresolved(session: RelaySession, tail: Optional[str]) -> None:
@@ -4096,6 +4134,10 @@ def _died_phrase(reason: str) -> str:
         return 'sent nothing in time'
     if reason == REASON_FFMPEG_EXITED:
         return 'stopped delivering'
+    if reason == REASON_NO_DATA:
+        return 'stopped sending'
+    if reason == REASON_TOO_SLOW:
+        return 'slowed to a trickle'
     if reason == REASON_MOVED_BY_HAND:
         return 'was left by hand, from Watching now'
     raise ValueError(f'No words for why a play left a channel: "{reason}"')

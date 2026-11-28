@@ -797,7 +797,7 @@ class Picture:
 
 #: Why a picture's session stops when its channel stopped delivering or would not start.
 _DROPPED_REASONS = (feed.REASON_NO_MEMBER, feed.REASON_FFMPEG_EXITED, feed.REASON_CONNECT_TIMEOUT,
-                    feed.REASON_LAUNCH_FAILED)
+                    feed.REASON_NO_DATA, feed.REASON_TOO_SLOW, feed.REASON_LAUNCH_FAILED)
 #: And when the engine or a person closed it.
 _CLOSED_REASONS = (feed.REASON_STOPPED, feed.REASON_TAKEN_OFF, feed.REASON_CLIENT_GONE,
                    feed.REASON_SHUTDOWN, feed.REASON_DISABLED)

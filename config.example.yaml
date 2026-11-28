@@ -194,6 +194,14 @@ watchdog:
   fast_delivery_ratio: 1.5              # 0 disables
   fast_delivery_window_seconds: 120
   fast_delivery_strike_count: 3         # strikes on one member before moving off it
+  # Slow delivery, the other end of the same ratio: a feed delivering less than this many
+  # seconds of content per second of wall clock across the window has slowed to a trickle,
+  # which the stall check misses while a little keeps arriving. A recording counts it as a
+  # stall; an IPTV output play moves to another channel (a group's or a game's) or ends.
+  # One reconnect inside the window dips to about 0.55x; under 0.4 takes more silence than
+  # the stall timeout allows, so a single gap never trips it.
+  slow_delivery_ratio: 0.4              # 0 disables
+  slow_delivery_window_seconds: 60
   # The post-capture half, applied by the join to each finished segment: a segment holding
   # more content than the seconds it ran for, by more than this, FLAGS the recording for a
   # human to check. Nothing is stopped and nothing is thrown away - a segment under the

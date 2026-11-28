@@ -836,6 +836,11 @@ TRACK_END_GAP_OUT_OF_STEP_SECONDS = 2.0
 # sound kept arriving. Named because app/track_ends.py reads it back: that segment's sound
 # runs on past its picture by construction.
 SEGMENT_EXIT_VIDEO_STOPPED = 'VIDEO_STOPPED'
+# RecordingSegment.exit_reason for a capture killed because the feed slowed to a trickle:
+# proc_utils.SlowDeliveryCheck's verdict, the one an IPTV output play reaches as
+# output_feed.REASON_TOO_SLOW. Counted as a stall - too little of the program was arriving
+# to record - but named apart, since the file never stopped growing (dev/changelog/1799).
+SEGMENT_EXIT_SLOW_DELIVERY = 'SLOW_DELIVERY_KILLED'
 
 # Recording.gave_up_reason vocabulary: the three give-ups above, on a capture that held data
 # when it happened. A different column from failure_reason because the row is not FAILED: its
@@ -1988,7 +1993,7 @@ class RecordingSegment(db.Model):
     # | MANUAL_CANCEL | MANUAL_PAUSE | MANUAL_STOP | SERVICE_RESTART | RECORDING_HANDOFF
     # | ACCOUNT_BLOCKED (the user blocked its account, dev/changelog/1151)
     # | CHANNEL_SWITCHED (the user picked another member, dev/changelog/1254)
-    # | VIDEO_STOPPED
+    # | VIDEO_STOPPED | SLOW_DELIVERY_KILLED
     # STALL_KILLED and PROCESS_EXITED are both "the feed died, we restarted", kept apart
     # because only the first one is us doing the killing (dev/changelog/431). VIDEO_STOPPED
     # is a restart of a feed that had NOT died - its audio was still arriving - and is never
