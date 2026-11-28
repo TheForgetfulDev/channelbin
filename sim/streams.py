@@ -712,13 +712,14 @@ class Headend:
 
     def describe(self, host: str, path: str) -> dict | None:
         """What a stream request is, as the fault layers see it: its login (a LoginSpec or
-        None), channel label, backend, stage (serve, or redirect for a 302 to a play URL) and
-        form (ts, hls_playlist, hls_segment, hls_master or radio)."""
+        None), channel label, backend, stage (serve, or redirect for a 302 to a play URL),
+        form (ts, hls_playlist, hls_segment, hls_master or radio) and whether it carries
+        credentials (a play URL's token does not)."""
         t = self.target(host, path)
         if t is None:
             return None
         out = {'login': None, 'channel': None, 'backend': t.backend, 'stage': STAGE_SERVE,
-               'form': None}
+               'form': None, 'credentialed': t.kind in (KIND_TS, KIND_HLS)}
         if t.kind in ('play', 'segment'):
             p = self._play(t)
             if p is not None:

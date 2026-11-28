@@ -580,5 +580,36 @@ class HlsFaultTests(_Faulted):
         self.assertGreater(span(pes_dts(seg, AUDIO_PID)), 3.5)
 
 
+class WrongResellerLoginTests(_Faulted):
+    """Two resellers of one backend, a stream host each: a host serves the logins its reseller
+    sold and refuses the other's as unknown credentials (DESIGN-account-providers.md §14.1).
+    Assumed behavior - see the kind's evidence."""
+
+    def on(self, url: str, host: str) -> str:
+        """`url` with its host swapped for the world host `host`'s address."""
+        from urllib.parse import urlsplit
+        return self.sim.url(host, urlsplit(url).path)
+
+    def test_a_host_refuses_the_other_resellers_login_and_serves_its_own(self):
+        h1, h2 = self.world.backends['cove'].stream_host_names()
+        self.sim.inject('wrong_reseller_login', h1, accepts=['reeduser'])
+        self.sim.inject('wrong_reseller_login', h2, accepts=['fernuser'])
+        reed = self.sim.stream_urls('cove-tv', 'reeduser')[self.sid]
+        fern = self.sim.stream_urls('cove-tv', 'fernuser')[self.sid]
+        self.assertEqual(requests.get(self.on(fern, h1), timeout=5).status_code, 401)
+        self.assertEqual(requests.get(self.on(reed, h2), timeout=5).status_code, 401)
+        refused = [r for r in self.sim.ledger.entries(endpoint='stream') if r.status == 401]
+        self.assertEqual([(r.host, r.faults) for r in refused],
+                         [(h1, ('wrong_reseller_login',)), (h2, ('wrong_reseller_login',))])
+        # Each login on its own reseller's host plays, its redirect to the backend's next edge
+        # included - a play URL carries a token, not the login, and is not asked again.
+        for url, user in ((self.on(reed, h1), 'reeduser'), (self.on(fern, h2), 'fernuser'),
+                          (self.on(reed, h1), 'reeduser')):
+            status, data = read_for(url, 0.3)
+            self.assertEqual(status, 200, url)
+            self.assertGreater(len(data), 0)
+            self.free(user)
+
+
 if __name__ == '__main__':
     unittest.main()

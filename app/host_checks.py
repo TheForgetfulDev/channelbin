@@ -38,7 +38,8 @@ never swaps hosts - only a host that stops resolving does (DESIGN-account-provid
 `rank()` lets that swap prefer a host that answered at its last check. An ACTIVE host that
 stops answering raises `ACCOUNT_HOST_NOT_ANSWERING`, cleared when it answers again or another
 host becomes active; a standby host's change of answer is an INFO line on the account's
-Activity card.
+Activity card. A login's own active host that stops answering raises
+`LOGIN_HOST_NOT_ANSWERING` the same way, keyed on the login (DESIGN-account-providers.md §14.7).
 """
 from __future__ import annotations
 
@@ -397,7 +398,7 @@ def _reassess_set_aside(hosts: list) -> None:
     """A resolving lookup that set aside a "Doesn't resolve" full check on an active host
     takes that host's warning down (dev/changelog/1731). Only those: re-asking every active
     host would bring a standing warning back unread at every scheduled lookup."""
-    from .database import AccountHost
+    from .database import AccountHost, LoginHost
     if not hosts:
         return
     try:
@@ -408,12 +409,17 @@ def _reassess_set_aside(hosts: list) -> None:
         accounts = {a for (a,) in db.session.query(AccountHost.account_id)
                     .filter(AccountHost.host.in_(set_aside), AccountHost.is_active.is_(True),
                             AccountHost.enabled.is_(True)).all()}
+        logins = {lid for (lid,) in db.session.query(LoginHost.login_id)
+                  .filter(LoginHost.host.in_(set_aside), LoginHost.is_active.is_(True),
+                          LoginHost.enabled.is_(True)).all()}
     except Exception:
         # Never raises: a swap reaches here through its lookups, before it moves anything.
         log.exception('Host check: could not reassess hosts a lookup found again')
         return
     for account_id in sorted(accounts):
         reassess_active(account_id)
+    for login_id in sorted(logins):
+        reassess_login_active(login_id)
 
 
 def _write_full(host: str, result: dict, trigger: str, in_use: bool) -> HostCheck:
@@ -556,15 +562,27 @@ def _not_answering_source(account_id: int) -> str:
     return f'account:{account_id}:host-not-answering'
 
 
+def _login_not_answering_source(login_id: int) -> str:
+    return f'login:{login_id}:host-not-answering'
+
+
 def _report(host: str, was: Optional[bool], row: HostCheck) -> None:
-    """The active host not answering raises (or clears) the account's standing warning; a
-    standby host whose answer changed gets one INFO line on the account's Activity card.
-    Never raises: the check's row is already written."""
+    """The active host not answering raises (or clears) the standing warning of each account,
+    and of each login (§14.7), whose active host it is; a standby host on an account whose
+    answer changed gets one INFO line on that account's Activity card. Never raises: the
+    check's row is already written."""
     from .alerts import ACCOUNT_HOST_ANSWER_CHANGED, create_alert
-    from .database import Account, AccountHost
+    from .database import Account, AccountHost, Login, LoginHost
     try:
         now = is_answering(row)
         words = describe(row)
+        for login_id, login_name in (db.session.query(LoginHost.login_id, Login.name)
+                                     .join(Login, Login.id == LoginHost.login_id)
+                                     .filter(LoginHost.host == host,
+                                             LoginHost.is_active.is_(True),
+                                             LoginHost.enabled.is_(True)).all()):
+            _set_login_not_answering(login_id, login_name, host,
+                                     words if now is False else None)
         rows = (db.session.query(AccountHost, Account.name)
                 .join(Account, Account.id == AccountHost.account_id)
                 .filter(AccountHost.host == host).all())
@@ -596,6 +614,72 @@ def _set_not_answering(account_id: int, name: str, host: str, words: Optional[di
         body=(f'A check of {host}, the host every stream on {name} uses, found: {words["line"]} '
               f'Streams still use it, because a host is swapped only when it stops resolving. '
               f'Make another host active on the account page to move now.'))
+
+
+def _set_login_not_answering(login_id: int, name: str, host: str,
+                             words: Optional[dict]) -> None:
+    """A login's own active host's standing warning (§14.7): one alert keyed on the login,
+    which every account holding it lists (account_activity.alert_sources)."""
+    from .accounts import _raise_or_resolve_standing_alert
+    from .alerts import LOGIN_HOST_NOT_ANSWERING
+    from .database import Account, AccountLogin
+    source = _login_not_answering_source(login_id)
+    if words is None:
+        _raise_or_resolve_standing_alert(LOGIN_HOST_NOT_ANSWERING, source=source, active=False)
+        return
+    from .fmt_utils import join_labels
+    holders = [n for (n,) in db.session.query(Account.name)
+               .join(AccountLogin, AccountLogin.account_id == Account.id)
+               .filter(AccountLogin.login_id == login_id).order_by(Account.name).all()]
+    on = f' on {join_labels(holders)}' if holders else ''
+    _raise_or_resolve_standing_alert(
+        LOGIN_HOST_NOT_ANSWERING, source=source, active=True,
+        title=f'Login "{name}": its active host {host} isn\'t answering ({words["label"].lower()})',
+        body=(f'A check of {host}, the host streams{on} use when they are on login "{name}", '
+              f'found: {words["line"]} Streams still use it, because a host is swapped only '
+              f'when it stops resolving. Make another of the login\'s hosts active (Hosts... '
+              f'on the Logins card) to move now.'))
+
+
+def reassess_login_active(login_id: int) -> None:
+    """A login's own active host changed (a roll, Make active, a switch, an add or a removal):
+    raise or clear its warning from what the new active host's last check found. Never
+    raises."""
+    from .database import Login, LoginHost
+    try:
+        login = db.session.get(Login, login_id)
+        if login is None:
+            return
+        active = LoginHost.query.filter_by(login_id=login_id, is_active=True, enabled=True).first()
+        check = effective(latest_for_hosts([active.host]).get(active.host)) if active else None
+        if active is not None and is_answering(check) is False:
+            _set_login_not_answering(login_id, login.name, active.host, describe(check))
+        else:
+            _set_login_not_answering(login_id, login.name, '', None)
+    except Exception:
+        log.exception('Host check: could not reassess login %d\'s active host', login_id)
+
+
+def not_answering_logins(account_ids: Iterable[int]) -> dict:
+    """{account_id: [(login name, host), ...]} for the logins each account holds, turned on
+    there, whose own active host did not answer at its last check - the badge and notice on
+    every account streaming through the login (§14.7). Two queries."""
+    from .database import AccountLogin, Login, LoginHost
+    ids = [a for a in account_ids if a is not None]
+    if not ids:
+        return {}
+    rows = (db.session.query(AccountLogin.account_id, Login.name, LoginHost.host)
+            .join(Login, Login.id == AccountLogin.login_id)
+            .join(LoginHost, LoginHost.login_id == AccountLogin.login_id)
+            .filter(AccountLogin.account_id.in_(ids), AccountLogin.enabled.is_(True),
+                    LoginHost.is_active.is_(True), LoginHost.enabled.is_(True))
+            .order_by(AccountLogin.account_id, AccountLogin.position).all())
+    latest = latest_for_hosts({h for _a, _n, h in rows})
+    out: dict = {}
+    for account_id, name, host in rows:
+        if is_answering(effective(latest.get(host))) is False:
+            out.setdefault(account_id, []).append((name, host))
+    return out
 
 
 def reassess_active(account_id: int) -> None:

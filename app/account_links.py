@@ -341,7 +341,8 @@ def list_playlist_rows(account_id: int, host: Optional[str], pair: Optional[tupl
       username and password (it keeps its own name and seats), or adds one whose seats are the
       account's own Max connections. Added beside logins of the user's that the playlist's is
       not one of, it starts off: turning it on would add seats the user never set. A changed
-      username or password rewrites the playlist's row and clears its refusal stamp.
+      username or password rewrites the playlist's row and clears its refusal stamp; the
+      login's own hosts stay on it, and the change names them (`hosts_kept`, §14.8).
     - Any change to the host list re-renders the account's stream URLs, and an active host
       that is off hands the role to the first host that is on.
 
@@ -494,6 +495,11 @@ def _list_playlist_login(account_id: int, pair: tuple, now: datetime) -> list:
             from .account_blocks import drop_login_blocks, login_blocks_at
             change['block_ended'] = bool(login_blocks_at(None, [own.id]))
             drop_login_blocks([own.id])
+        # Its own hosts stay (§14.8): the new credential may be another reseller's, and the
+        # app does not guess - the line names them so the user can check.
+        kept = [r.host for r in _login_host_rows(own.id)]
+        if kept:
+            change['hosts_kept'] = kept
         change['on'] = bool(db.session.query(AccountLogin.enabled).filter_by(
             account_id=account_id, login_id=own.id).scalar())
         return [change]
@@ -544,6 +550,11 @@ def playlist_change_line(change: dict) -> str:
         tail = 'It stays turned off, so streams won\'t use it.'
     if change.get('block_ended'):
         tail += f' The block on {change["old"]} ended with it.'
+    kept = change.get('hosts_kept')
+    if kept:
+        more = f' and {len(kept) - 1} more' if len(kept) > 1 else ''
+        tail += (f' It keeps its own hosts ({kept[0]}{more}). The new login may be from another '
+                 f'reseller, so check them under Hosts... on the Logins card.')
     return f'{head} {tail}'
 
 
@@ -853,10 +864,10 @@ def add_login_host(login_id: int, raw_host: str):
                 r.is_active = False
         db.session.add(row)
         db.session.commit()
-        return row, login.name
+        return row, login.name, first_on
 
-    row, name = _add_and_commit()
-    _clear_login_rolled_alert(login_id)
+    row, name, moved = _add_and_commit()
+    _after_login_list_edit(login_id, moved)
     log.info('Login %d ("%s"): host %s added to its own list', login_id, name, host)
     return row
 
@@ -891,11 +902,11 @@ def copy_account_hosts_to_login(account_id: int, login_id: int) -> list:
             for r in rows:
                 r.is_active = False
         db.session.commit()
-        return added, login.name
+        return added, login.name, bool(added and need_active)
 
-    added, name = _copy_and_commit()
+    added, name, moved = _copy_and_commit()
     if added:
-        _clear_login_rolled_alert(login_id)
+        _after_login_list_edit(login_id, moved)
         log.info('Login %d ("%s"): %d host(s) copied from account %d: %s', login_id, name,
                  len(added), account_id, ', '.join(added))
     return added
@@ -918,13 +929,13 @@ def remove_login_host(login_id: int, host_id: int) -> str:
         if target is not None:
             target.is_active = True
             target.activated_at = datetime.utcnow()
-        name = row.host
+        name, was_active = row.host, row.is_active
         db.session.delete(row)
         db.session.commit()
-        return name
+        return name, was_active
 
-    name = _remove_and_commit()
-    _clear_login_rolled_alert(login_id)
+    name, moved = _remove_and_commit()
+    _after_login_list_edit(login_id, moved)
     log.info('Login %d: host %s removed from its own list', login_id, name)
     return name
 
@@ -942,16 +953,17 @@ def set_login_host_active(login_id: int, host_id: int) -> str:
             raise LookupError('Host not found.')
         if not row.enabled:
             raise ValueError(f'{row.host} is turned off. Turn it on first.')
-        if not row.is_active:
+        moved = not row.is_active
+        if moved:
             for r in rows:
                 r.is_active = False
             row.is_active = True
             row.activated_at = datetime.utcnow()
             db.session.commit()
-        return row.host
+        return row.host, moved
 
-    host = _activate_and_commit()
-    _clear_login_rolled_alert(login_id)
+    host, moved = _activate_and_commit()
+    _after_login_list_edit(login_id, moved)
     log.info('Login %d: host %s made active by hand', login_id, host)
     return host
 
@@ -971,6 +983,7 @@ def set_login_host_enabled(login_id: int, host_id: int, enabled: bool) -> dict:
         if row is None:
             raise LookupError('Host not found.')
         active = next((r for r in rows if r.is_active and r.enabled), None)
+        moved = False
         if row.enabled != enabled:
             now = datetime.utcnow()
             row.enabled = enabled
@@ -983,34 +996,42 @@ def set_login_host_enabled(login_id: int, host_id: int, enabled: bool) -> dict:
                 target = _next_on_host(rows, row)
             elif enabled and active is None:
                 target = row
+            # The host streams use moved when the active one went off or one came on as it.
+            moved = row.is_active or target is not None
             if target is not None:
                 for r in rows:
                     r.is_active = r is target
                 target.activated_at = now
             db.session.commit()
             active = next((r for r in rows if r.is_active and r.enabled), None)
-        return {'host': row.host, 'enabled': enabled, 'active': active.host if active else None}
+        return {'host': row.host, 'enabled': enabled,
+                'active': active.host if active else None}, moved
 
-    out = _switch_and_commit()
-    _clear_login_rolled_alert(login_id)
+    out, moved = _switch_and_commit()
+    _after_login_list_edit(login_id, moved)
     log.info('Login %d: host %s turned %s', login_id, out['host'], 'on' if enabled else 'off')
     return out
 
 
 def drop_login_hosts(login_ids: Iterable[int]) -> int:
     """Inside the caller's unit (no commit): everything a login's own hosts made, for logins
-    being deleted - the rows, the standing LOGIN_HOST_ROLLED alert, the in-memory roll stamp.
+    being deleted - the rows, the standing LOGIN_HOST_ROLLED and LOGIN_HOST_NOT_ANSWERING
+    alerts, the in-memory roll stamp.
     The one teardown every path that deletes a Login row calls (§14.8), so a fifth delete path
     cannot forget a piece. host_checks is keyed by name and needs nothing. Returns the rows
     deleted."""
-    from .alerts import LOGIN_HOST_ROLLED, mark_cleared
+    from .alerts import LOGIN_HOST_NOT_ANSWERING, LOGIN_HOST_ROLLED, mark_cleared
     from .database import Alert, LoginHost
+    from .host_checks import _login_not_answering_source
     ids = [i for i in login_ids if i is not None]
     if not ids:
         return 0
-    mark_cleared(Alert.query.filter(Alert.alert_type == LOGIN_HOST_ROLLED,
-                                    Alert.source.in_([_login_alert_source(i) for i in ids]),
-                                    Alert.dismissed_at.is_(None)).all())
+    sources = ([(LOGIN_HOST_ROLLED, _login_alert_source(i)) for i in ids]
+               + [(LOGIN_HOST_NOT_ANSWERING, _login_not_answering_source(i)) for i in ids])
+    mark_cleared([a for a in Alert.query.filter(
+        Alert.alert_type.in_([LOGIN_HOST_ROLLED, LOGIN_HOST_NOT_ANSWERING]),
+        Alert.source.in_([src for _t, src in sources]),
+        Alert.dismissed_at.is_(None)).all() if (a.alert_type, a.source) in sources])
     for i in ids:
         _last_login_roll_attempt.pop(i, None)
     return LoginHost.query.filter(LoginHost.login_id.in_(ids)).delete(synchronize_session=False)
@@ -1023,6 +1044,17 @@ def _login_alert_source(login_id: int) -> str:
 def _clear_login_rolled_alert(login_id: int) -> None:
     from .alerts import LOGIN_HOST_ROLLED, dismiss_open_alerts
     dismiss_open_alerts(LOGIN_HOST_ROLLED, _login_alert_source(login_id))
+
+
+def _after_login_list_edit(login_id: int, moved: bool) -> None:
+    """The user edited a login's own list: its roll alert clears (§14.6), and when the host
+    its streams use moved, its "not answering" warning follows the new one (§14.7). Only
+    then, as for an account (dev/changelog/1732): re-asking on every edit would bring a
+    standing warning back unread for adding a standby host."""
+    _clear_login_rolled_alert(login_id)
+    if moved:
+        from .host_checks import reassess_login_active
+        reassess_login_active(login_id)
 
 
 def roll_login_host(login_id: int, trigger: str, recording_id: Optional[int] = None,
@@ -1106,6 +1138,8 @@ def roll_login_host(login_id: int, trigger: str, recording_id: Optional[int] = N
         db.session.commit()
 
     _move_and_commit()
+    from .host_checks import reassess_login_active
+    reassess_login_active(login_id)
     old, new = active.host, chosen.host
     # What it did not do: an account holding the login whose own sync address is on the host
     # that just failed keeps it. Rolling an account's list from a login's failure would be the

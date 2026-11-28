@@ -1759,6 +1759,109 @@ class LoginHostWriteBypassTests(unittest.TestCase):
             self.assertRegex(line, self._PATTERN)
 
 
+class LaunchUrlFromRenderHeldLoginTests(unittest.TestCase):
+    """Every ffmpeg command built for a channel's stream URL takes that URL from
+    `account_links.render_held_login()` (DESIGN-account-providers.md §14.4,
+    dev/changelog/1778): the one call that renders the seated login's credentials and its own
+    host together. A launch site that built its command from the stored URL would go out on the
+    account's host with the playlist's login, on a reseller that refuses it.
+
+    Read by AST: the URL argument of each `build_capture_cmd`, `build_preview_cmd` and
+    `build_relay_cmd` call must be a name the enclosing function assigns from that call (or
+    from the `.url` of its answer). A fallback assignment beside it - the recorder's
+    `rec.url` for a recording whose channel was deleted - is allowed; having none is not."""
+
+    _BUILDERS = ('build_capture_cmd', 'build_preview_cmd', 'build_relay_cmd')
+    # Commands built for a URL that is no channel's, so there is no seat and no login.
+    _NOT_A_CHANNEL = {
+        ('app/routes/recordings.py', 'test_recording_url'): 'a URL the user typed, on no account',
+    }
+
+    @staticmethod
+    def _name_of(func):
+        return func.id if isinstance(func, ast.Name) else getattr(func, 'attr', None)
+
+    def _from_render(self, fn, url_name):
+        """True when `fn` assigns `url_name` from render_held_login()'s answer."""
+        held = set()
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                    and self._name_of(node.value.func) == 'render_held_login'):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        held.add(t.id)
+
+        def is_held_url(value):
+            return (isinstance(value, ast.Attribute) and value.attr == 'url'
+                    and isinstance(value.value, ast.Name) and value.value.id in held)
+
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Assign):
+                continue
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == url_name and is_held_url(node.value):
+                    return True
+                if not isinstance(t, ast.Tuple):
+                    continue
+                names = [e.id if isinstance(e, ast.Name) else None for e in t.elts]
+                if url_name not in names:
+                    continue
+                if (isinstance(node.value, ast.Call)
+                        and self._name_of(node.value.func) == 'render_held_login'):
+                    return True
+                if (isinstance(node.value, ast.Tuple)
+                        and is_held_url(node.value.elts[names.index(url_name)])):
+                    return True
+        return False
+
+    def _offenders(self, source, rel):
+        found, bad = [], []
+        tree = ast.parse(source)
+        tops = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        inner = {id(c) for f in tops for c in ast.walk(f) if c is not f
+                 and isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for fn in (f for f in tops if id(f) not in inner):
+            for call in ast.walk(fn):
+                if not (isinstance(call, ast.Call) and self._name_of(call.func) in self._BUILDERS):
+                    continue
+                if (rel, fn.name) in self._NOT_A_CHANNEL:
+                    continue
+                url = call.args[1] if len(call.args) > 1 else next(
+                    (k.value for k in call.keywords if k.arg == 'url'), None)
+                found.append(f'{rel}::{fn.name}')
+                if not (isinstance(url, ast.Name) and self._from_render(fn, url.id)):
+                    bad.append(f'{rel}:{call.lineno} {fn.name}: {ast.unparse(call)}')
+        return found, bad
+
+    def test_every_channel_launch_takes_its_url_from_render_held_login(self):
+        found, bad = [], []
+        for path in _walk(APP_DIR, '.py'):
+            rel = _rel(path)
+            if rel == 'app/proc_utils.py':
+                continue
+            source = _read(path)
+            if not any(b in source for b in self._BUILDERS):
+                continue
+            f, b = self._offenders(source, rel)
+            found += f
+            bad += b
+        self.assertEqual(bad, [], 'a command built from a URL render_held_login() did not hand out')
+        for site in ('app/recorder.py', 'app/channel_tester.py', 'app/preview.py',
+                     'app/output_feed.py'):
+            self.assertTrue(any(f.startswith(site) for f in found), f'no launch found in {site}')
+
+    def test_the_scan_would_catch_a_launch_from_the_stored_url(self):
+        source = textwrap.dedent('''
+            def launch(ch, cfg):
+                url, _l, _h = render_held_login(ch.stream_url, ch.account_id, 'test', 1)
+                good = build_capture_cmd(cfg, url, 'out.ts')
+                return build_relay_cmd(cfg, ch.stream_url)
+        ''')
+        _found, bad = self._offenders(source, 'app/x.py')
+        self.assertEqual(len(bad), 1)
+        self.assertIn('ch.stream_url', bad[0])
+
+
 class AccountHostWriteBypassTests(unittest.TestCase):
     """An account's host list is written by `app/account_links.py` and by nothing else.
 

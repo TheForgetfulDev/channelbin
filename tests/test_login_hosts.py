@@ -32,9 +32,10 @@ from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
 from app import account_links as links  # noqa: E402
 from app import connection_limits as connlim  # noqa: E402
-from app.alerts import ACCOUNT_HOST_ROLLED, LOGIN_HOST_ROLLED  # noqa: E402
+from app.alerts import ACCOUNT_HOST_ROLLED, LOGIN_HOST_NOT_ANSWERING, LOGIN_HOST_ROLLED  # noqa: E402
 from app.database import (  # noqa: E402
-    Account, AccountHost, AccountLogin, Alert, Channel, Login, LoginHost, Provider,
+    HOST_CHECK_ANSWERS, HOST_CHECK_REFUSED, Account, AccountHost, AccountLogin, Alert, Channel,
+    Login, LoginHost, Provider,
 )
 
 OLD = 'old.curation.example'
@@ -343,6 +344,131 @@ class TeardownTests(_Case):
 
 
 
+class NotAnsweringTests(_Case):
+    """§14.7: a login's own active host that fails a full check raises one warning keyed on
+    the login, shown on every account holding it; it follows the active host and clears
+    itself."""
+
+    def _check(self, host, status):
+        from app import host_checks as hc
+        result = {'status': status, 'lookup_ms': 5, 'connect_ms': 3 if status == HOST_CHECK_ANSWERS else None,
+                  'answer_ms': 4 if status == HOST_CHECK_ANSWERS else None,
+                  'http_status': 200 if status == HOST_CHECK_ANSWERS else None, 'port': 80,
+                  'error': None if status == HOST_CHECK_ANSWERS else
+                  'nothing is taking connections on port 80 (connection refused)'}
+        with mock.patch.object(hc, 'streaming_hosts', return_value=set()), \
+                mock.patch.object(hc, 'probe', return_value=result):
+            return hc.check_one(host, hc.TRIGGER_MANUAL)
+
+    def _open(self):
+        return Alert.query.filter_by(alert_type=LOGIN_HOST_NOT_ANSWERING, dismissed_at=None).all()
+
+    def _shared(self):
+        """alpha with two hosts of its own, shared onto a second account of the provider."""
+        _pl, alpha, _b = self._logins()
+        links.add_login_host(alpha, A1)
+        standby = links.add_login_host(alpha, B1)
+        other = seed.make_account(name='harbor-direct')
+        db.session.add(Provider(name='Harbor'))
+        db.session.commit()
+        prov = Provider.query.one()
+        for acc_id in (self.acc_id, other.id):
+            links.set_account_provider(acc_id, prov.id)
+        links.share_login(alpha, other.id)
+        return alpha, standby.id, other.id
+
+    def test_it_warns_on_every_holder_and_follows_the_active_host(self):
+        from app import account_activity
+        from app import host_checks as hc
+        alpha, standby, other = self._shared()
+        self._check(A1, HOST_CHECK_REFUSED)
+        alerts = self._open()
+        self.assertEqual([a.source for a in alerts], [f'login:{alpha}:host-not-answering'])
+        self.assertIn(f'Login "alpha": its active host {A1}', alerts[0].title)
+        self.assertIn('harbor-curated and harbor-direct', alerts[0].body)
+        self.assertEqual(hc.not_answering_logins([self.acc_id, other]),
+                         {self.acc_id: [('alpha', A1)], other: [('alpha', A1)]})
+        for acc_id in (self.acc_id, other):
+            acc = db.session.get(Account, acc_id)
+            self.assertIn(alerts[0].id, [e['obj'].id for e in account_activity.entries(acc)
+                                         if e['kind'] == account_activity.KIND_ALERT])
+        db.session.remove()
+        self.assertIn('id="acct-login-host-not-answering"',
+                      self.client.get(f'/accounts/{other}').get_data(as_text=True))
+        self.assertIn('Login host not answering', self.client.get('/accounts').get_data(as_text=True))
+        links.set_login_host_active(alpha, standby)
+        self.assertEqual(self._open(), [], 'the new active host has no failed check')
+        links.set_login_host_active(alpha, LoginHost.query.filter_by(host=A1).one().id)
+        self.assertEqual(len(self._open()), 1, 'back on the host that failed, the warning is back')
+        self._check(A1, HOST_CHECK_ANSWERS)
+        self.assertEqual(self._open(), [])
+
+    def test_a_standby_host_on_a_login_raises_nothing(self):
+        self._shared()
+        self._check(B1, HOST_CHECK_REFUSED)
+        self.assertEqual(self._open(), [])
+
+    def test_an_edit_that_leaves_the_active_host_does_not_bring_the_warning_back_unread(self):
+        """As for an account (dev/changelog/1732): the warning is re-asked when the host
+        streams use moves, never for adding, copying, switching or removing a standby host,
+        a standby's own failure, or Make active on the host already active."""
+        from datetime import datetime
+        alpha, standby, _other = self._shared()
+        self._check(A1, HOST_CHECK_REFUSED)
+        alert = self._open()[0]
+        alert.read_at = read = datetime(2026, 11, 1, 12, 0)
+        db.session.commit()
+        active = LoginHost.query.filter_by(login_id=alpha, host=A1).one().id
+        added = links.add_login_host(alpha, A2)
+        links.copy_account_hosts_to_login(self.acc_id, alpha)
+        links.set_login_host_enabled(alpha, standby, False)
+        links.set_login_host_enabled(alpha, standby, True)
+        links.remove_login_host(alpha, added.id)
+        links.set_login_host_active(alpha, active)
+        self._check(B1, HOST_CHECK_REFUSED)
+        db.session.expire_all()
+        still = self._open()
+        self.assertEqual([(a.id, a.read_at) for a in still], [(alert.id, read)])
+
+    def test_a_holder_with_the_login_turned_off_shows_no_notice(self):
+        from app import host_checks as hc
+        alpha, _standby, other = self._shared()
+        self._check(A1, HOST_CHECK_REFUSED)
+        links.set_login_enabled(other, alpha, False)
+        self.assertEqual(hc.not_answering_logins([self.acc_id, other]),
+                         {self.acc_id: [('alpha', A1)]})
+
+    def test_removing_the_login_takes_the_warning_with_it(self):
+        _pl, alpha, _b = self._logins()
+        links.add_login_host(alpha, A1)
+        self._check(A1, HOST_CHECK_REFUSED)
+        self.assertEqual(len(self._open()), 1)
+        links.remove_login(self.acc_id, alpha)
+        self.assertEqual(self._open(), [])
+
+
+class PlaylistLineTests(_Case):
+    """§14.8: a sync rewriting the playlist's own login in place keeps its hosts and says so."""
+
+    def test_a_rewritten_playlist_login_keeps_its_hosts_and_the_line_names_them(self):
+        playlist, _a, _b = self._logins()
+        links.add_login_host(playlist, A1)
+        links.add_login_host(playlist, A2)
+        changes = links.list_playlist_rows(self.acc_id, OLD, ('fresh', 'fpw'))
+        login_change = next(c for c in changes if c['what'] == links.PLAYLIST_LOGIN)
+        self.assertEqual(login_change['hosts_kept'], [A1, A2])
+        line = links.playlist_change_line(login_change)
+        self.assertIn(f'It keeps its own hosts ({A1} and 1 more).', line)
+        self.assertIn('may be from another reseller', line)
+        self.assertEqual([h.host for h in links.login_hosts_for_logins([playlist])[playlist]], [A1, A2])
+
+    def test_a_login_with_no_hosts_of_its_own_says_nothing_about_hosts(self):
+        self._logins()
+        changes = links.list_playlist_rows(self.acc_id, OLD, ('fresh', 'fpw'))
+        line = links.playlist_change_line(next(c for c in changes if c['what'] == links.PLAYLIST_LOGIN))
+        self.assertNotIn('own hosts', line)
+
+
 class PageAndRouteTests(_Case):
     """The Logins card says where each login's streams go, its Hosts dialog is in the page,
     and the routes write through the module's writers."""
@@ -403,6 +529,28 @@ class PageAndRouteTests(_Case):
         self.assertIn('1 login uses its own hosts instead: alpha.', html)
         self.assertIn("Every host here is off. Streams go out on each login's own hosts.", html)
         self.assertNotIn('Nothing on this account can stream', html)
+
+    def test_the_activity_card_names_a_login_hosts_switch_on_every_holder(self):
+        """§14.9: "Host bravo1.harbor.example on login "second" turned off.\""""
+        _pl, alpha, _b = self._logins()
+        row = links.add_login_host(alpha, A1)
+        links.add_login_host(alpha, A2)
+        other = seed.make_account(name='harbor-direct')
+        lonely = seed.make_account(name='harbor-other')
+        db.session.add(Provider(name='Harbor'))
+        db.session.commit()
+        prov = Provider.query.one()
+        other_id, lonely_id = other.id, lonely.id
+        for acc_id in (self.acc_id, other_id, lonely_id):
+            links.set_account_provider(acc_id, prov.id)
+        links.share_login(alpha, other_id)
+        links.set_login_host_enabled(alpha, row.id, False)
+        line = f'Host <code>{A1}</code> on login "alpha" turned off.'
+        self.assertIn(line, self._page())
+        for acc_id, shown in ((other_id, True), (lonely_id, False)):
+            db.session.remove()
+            html = self.client.get(f'/accounts/{acc_id}').get_data(as_text=True)
+            self.assertEqual(line in html, shown, acc_id)
 
 
 class RedirectTests(_Case):

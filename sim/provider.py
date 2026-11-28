@@ -190,6 +190,7 @@ class Provider:
         if stream is not None:
             ask.channel, ask.backend = stream['channel'], stream['backend']
             ask.stage, ask.form = stream['stage'], stream['form']
+            ask.credentialed = stream['credentialed']
         return ask
 
     def _describe_stream(self, host, path):
