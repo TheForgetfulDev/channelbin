@@ -54,6 +54,7 @@ from ..channel_groups import (
 )
 from ..config import load_config
 from ..db_utils import retry_on_locked
+from ..output_arrangement import forget_items
 from ..fmt_utils import plural
 from ..logo_cache import resolve_logo_url
 from ..tz_utils import local_input_value, format_local
@@ -2791,6 +2792,9 @@ def dissolve_group(group_id):
         _grouping_events(members, g, CHANNEL_UNGROUPED,
                          'Channel group "{group_name}" dissolved')
         pip_rows = pip_channels.detach_refs(PIP_SOURCE_GROUP, [group_id])
+        # Group ids are reused: its place on the IPTV output and its id in a login's channel
+        # list go with it (dev/changelog/1797).
+        forget_items(feed_ids=[output_feed.feed_id_for_group(group_id)])
         db.session.delete(g)  # membership rows go via the delete-orphan cascade
         # After the group delete, not before it: the memberships that protect these
         # channels only stop existing when that cascade flushes, and a recompute run one

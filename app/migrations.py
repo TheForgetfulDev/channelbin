@@ -155,6 +155,9 @@ _BF_DEFAULT_HIDE_RULES = 'm098.default_hide_rules'
 #: are refresh_rule_stats(), which is ORM code a step cannot call.
 _BF_HIDE_RULE_ACCOUNT_COUNTS = 'm143.hide_rule_account_counts'
 _BF_PROVIDER_EPG_ORDER = 'm148.provider_epg_order'
+#: Discharged by output_arrangement.backfill() from create_app(): the output's rows in today's
+#: order are output_feed's catalog, ORM code a step cannot call (dev/changelog/1797).
+_BF_OUTPUT_ARRANGEMENT = 'm159.output_arrangement'
 
 
 def _register_backfill(conn, cur, name: str):
@@ -4248,6 +4251,44 @@ def _m158_channel_replacements(conn, cur):
     conn.commit()
 
 
+def _m159_output_arrangement(conn, cur):
+    """output_categories + output_items: the IPTV output's own categories, with ids that stay
+    put, and where each channel sits in them (DESIGN-output-feed.md 16.3, dev/changelog/1797).
+
+    The obligation to fill them from today's order is registered before the tables are made,
+    and output_arrangement.backfill() discharges it from create_app() in the commit that fills
+    them (dev/changelog/686). CREATE TABLE IF NOT EXISTS, so re-runnable from the top."""
+    _register_backfill(conn, cur, _BF_OUTPUT_ARRANGEMENT)
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS output_categories (
+            id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            origin VARCHAR(16) NOT NULL,
+            builtin VARCHAR(16),
+            source_key VARCHAR(255),
+            source_name VARCHAR(255),
+            name VARCHAR(100),
+            position INTEGER NOT NULL DEFAULT 0,
+            placed_auto BOOLEAN NOT NULL DEFAULT 0,
+            last_sent_at DATETIME,
+            created_at DATETIME NOT NULL,
+            UNIQUE (source_key)
+        );
+        CREATE TABLE IF NOT EXISTS output_items (
+            id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            item_kind VARCHAR(16) NOT NULL,
+            item_id INTEGER NOT NULL,
+            category_id INTEGER NOT NULL REFERENCES output_categories (id),
+            home_category_id INTEGER NOT NULL REFERENCES output_categories (id),
+            position INTEGER NOT NULL DEFAULT 0,
+            name VARCHAR(100),
+            placed_auto BOOLEAN NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL,
+            CONSTRAINT uq_output_item UNIQUE (item_kind, item_id)
+        );
+    """)
+    conn.commit()
+
+
 #: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
 #: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
 #: time; the rebuild test holds step 148's output to this text, and the column list after
@@ -5139,6 +5180,8 @@ SCHEMA_MIGRATIONS = [
      _m157_output_feed_login_lineup_except),
     (158, 'channel_replacements + ix_channels_provider_stream_id: a channel that took the place of '
           'one its playlist stopped listing', _m158_channel_replacements),
+    (159, 'output_categories + output_items: the IPTV output\'s categories with fixed ids, and where '
+          'each channel sits in them', _m159_output_arrangement),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

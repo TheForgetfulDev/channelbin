@@ -59,6 +59,14 @@ class HeadStartsNoPlayTests(FeedCase):
 
 
 class KeptAnswerRouteTests(FeedCase):
+    def setUp(self):
+        super().setUp()
+        # The rig seeds its rows straight into the database, where a web UI write would have
+        # recorded their places; an answer built around unrecorded rows is never kept
+        # (output_arrangement.arrange(), dev/changelog/1797).
+        from app import output_arrangement
+        output_arrangement.reconcile()
+
     def builds(self):
         return mock.patch.object(feed, 'catalog', wraps=feed.catalog)
 

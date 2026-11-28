@@ -444,7 +444,7 @@ service, under [Getting told when something breaks](#getting-told-when-something
 ## Watching your channels in an IPTV player
 
 ChannelBin can be an Xtream Codes source itself, so an IPTV player such as TiviMate adds it as an
-account and sees your TV Guide - every channel and group in it, in the guide's order, with the
+account and sees your TV Guide - every channel and group in it, filed by category in the guide's order, with the
 guide's own listings - instead of the provider's whole list. A group is one channel in the
 player, played from the member ChannelBin would record from right now, and if that member dies
 the picture moves to another one without the player noticing.

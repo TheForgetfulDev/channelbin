@@ -1862,6 +1862,11 @@ def detach_channel_references(channel_ids, pip_rows: set = None) -> int:
     ids = list(channel_ids)
     if not ids:
         return 0
+    # The channel's place on the IPTV output and its id in any login's channel list go too, for
+    # the same reason (output_arrangement.forget_items(), dev/changelog/1797).
+    from .output_arrangement import forget_items
+    from .output_feed import feed_id_for_channel
+    forget_items(feed_ids=[feed_id_for_channel(i) for i in ids])
     from .pip_channels import detach_refs
     touched = detach_refs(PIP_SOURCE_CHANNEL, ids)
     if pip_rows is not None:
@@ -4124,6 +4129,61 @@ class OutputFeedLogin(db.Model):
     # Whether its player is told a refusal's whole sentence rather than only its kind. Never on
     # the public port (routes/output_feed.py::live, dev/changelog/1770, 1781).
     full_refusals   = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
+
+
+#: How an output category came to exist (OutputCategory.origin).
+OUTPUT_CATEGORY_ARRIVED = 'arrived'   # a provider's category, a league's name, or one built in
+OUTPUT_CATEGORY_MADE = 'made'         # the owner made it
+#: The two built-in categories (OutputCategory.builtin), compared by this mark, never by name.
+OUTPUT_BUILTIN_UNCATEGORIZED = 'uncategorized'
+OUTPUT_BUILTIN_CHANNELBIN = 'channelbin'
+#: What an arranged item's key names (OutputItem.item_kind).
+OUTPUT_ITEM_FEED = 'feed'       # one feed row: item_id is its lineup key (output_feed.lineup_key)
+OUTPUT_ITEM_LEAGUE = 'league'   # a league's numbered sports channels: item_id is the league's id
+
+
+class OutputCategory(db.Model):
+    """One category on the IPTV output (app/output_arrangement.py, DESIGN-output-feed.md 16.2).
+    Its id is the `category_id` an IPTV player is sent and caches, so AUTOINCREMENT keeps it from
+    ever naming another category. An arrived category is identified by `source_key`, the name it
+    arrives with normalized once (output_arrangement.source_key()). Written only by
+    app/output_arrangement.py."""
+    __tablename__ = 'output_categories'
+    __table_args__ = ({'sqlite_autoincrement': True},)
+    id           = db.Column(db.Integer, primary_key=True)
+    origin       = db.Column(db.String(16), nullable=False)
+    builtin      = db.Column(db.String(16))
+    source_key   = db.Column(db.String(255), unique=True)
+    source_name  = db.Column(db.String(255))
+    # The owner's name for it; NULL sends source_name.
+    name         = db.Column(db.String(100))
+    position     = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    # Set when reconcile() made it, cleared only by the owner (16.4).
+    placed_auto  = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
+    # The last time reconcile() found something arriving under its name, to the hour.
+    last_sent_at = db.Column(db.DateTime)
+    created_at   = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class OutputItem(db.Model):
+    """One arranged item on the IPTV output: a feed row, or a league's numbered sports channels
+    as one (DESIGN-output-feed.md 16.1). Its category is fixed when it is placed and only the
+    owner moves it afterward. Deleted with the row it names (output_arrangement.forget_items()),
+    since channel, group and league ids are reused. Written only by app/output_arrangement.py."""
+    __tablename__ = 'output_items'
+    __table_args__ = (db.UniqueConstraint('item_kind', 'item_id', name='uq_output_item'),
+                      {'sqlite_autoincrement': True})
+    id               = db.Column(db.Integer, primary_key=True)
+    item_kind        = db.Column(db.String(16), nullable=False)
+    item_id          = db.Column(db.Integer, nullable=False)
+    category_id      = db.Column(db.Integer, db.ForeignKey('output_categories.id'), nullable=False)
+    # Where it was first placed, for "put back where it arrived".
+    home_category_id = db.Column(db.Integer, db.ForeignKey('output_categories.id'), nullable=False)
+    position         = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
+    # The owner's name for it (channels and groups only); NULL sends the real one.
+    name             = db.Column(db.String(100))
+    placed_auto      = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
+    created_at       = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
 class SportsTeam(db.Model):

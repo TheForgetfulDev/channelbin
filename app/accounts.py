@@ -1095,6 +1095,10 @@ def sync_account(app, account_id: int, use_dump: bool = False, force_epg_resync:
             with app.app_context():
                 _do_sync(account_id, stop_event, use_dump=use_dump,
                          force_epg_resync=force_epg_resync)
+                # A sync changes what a category arrives as, which the output's arrangement
+                # stamps, and never moves anything (DESIGN-output-feed.md 16.4).
+                from .output_arrangement import reconcile_guarded
+                reconcile_guarded(f'the sync of account {account_id}')
         finally:
             with _sync_locks_mutex:
                 _sync_threads.pop(account_id, None)
