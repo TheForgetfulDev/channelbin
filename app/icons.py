@@ -61,7 +61,7 @@ ICONS = {
     'menu-expand': 'chevron-double-right',
     'stats': 'chart-bar',
     'bottom': 'arrow-collapse-down',
-    'repoint': 'swap-horizontal',
+    'replace': 'swap-horizontal',
     'about': 'information-outline',
 
     # Status marks.

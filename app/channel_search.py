@@ -77,7 +77,8 @@ from . import db, health_bands
 from .channel_groups import guide_scope_channel_ids, guide_scope_group_member_ids
 from .duplicate_streams import effective_health, in_any_group_expr  # noqa: F401 - re-exported: the search's callers read them here
 from .database import (Account, AccountSyncLog, Channel, ChannelGroup,
-                       ChannelGroupMember, EPGEntry, Tag, SYNC_LOG_IMPORTED, SYNC_LOG_SKIPPED)
+                       ChannelGroupMember, ChannelReplacement, EPGEntry, Tag,
+                       SYNC_LOG_IMPORTED, SYNC_LOG_SKIPPED)
 from .fmt_utils import lower_first
 from .search_index import (AIRING_PROBE_MAX_ROWS, SEARCH_INDEX_CHANNELS, SEARCH_INDEX_NAMES,
                            SEARCH_INDEX_PROGRAMS, TRIGRAM_MIN_CHARS,
@@ -496,9 +497,16 @@ OTHER_MONITORED = 'monitored'
 #: or that the account stopped reading, still counts - it is the user's answer, and the
 #: channel page says which of the two holds.
 OTHER_SOURCE_OVERRIDE = 'srcoverride'
-OTHER_VALUES = (OTHER_REMOVED, OTHER_NEW, OTHER_IN_GUIDE, OTHER_GUIDE_OWN_ROW,
-                OTHER_GUIDE_VIA_GROUP, OTHER_DUP_URL, OTHER_PROVIDER, OTHER_MONITORED,
-                OTHER_SOURCE_OVERRIDE)
+#: The account's last imported sync did not list this channel (accounts.channel_unlisted(),
+#: DESIGN-channel-successors.md section 3): a separate fact from `removed`, which waits
+#: channel_missing_after_days on top. A removed channel is always unlisted too.
+OTHER_UNLISTED = 'unlisted'
+#: Another channel took this one's place (`channel_replacements.old_channel_id`). "Replaced"
+#: is that one fact and not a lifecycle state, so it sits beside `removed`, not inside it.
+OTHER_REPLACED = 'replaced'
+OTHER_VALUES = (OTHER_REMOVED, OTHER_NEW, OTHER_UNLISTED, OTHER_REPLACED, OTHER_IN_GUIDE,
+                OTHER_GUIDE_OWN_ROW, OTHER_GUIDE_VIA_GROUP, OTHER_DUP_URL, OTHER_PROVIDER,
+                OTHER_MONITORED, OTHER_SOURCE_OVERRIDE)
 LISTINGS_NONE = 'none'
 #: A `listings` filter reads as one phrase, picked and excluded, never as "Listings is <value>":
 #: the chip, its tooltip and a described search all say it this way (dev/changelog/1450).
@@ -513,6 +521,8 @@ LISTINGS_PHRASES = {LISTINGS_NONE: {
 OTHER_LABELS = {
     OTHER_REMOVED: 'Deleted by provider',
     OTHER_NEW: 'Newly added by provider',
+    OTHER_UNLISTED: 'Not in the last sync',
+    OTHER_REPLACED: 'Replaced',
     OTHER_IN_GUIDE: 'In your guide',
     OTHER_GUIDE_OWN_ROW: 'Has its own guide row',
     OTHER_GUIDE_VIA_GROUP: 'In the guide via a group',
@@ -2485,6 +2495,12 @@ def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str 
             return _missing_predicate(ctx)
         if value == OTHER_NEW:
             return _new_predicate(ctx)
+        if value == OTHER_UNLISTED:
+            from .accounts import unlisted_channel_expr
+            return unlisted_channel_expr(ctx.unlisted_bounds())
+        if value == OTHER_REPLACED:
+            return Channel.id.in_(select(ChannelReplacement.old_channel_id).where(
+                ChannelReplacement.old_channel_id.isnot(None)))
         if value == OTHER_IN_GUIDE:
             # Guide SCOPE, not the raw flag - the difference, and why an id set rather than a
             # column predicate, are on guide_scope_channel_ids(). Channel-side on BOTH grains:
@@ -2991,8 +3007,8 @@ def _group_other_predicate(value: str, ctx: 'SearchContext'):
     """
     if value in (OTHER_IN_GUIDE, OTHER_GUIDE_VIA_GROUP):
         return ChannelGroup.in_guide.is_(True)
-    if value in (OTHER_GUIDE_OWN_ROW, OTHER_REMOVED, OTHER_NEW, OTHER_DUP_URL,
-                 OTHER_PROVIDER):
+    if value in (OTHER_GUIDE_OWN_ROW, OTHER_REMOVED, OTHER_NEW, OTHER_UNLISTED, OTHER_REPLACED,
+                 OTHER_DUP_URL, OTHER_PROVIDER):
         return db.false()
     if value == OTHER_SOURCE_OVERRIDE:
         # A guide source override is a channel's (its page is where it is set); a group's
@@ -3366,6 +3382,8 @@ class SearchContext:
     #: the two cannot be confused into recomputing on every call. See
     #: monitored_channel_ids() for why this one is lazy where the fields above are eager.
     monitored_ids: tuple | None = None
+    #: The `unlisted` Other value's sync bounds, memoized once asked for - unlisted_bounds().
+    sync_bounds: dict | None = None
     #: The display timezone's UTC offsets across the guide, memoized once asked for - see
     #: offset_segments(). None means "not asked yet".
     tz_segments: tuple | None = None
@@ -3463,6 +3481,15 @@ class SearchContext:
             from .channel_tester import monitored_channel_ids
             self.monitored_ids = tuple(sorted(monitored_channel_ids()))
         return self.monitored_ids
+
+    def unlisted_bounds(self) -> dict:
+        """accounts.last_sync_bounds(), memoized for the request: what OTHER_UNLISTED reads.
+        Lazy for the reason monitored_channel_ids() is - a request that neither filters on the
+        value nor draws the Other rail never pays its query."""
+        if self.sync_bounds is None:
+            from .accounts import last_sync_bounds
+            self.sync_bounds = last_sync_bounds()
+        return self.sync_bounds
 
     def offset_segments(self) -> tuple:
         """The display timezone's UTC offsets over every start time in `epg_entries`, for

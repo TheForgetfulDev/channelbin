@@ -861,6 +861,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .nav-count.nav-count-ready-warn,
 .nav-link.active .nav-count.nav-count-ready-warn { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
 .nav-count-ready-bad + .nav-count-ready-warn { margin-left: -5px; }
+/* The Replacements link's count of channels waiting (DESIGN-channel-successors.md section 9),
+   amber like the pairs above under its own name, so neither of their appliers writes it. */
+.nav-count.nav-count-replacements,
+.nav-link.active .nav-count.nav-count-replacements { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
 /* Log out is a POST (state-changing), so it's a <button> in its own <form>, not an <a> -
    reset to match every .nav-link <a> around it. */
 .nav-logout-form { margin: 0; }
@@ -3375,6 +3379,10 @@ th.gd-c-part { text-align: center; }
 .recovery-card .rc-head { display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--accent-text); font-size: var(--fs-base); margin-bottom: 5px; }
 .recovery-card .rc-body { font-size: var(--fs-md); color: var(--text-muted); }
 .recovery-card .rc-actions { margin-top: 11px; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+/* A replacement's carry checkboxes, on the Replacements page and in a channel page's Replace
+   confirm (DESIGN-channel-successors.md section 9). */
+.carry-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: 0.35rem 1rem; margin: 0.5rem 0; }
+.carry-grid label { display: flex; gap: 0.4rem; align-items: baseline; }
 
 /* ── Split cards (round 4) ───────────────────────────────
    Every card stays full width, but a card whose content is narrow lays its own

@@ -1355,24 +1355,26 @@ class QueryPlanTests(_AiringTestCase):
         showings "Collapse channel groups" hides that a value would bring back are one more pair:
         the collapse's window, and the grouped channels' answers - asked whether or not anything
         is hidden, so the count does not move with the data. A Group facet adds its memberships
-        (dev/changelog/1448)."""
+        (dev/changelog/1448). Other's `unlisted` value reads the accounts' last sync bounds once
+        per request, one more statement (dev/changelog/1798)."""
         # With duplicates hidden, which is no longer the default (dev/changelog/1458): that
         # is the search that pays for the duplicates' pair.
         folding = default_standing_for(GRAIN_AIRINGS) - {'showdup'}
         without = len(self._statements(standing=folding, facets=()))
         with_four = len(self._statements(standing=folding,
                                          facets=('acct', 'cat', 'health', 'other')))
-        self.assertEqual(with_four - without, 5,
+        self.assertEqual(with_four - without, 6,
                          'the four single-scan facet dimensions should add one statement '
-                         'between them and one pair each for the duplicates and the collapse, '
-                         'not one each')
+                         'between them, one pair each for the duplicates and the collapse, and '
+                         'the sync bounds, not one each')
 
     def test_a_filtered_dimension_still_falls_back_to_its_own_aggregate(self):
         """The combined pass counts each dimension against the same base, so a dimension the
         user has filtered ON cannot join it - its own filter has to come off first. Filtering
         one of the four therefore costs two statements, not one, plus a pair for the duplicates
         and a pair for the collapsed showings each of those passes would bring back
-        (dev/changelog/1435, 1448).
+        (dev/changelog/1435, 1448), and the sync bounds Other's `unlisted` value reads once per
+        request (dev/changelog/1798).
 
         The baseline also carries the cat filter (facets=()) rather than being fully
         unfiltered: an unfiltered airing search takes the cached-breakdown path
@@ -1384,7 +1386,7 @@ class QueryPlanTests(_AiringTestCase):
         cat_filter = (DimensionFilter('cat', ('Sports',), ()),)
         without = len(self._statements(filters=cat_filter, standing=folding, facets=()))
         filtered = len(self._statements(filters=cat_filter, **state))
-        self.assertEqual(filtered - without, 10)
+        self.assertEqual(filtered - without, 11)
 
     def test_the_combined_pass_returns_exactly_what_the_separate_aggregates_did(self):
         """The correctness half. Collapsing four aggregates into one grouped scan changes

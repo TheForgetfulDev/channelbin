@@ -315,7 +315,11 @@ class OptInTests(unittest.TestCase):
                       'templates/account_detail.html', 'templates/account_form.html',
                       'templates/epg_source_review.html',
                       'templates/channels/guide_compare.html',
-                      'templates/epg_manager.html'} | {p for p, _b, _n in REFLOWING_JS}
+                      'templates/epg_manager.html',
+                      # Its table is in the template and its rows are drawn by
+                      # replacements.js::draw(), whose cells are checked for data-label by
+                      # tests/test_channel_successors_pages.py::ReviewPageTests.
+                      'templates/channels/replacements.html'} | {p for p, _b, _n in REFLOWING_JS}
         # util.js builds no table: its tooltip reads the class to find a card table's hidden
         # header (dev/changelog/1589), so it has no cells to check for a label.
         found.discard('static/js/util.js')

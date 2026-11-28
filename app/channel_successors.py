@@ -40,6 +40,7 @@ from .database import (
     REC_STATUS_SCHEDULED, REPLACE_MATCH_PICKED, REPLACE_MATCH_STREAM_ID, REPLACE_MATCH_URL,
 )
 from .db_utils import chunked, retry_on_locked
+from .fmt_utils import counted, iso_or_none
 from .url_utils import mask_creds
 
 log = logging.getLogger(__name__)
@@ -111,33 +112,52 @@ def replaced_old_ids(channel_ids=None) -> set:
     """Ids of channels that are the old side of a live replacement."""
     q = db.session.query(ChannelReplacement.old_channel_id).filter(
         ChannelReplacement.old_channel_id.isnot(None))
-    if channel_ids is not None:
-        ids = list(channel_ids)
-        if not ids:
-            return set()
-        q = q.filter(ChannelReplacement.old_channel_id.in_(ids))
-    return {cid for (cid,) in q.all()}
+    if channel_ids is None:
+        return {cid for (cid,) in q.all()}
+    out = set()
+    for chunk in chunked(sorted(set(channel_ids)), 500):
+        out.update(cid for (cid,) in q.filter(ChannelReplacement.old_channel_id.in_(chunk)))
+    return out
 
 
 def stranded_channels(bounds=None, *, group_id=None):
     """Channels that are unlisted (accounts.channel_unlisted) and still hold something a
     replacement would move - a group membership or a guide row - and have not been replaced.
-    One query, whatever the size: a page reads it once (section 4, Cost)."""
+    A fixed number of queries whatever the size (section 4, Cost)."""
+    if bounds is None:
+        bounds = last_sync_bounds()
+    ids = stranded_ids(bounds, group_id)
+    if not ids:
+        return []
+    out = []
+    for chunk in chunked(sorted(ids), 400):
+        out += Channel.query.filter(Channel.id.in_(chunk)).all()
+    return sorted(out, key=lambda c: (c.name or '', c.id))
+
+
+def stranded_ids(bounds=None, group_id=None) -> set:
+    """Ids of the channels stranded_channels() lists. Driven from what they hold - the
+    membership rows and the guide rows, a few thousand at most - and tested for unlisted in
+    Python with channel_unlisted()'s own rule: as one SQL predicate SQLite walks every
+    channel of every synced account instead (150 ms over prod's 183,000, against 5 ms this
+    way, measured on the dev instance's copy 2026-11-28), and the menu asks on every page."""
     if bounds is None:
         bounds = last_sync_bounds()
     if not bounds:
-        return []
-    members = db.session.query(ChannelGroupMember.channel_id)
+        return set()
+    cols = (Channel.id, Channel.account_id, Channel.last_seen_at)
+    held = db.session.query(*cols).join(ChannelGroupMember,
+                                        ChannelGroupMember.channel_id == Channel.id)
     if group_id is not None:
-        members = members.filter(ChannelGroupMember.group_id == group_id)
-    holds = Channel.id.in_(members) if group_id is not None else db.or_(
-        Channel.id.in_(members),
-        Channel.in_guide.is_(True))  # guide-flag-read-ok: a guide row of its own is one of the two things a replacement moves
-    replaced = db.session.query(ChannelReplacement.old_channel_id).filter(
-        ChannelReplacement.old_channel_id.isnot(None))
-    return (Channel.query.filter(unlisted_channel_expr(bounds), holds,
-                                 Channel.id.notin_(replaced))
-            .order_by(Channel.name, Channel.id).all())
+        held = held.filter(ChannelGroupMember.group_id == group_id)
+    else:
+        held = held.union(db.session.query(*cols).filter(
+            Channel.in_guide.is_(True)))  # guide-flag-read-ok: a guide row of its own is one of the two things a replacement moves
+    # duplicated from accounts.channel_unlisted() - the same rule over (id, account, seen)
+    # tuples rather than Channel rows; keep the three spellings in step.
+    ids = {cid for cid, aid, seen in held.all()
+           if bounds.get(aid) is not None and seen is not None and seen < bounds[aid]}
+    return ids - replaced_old_ids(ids) if ids else ids
 
 
 def _provider_of(account_ids) -> dict:
@@ -186,10 +206,20 @@ def proposals(olds, bounds=None) -> dict:
                 found[ch.id] = ch
     taken = replaced_old_ids(found.keys())
     providers = _provider_of({c.account_id for c in olds} | {c.account_id for c in found.values()})
+    # Each old channel is compared only with the candidates that share one of its two keys:
+    # every old against every candidate was 560,000 comparisons and 1.5 s for prod's 260.
+    by_psid, by_url = {}, {}
+    for cand in found.values():
+        if cand.provider_stream_id:
+            by_psid.setdefault(cand.provider_stream_id, []).append(cand)
+        if cand.stream_url:
+            by_url.setdefault(cand.stream_url, []).append(cand)
     out = {}
     for old in olds:
         rows = []
-        for cand in found.values():
+        near = {c.id: c for c in by_psid.get(old.provider_stream_id, []) if old.provider_stream_id}
+        near.update((c.id, c) for c in by_url.get(old.stream_url, []) if old.stream_url)
+        for cand in near.values():
             if cand.id == old.id or cand.id in taken:
                 continue
             kind = match_kind(old, cand, providers)
@@ -927,3 +957,247 @@ def before_channel_delete(channel_ids, cfg) -> int:
         if isinstance(obj, Channel) and obj.id in ids:
             db.session.expire(obj, ['tests', 'events', 'health_exclusions'])
     return touched
+
+
+# ── The review (section 9) ──────────────────────────────────────────────────────────────────
+
+#: What each carry checkbox brings over, for its tooltip on the review page and the Replace
+#: confirm. Keyed like CARRY_LABELS, so a new piece is one entry in each.
+CARRY_TIPS = {
+    CARRY_HEALTH: ("The new channel's score counts the old channel's tests and recordings up to "
+                   "now, so it does not start from nothing. You can turn this off later on the "
+                   "new channel's page."),
+    CARRY_GUIDE: ('When the old channel has a TV Guide row of its own, the new one takes it, in '
+                  'the same place, and on the IPTV output too.'),
+    CARRY_NOTES: 'The note on the old channel.',
+    CARRY_ADJUSTMENT: "The plus or minus you set by hand on the old channel's score, with its note.",
+    CARRY_PROFILE: 'The recording profile chosen for the old channel.',
+    CARRY_PACE: 'Whether the old channel is read at its own pace when recording.',
+    CARRY_TEST_SWITCH: ('The channel-wide switch that lets health checks test it. Only ever '
+                        'turned on, never off.'),
+    CARRY_HIDE: 'Hidden or always shown, when you set one by hand on the old channel.',
+    CARRY_EPG: ("EPG ids you accepted or refused for the old channel, and a guide source you "
+                "picked for it, where the new channel's account reads that source."),
+    CARRY_PIP: 'Picture-in-picture channels that show the old channel show the new one.',
+    CARRY_SCHEDULED: ('Recordings scheduled on the old channel that have not started. A '
+                      'recording already running is never moved.'),
+}
+
+#: A carry preview's states: what replace() would do with a piece if it were checked. The
+#: page shows only the checked ones, so the preview never depends on the checkboxes.
+PREVIEW_CARRY = 'carry'
+PREVIEW_KEPT = 'kept'
+
+
+def carry_facts(channel_ids) -> dict:
+    """The per-channel facts a carry preview reads that are not columns on Channel, for many
+    channels at once: {channel id: {'epg': bool, 'scheduled': int, 'pip': bool}}. A fixed
+    number of queries per 400 channels, never one per row (CLAUDE.md, no hidden I/O in
+    per-row loops)."""
+    from .database import EpgChannelKey, PipChannel
+    from .pip_channels import PIP_SOURCE_CHANNEL, ROLES
+    ids = sorted(set(channel_ids))
+    facts = {cid: {'epg': False, 'scheduled': 0, 'pip': False} for cid in ids}
+    for chunk in chunked(ids, 400):
+        for (cid,) in (db.session.query(EpgChannelKey.channel_id).distinct()
+                       .filter(EpgChannelKey.channel_id.in_(chunk),
+                               EpgChannelKey.status.in_([EPG_KEY_ACCEPTED, EPG_KEY_REJECTED]))):
+            facts[cid]['epg'] = True
+        for cid, n in (db.session.query(Recording.channel_id, db.func.count(Recording.id))
+                       .filter(Recording.channel_id.in_(chunk),
+                               Recording.status == REC_STATUS_SCHEDULED,
+                               Recording.group_id.is_(None))
+                       .group_by(Recording.channel_id)):
+            facts[cid]['scheduled'] = n
+        for role in ROLES:
+            kind_col = getattr(PipChannel, f'{role}_kind')
+            ref_col = getattr(PipChannel, f'{role}_ref')
+            for (cid,) in (db.session.query(ref_col).distinct()
+                           .filter(kind_col == PIP_SOURCE_CHANNEL, ref_col.in_(chunk))):
+                if cid in facts:
+                    facts[cid]['pip'] = True
+    return facts
+
+
+def carry_preview(old, new, facts) -> list:
+    """[{'k', 'label', 'state'}] for every piece the old channel has something for: 'carry'
+    when replace() would bring it over if checked, 'kept' when the new channel's own value
+    stands (section 8: never overwritten). Mirrors replace()'s rules from columns and
+    carry_facts(); the accept re-derives everything, so where the preview cannot know (an EPG
+    source the new channel's account does not read) it says carry and the event says what
+    happened."""
+    of, nf = facts.get(old.id, {}), facts.get(new.id, {})
+    out = []
+
+    def piece(k, has, new_has, label=None):
+        if has:
+            out.append({'k': k, 'label': label or CARRY_LABELS[k],
+                        'state': PREVIEW_KEPT if new_has else PREVIEW_CARRY})
+
+    samples = old.health_score_sample_count or 0
+    piece(CARRY_HEALTH, samples > 0, False,
+          f'health history ({counted(samples, "observation")})')
+    piece(CARRY_GUIDE, old.in_guide, new.in_guide)
+    piece(CARRY_NOTES, bool(old.notes), bool(new.notes) and new.notes != old.notes)
+    piece(CARRY_ADJUSTMENT, bool(old.manual_health_adjustment or old.manual_health_note),
+          bool(new.manual_health_adjustment or new.manual_health_note))
+    piece(CARRY_PROFILE, old.default_profile_id is not None, new.default_profile_id is not None)
+    piece(CARRY_PACE, old.pace_realtime is not None, new.pace_realtime is not None)
+    piece(CARRY_TEST_SWITCH, bool(old.test_enabled) and not new.test_enabled, False)
+    piece(CARRY_HIDE, old.hidden_override is not None, new.hidden_override is not None)
+    piece(CARRY_EPG, of.get('epg') or old.epg_source_override_id is not None,
+          nf.get('epg') or new.epg_source_override_id is not None)
+    piece(CARRY_PIP, of.get('pip'), False)
+    n = of.get('scheduled', 0)
+    piece(CARRY_SCHEDULED, n > 0, False, counted(n, 'scheduled recording'))
+    return out
+
+
+def stranded_count(bounds=None) -> int:
+    """How many channels stranded_channels() would list: the number the menu
+    and the Dashboard show while it is above zero."""
+    return len(stranded_ids(bounds))
+
+
+def carried_labels(link) -> list:
+    """The pieces a replacement brought over, in CARRY_PIECES order, from the link's record."""
+    try:
+        carried = json.loads(link.carried or '{}')
+    except ValueError:
+        log.warning('Replacement %d: unreadable carried record', link.id)
+        return []
+    return [CARRY_LABELS[p] for p in CARRY_PIECES if carried.get(p) == CARRIED]
+
+
+def channel_page_view(channel, cfg, bounds=None) -> dict:
+    """What a channel's page says about replacements (section 9), in a fixed handful of
+    queries:
+
+      * `replaced_by` - this channel is the old side of a live replacement;
+      * `continues` - every replacement this channel is the new side of, live or with the
+        old row since deleted, each with its health switch;
+      * `chain` - carried_chain(), the old channels whose tests and recordings the page lists
+        beside its own while their history counts;
+      * `offer` - this channel is unlisted or missing and not replaced, with every proposal
+        and its carry preview, for the Replace confirm."""
+    from .database import ChannelReplacement as CR
+    replaced_by = None
+    link = CR.query.filter_by(old_channel_id=channel.id).first()
+    if link is not None:
+        new = db.session.get(Channel, link.new_channel_id)
+        replaced_by = {'link_id': link.id, 'new': new, 'accepted_at': link.accepted_at,
+                       'carried': carried_labels(link)}
+    continues = []
+    links = CR.query.filter_by(new_channel_id=channel.id).order_by(CR.accepted_at).all()
+    alive = [lk.old_channel_id for lk in links if lk.old_channel_id]
+    olds = {c.id: c for c in Channel.query.filter(Channel.id.in_(alive))} if alive else {}
+    for lk in links:
+        old = olds.get(lk.old_channel_id)
+        continues.append({'link_id': lk.id, 'old': old, 'old_name': lk.old_name,
+                          'old_account_name': lk.old_account_name,
+                          'accepted_at': lk.accepted_at, 'health_carried': bool(lk.health_carried)})
+    offer = None
+    if replaced_by is None:
+        if bounds is None:
+            bounds = last_sync_bounds([channel.account_id])
+        missing = missing_channels_query(None, cfg, channel_ids=[channel.id]).count()
+        if channel_unlisted(channel, bounds) or missing:
+            rows = proposals([channel]).get(channel.id, [])
+            facts = carry_facts([channel.id] + [c.id for c, _ in rows])
+            offer = {'matches': [{
+                'id': c.id, 'name': c.name, 'account_id': c.account_id,
+                'account': _account_name(c), 'kind': kind, 'score': c.health_score,
+                'samples': c.health_score_sample_count or 0,
+                'carry': carry_preview(channel, c, facts)} for c, kind in rows]}
+    return {'replaced_by': replaced_by, 'continues': continues,
+            'chain': carried_chain(channel.id), 'offer': offer}
+
+
+def _channel_view(c):
+    return {'id': c.id, 'name': c.name, 'account_id': c.account_id,
+            'psid': c.provider_stream_id, 'last_seen': iso_or_none(c.last_seen_at),
+            'score': c.health_score, 'samples': c.health_score_sample_count or 0,
+            'in_guide': bool(c.in_guide)}
+
+
+def review_payload() -> dict:
+    """Everything the Replacements page draws, read in a fixed number of queries whatever the
+    number of stranded channels (tests/test_scaling_pages.py): the stranded channels, every
+    proposal for each with its carry preview, the groups each one is in, the accounts with
+    their last sync and whether it shrank, and the choices for "Replace with channels from".
+
+    One row per old channel, not per membership: a replacement is a fact about a channel and
+    moves every group it is in (section 8.1), so a channel in two groups is one row with two
+    group chips (dev/changelog/1789)."""
+    from .database import Alert, Provider
+    bounds = last_sync_bounds()
+    olds = stranded_channels(bounds)
+    props = proposals(olds, bounds)
+    old_ids = [c.id for c in olds]
+    cands = {cand.id: cand for rows in props.values() for cand, _ in rows}
+
+    memberships, group_names = {}, {}
+    for chunk in chunked(old_ids, 400):
+        for cid, gid, gname in (db.session.query(ChannelGroupMember.channel_id,
+                                                 ChannelGroup.id, ChannelGroup.name)
+                                .join(ChannelGroup, ChannelGroup.id == ChannelGroupMember.group_id)
+                                .filter(ChannelGroupMember.channel_id.in_(chunk))):
+            memberships.setdefault(cid, set()).add(gid)
+            group_names[gid] = gname
+
+    facts = carry_facts(old_ids + list(cands))
+    account_ids = {c.account_id for c in olds} | {c.account_id for c in cands.values()}
+    accounts = ({a.id: a for a in Account.query.filter(Account.id.in_(list(account_ids)))}
+                if account_ids else {})
+    provider_ids = {a.provider_id for a in accounts.values() if a.provider_id is not None}
+    # Every account of a provider a stranded channel's account is on, so "Replace with
+    # channels from" can name one that holds no proposal and say so in each row.
+    peers = (Account.query.filter(Account.provider_id.in_(list(provider_ids)))
+             .order_by(Account.name).all() if provider_ids else [])
+    for a in peers:
+        accounts.setdefault(a.id, a)
+    providers = ({p.id: p.name for p in Provider.query.filter(Provider.id.in_(list(provider_ids)))}
+                 if provider_ids else {})
+    shrunk = set()
+    if accounts:
+        # duplicated from accounts.py::_raise_channel_lifecycle_alerts - the standing alert's
+        # type and source key, which that module spells inline; rename them together.
+        sources = {f'account:{aid}:feed-shrunk': aid for aid in accounts}
+        for (source,) in (db.session.query(Alert.source)
+                          .filter(Alert.alert_type == 'SYNC_FEED_SHRUNK',
+                                  Alert.dismissed_at.is_(None),
+                                  Alert.source.in_(list(sources)))):
+            shrunk.add(sources[source])
+
+    homes = {c.account_id for c in olds}
+    # An account every stranded channel already lives on is what "own account" means;
+    # offering it again would be one choice under two names (dev/changelog/1789).
+    targets = [{'v': 'own', 'label': "Each channel's own account"}]
+    targets += [{'v': str(a.id), 'label': f'{a.name} ({providers.get(a.provider_id, "")})'}
+                for a in peers if homes != {a.id}]
+
+    rows = [{
+        'old_id': old.id,
+        'groups': sorted(memberships.get(old.id, ()), key=lambda g: (group_names[g].lower(), g)),
+        'matches': [{'id': cand.id, 'kind': kind, 'carry': carry_preview(old, cand, facts)}
+                    for cand, kind in props.get(old.id, [])],
+    } for old in olds]
+    channels = {c.id: _channel_view(c) for c in olds}
+    channels.update({c.id: _channel_view(c) for c in cands.values()})
+    return {
+        'rows': rows,
+        'channels': channels,
+        'groups': group_names,
+        'accounts': {a.id: {'id': a.id, 'name': a.name, 'color': a.color,
+                            'provider_id': a.provider_id,
+                            'last_sync_at': iso_or_none(a.last_sync_at), 'shrunk': a.id in shrunk}
+                     for a in accounts.values()},
+        'targets': targets,
+        'carry': carry_options(),
+    }
+
+
+def carry_options() -> list:
+    """The carry checkboxes, in order, for the review page and the Replace confirm."""
+    return [{'k': k, 'label': CARRY_LABELS[k][:1].upper() + CARRY_LABELS[k][1:],
+             'tip': CARRY_TIPS[k]} for k in CARRY_PIECES]

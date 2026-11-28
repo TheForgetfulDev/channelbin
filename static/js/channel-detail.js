@@ -260,28 +260,93 @@
       .catch(e => showToast(e.message, { type: 'error' }));
   }
 
-  async function repointChannel() {
-    const r = C.repoint;
-    if (!r) return;
-    if (!(await confirmModal({
-      title: 'Re-point channel',
-      message: `"${r.name}" on ${r.account} takes the place of "${C.channelName}" in its ` +
-        `groups and the TV Guide, its scheduled recordings move, and its health score counts ` +
-        `"${C.channelName}"'s history. Notes and settings come across where "${r.name}" has ` +
-        `none of its own.`,
-      consequence: `"${C.channelName}" keeps its recordings and tests but leaves its groups ` +
-        `and the guide.`,
-      confirmLabel: 'Re-point',
-    }))) return;
-    jsonFetch(C.urls.repoint, {
-      method: 'POST', body: JSON.stringify({ survivor_channel_id: r.id }),
-    })
-      .then(data => {
-        showToast(data.message || 'Re-pointed successfully.');
-        setTimeout(() => { location.href = `/channels/${r.id}`; }, 900);  // nav-ok: redirect after a save
-      })
-      .catch(e => showActionError(e.message || 'Re-point failed.'));
+  /* The single Replace confirm (DESIGN-channel-successors.md section 9, mockup 66): which
+     proposal, both scores, and the carry checkboxes - a piece the old channel has nothing for
+     says "nothing set" and one the new channel already has says "kept its own", both
+     disabled, so the dialog says per piece what will happen. The server re-checks the pairing
+     and re-derives every piece on the accept. */
+  function replaceChannel() {
+    const R = C.replace;
+    if (!R || !R.matches.length) return;
+    let pick = R.matches.length === 1 ? R.matches[0] : null;
+    const on = Object.fromEntries(R.carry.map((p) => [p.k, true]));
+    const score = (s, n) => (s === null || s === undefined
+      ? '<span class="text-muted">No score</span>'
+      : `<span class="num hb-text ${healthBandCss(Math.round(s))}">${icon('health-score')}${Math.round(s)}</span> <span class="text-faint small">${escHtml(counted(n, 'observation'))}</span>`);
+    const body = document.createElement('div');
+    const draw = () => {
+      const plan = pick ? pick.carry : [];
+      const where = R.groups.length ? joinLabels(R.groups) : '';
+      const place = [where, R.inGuide ? 'the TV Guide' : ''].filter(Boolean).join(' and ') || 'nothing yet';
+      body.innerHTML = `
+        ${R.matches.length > 1 ? `<p>${R.matches.length} channels carry this stream. Replace with:</p>
+          <div class="cd-choose">${R.matches.map((m) => `<label><input type="radio" name="cd-replace" value="${m.id}"${pick && pick.id === m.id ? ' checked' : ''}> ${escHtml(m.name)} <span class="text-faint small">${escHtml(m.account)}</span></label>`).join('')}</div>` : ''}
+        ${pick ? `<p><a href="/channels/${pick.id}">${escHtml(pick.name)}</a> on ${escHtml(pick.account)} takes this channel's place in ${escHtml(place)}, with the same Recording and Health check switches.</p>` : ''}
+        <div class="cd-scores">
+          <div><div class="text-faint small">This channel now</div>${score(R.score, R.samples)}</div>
+          <div><div class="text-faint small">${pick ? escHtml(pick.name) : 'The new channel'} now</div>${pick ? score(pick.score, pick.samples) : '-'}</div>
+        </div>
+        <p class="text-faint small">With its health history brought over, the new channel's score is replayed from both channels' tests and recordings. Tests already pruned cannot be replayed, so it can come out a little different from this channel's.</p>
+        <div class="carry-grid">${R.carry.map((p) => {
+          const piece = plan.find((x) => x.k === p.k);
+          const usable = piece && piece.state === 'carry';
+          const NOTES = { carry: '', kept: ' <span class="val-warn small">kept its own</span>' };
+          const note = !piece ? ' <span class="text-faint small">nothing set</span>' : NOTES[piece.state];
+          return `<label class="tip-plain" data-tip="${escHtml(p.label)}.&#10;${escHtml(p.tip)}"><input type="checkbox" data-carry="${p.k}"${usable && on[p.k] ? ' checked' : ''}${usable ? '' : ' disabled'}> ${escHtml(p.label)}${note}</label>`;
+        }).join('')}</div>
+        <p class="text-faint small">This channel keeps its recordings and tests.</p>`;
+    };
+    draw();
+    body.addEventListener('change', (e) => {
+      if (e.target.name === 'cd-replace') {
+        pick = R.matches.find((m) => String(m.id) === e.target.value) || null;
+        draw();
+      } else if (e.target.dataset.carry) {
+        on[e.target.dataset.carry] = e.target.checked;
+      }
+    });
+    buildModal({
+      title: `Replace ${C.channelName}`,
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn' },
+        { label: 'Replace', class: 'btn btn-primary', onClick: (close) => {
+          if (!pick) { showToast('Choose the channel to replace it with first.', { type: 'error' }); return false; }
+          const target = pick;
+          jsonFetch(C.urls.replace, {
+            method: 'POST',
+            body: JSON.stringify({
+              pairs: [{ old_id: C.channelId, new_id: target.id }],
+              carry: R.carry.map((p) => p.k).filter((k) => on[k]),
+              surface: 'channel_page',
+            }),
+          }).then((d) => {
+            close();
+            showToastAfterLoad(`Replaced: ${d.replaced[0].summary}.`);
+            location.href = `/channels/${target.id}`;  // nav-ok: the new channel's page after the replacement
+          }).catch((err) => showToast(err.message || 'The replacement did not go through.', { type: 'error', durationMs: 10000 }));
+          return false;
+        } },
+      ],
+    });
   }
+
+  // The Count its history switch on a channel that took another's place (section 6).
+  document.addEventListener('change', (e) => {
+    const sw = e.target.closest('input[data-act="history"]');
+    if (!sw) return;
+    sw.disabled = true;
+    jsonFetch(`${C.urls.replaceHealth}${sw.dataset.linkId}/health`, {
+      method: 'POST', body: JSON.stringify({ on: sw.checked }),
+    }).then(() => {
+      showToastAfterLoad(sw.checked ? 'Its history counts again.' : 'Its history no longer counts.');
+      location.reload();
+    }).catch((err) => {
+      sw.checked = !sw.checked;
+      sw.disabled = false;
+      showToast(err.message || 'The switch did not move.', { type: 'error' });
+    });
+  });
 
   /* Delete this one channel, through the SAME preview-then-delete pair the Browse tab's
      sweep uses (dev/changelog/772). No confirm() of our own: the shared modal fetches the
@@ -798,7 +863,7 @@
       case 'actions-sheet': openActionsSheet(); return;
       case 'sections': sectionLayout.open(); return;
       case 'copy-url': copyStreamUrl(el); return;
-      case 'repoint': repointChannel(); return;
+      case 'replace': replaceChannel(); return;
       case 'test-now': testNow(el); return;
       case 'preview': openLivePreview({ channelId: C.channelId, channelName: C.channelName }); return;
       case 'screenshot': captureScreenshot(); return;

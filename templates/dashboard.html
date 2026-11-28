@@ -324,9 +324,12 @@
       </div>
       {#- What the EPG check found someone should act on (dev/changelog/1718): a page line,
           never an alert. -#}
-      {% if epg_findings %}
+      {% if epg_findings or nav_replacements %}
       <div class="dash-findings">
         {% for f in epg_findings %}<p>{{ f.account }}: {{ f.text }}. <a href="{{ f.url }}">EPG sources {{ icon('forward') }}</a></p>{% endfor %}
+        {#- Channels in a group or the guide that their account's last sync did not list
+            (DESIGN-channel-successors.md section 9); the count is base.html's menu count. -#}
+        {% if nav_replacements %}<p>{{ '{:,}'.format(nav_replacements) }} channel{{ '' if nav_replacements == 1 else 's' }} in your groups or guide {{ 'was' if nav_replacements == 1 else 'were' }} not in {{ 'its' if nav_replacements == 1 else 'their' }} account's last sync. <a href="{{ url_for('replacements.review_page') }}">Replacements {{ icon('forward') }}</a></p>{% endif %}
       </div>
       {% endif %}
     {% endif %}

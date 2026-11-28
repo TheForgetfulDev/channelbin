@@ -826,7 +826,19 @@ def channel_detail(channel_id):
         per_page = '10'
     page = request.args.get('page', 1, type=int)
 
-    test_query = ChannelTest.query.filter_by(channel_id=channel_id)\
+    # Replacements (DESIGN-channel-successors.md section 9): a channel that took another's
+    # place lists that channel's tests and recordings beside its own while its health
+    # history counts, each up to the accept, so the score can be explained from the rows on
+    # the page. A fixed handful of queries.
+    from .. import channel_successors as successors
+    cfg = load_config()
+    succession = successors.channel_page_view(channel, cfg)
+    own_or_inherited_test = db.or_(ChannelTest.channel_id == channel_id, *[
+        db.and_(ChannelTest.channel_id == old_id, ChannelTest.test_started_at <= cutoff)
+        for old_id, cutoff, _ in succession['chain']])
+    inherited_names = {old_id: name for old_id, _, name in succession['chain']}
+
+    test_query = ChannelTest.query.filter(own_or_inherited_test)\
         .order_by(ChannelTest.test_started_at.desc())
 
     if per_page == 'all':
@@ -869,7 +881,10 @@ def channel_detail(channel_id):
 
     recording_observations = (
         Recording.query
-        .filter(Recording.channel_id == channel_id, Recording.health_quality_score.isnot(None))
+        .filter(db.or_(Recording.channel_id == channel_id, *[
+                    db.and_(Recording.channel_id == old_id, Recording.completed_at <= cutoff)
+                    for old_id, cutoff, _ in succession['chain']]),
+                Recording.health_quality_score.isnot(None))
         .order_by(Recording.completed_at.desc())
         .limit(10)
         .all()
@@ -929,7 +944,6 @@ def channel_detail(channel_id):
     # browsers - the generic user-prefs row the group page already uses (DESIGN.md 3.11).
     sec_pref = db.session.get(UserPref, 'channel_detail_sections')
 
-    cfg = load_config()
     lifecycle_by_channel = _lifecycle_states_for_channels([channel], cfg)
     # Which check will test it next and when, for a channel no test has reached yet - so
     # "never tested" on a channel that is enrolled says what happens next rather than
@@ -960,8 +974,6 @@ def channel_detail(channel_id):
         }
 
     lifecycle_state, lifecycle_since = lifecycle_by_channel.get(channel.id, (None, None))
-    repoint_candidate = _repoint_candidates_for_channels(
-        [channel], cfg, lifecycle_by_channel).get(channel.id)
 
     # What's On is the guide grid with one row in it, so it takes the guide's own window,
     # tag list and Layout state (under this page's keys - see the constants above). Both
@@ -1025,7 +1037,9 @@ def channel_detail(channel_id):
         lifecycle_state=lifecycle_state,
         not_normalizable=channel.id in _unnormalizable_channel_ids([channel], cfg),
         lifecycle_since=lifecycle_since,
-        repoint_candidate=repoint_candidate,
+        succession=succession,
+        inherited_names=inherited_names,
+        replace_payload=_replace_payload(channel, succession),
         duplicate_channels=duplicate_channels,
         duplicate_key=duplicate_key,
         stream_view=_stream_url_view(channel, cfg),
@@ -1116,6 +1130,22 @@ def toggle_channel(channel_id):
     flash(f'"{channel.name}" added to guide.' + (f' {note}' if note else ''), 'success')
     db.session.commit()
     return redirect(next_url)
+
+
+def _replace_payload(channel, succession):
+    """What channel-detail.js needs for the Replace confirm and the Count its history switch
+    (DESIGN-channel-successors.md section 9): the proposals with their carry previews, the
+    carry checkboxes, and this channel's own score. Built from rows already loaded."""
+    from .. import channel_successors as successors
+    offer = succession['offer']
+    return {
+        'matches': offer['matches'] if offer else [],
+        'carry': successors.carry_options(),
+        'score': channel.health_score,
+        'samples': channel.health_score_sample_count or 0,
+        'groups': [gm.group.name for gm in channel.group_memberships],
+        'inGuide': bool(channel.in_guide),
+    }
 
 
 @channels_bp.route('/channels/<int:channel_id>/repoint', methods=['POST'])
@@ -1322,11 +1352,27 @@ def missing_delete_preview():
     for ch in eligible:
         bucket_counts[_missing_days_bucket((now - ch.last_seen_at).days)] += 1
 
+    # The two replacement facts the dialog states first (DESIGN-channel-successors.md section
+    # 9): channels with a replacement waiting, which a delete would take out of their groups
+    # with their history, and channels already replaced, whose history moves to the channel
+    # that took their place. "Waiting" is what the Replacements page lists: a stranded
+    # channel, which holds a membership or a guide row - only a group's own delete can reach
+    # one, since every other scope leaves a channel in use out of the batch. Batched.
+    from .. import channel_successors as successors
+    eligible_ids = [ch.id for ch in eligible]
+    replaced = successors.replaced_old_ids(eligible_ids)
+    stranded = successors.stranded_ids(group_id=group_id) & set(eligible_ids)
+    props = successors.proposals([ch for ch in eligible if ch.id in stranded])
+    waiting = sum(1 for cid in stranded if props.get(cid))
+
     account = db.session.get(Account, account_id) if account_id and not group_id else None
     return jsonify({
         'success': True,
         'account_name': account.name if account else None,
         'eligible_count': len(eligible),
+        'replacement_waiting_count': waiting,
+        'replaced_count': len(replaced),
+        'replacements_url': url_for('replacements.review_page', group=group_id),
         # Hidden channels stay eligible for this sweep (decided: hidden means out of the
         # way, not protected), so the preview says how many of the batch the user cannot
         # currently see in the search, rather than a delete count the search header cannot
