@@ -846,9 +846,13 @@ def _logins(sessions, rows, accounts: dict) -> list:
     for row in OutputFeedLogin.query.order_by(db.func.lower(OutputFeedLogin.name),
                                               OutputFeedLogin.id).all():
         lineup, own = output_feed.lineup_of(row), output_feed.accounts_of(row)
+        # The rows it leaves out that the output still has, offered now or not; one deleted
+        # since is not counted (dev/changelog/1787).
+        left_out = len(output_feed.excluded_of(row) & existing) if lineup is None else 0
         view = {'id': row.id, 'name': row.name, 'username': row.username, 'on': row.enabled,
                 'max_streams': row.max_streams, 'playing': playing.get(row.id, 0),
-                'everything': lineup is None, 'own_accounts': own is not None,
+                'everything': lineup is None and not left_out, 'left_out': left_out,
+                'own_accounts': own is not None,
                 'provider_direct': bool(row.provider_direct),
                 'full_refusals': bool(row.full_refusals)}
         if own is not None:
@@ -878,13 +882,14 @@ def _logins(sessions, rows, accounts: dict) -> list:
 LINEUP_TAKEN_OFF = 'Taken off the output'
 
 
-def lineup_choices(cfg: dict, lineup, accounts=None) -> dict:
+def lineup_choices(cfg: dict, lineup, accounts=None, excluded=frozenset()) -> dict:
     """The Choose channels dialog's list (routes/iptv_output.py::login_channels): every row the
     output has, in its order, offered right now or not, a picture-in-picture channel's swapped
-    copy folded into its channel, and which of them `lineup` picks (None for everything). A
-    pick of a row the output no longer has at all is not listed, so the next save drops it.
-    `accounts` is the login's own account list (None for the output's), which says which rows
-    its player would leave out (output_feed.left_out_for_login, dev/changelog/1765)."""
+    copy folded into its channel, and which of them `lineup` picks (None for everything) or
+    `excluded` leaves out (dev/changelog/1787) - `mode` says which. A pick of a row the output
+    no longer has at all is not listed, so the next save drops it. `accounts` is the login's
+    own account list (None for the output's), which says which rows its player would leave out
+    (output_feed.left_out_for_login, dev/changelog/1765)."""
     choices, by_key = [], {}
     for r in output_feed.catalog(cfg, everything=True):
         key = output_feed.lineup_key(r.feed_id)
@@ -903,9 +908,13 @@ def lineup_choices(cfg: dict, lineup, accounts=None) -> dict:
         by_key[key] = {'id': key, 'name': r.name, 'category': r.category, 'num': r.num,
                        'off': off, 'swapped': False}
         choices.append(by_key[key])
-    return {'everything': lineup is None,
-            'picked': sorted(k for k in (lineup or ()) if k in by_key),
-            'rows': choices}
+    if lineup is not None:
+        mode, picks = output_feed.LINEUP_ONLY, lineup
+    elif excluded:
+        mode, picks = output_feed.LINEUP_EXCEPT, excluded
+    else:
+        mode, picks = output_feed.LINEUP_ALL, ()
+    return {'mode': mode, 'picked': sorted(k for k in picks if k in by_key), 'rows': choices}
 
 
 def account_choices(cfg: dict, accounts) -> dict:

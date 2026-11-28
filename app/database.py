@@ -4015,7 +4015,8 @@ class OutputFeedLogin(db.Model):
     """One login to the IPTV output (app/output_feed.py, dev/changelog/1760). Every login is a
     row here, the owner's own included (dev/changelog/1781). This row says who may log in,
     whether they may right now, how many streams they may hold at once, which of the output's
-    channels they get (`lineup`), which IPTV accounts their plays come from (`accounts`), and two
+    channels they get (`lineup`) or are kept from (`lineup_except`), which IPTV accounts their
+    plays come from (`accounts`), and two
     things its player gets only on the web UI's port: being sent straight to the IPTV provider
     (`provider_direct`) and a refusal's whole reason (`full_refusals`).
 
@@ -4038,6 +4039,11 @@ class OutputFeedLogin(db.Model):
     # offers, a row added later included (output_feed.lineup_of(), dev/changelog/1764). A
     # picture-in-picture channel is stored as its own feed id and brings its swapped copy.
     lineup      = db.Column(db.Text)
+    # The channels this login does not get, as a JSON list of feed ids; NULL is none. A row added
+    # to the output later is included. Never a second meaning of `lineup`: a login gets a row
+    # when `lineup` has it (or is NULL) and this does not; a save writes only one of the two
+    # (output_feed.excluded_of(), dev/changelog/1787).
+    lineup_except = db.Column(db.Text)
     # The IPTV accounts its plays come from, as a JSON list of account ids, in place of the
     # output's own `accounts` list; NULL is the output's list, whatever it is then
     # (output_feed.accounts_of(), dev/changelog/1765). Never written into the output's config.
