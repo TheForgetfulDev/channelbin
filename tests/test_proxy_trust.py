@@ -350,8 +350,9 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual((proxy_trust.policy_from(cfg).web, proxy_trust.policy_from(cfg).public),
                          (True, True))
 
-    def test_it_is_the_newest_migration_and_the_keys_need_a_restart(self):
-        self.assertEqual(config_mod.CONFIG_MIGRATIONS[-1][2], config_mod._cfg_m010_public_behind_proxy)
+    def test_it_is_migration_10_and_the_keys_need_a_restart(self):
+        by_version = {m[0]: m[2] for m in config_mod.CONFIG_MIGRATIONS}
+        self.assertIs(by_version[10], config_mod._cfg_m010_public_behind_proxy)
         for key in ('flask.behind_proxy', 'flask.trusted_proxies',
                     'integrations.output_feed.public_behind_proxy'):
             self.assertIn(key, config_mod.RESTART_REQUIRED_KEYS)

@@ -77,6 +77,14 @@ class WatchdogHarness(unittest.TestCase):
             recorder._active.pop(self.rid, None)
         self.t.cleanup()
 
+    def _window_too_short_to_retry(self):
+        """End the rig's window 40 s from now, under the minute a last retry leaves to capture
+        (watchdog._LAST_RETRY_LEFT). With the window open a dead stream waits and tries again
+        (dev/changelog/1793), so a test of the end of a capture starts here."""
+        rec = db.session.get(Recording, self.rid)
+        rec.stop_time = datetime.utcnow() + timedelta(seconds=40)
+        db.session.commit()
+
     def _nothing_captured(self):
         """Empty the rig's segment file. A give-up on a capture holding data ends it and joins
         what it holds (dev/changelog/1404), so a test of the FAILED path starts here."""

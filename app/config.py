@@ -369,13 +369,12 @@ _DEFAULTS = {
         'early_fail_min_bytes': 1048576,          # ...and produce fewer than this many bytes (1MB)
         'early_fail_abort_count': 3,               # consecutive early-failure segments before auto-abort
         'early_fail_abort_window_seconds': 180,    # the streak must occur within this window
-        # Dead-stream retry (Product Principle 2): once the fast-fail trip-wire above fires,
-        # retry at 1/2/5/15 minutes then hourly (hardcoded cadence) instead of giving up
-        # immediately, up to this many total attempts - whichever comes first against the
-        # recording's own scheduled window. 0 = no retries, same as pre-retry behavior.
-        'dead_stream_max_retry_attempts': 10,
-        # ...and no wait between attempts is ever longer than this. Hourly waits left prod
-        # recording 26 checked twice in its last two and a half hours (dev/changelog/1264).
+        # Dead-stream retry (Product Principle 2): once the fast-fail trip-wire above or
+        # max_consecutive_failures fires, retry at 1/2/5/15 minutes then hourly (hardcoded
+        # cadence) instead of giving up, until the recording's window is over
+        # (dev/changelog/1793) - and no wait between attempts is ever longer than this. Hourly
+        # waits left prod recording 26 checked twice in its last two and a half hours
+        # (dev/changelog/1264).
         'dead_stream_retry_max_delay_minutes': 10,
         # Stall-rate demotion: move a group-backed recording off a member that stalls this
         # many times inside a rolling window, even though every restart succeeds. The three
@@ -1743,6 +1742,18 @@ def _cfg_m010_public_behind_proxy(cfg: dict) -> dict:
     return cfg
 
 
+def _cfg_m011_drop_dead_stream_retry_cap(cfg: dict) -> dict:
+    """watchdog.dead_stream_max_retry_attempts is gone: a recording whose stream is dead keeps
+    trying until its window is over (dev/changelog/1793). Named in the log, since a stored 0
+    meant "never retry" and that choice no longer exists."""
+    present, value = _pop_config_path(cfg, ('watchdog', 'dead_stream_max_retry_attempts'))
+    if present:
+        log.warning('config migration: watchdog.dead_stream_max_retry_attempts dropped (was %s) '
+                    '- a recording whose stream is dead now retries until its window is over, '
+                    'never more than watchdog.dead_stream_retry_max_delay_minutes apart', value)
+    return cfg
+
+
 def public_url_problem(value) -> str:
     """Why `value` cannot be `flask.public_url`, or ''. Blank is allowed and means unset.
     The address starts every link in a push notification and is typed into an IPTV player
@@ -1787,6 +1798,8 @@ CONFIG_MIGRATIONS = [
      _cfg_m009_public_url),
     (10, 'the IPTV output\'s public port gets its own "behind a reverse proxy" switch',
      _cfg_m010_public_behind_proxy),
+    (11, 'watchdog.dead_stream_max_retry_attempts dropped, a dead stream is retried until '
+         'the window ends', _cfg_m011_drop_dead_stream_retry_cap),
 ]
 
 CURRENT_CONFIG_VERSION = CONFIG_MIGRATIONS[-1][0]

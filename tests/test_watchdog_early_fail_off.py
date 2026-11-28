@@ -33,7 +33,6 @@ class ZeroMeansOffTests(RestartHarness):
             'early_fail_abort_count': 0,
             'early_fail_window_seconds': 600,
             'early_fail_min_bytes': 10 ** 9,
-            'dead_stream_max_retry_attempts': 10,
         }})
 
     def test_an_early_failure_under_a_zero_count_restarts_like_any_other_stall(self):

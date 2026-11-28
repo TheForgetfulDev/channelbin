@@ -4,7 +4,10 @@ fail beside its segments (dev/changelog/1404, BUGS.md 2026-11-02).
 Principle 2 wants the join, principle 1 wants the give-up as visible as the FAILED row it
 replaced, so these cover both halves:
 
-  - GiveUpTests: each of the watchdog's give-up sites ends the capture and starts the join.
+  - WaitsMidWindowTests: a dead stream or the consecutive-failure limit with the window open
+    waits and tries again rather than giving up (dev/changelog/1793).
+  - EndOfWindowTests: with too little window left for a try, the capture ends and joins.
+  - EndCaptureDirectTests: the give-up itself, which the fast-delivery stop still takes.
   - NothingCapturedTests: a capture holding nothing still fails.
   - HealthOutcomeTests: it scores 'failed' once, however the join turns out.
   - SurfaceTests: the words on the list, the recording page and the guide's mark.
@@ -12,7 +15,7 @@ replaced, so these cover both halves:
 
 No network and no real ffmpeg: every child is a local `sys.executable -c`, and the join is
 stubbed where it is not the subject. The real pipeline runs in
-tests/capture/scenario_dead_stream_gives_up.py.
+tests/capture/scenario_dead_until_later.py.
 
   python3 -m unittest tests.test_capture_gave_up
 """
@@ -35,7 +38,8 @@ from app.database import (  # noqa: E402
     Alert, AutoRule, CAPTURE_GAVE_UP, Channel, FAILURE_DEAD_STREAM_DETECTED,
     FAILURE_FAST_DELIVERY_DETECTED, FAILURE_MAX_CONSECUTIVE_FAILURES, GAVE_UP_REASONS,
     RECORDING_FAILED, RECORDING_FAILED_DEAD_STREAM, REC_STATUS_ABORTED, REC_STATUS_COMPLETED,
-    REC_STATUS_CONCATENATING, REC_STATUS_FAILED, REC_STATUS_IN_PROGRESS, Recording,
+    REC_STATUS_CONCATENATING, REC_STATUS_FAILED, REC_STATUS_IN_PROGRESS, REC_STATUS_RETRYING,
+    RECORDING_RETRY_SCHEDULED, Recording,
     RecordingEvent, RecordingSegment, RuleMatch, detach_recording_references, rule_status,
 )
 from app.health_score import apply_capture_phase_health_observation  # noqa: E402
@@ -99,68 +103,83 @@ class _GiveUpHarness(RestartHarness):
         return RecordingEvent.query.filter_by(recording_id=self.rid,
                                               event_type=event_type).all()
 
-    def _assert_joined_with_reason(self, rec, reason):
-        self.assertEqual(rec.gave_up_reason, reason)
-        self.assertIsNone(rec.failure_reason, 'the row is not FAILED, so it has no failure reason')
-        self.assertEqual(self._events(RECORDING_FAILED), [])
-        self.assertEqual(self._events(RECORDING_FAILED_DEAD_STREAM), [])
-        self.assertTrue(self.joined.wait(10), 'the join was never started')
-        self.assertLess(rec.stop_time, self.scheduled_stop,
-                        'left in place, the rest of the window reads as recorded on the guide')
-        self.assertEqual(rec.scheduled_stop_time, self.scheduled_stop)
-        self.assertFalse(connlim.at_limit(self.account_id), 'the slot was not released')
-        with recorder._lock:
-            self.assertNotIn(self.rid, recorder._active)
-        alerts = Alert.query.filter_by(recording_id=self.rid,
-                                       alert_type='RECORDING_GAVE_UP').all()
-        self.assertEqual(len(alerts), 1)
+class WaitsMidWindowTests(_GiveUpHarness):
+    """A dead stream holding data used to give up mid-window and join (dev/changelog/1404).
+    With the window open it now waits and tries again, however many tries it has made, and
+    the limit on consecutive failures does the same (dev/changelog/1793): prod recording 88
+    gave up with two hours of its window left."""
 
+    def _assert_waiting(self, rec):
+        self.assertEqual(rec.status, REC_STATUS_RETRYING)
+        self.assertIsNone(rec.gave_up_reason)
+        self.assertEqual(self._events(CAPTURE_GAVE_UP), [])
+        self.assertFalse(self.joined.is_set())
+        self.assertEqual(rec.stop_time, self.scheduled_stop)
+        self.assertFalse(connlim.at_limit(self.account_id), 'the wait keeps no connection')
 
-class GiveUpTests(_GiveUpHarness):
-    def test_retries_used_up_mid_window_joins_what_was_captured(self):
-        self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
-                                    'dead_stream_max_retry_attempts': 2}
+    def test_many_retries_in_it_still_waits(self):
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1}
         rec = db.session.get(Recording, self.rid)
-        rec.dead_stream_retry_count = 2
+        rec.dead_stream_retry_count = 12
         db.session.commit()
-        rec = self._give_up()
-        self._assert_joined_with_reason(rec, FAILURE_DEAD_STREAM_DETECTED)
-        self.assertIn('2 retry attempt(s)', self._events(CAPTURE_GAVE_UP)[0].detail)
-        self.assertIn('Ending the capture now', self.join_reasons[0])
+        self._assert_waiting(self._give_up(event=RECORDING_RETRY_SCHEDULED))
 
-    def test_retrying_turned_off_joins_too(self):
-        self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
-                                    'dead_stream_max_retry_attempts': 0}
-        rec = self._give_up()
-        self._assert_joined_with_reason(rec, FAILURE_DEAD_STREAM_DETECTED)
-        self.assertIn('no retry left', self._events(CAPTURE_GAVE_UP)[0].detail)
-
-    def test_max_failures_reached_on_the_next_stall_joins(self):
+    def test_max_failures_reached_on_the_next_stall_waits(self):
         self._extra_watchdog_cfg = {'max_consecutive_failures': 1}
         rec = db.session.get(Recording, self.rid)
         rec.consecutive_failures = 1
         db.session.commit()
-        rec = self._give_up()
-        self._assert_joined_with_reason(rec, FAILURE_MAX_CONSECUTIVE_FAILURES)
+        self._assert_waiting(self._give_up(event=RECORDING_RETRY_SCHEDULED))
 
-    def test_max_failures_reached_by_a_restart_with_no_data_joins(self):
+    def test_max_failures_reached_by_a_restart_with_no_data_waits(self):
         self._extra_watchdog_cfg = {'max_consecutive_failures': 1}
-        rec = self._give_up()
-        self._assert_joined_with_reason(rec, FAILURE_MAX_CONSECUTIVE_FAILURES)
+        self._assert_waiting(self._give_up(event=RECORDING_RETRY_SCHEDULED))
         seg = (RecordingSegment.query.filter_by(recording_id=self.rid)
                .order_by(RecordingSegment.segment_number.desc()).first())
         self.assertIsNotNone(seg.ended_at, 'the restart\'s empty segment was left open')
 
-    def test_the_cause_ffmpeg_gave_is_in_the_alert(self):
-        self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
-                                    'dead_stream_max_retry_attempts': 0}
+
+class EndOfWindowTests(_GiveUpHarness):
+    """Too little of the window left for another try: the capture ends now and joins what it
+    holds, an ordinary end and no give-up, and says why on the join."""
+
+    def setUp(self):
+        super().setUp()
+        rec = db.session.get(Recording, self.rid)
+        rec.stop_time = self.scheduled_stop = datetime.utcnow() + timedelta(seconds=40)
+        db.session.commit()
+
+    def _assert_joined(self, rec):
+        self.assertIsNone(rec.gave_up_reason)
+        self.assertIsNone(rec.failure_reason)
+        self.assertEqual(self._events(CAPTURE_GAVE_UP), [])
+        self.assertEqual(self._events(RECORDING_FAILED_DEAD_STREAM), [])
+        self.assertTrue(self.joined.wait(10), 'the join was never started')
+        self.assertIn('before another retry could come', self.join_reasons[0])
+
+    def test_a_dead_stream_joins_with_the_cause(self):
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1}
         self._exited_capture(stderr_text='Connection refused\n')
-        rec = self._run_until_event(CAPTURE_GAVE_UP, stall_timeout=1, restart_delay=0,
-                                    produces_data=False)
-        self._assert_joined_with_reason(rec, FAILURE_DEAD_STREAM_DETECTED)
-        alert = Alert.query.filter_by(recording_id=self.rid,
-                                      alert_type='RECORDING_GAVE_UP').one()
-        self.assertIn('Connection refused', alert.body)
+        self._run_until_joined()
+        self.assertIn('Connection refused', self.join_reasons[0])
+        self._assert_joined(db.session.get(Recording, self.rid))
+
+    def test_max_failures_joins(self):
+        self._extra_watchdog_cfg = {'max_consecutive_failures': 1}
+        self.state.process = sleeper()
+        self._run_until_joined()
+        self._assert_joined(db.session.get(Recording, self.rid))
+
+    def _run_until_joined(self):
+        with mock.patch.object(cfgmod, 'load_config', return_value=self._cfg(1, 0)), \
+             mock.patch.object(recorder, '_launch_segment',
+                               self._stub_launch_next(produces_data=False)):
+            self.wd = wdmod.WatchdogThread(self.rid, self.state, self.t.app)
+            self.wd.start()
+            self.assertTrue(self.joined.wait(45), 'the capture was not ended')
+            self.state.stop_event.set()
+            self.wd.join(timeout=15)
+        db.session.expire_all()
 
 
 class EndCaptureDirectTests(_GiveUpHarness):
@@ -238,13 +257,18 @@ class EndCaptureDirectTests(_GiveUpHarness):
 
 
 class NothingCapturedTests(_GiveUpHarness):
+    """At the end of its window - with an open window it waits and tries again
+    (dev/changelog/1793) - a capture holding nothing still fails."""
+
     def setUp(self):
         super().setUp()
         open(self.seg_path, 'wb').close()
+        rec = db.session.get(Recording, self.rid)
+        rec.stop_time = datetime.utcnow() + timedelta(seconds=40)
+        db.session.commit()
 
     def test_a_dead_stream_that_captured_nothing_still_fails(self):
-        self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
-                                    'dead_stream_max_retry_attempts': 0}
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1}
         rec = self._give_up(event=RECORDING_FAILED_DEAD_STREAM)
         self.assertEqual(rec.status, REC_STATUS_FAILED)
         self.assertEqual(rec.failure_reason, FAILURE_DEAD_STREAM_DETECTED)

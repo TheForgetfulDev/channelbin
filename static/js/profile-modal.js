@@ -126,8 +126,8 @@ const RECORDING_PROFILE_SECTIONS = [
         meta: 'How long to wait before restarting ffmpeg after a stall.' },
       { key: 'max_consecutive_failures', label: 'Max consecutive failures', type: 'int',
         inheritable: true,
-        meta: 'How many restarts in a row may fail before the recording is given up on ' +
-          'and marked FAILED.' },
+        meta: 'How many restarts in a row may fail before the recording moves to another ' +
+          'channel, when it has one, or waits and tries again until its window ends.' },
       { key: 'stall_move_count', label: 'Stalls before moving on', type: 'int',
         inheritable: true,
         meta: 'For a recording from a channel group: how many stalls the current member ' +

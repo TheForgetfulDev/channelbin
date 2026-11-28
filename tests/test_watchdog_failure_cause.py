@@ -27,19 +27,22 @@ at runtime, not something these tests assert on.
 """
 import os
 import subprocess
+import threading
 import sys
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import app.config as cfgmod  # noqa: E402
 import app.recorder as recorder  # noqa: E402
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
-    Alert, CAPTURE_GAVE_UP, RECORDING_FAILED, RECORDING_FAILED_DEAD_STREAM, Recording,
+    Alert, RECORDING_FAILED, RECORDING_FAILED_DEAD_STREAM, Recording,
     RecordingEvent,
 )
 from tests.support import seed  # noqa: E402
+from app.watchdog import WatchdogThread  # noqa: E402
 from tests.support.watchdog import RestartHarness  # noqa: E402
 
 
@@ -99,9 +102,10 @@ class DeadStreamAbortNamesCauseTests(_FailureCauseHarness):
 
     def test_dead_stream_abort_detail_quotes_the_ffmpeg_error(self):
         self._nothing_captured()
-        # dead_stream_max_retry_attempts=0: keep this test on the immediate give-up path -
-        # the retry path is exercised separately in tests/test_dead_stream_retry.py.
-        self._extra_watchdog_cfg = {'early_fail_abort_count': 1, 'dead_stream_max_retry_attempts': 0}
+        # A window too short to retry keeps this test on the give-up path - the retry path
+        # is exercised separately in tests/test_dead_stream_retry.py.
+        self._window_too_short_to_retry()
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1}
         self._exited_capture(code=8, stderr_text='[http @ 0x1] HTTP error 405 Method Not Allowed\n')
         with mock.patch.object(recorder, 'failover_group_member', return_value=False), \
              self.assertLogs('app.watchdog', level='ERROR') as logs:
@@ -117,9 +121,10 @@ class DeadStreamAbortNamesCauseTests(_FailureCauseHarness):
 
     def test_dead_stream_abort_masks_credentials_in_the_quoted_cause(self):
         self._nothing_captured()
-        # dead_stream_max_retry_attempts=0: keep this test on the immediate give-up path -
-        # the retry path is exercised separately in tests/test_dead_stream_retry.py.
-        self._extra_watchdog_cfg = {'early_fail_abort_count': 1, 'dead_stream_max_retry_attempts': 0}
+        # A window too short to retry keeps this test on the give-up path - the retry path
+        # is exercised separately in tests/test_dead_stream_retry.py.
+        self._window_too_short_to_retry()
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1}
         self._exited_capture_with_stderr_file(
             code=8,
             stderr_text=('[http @ 0x1] Error opening input file '
@@ -139,6 +144,7 @@ class MaxConsecutiveFailuresAbortNamesCauseTests(_FailureCauseHarness):
 
     def test_max_consecutive_failures_abort_detail_quotes_the_ffmpeg_error(self):
         self._nothing_captured()
+        self._window_too_short_to_retry()
         self._extra_watchdog_cfg = {'max_consecutive_failures': 1}
         self._exited_capture(code=8, stderr_text='[http @ 0x1] HTTP error 405 Method Not Allowed\n')
         with mock.patch.object(recorder, 'failover_group_member', return_value=False), \
@@ -154,32 +160,46 @@ class MaxConsecutiveFailuresAbortNamesCauseTests(_FailureCauseHarness):
             f'the ERROR log (source of the alert body) named no cause: {logs.output!r}')
 
 
-class GiveUpHoldingDataNamesCauseTests(_FailureCauseHarness):
-    """The same promise on the give-up that keeps what was captured (dev/changelog/1404): the
-    row, the log line and the alert all carry ffmpeg's reason, masked."""
+class EndHoldingDataNamesCauseTests(_FailureCauseHarness):
+    """The same promise on the end that keeps what was captured (dev/changelog/1404), which
+    since dev/changelog/1793 comes only with too little of the window left to try again: the
+    join's reason carries ffmpeg's, masked."""
 
-    def _give_up(self):
-        self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
-                                    'dead_stream_max_retry_attempts': 0}
+    def _end(self):
+        self._window_too_short_to_retry()
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1}
+        reasons, joined = [], threading.Event()
+
+        def _join(app, recording_id, reason=''):
+            reasons.append(reason)
+            joined.set()
+
         with mock.patch.object(recorder, 'failover_group_member', return_value=False), \
-             mock.patch('app.concatenator.do_concatenation'):
-            self._run_until_event(CAPTURE_GAVE_UP, stall_timeout=1, restart_delay=0,
-                                  produces_data=False)
-        return self._terminal_event(CAPTURE_GAVE_UP)
+             mock.patch('app.concatenator.do_concatenation', side_effect=_join), \
+             mock.patch.object(cfgmod, 'load_config', return_value=self._cfg(1, 0)), \
+             mock.patch.object(recorder, '_launch_segment',
+                               self._stub_launch_next(produces_data=False)), \
+             self.assertLogs('app.watchdog', level='WARNING') as logs:
+            self.wd = WatchdogThread(self.rid, self.state, self.t.app)
+            self.wd.start()
+            self.assertTrue(joined.wait(45), 'the capture was not joined')
+            self.state.stop_event.set()
+            self.wd.join(timeout=15)
+        return reasons[0], logs.output
 
     def test_it_quotes_the_ffmpeg_error(self):
         self._exited_capture(code=8, stderr_text='[http @ 0x1] HTTP error 405 Method Not Allowed\n')
-        self.assertIn('HTTP error 405 Method Not Allowed', self._give_up().detail)
+        reason, _logs = self._end()
+        self.assertIn('HTTP error 405 Method Not Allowed', reason)
 
     def test_it_masks_credentials_in_the_quoted_cause(self):
         self._exited_capture_with_stderr_file(
             code=8,
             stderr_text=('[http @ 0x1] Error opening input file '
                          'http://host.example/live/realuser/realpass/2077000\n'))
-        evt = self._give_up()
-        self.assertIn('/live/***/***/2077000', evt.detail)
-        for row in [evt] + Alert.query.filter_by(recording_id=self.rid).all():
-            text = getattr(row, 'detail', None) or getattr(row, 'body', None)
+        reason, logs = self._end()
+        self.assertIn('/live/***/***/2077000', reason)
+        for text in [reason] + logs + [a.body for a in Alert.query.filter_by(recording_id=self.rid)]:
             self.assertNotIn('realuser', text)
             self.assertNotIn('realpass', text)
 

@@ -38,7 +38,7 @@ from app import connection_limits as connlim  # noqa: E402
 from app import recorder  # noqa: E402
 import app.config as cfgmod  # noqa: E402
 from app.database import (  # noqa: E402
-    CAPTURE_GAVE_UP, RECORDING_FAILED, Recording, RecordingSegment, RecordingEvent, Alert,
+    RECORDING_FAILED, Recording, RecordingSegment, RecordingEvent, Alert,
     ChannelTest,
 )
 from app import scheduler as sched_mod  # noqa: E402
@@ -396,11 +396,12 @@ class WatchdogGiveUpReleasesEverythingTests(_ConnectionReleaseHarness):
             self.state.current_segment_num = seg_num
         return _stub
 
-    def _run_until_give_up(self, event_type, timeout=60):
+    def _run_until_give_up(self, event_type, timeout=60, until=None):
         """Deliberately never sets stop_event, unlike RestartHarness._run_until_event:
         the give-up has to wind its own thread down, and setting the flag here would make
         the thread-exit assertion below pass for the wrong reason. tearDown sets it
         regardless, so a give-up that hangs cannot hang the suite."""
+        self._window_too_short_to_retry()
         with mock.patch.object(cfgmod, 'load_config', return_value=self._cfg(1, 0)), \
              mock.patch.object(recorder, '_launch_segment',
                                self._stub_launch_live_but_empty()), \
@@ -411,12 +412,12 @@ class WatchdogGiveUpReleasesEverythingTests(_ConnectionReleaseHarness):
             seen = False
             while time.monotonic() < deadline:
                 db.session.expire_all()
-                seen = bool(RecordingEvent.query.filter_by(
-                    recording_id=self.rid, event_type=event_type).first())
+                seen = (until() if until else bool(RecordingEvent.query.filter_by(
+                    recording_id=self.rid, event_type=event_type).first()))
                 if seen:
                     break
                 time.sleep(0.2)
-            self.assertTrue(seen, f'no {event_type} event within {timeout}s')
+            self.assertTrue(seen, f'no {event_type or "end"} within {timeout}s')
             self.wd.join(timeout=20)
         db.session.expire_all()
 
@@ -459,17 +460,20 @@ class WatchdogGiveUpReleasesEverythingTests(_ConnectionReleaseHarness):
     def test_a_give_up_holding_data_releases_the_same_things_and_keeps_its_segment(self):
         """The give-up that joins what it captured (dev/changelog/1404) owes every release
         the FAILED one does, and reaches them through stop_recording rather than
-        _mark_recording_failed."""
+        _mark_recording_failed. Since dev/changelog/1793 it comes only at the end of the
+        window, as a join with no gave_up_reason."""
         self._extra_watchdog_cfg = {'max_consecutive_failures': 2}
         self.state.process = sleeper()
         self.relaunched.append(self.state.process)
         path, fh = recorder._open_segment_stderr_spool(self.t.app, self.rid, 0)
         self.state.stderr_path, self.state.stderr_fh = path, fh
 
-        with mock.patch('app.concatenator.do_concatenation'):
-            self._run_until_give_up(CAPTURE_GAVE_UP)
+        joined = threading.Event()
+        with mock.patch('app.concatenator.do_concatenation',
+                        side_effect=lambda *a, **k: joined.set()):
+            self._run_until_give_up(None, until=joined.is_set)
 
-        self.assertIsNotNone(db.session.get(Recording, self.rid).gave_up_reason)
+        self.assertIsNone(db.session.get(Recording, self.rid).gave_up_reason)
         self.assertTrue(self.relaunched, 'precondition: no restart was ever attempted')
         self.assertIsNotNone(self.relaunched[-1].poll(), 'the give-up abandoned a live child')
         self.assertFalse(self.wd.is_alive())

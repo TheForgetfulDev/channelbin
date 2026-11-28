@@ -137,7 +137,7 @@ class WhatHappenedCardTests(_Base):
         items = what_happened(rec)
         self.assertIn('It started 20m after the program began, so the start of the program '
                       'is not in the file.', items)
-        self.assertIn('It moved to another channel in its group 1 time.', items)
+        self.assertIn('It moved to another channel 1 time.', items)
         self.assertIn('You stopped it 40m before its scheduled end.', items)
 
     def test_a_finished_recording_with_trouble_leads_with_the_file_that_is_left(self):

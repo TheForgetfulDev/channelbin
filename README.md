@@ -366,7 +366,7 @@ ever set. The table below is only the handful people change first.
 | `recording.filename_template` | `{date} - {title} - {sub_title} - {channel}` | Output filename pattern |
 | `watchdog.stall_timeout_seconds` | 30 | Seconds of no file growth before declaring the stream dead |
 | `watchdog.restart_delay_seconds` | 30 | Seconds to wait before restarting after a stall |
-| `watchdog.max_consecutive_failures` | 10 | Give up (or fail over) after this many failed restarts |
+| `watchdog.max_consecutive_failures` | 10 | After this many failed restarts, fail over to another channel, or wait and try again until the window ends |
 | `watchdog.stall_move_count` | 3 | Move a group recording to another member after this many stalls in the window below, even when every restart succeeds. 0 disables |
 | `watchdog.stall_move_window_minutes` | 30 | The rolling window those stalls must fall inside |
 | `accounts.default_max_connections` | 1 | Simultaneous connections allowed per provider account |

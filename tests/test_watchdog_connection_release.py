@@ -81,6 +81,7 @@ class MaxConsecutiveFailuresGiveUpReleasesSlotTests(_ConnectionReleaseHarness):
 
     def test_slot_is_released_when_the_watchdog_gives_up_with_no_group_to_fail_over_to(self):
         self._nothing_captured()
+        self._window_too_short_to_retry()
         self._extra_watchdog_cfg = {'max_consecutive_failures': 1}
         self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
@@ -100,10 +101,10 @@ class DeadStreamGiveUpReleasesSlotTests(_ConnectionReleaseHarness):
 
     def test_slot_is_released_on_a_dead_stream_fast_fail_with_no_group_to_fail_over_to(self):
         self._nothing_captured()
-        # dead_stream_max_retry_attempts=0 keeps this test on the immediate give-up path it
-        # was written to guard - the retry path (watchdog.dead_stream_max_retry_attempts > 0)
-        # is exercised separately in tests/test_dead_stream_retry.py.
-        self._extra_watchdog_cfg = {'early_fail_abort_count': 1, 'dead_stream_max_retry_attempts': 0}
+        # A window too short to retry keeps this test on the give-up path it was written to
+        # guard - the retry path is exercised separately in tests/test_dead_stream_retry.py.
+        self._window_too_short_to_retry()
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1}
         self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             self._run_until_event(RECORDING_FAILED_DEAD_STREAM, stall_timeout=1,
@@ -149,6 +150,7 @@ class ChannelLessRecordingGiveUpTests(RestartHarness):
         self._nothing_captured()
         self.assertIsNone(db.session.get(Recording, self.rid).channel_id,
                           'harness precondition: this recording must be channel-less')
+        self._window_too_short_to_retry()
         self._extra_watchdog_cfg = {'max_consecutive_failures': 1}
         self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
@@ -160,7 +162,8 @@ class ChannelLessRecordingGiveUpTests(RestartHarness):
 
     def test_dead_stream_give_up_completes_without_channel(self):
         self._nothing_captured()
-        self._extra_watchdog_cfg = {'early_fail_abort_count': 1, 'dead_stream_max_retry_attempts': 0}
+        self._window_too_short_to_retry()
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1}
         self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             rec = self._run_until_event(RECORDING_FAILED_DEAD_STREAM, stall_timeout=1,
