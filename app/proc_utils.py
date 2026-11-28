@@ -1600,6 +1600,82 @@ class DeliveryRateMonitor:
         self._samples.clear()
 
 
+# ── Slow delivery: a feed that trickles without going silent ─────────────────────────
+# The other end of the same ratio. A provider that keeps sending a little never trips a
+# "no data for stall_timeout" check: an IPTV output play reads its pipe, which gets a few
+# KB every second, and a recording's file grows one 256 KiB block at a time, which at
+# anything over ~9 kB/s lands inside the stall timeout. Seconds of content per second of
+# wall clock is the measure because it does not depend on the channel's bitrate: an
+# audio-only or SD channel sends a tenth of an HD one's bytes, and every healthy channel
+# still delivers one second of program per second (dev/changelog/1799).
+#
+# Measured on prod's 46 segments of 60 s or longer carrying a content duration
+# (2026-11-28): median 1.003x, lowest 0.83x (a manually stopped one) and every other one
+# 0.95x or over. Recording 71's degrading feed (dev/changelog/429) fell from 1,030 kB/s to
+# 610-740, then 237, then 24: about 0.65x, 0.23x and 0.02x of its healthy rate. Those are
+# whole-segment averages; the honest dip inside a short window is an in-process reconnect,
+# worked out rather than measured (a spool's lines carry no wall clock): ffmpeg waits
+# ffmpeg.read_timeout_seconds (20) with nothing arriving, then up to reconnect_delay_max
+# (2) and a connect, so one reconnect is 25-28 s of nothing and reads 0.53-0.58x across
+# 60 s before the replayed back-buffer brings it back. The threshold is 0.4x so that no
+# single gap can trip it on its own: reading under 0.4 across 60 s takes more than 36 s
+# of nothing, which is past watchdog.stall_timeout_seconds (30) and so already a silent
+# stall. Two reconnects in one window read under it, as do recording 71's 0.23x and 0.02x
+# stretches. Its 0.6-0.7x stretch stays above the line on purpose: it overlaps a healthy
+# reconnect's dip, and only a longer window could tell them apart.
+#
+# Unlike the fast check above, -re does not blind this one: pacing caps a read at 1x,
+# and a feed delivering less than that is exactly as slow either way.
+
+
+class SlowDeliveryCheck:
+    """One stream's slow-delivery judge. Feed it ffmpeg's content position each time the
+    caller looks (read_capture_content_position on the live stderr spool); update()
+    returns the measured ratio once a full window has run under `ratio`, else None.
+
+    The one implementation for every live reader of a stream - the recorder's watchdog
+    and the IPTV output's relay both hold one, read the same two settings through
+    slow_delivery_settings() and say what they found with slow_delivery_detail(), so a
+    recording and a play of the same feed reach the same verdict (CLAUDE.md, recordings
+    and plays judge a stream the same way). What each does about it stays with the caller.
+
+    A ratio of 0 or less disables it. reset() at every new ffmpeg, so the window refills
+    from scratch and a fresh connection's opening burst is never measured on its own."""
+
+    def __init__(self, ratio: float, window_seconds: float):
+        self.ratio = ratio
+        self.window_seconds = window_seconds
+        self._rate = DeliveryRateMonitor(window_seconds)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.ratio) and self.ratio > 0
+
+    def update(self, content_seconds, now=None):
+        if not self.enabled:
+            return None
+        observed = self._rate.update(content_seconds, now)
+        if observed is not None and observed < self.ratio:
+            return observed
+        return None
+
+    def reset(self):
+        self._rate.reset()
+
+
+def slow_delivery_settings(cfg: dict) -> tuple:
+    """(ratio, window seconds) for SlowDeliveryCheck, from watchdog.slow_delivery_*: one pair
+    of settings for recordings and IPTV output plays alike."""
+    w = cfg.get('watchdog') or {}
+    return float(w.get('slow_delivery_ratio') or 0), float(w.get('slow_delivery_window_seconds') or 60)
+
+
+def slow_delivery_detail(ratio: float, window_seconds: float) -> str:
+    """What a slow-delivery verdict measured, in the same words on a recording and a play."""
+    return (f'the feed delivered {ratio:.2f} seconds of video per second for '
+            f'{window_seconds:.0f}s straight')
+
+
 # ── Supervised ffmpeg runs ────────────────────────────────────────────────────────────
 # A JOB THAT IS STILL ADVANCING IS NEVER KILLED. Two rules bound an ffmpeg whose total
 # work is not knowable in advance, and neither of them is a whole-job deadline:

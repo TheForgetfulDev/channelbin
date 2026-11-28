@@ -24,6 +24,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -762,6 +763,94 @@ class ReaperJudgementTests(_FeedCase):
         with mock.patch('app.output_feed.terminate_or_kill'):
             feed._check(session)
         self.assertEqual(session.reason, feed.REASON_CLIENT_TOO_SLOW)
+
+
+class SlowDeliveryReaperTests(_FeedCase):
+    """dev/docs/BUGS.md 2026-11-28 @ 12:21:46 PM: a play whose provider kept sending a few KB a
+    second was never called stalled - its stall was only "no data for stall_timeout" - so the TV
+    sat on a frozen picture and the play never failed over. The reaper now judges how much of
+    the program arrives per second with proc_utils.SlowDeliveryCheck, the check a recording's
+    watchdog holds too (dev/changelog/1799)."""
+
+    _session = ReaperJudgementTests._session
+
+    def _playing(self, content_seconds, measured_from=61.0):
+        """A play whose window opened `measured_from` seconds ago at position 0 and whose
+        stderr spool now reads `content_seconds`."""
+        from app.proc_utils import SlowDeliveryCheck
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        session = self._session(proc=proc)
+        now = time.monotonic()
+        session.launched_mono = now - measured_from
+        session.state = feed.STATE_STREAMING
+        session.last_data_mono = now
+        session.stderr_path = os.path.join(self.t._tmpdir, f'relay-{session.id}.stderr')
+        h, rem = divmod(content_seconds, 3600)
+        m, s = divmod(rem, 60)
+        with open(session.stderr_path, 'w') as fh:
+            fh.write('frame=  10 fps=25 q=-1.0 size=  10kB time=%02d:%02d:%05.2f bitrate=1.0kbits/s '
+                     'speed=1.0x    \r' % (h, m, s))
+        session.slow_delivery = SlowDeliveryCheck(0.4, 60.0)
+        session.slow_delivery.update(0.0, now=now - measured_from)
+        return session
+
+    def _died(self, session):
+        calls = []
+        with mock.patch.object(feed, '_member_died',
+                               side_effect=lambda s, reason, detail: calls.append((reason, detail))):
+            feed._check(session)
+        return calls
+
+    def test_a_play_that_slowed_to_a_trickle_leaves_its_channel(self):
+        calls = self._died(self._playing(1.0))
+        self.assertEqual(len(calls), 1, calls)
+        reason, detail = calls[0]
+        self.assertEqual(reason, feed.REASON_TOO_SLOW)
+        self.assertIn('0.02 seconds of video per second for 60s', detail)
+
+    def test_a_play_at_real_time_is_left_alone(self):
+        self.assertEqual(self._died(self._playing(61.0)), [])
+
+    def test_one_reconnects_dip_is_left_alone(self):
+        """ffmpeg's in-process reconnect: 20 s with nothing, a few to connect - 35 of 60 s."""
+        self.assertEqual(self._died(self._playing(35.0, measured_from=60.0)), [])
+
+    def test_the_spool_is_read_every_few_seconds_not_every_tick(self):
+        session = self._playing(1.0)
+        session.slow_read_mono = time.monotonic()
+        self.assertEqual(self._died(session), [])
+
+    def test_a_silent_stall_names_its_own_reason(self):
+        """One flag, one meaning: "the stream stopped sending" was filed as ffmpeg exiting."""
+        session = self._playing(61.0)
+        session.last_data_mono = time.monotonic() - session.stall_timeout - 1
+        calls = self._died(session)
+        self.assertEqual([c[0] for c in calls], [feed.REASON_NO_DATA])
+        self.assertIn('no data for', calls[0][1])
+
+    def test_both_reasons_read_as_words_on_a_move(self):
+        self.assertIn('slowed to a trickle', feed.move_text('A', 'B', feed.REASON_TOO_SLOW))
+        self.assertIn('stopped sending', feed.move_text('A', 'B', feed.REASON_NO_DATA))
+        for reason in (feed.REASON_TOO_SLOW, feed.REASON_NO_DATA):
+            self.assertIn(reason, feed.REASON_TEXT)
+
+    def test_each_adopted_ffmpeg_gets_a_fresh_window_from_the_settings(self):
+        limits = feed._session_limits(load_config(), {})
+        self.assertEqual((limits['slow_ratio'], limits['slow_window']), (0.4, 60.0))
+        session = self._session()
+        session.slow_ratio, session.slow_window = limits['slow_ratio'], limits['slow_window']
+        first = None
+        for _ in range(2):
+            proc = subprocess.Popen([sys.executable, '-c', 'pass'], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE)
+            reader = feed._adopt(session, proc)
+            reader.join(5)
+            proc.wait(5)
+            self.assertEqual((session.slow_delivery.ratio, session.slow_delivery.window_seconds),
+                             (0.4, 60.0))
+            self.assertIsNot(session.slow_delivery, first)
+            first = session.slow_delivery
 
 
 class PlayTimeByAccountTests(_FeedCase):

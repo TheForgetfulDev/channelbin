@@ -434,6 +434,18 @@ _DEFAULTS = {
         # times, then move on" the other trip-wires use, because a frozen feed has a
         # decent chance of resuming on a reconnect. 0 moves on at the first detection.
         'fast_delivery_strike_count': 3,
+        # Slow delivery, the other end of the same ratio: a feed delivering less than this
+        # many seconds of content per second of wall clock across the window has slowed to
+        # a trickle, which the stall check above misses for as long as a little keeps
+        # arriving. A recording counts it as a stall (restart, then the stall-rate move);
+        # an IPTV output play fails over or ends. One pair for both, read only through
+        # proc_utils.slow_delivery_settings(). Under 0.4 across 60 s takes more than 36 s of
+        # nothing from a single gap, past stall_timeout_seconds, so one in-process reconnect
+        # (0.53-0.58x) never trips it; prod's lowest honest segment read 0.83x - the
+        # reasoning is at proc_utils.SlowDeliveryCheck (dev/changelog/1799).
+        # 0 disables it.
+        'slow_delivery_ratio': 0.4,
+        'slow_delivery_window_seconds': 60,
         # The post-capture half of the same question, and the one knob here the watchdog
         # does not read: app/concatenator.py applies it to each finished segment just
         # before the join, to FLAG a recording whose video arrived faster than the clock

@@ -690,6 +690,9 @@
           {# We did kill it, but "stall" would imply a capture that was running and stopped.
              This one never delivered a byte, which is a different story. #}
           {% set lbl = 'Restart got no data (seg ' ~ (evt.segment_number + seg_offset) ~ ')' %}
+        {% elif seg_exit.get(evt.segment_number) == 'SLOW_DELIVERY_KILLED' %}
+          {# The file never stood still; the feed was too slow to keep up (dev/changelog/1799). #}
+          {% set lbl = 'Slowed to a trickle (seg ' ~ (evt.segment_number + seg_offset) ~ ' restarted)' %}
         {% else %}
           {% set lbl = 'Stall (seg ' ~ (evt.segment_number + seg_offset) ~ ' killed)' %}
         {% endif %}
@@ -710,7 +713,8 @@
          stays because the two land within the cluster window and read as one dot whose
          tooltip names both. #}
       {% if prev.exit_reason not in ('STALL_KILLED', 'PROCESS_EXITED', 'RESTART_NO_DATA',
-                                     'FAST_DELIVERY_KILLED', 'VIDEO_STOPPED') and seg.started_at %}
+                                     'FAST_DELIVERY_KILLED', 'VIDEO_STOPPED',
+                                     'SLOW_DELIVERY_KILLED') and seg.started_at %}
         {% set _ = ns_ms.items.append({'ts': seg.started_at, 'kind': 'neutral', 'label': 'Segment boundary', 'prio': 1, 'silent': False}) %}
       {% endif %}
     {% endif %}
@@ -1144,6 +1148,7 @@
   'PROCESS_EXITED':           ('warn', 'ffmpeg exited on its own - ChannelBin did not kill it. The watchdog noticed within a poll and started a new segment after the restart delay. The exit code beside this pill is ffmpeg\'s own reason.'),
   'RESTART_NO_DATA':          ('bad',  'This segment was a restart attempt and it never produced a byte. The watchdog closed it the moment the reconnect wait ran out, instead of spending a second stall timeout proving the same thing again.'),
   'FAST_DELIVERY_KILLED':     ('bad',  'The feed kept delivering video faster than real time for a sustained stretch, so it was not showing live content. Usually that means the provider was re-serving the same few seconds over and over, though ChannelBin measures the delivery rate rather than the picture. The watchdog stopped this capture rather than let it keep filling the recording.'),
+  'SLOW_DELIVERY_KILLED':     ('warn', 'The feed slowed to a trickle: it kept sending a little, so the file kept growing, but far less than a second of the program arrived each second. The watchdog counted it as a stall, killed ffmpeg and started a new segment after the restart delay, the same as an IPTV output play of this channel would move on.'),
   'VIDEO_STOPPED':            ('warn', 'The video stopped arriving while the sound kept coming, so the file kept growing and this was not a stall. The watchdog restarted the capture to get the picture back, because a fresh connection usually does. It is not counted as a stall or a failure.'),
   'ERROR':                    ('bad',  'Restart attempt produced no data. ffmpeg reconnected but the new segment stayed empty, so the watchdog killed it.'),
   'MANUAL_CANCEL':            ('na',   'The recording was cancelled manually.'),

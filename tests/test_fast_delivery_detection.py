@@ -40,6 +40,7 @@ from app.proc_utils import (  # noqa: E402
 from app.recorder import RecordingState  # noqa: E402
 from app.watchdog import WatchdogThread  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.support.watchdog import FAKE_PROGRESS_CAPTURE as _FAKE_CAPTURE  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 
 
@@ -233,41 +234,6 @@ class FastDeliveryHealthObservationTests(unittest.TestCase):
             event_type=CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION).count(), 0)
 
 
-# A stand-in capture: writes ffmpeg-shaped progress lines into the spool it inherits as
-# stderr, advancing the content position `rate` times faster than the wall clock, and stays
-# alive so the watchdog sees a running process rather than one that exited.
-_FAKE_CAPTURE = (
-    'import sys, time\n'
-    'rate = float(sys.argv[1])\n'
-    'for _ in range(int(sys.argv[2]) if len(sys.argv) > 2 else 0):\n'
-    '    sys.stderr.write("[http @ 0x1] Will reconnect at 22474200 in 0 second(s), '
-    'error=Connection timed out.\\n")\n'
-    'replay = len(sys.argv) > 3\n'
-    'step = 0.1\n'
-    'content = 0.0\n'
-    'tick = 0\n'
-    'while True:\n'
-    # A feed fast only by its replays runs at real time between reconnects; each reconnect
-    # then moves the position by the replay in one jump, after the reconnect notice and
-    # before the next position line - where ffmpeg puts it. Spreading the replay over the
-    # ticks instead, with the notice every fifth, read as 2.0x "own" speed whenever a loaded
-    # box stretched the tick and a 1 s window held 8 ticks and one notice (dev/docs/BUGS.md
-    # 2026-11-09). `rate` is still what the detector reads over any whole number of cycles.
-    '    content += step * (1.0 if replay else rate)\n'
-    '    tick += 1\n'
-    '    h, rem = divmod(content, 3600)\n'
-    '    m, s = divmod(rem, 60)\n'
-    '    sys.stderr.write("frame=1 time=%02d:%02d:%05.2f speed=%.2fx    \\r" % (h, m, s, rate))\n'
-    '    if replay and tick % 5 == 0:\n'
-    '        jump = 5 * step * (rate - 1)\n'
-    '        sys.stderr.write("[http @ 0x1] Will reconnect at 1 in 0 second(s), '
-    'error=Input/output error.\\n[vist#0:0/h264 @ 0x2] timestamp discontinuity (stream id=256): '
-    '%d, new offset= 1\\n" % -int(jump * 1000000))\n'
-    '        content += jump\n'
-    '    sys.stderr.flush()\n'
-    '    time.sleep(step)\n'
-)
-
 # Recording 32's segment 1 as ffmpeg wrote it: position, then a reconnect, then its closure.
 _REPLAY_SPOOL = (
     b'frame=1 time=00:01:00.00 speed=1.6x\r'
@@ -410,6 +376,9 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
             'fast_delivery_ratio': ratio,
             'fast_delivery_window_seconds': window,
             'fast_delivery_strike_count': strikes,
+            # The other end of the same ratio reads the same positions; off, so a disabled
+            # fast detector is proved to read none (tests/test_slow_delivery.py has its own).
+            'slow_delivery_ratio': 0,
         }})
 
     def _run(self, rate=5.0, ratio=1.5, window=1.0, strikes=3, early_fail=99, timeout=30,

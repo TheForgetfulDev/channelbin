@@ -11,7 +11,7 @@ from typing import NamedTuple
 
 from .database import (
     add_recording_event, CAPTURE_GAVE_UP, REC_STATUS_FAILED, REC_STATUS_RETRYING,
-    SEGMENT_EXIT_VIDEO_STOPPED, WINDOW_OPEN_STATUSES,
+    SEGMENT_EXIT_SLOW_DELIVERY, SEGMENT_EXIT_VIDEO_STOPPED, WINDOW_OPEN_STATUSES,
     FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED, FAILURE_FAST_DELIVERY_DETECTED,
 )
 from .db_utils import retry_on_locked
@@ -19,9 +19,10 @@ from . import provider_stalls
 from .account_links import (is_credential_refusal, is_resolution_failure,
                             note_refusal_for_holder, roll_host_for_channel)
 from .probe import parse_ffprobe
-from .proc_utils import (DeliveryRateMonitor, GrowthMonitor, VideoArrivalMonitor,
-                         read_capture_content_position, read_capture_frame_count,
-                         read_replay_seconds_since,
+from .proc_utils import (DeliveryRateMonitor, GrowthMonitor, SlowDeliveryCheck,
+                         VideoArrivalMonitor, read_capture_content_position,
+                         read_capture_frame_count, read_replay_seconds_since,
+                         slow_delivery_detail, slow_delivery_settings,
                          stderr_cause, terminate_or_kill, wait_for_file_data)
 
 log = logging.getLogger(__name__)
@@ -421,6 +422,7 @@ class WatchdogThread(threading.Thread):
                 fast_delivery_ratio = cfg['watchdog']['fast_delivery_ratio']
                 fast_delivery_window = cfg['watchdog']['fast_delivery_window_seconds']
                 fast_delivery_strikes = cfg['watchdog']['fast_delivery_strike_count']
+                slow_ratio, slow_window = slow_delivery_settings(cfg)
 
                 seg_num = self.state.current_segment_num
                 seg = RecordingSegment.query.filter_by(
@@ -440,6 +442,9 @@ class WatchdogThread(threading.Thread):
                 # lands in a window that is not yet full, so it can never be measured on its
                 # own (dev/changelog/964).
                 delivery = DeliveryRateMonitor(fast_delivery_window)
+                # Per segment too: a trickle is judged on this ffmpeg's own window, the same
+                # check an IPTV output play of the feed holds (dev/changelog/1799).
+                slow_check = SlowDeliveryCheck(slow_ratio, slow_window)
                 # Per segment for the same reason: a new ffmpeg counts frames from zero.
                 video = VideoArrivalMonitor(stall_timeout)
                 # Set when this segment is to be closed and restarted for a video stop - a
@@ -451,6 +456,10 @@ class WatchdogThread(threading.Thread):
                 # faster than real time across a full window. A fourth way for a segment to
                 # end, alongside a stall, a self-exit and a dead restart.
                 fast_delivery = None
+                # The measured ratio when this segment's feed has delivered less than
+                # watchdog.slow_delivery_ratio across a full window: a feed slowed to a trickle
+                # still grows the file often enough that the stall check never fires.
+                slow_delivery = None
                 # Consumed once, for the one segment it was recorded against: a later
                 # segment must be judged on its own growth, not on a stale verdict.
                 restart_produced_no_data = (restart_no_data_segment == seg_num)
@@ -607,9 +616,15 @@ class WatchdogThread(threading.Thread):
                     # open in both directions - an unreadable or unparseable spool yields
                     # None, which the monitor treats as a gap in the record rather than as
                     # evidence either way.
-                    if fast_delivery is None and fast_delivery_ratio and fast_delivery_ratio > 0:
-                        observed = delivery.update(
-                            read_capture_content_position(self.state.stderr_path))
+                    want_fast = (fast_delivery is None and fast_delivery_ratio
+                                 and fast_delivery_ratio > 0)
+                    want_slow = slow_delivery is None and slow_check.enabled
+                    position = (read_capture_content_position(self.state.stderr_path)
+                                if want_fast or want_slow else None)
+                    if want_slow:
+                        slow_delivery = slow_check.update(position)
+                    if want_fast:
+                        observed = delivery.update(position)
                         if observed is not None and observed >= fast_delivery_ratio:
                             # A reconnect's replay moves the position with nothing new
                             # delivered. Only what is left after it is the feed's own speed
@@ -748,15 +763,24 @@ class WatchdogThread(threading.Thread):
                     # is over-delivery that ends in a clean EOF.
                     if fast_delivery is not None and (proc_exited or restart_dead):
                         fast_delivery = None
+                    # A trickle is a slow stall, so the plainer fact owns the segment: a feed
+                    # that also went silent long enough, exited or restarted dead is told by
+                    # that, and a feed that raced ahead is not slow.
+                    if slow_delivery is not None and (proc_exited or restart_dead
+                                                      or fast_delivery is not None
+                                                      or stalled_for > stall_timeout):
+                        slow_delivery = None
                     # Likewise a video-stop restart yields to any other shape on the same
                     # tick: each of them describes the segment more completely, and every one
                     # of them restarts it anyway.
                     if video_restart and (proc_exited or restart_dead or fast_delivery is not None
+                                          or slow_delivery is not None
                                           or stalled_for > stall_timeout):
                         video_restart = False
 
                     if (stalled_for > stall_timeout or proc_exited or restart_dead
-                            or fast_delivery is not None or video_restart):
+                            or fast_delivery is not None or slow_delivery is not None
+                            or video_restart):
                         if video_restart:
                             log.warning(
                                 'Recording %d: seg %d video frame count stood at %s for %.0fs '
@@ -769,6 +793,12 @@ class WatchdogThread(threading.Thread):
                                 '- the feed is not advancing, stopping this capture',
                                 self.recording_id, seg_num, fast_delivery.ratio,
                                 fast_delivery.window_seconds,
+                            )
+                        elif slow_delivery is not None:
+                            log.warning(
+                                'Recording %d: seg %d delivered %.2fx real time across %.0fs '
+                                '- the feed slowed to a trickle, restarting this capture',
+                                self.recording_id, seg_num, slow_delivery, slow_window,
                             )
                         elif proc_exited:
                             log.warning(
@@ -906,6 +936,12 @@ class WatchdogThread(threading.Thread):
                             stall_detail = (f'Restarted segment produced no data within '
                                             f'{stall_timeout}s - closed on that verdict '
                                             f'rather than waiting to re-derive it')
+                        elif slow_delivery is not None:
+                            exit_reason = SEGMENT_EXIT_SLOW_DELIVERY
+                            stall_reason = 'slow_delivery'
+                            stall_detail = (f'Slowed to a trickle: '
+                                            f'{slow_delivery_detail(slow_delivery, slow_window)}, '
+                                            f'too little to record - restarting')
                         else:
                             exit_reason = 'STALL_KILLED'
                             stall_reason = 'no_growth'
@@ -1020,12 +1056,19 @@ class WatchdogThread(threading.Thread):
                                 if r.consecutive_failures > r.consecutive_failures_peak:
                                     r.consecutive_failures_peak = r.consecutive_failures
 
+                            extra = {'bytes': monitor.last_size,
+                                     'stall_duration': stalled_for,
+                                     'stall_reason': stall_reason}
+                            if slow_delivery is not None:
+                                # A trickle's stall_duration is the growth clock, near 0 - the
+                                # file never stood still. What was measured is the ratio and the
+                                # window it held across (dev/changelog/1799).
+                                extra['ratio'] = round(slow_delivery, 3)
+                                extra['window_seconds'] = round(slow_window, 1)
                             add_recording_event(self.recording_id, STALL_DETECTED,
                                 detail=stall_detail,
                                 segment_number=seg_num,
-                                extra={'bytes': monitor.last_size,
-                                       'stall_duration': stalled_for,
-                                       'stall_reason': stall_reason})
+                                extra=extra)
 
                             db.session.commit()
                             return r
