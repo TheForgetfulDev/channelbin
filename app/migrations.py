@@ -4206,6 +4206,17 @@ def _m156_output_feed_login_switches(conn, cur):
             cur.execute(f'ALTER TABLE output_feed_logins ADD COLUMN {col} BOOLEAN NOT NULL DEFAULT 0')
     conn.commit()
 
+
+def _m157_output_feed_login_lineup_except(conn, cur):
+    """output_feed_logins.lineup_except: the channels a login does not get, every other channel
+    on the output included (dev/changelog/1787). No backfill: NULL is none, which keeps every
+    login made before step 157 as it was. Re-runnable from the top: the ADD COLUMN asks PRAGMA
+    table_info first."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(output_feed_logins)').fetchall()}
+    if cols and 'lineup_except' not in cols:
+        cur.execute('ALTER TABLE output_feed_logins ADD COLUMN lineup_except TEXT')
+    conn.commit()
+
 #: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
 #: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
 #: time; the rebuild test holds step 148's output to this text, and the column list after
@@ -5093,6 +5104,8 @@ SCHEMA_MIGRATIONS = [
     (155, 'login_hosts: the hosts of the reseller who sold a login', _m155_login_hosts),
     (156, 'output_feed_logins.provider_direct + full_refusals: per-login switches the main IPTV '
           'output login used to have alone', _m156_output_feed_login_switches),
+    (157, 'output_feed_logins.lineup_except: the channels each IPTV output login is kept from',
+     _m157_output_feed_login_lineup_except),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

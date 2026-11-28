@@ -328,6 +328,9 @@ class FeedLogin:
     # The feed ids it gets (lineup_of()), None for everything the output offers: a login nobody
     # narrowed (dev/changelog/1764).
     lineup: Optional[frozenset] = None
+    # The feed ids it does not get (excluded_of()), empty for none: every other row, a row added
+    # later included (dev/changelog/1787).
+    excluded: frozenset = frozenset()
     # And how many times set_login_lineup() had run for it, as `generation` is for stop_login().
     lineup_generation: int = 0
     # The IPTV accounts its plays come from (accounts_of()), None for the output's own list: a
@@ -342,7 +345,12 @@ class FeedLogin:
 
     def offers(self, feed_id: int) -> bool:
         """Whether `feed_id` is one of this login's channels."""
-        return lineup_offers(self.lineup, feed_id)
+        return lineup_offers(self.lineup, feed_id, self.excluded)
+
+    @property
+    def narrowed(self) -> bool:
+        """Whether its channels are anything less than everything the output offers."""
+        return self.lineup is not None or bool(self.excluded)
 
     @property
     def log_name(self) -> str:
@@ -357,6 +365,7 @@ def _feed_login_of(row, counts: tuple) -> FeedLogin:
     return FeedLogin(row.username, row.password, feed_login_id=row.id, name=row.name or '',
                      max_streams=max(1, int(row.max_streams or 1)),
                      generation=generation.get(row.id, 0), lineup=lineup_of(row),
+                     excluded=excluded_of(row),
                      lineup_generation=lineup_generation.get(row.id, 0), accounts=accounts_of(row),
                      accounts_generation=accounts_generation.get(row.id, 0),
                      provider_direct=bool(row.provider_direct),
@@ -383,39 +392,70 @@ def lineup_key(feed_id: int) -> int:
     return feed_id
 
 
-def lineup_offers(lineup: Optional[frozenset], feed_id: int) -> bool:
-    return lineup is None or lineup_key(feed_id) in lineup
+def lineup_offers(lineup: Optional[frozenset], feed_id: int, excluded: frozenset = frozenset()) -> bool:
+    """Whether a login with `lineup` (None for no narrowing) and `excluded` gets `feed_id`."""
+    key = lineup_key(feed_id)
+    return (lineup is None or key in lineup) and key not in excluded
+
+
+#: What the Choose channels dialog says a login gets (output_feed_view.lineup_choices): every
+#: channel, only the ones picked (`lineup`), or every one but those picked (`lineup_except`).
+LINEUP_ALL = 'all'
+LINEUP_ONLY = 'only'
+LINEUP_EXCEPT = 'except'
+
+
+def _stored_ids(raw) -> frozenset:
+    """A stored list of feed ids as lineup keys. ValueError or TypeError when it is not one."""
+    ids = json.loads(raw)
+    if not isinstance(ids, list):
+        raise ValueError('not a list')
+    return frozenset(lineup_key(int(i)) for i in ids)
 
 
 def lineup_of(row) -> Optional[frozenset]:
     """An OutputFeedLogin's lineup: its stored feed ids, or None for everything. A value that
-    does not read as a list of ids is logged and read as nothing rather than everything, so a
-    damaged row never widens what a login gets."""
+    does not read as a list of ids, in `lineup` or in `lineup_except`, is logged and read as
+    nothing rather than everything, so a damaged row never widens what a login gets."""
     raw = getattr(row, 'lineup', None)
-    if raw is None:
-        return None
     try:
-        ids = json.loads(raw)
-        if not isinstance(ids, list):
-            raise ValueError('not a list')
-        return frozenset(lineup_key(int(i)) for i in ids)
+        if getattr(row, 'lineup_except', None) is not None:
+            _stored_ids(row.lineup_except)
+        return None if raw is None else _stored_ids(raw)
     except (TypeError, ValueError) as exc:
         log.warning('IPTV output: login %s has a channel list that cannot be read (%s), so it '
                     'gets no channels until its channels are chosen again', row.username, exc)
         return frozenset()
 
 
-def lineup_problem(value) -> tuple:
+def excluded_of(row) -> frozenset:
+    """An OutputFeedLogin's channels left out (`lineup_except`) as lineup keys, empty for none.
+    A value that cannot be read is empty here and narrows the login to nothing in lineup_of(),
+    which logs it."""
+    raw = getattr(row, 'lineup_except', None)
+    if raw is None:
+        return frozenset()
+    try:
+        return _stored_ids(raw)
+    except (TypeError, ValueError):
+        return frozenset()
+
+
+def lineup_problem(value, leaving_out: bool = False) -> tuple:
     """(feed ids to store, error) for a lineup a save sends: None for everything, else a
-    non-empty list of feed ids, each one stored as lineup_key() names it."""
+    non-empty list of feed ids, each one stored as lineup_key() names it. `leaving_out` words
+    the errors for a list of channels the login does not get (`lineup_except`)."""
     if value is None:
         return None, ''
     if not isinstance(value, list):
         return None, 'The channels must be a list, or nothing for everything.'
     if not value:
+        if leaving_out:
+            return None, 'Pick at least one channel to leave out, or choose Everything on the output.'
         return None, 'Pick at least one channel, or turn the login off.'
     if len(value) > LINEUP_MAX:
-        return None, f'A login can have at most {LINEUP_MAX} channels picked.'
+        return None, (f'A login can have at most {LINEUP_MAX} channels '
+                      f'{"left out" if leaving_out else "picked"}.')
     ids = set()
     for v in value:
         if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
@@ -1027,14 +1067,12 @@ def logo_in_lineup(login: FeedLogin, channel_id: int) -> bool:
     """Whether the feed's logo route may serve channel `channel_id`'s logo to `login`: always
     for a login with every channel, else when the channel's own row or a group it is in is one
     of its channels - the only rows whose logo is that channel's (catalog()). One query."""
-    if login.lineup is None:
-        return True
-    if feed_id_for_channel(channel_id) in login.lineup:
+    if not login.narrowed or login.offers(feed_id_for_channel(channel_id)):
         return True
     from .database import ChannelGroupMember
     group_ids = [gid for (gid,) in ChannelGroupMember.query.with_entities(ChannelGroupMember.group_id)
                  .filter(ChannelGroupMember.channel_id == channel_id)]
-    return any(feed_id_for_group(gid) in login.lineup for gid in group_ids)
+    return any(login.offers(feed_id_for_group(gid)) for gid in group_ids)
 
 
 def _group_lead(group, members, latest_by_channel, blocked):
@@ -1070,7 +1108,7 @@ def catalog(cfg=None, everything: bool = False, login: Optional[FeedLogin] = Non
     with `num` 0 and the reason on the row (`on_output`, `left_out`), from the same queries.
 
     `login` narrows the answer to that login's lineup (FeedLogin.lineup, dev/changelog/1764)
-    before the numbering, so each login's channels are numbered 1 to n with no gaps; a feed id
+    and the rows it leaves out (FeedLogin.excluded, dev/changelog/1787) before the numbering, so each login's channels are numbered 1 to n with no gaps; a feed id
     is the row's whatever the login. It also leaves out what the login's own accounts would
     (FeedLogin.accounts, left_out_for_login(), dev/changelog/1765). Ignored with `everything`,
     which is the owner's view."""
@@ -1080,8 +1118,8 @@ def catalog(cfg=None, everything: bool = False, login: Optional[FeedLogin] = Non
     if accounts is not None:
         for row in rows:
             row.left_out = left_out_for_login(row, accounts)
-    lineup = None if everything or login is None else login.lineup
-    offered = [row for row in rows if row.offered and lineup_offers(lineup, row.feed_id)]
+    narrow = login if login is not None and not everything else None
+    offered = [row for row in rows if row.offered and (narrow is None or narrow.offers(row.feed_id))]
     for n, row in enumerate(offered, start=1):
         row.num = n
     return rows if everything else offered
@@ -1465,9 +1503,9 @@ def forget_answers() -> None:
 
 
 def login_key(login: FeedLogin) -> tuple:
-    """What a catalog answer depends on about the login that asked: its lineup and accounts.
-    Every login nobody narrowed shares one key."""
-    return (login.lineup, login.accounts)
+    """What a catalog answer depends on about the login that asked: its lineup, the rows it
+    leaves out and its accounts. Every login nobody narrowed shares one key."""
+    return (login.lineup, login.excluded, login.accounts)
 
 
 # ── Picking what a feed id plays ───────────────────────────────────────────────────────────
@@ -2220,7 +2258,7 @@ _login_starting: dict = {}
 #: Login id -> how many times stop_login() has run for it (FeedLogin.generation).
 _login_changes: dict = {}
 #: Login id -> how many times set_login_lineup() has run for it (FeedLogin.lineup_generation),
-#: and the lineup it last set, which a play let in on an older one is checked against.
+#: and the (lineup, excluded) it last set, which a play let in on an older one is checked against.
 _lineup_changes: dict = {}
 _lineup_now: dict = {}
 #: Login id -> how many times set_login_accounts() has run for it (FeedLogin.accounts_generation),
@@ -2404,7 +2442,8 @@ class _LoginRoom:
         login_id = self.login.feed_login_id
         if _lineup_changes.get(login_id, 0) == self.login.lineup_generation:
             return True
-        return lineup_offers(_lineup_now.get(login_id), feed_id)
+        lineup, excluded = _lineup_now.get(login_id, (None, frozenset()))
+        return lineup_offers(lineup, feed_id, excluded)
 
     def accounts_moved_locked(self, session: RelaySession, output_allowed) -> bool:
         """Whether set_login_accounts() ran for the login since the gate read it and left
@@ -2488,16 +2527,18 @@ def stop_login(login_id: int, reason: str = REASON_LOGIN_OFF) -> int:
     return sum(1 for s in live if _finish(s, reason))
 
 
-def set_login_lineup(login_id: int, lineup: Optional[frozenset]) -> int:
+def set_login_lineup(login_id: int, lineup: Optional[frozenset],
+                     excluded: frozenset = frozenset()) -> int:
     """End every live play on login `login_id` whose channel `lineup` (the one just committed,
-    None for everything) leaves out, by name. How many it ended. Called after the commit, never
+    None for everything) or `excluded` (the rows it leaves out) leaves out, by name. How many it ended. Called after the commit, never
     inside it. The count it moves, in the same lock as the list it takes, catches a play the
     gate let in on the old list that registers after this list, which is ended too when `lineup`
     leaves its channel out (start_session)."""
     with _lock:
         _lineup_changes[login_id] = _lineup_changes.get(login_id, 0) + 1
-        _lineup_now[login_id] = lineup
-        live = [s for s in _login_plays_locked(login_id) if not lineup_offers(lineup, s.feed_id)]
+        _lineup_now[login_id] = (lineup, excluded)
+        live = [s for s in _login_plays_locked(login_id)
+                if not lineup_offers(lineup, s.feed_id, excluded)]
     return sum(1 for s in live if _finish(s, REASON_LINEUP))
 
 

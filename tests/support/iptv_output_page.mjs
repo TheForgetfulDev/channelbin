@@ -30,7 +30,7 @@ const requests = [];
 const REFUSE = new Set();
 // What a login's Choose channels read answers (routes/iptv_output.py::login_channels): two
 // categories, a row off the output, a picture-in-picture channel with its swapped copy.
-const CHANNELS = { success: true, name: 'Kim', everything: false, picked: [2], rows: [
+let CHANNELS = { success: true, name: 'Kim', mode: 'only', picked: [2], rows: [
   { id: 2, name: 'Alpha', category: 'News', num: 1, off: '', swapped: false },
   { id: 4, name: 'Beta', category: 'News', num: 0, off: 'Taken off the output', swapped: false },
   { id: 3, name: 'Game feeds', category: 'Sports', num: 2, off: '', swapped: false },
@@ -268,6 +268,34 @@ mark = requests.length;
 await click(modalButton('Save'));
 await wait(40);
 out.lu_everything_post = requests.slice(mark).filter((r) => r.method === 'POST').map((r) => r.body);
+// Everything except (dev/changelog/1787): a login read in that mode opens on it with its
+// left-out channels ticked; Save posts them as lineup_except, nothing ticked is refused.
+CHANNELS = { ...CHANNELS, mode: 'except', picked: [4] };
+await luOpen();
+const checkedMode = () => modal().querySelector('input[name="of-lu-mode"]:checked').value;
+out.lu_except_initial = { mode: checkedMode(), picked: luTicked(),
+                          pick_shown: !modal().querySelector('.of-lu-pick').hidden };
+await click(modal().querySelector('[data-lu="none"]'));
+mark = requests.length;
+await click(modalButton('Save'));
+await wait(40);
+out.lu_except_empty = { posts: requests.slice(mark).filter((r) => r.method === 'POST').length,
+                        toast: toasts().some((t) => t.includes('Pick at least one channel to leave out')) };
+luBoxes().find((b) => b.value === '3').checked = true;
+mark = requests.length;
+await click(modalButton('Save'));
+await wait(40);
+out.lu_except_post = requests.slice(mark).filter((r) => r.method === 'POST').map((r) => r.body);
+// From Everything, the except choice shows the list again.
+CHANNELS = { ...CHANNELS, mode: 'all', picked: [] };
+await luOpen();
+out.lu_all_initial = { mode: checkedMode(), pick_shown: !modal().querySelector('.of-lu-pick').hidden };
+const except = modal().querySelector('input[name="of-lu-mode"][value="except"]');
+except.checked = true;
+await change(except);
+out.lu_except_shows_list = !modal().querySelector('.of-lu-pick').hidden;
+await click(modalButton('Cancel'));
+await wait(20);
 
 /* Choose accounts (dev/changelog/1765): the login's own read, the list hidden while it plays
    from the output's accounts, nothing picked refused, Save posts account ids or null. */

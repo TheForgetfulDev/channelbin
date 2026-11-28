@@ -364,11 +364,19 @@ def _login_fields(data: dict, login_id=None) -> tuple:
             if not isinstance(data.get(key), bool):
                 return None, 'The switch takes true or false.'
             out[key] = data[key]
-    if 'lineup' in data:
+    if 'lineup' in data or 'lineup_except' in data:
+        # Both columns are written together, so a save in one mode clears the other
+        # (dev/changelog/1787).
         ids, problem = output_feed.lineup_problem(data.get('lineup'))
         if problem:
             return None, problem
+        left_out, problem = output_feed.lineup_problem(data.get('lineup_except'), leaving_out=True)
+        if problem:
+            return None, problem
+        if ids is not None and left_out is not None:
+            return None, 'A login gets either only the channels picked or all but those picked, not both.'
         out['lineup'] = None if ids is None else json.dumps(ids)
+        out['lineup_except'] = None if left_out is None else json.dumps(left_out)
     if 'accounts' in data:
         existing = {a.id for a in Account.query.with_entities(Account.id)}
         ids, problem = output_feed.accounts_problem(data.get('accounts'), existing)
@@ -439,11 +447,13 @@ def edit_login(login_id):
         cut = ((fields.get('enabled') is False and row.enabled)
                or ('username' in fields and fields['username'] != row.username)
                or ('password' in fields and fields['password'] != row.password))
-        before, accounts_before = output_feed.lineup_of(row), output_feed.accounts_of(row)
+        before = (output_feed.lineup_of(row), output_feed.excluded_of(row))
+        accounts_before = output_feed.accounts_of(row)
         for key, value in fields.items():
             setattr(row, key, value)
         db.session.commit()
-        after, accounts_after = output_feed.lineup_of(row), output_feed.accounts_of(row)
+        after = (output_feed.lineup_of(row), output_feed.excluded_of(row))
+        accounts_after = output_feed.accounts_of(row)
         return (cut, (after if after != before else _UNCHANGED),
                 (accounts_after if accounts_after != accounts_before else _UNCHANGED), row.username)
 
@@ -458,9 +468,15 @@ def edit_login(login_id):
     ended = output_feed.stop_login(login_id) if cut else 0
     if lineup is not _UNCHANGED:
         # After the commit: the plays its new channels leave out end by name (dev/changelog/1764).
-        ended += output_feed.set_login_lineup(login_id, lineup)
-        log.info('IPTV output: login %s now gets %s', username,
-                 'every channel on the output' if lineup is None else counted(len(lineup), 'channel'))
+        only, excluded = lineup
+        ended += output_feed.set_login_lineup(login_id, only, excluded)
+        if only is not None:
+            gets = counted(len(only), 'channel')
+        elif excluded:
+            gets = f'every channel on the output except {counted(len(excluded), "channel")}'
+        else:
+            gets = 'every channel on the output'
+        log.info('IPTV output: login %s now gets %s', username, gets)
     if accounts is not _UNCHANGED:
         # After the commit: its plays take the new accounts, and those outside them end by name
         # (dev/changelog/1765).
@@ -473,8 +489,8 @@ def edit_login(login_id):
     return jsonify({'success': True, 'ended': ended})
 
 
-#: What _edit() hands back for a lineup or accounts the save left as they were, since None means
-#: everything (the lineup) or the output's list (the accounts).
+#: What _edit() hands back for a lineup (the pair of lineup_of() and excluded_of()) or accounts
+#: the save left as they were, since None means the output's list (the accounts).
 _UNCHANGED = object()
 
 
@@ -489,7 +505,8 @@ def login_channels(login_id):
         return jsonify({'error': 'That login no longer exists'}), 404
     return jsonify({'success': True, 'name': row.name,
                     **output_feed_view.lineup_choices(load_config(), output_feed.lineup_of(row),
-                                                      output_feed.accounts_of(row))})
+                                                      output_feed.accounts_of(row),
+                                                      output_feed.excluded_of(row))})
 
 
 @iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>/accounts')

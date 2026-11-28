@@ -496,12 +496,16 @@
     const list = Array.from(byCat, ([cat, rows]) => `<div data-lu-cat><div class="of-lu-head">${escHtml(cat)}</div>`
       + `${rows.map(rowHtml).join('')}</div>`).join('');
     // Not inside .of-login, whose block labels would undo .check-row's line.
+    // The mode's radio values are the server's own words for it (output_feed.LINEUP_*).
+    const checked = (mode) => (d.mode === mode ? ' checked' : '');
     const body = `<div>
-      <label class="fp-radio"><input type="radio" name="of-lu-mode" value="all"${d.everything ? ' checked' : ''}> Everything on the output
+      <label class="fp-radio"><input type="radio" name="of-lu-mode" value="all"${checked('all')}> Everything on the output
         <span class="text-muted">Every channel you offer, and any you add to the output later.</span></label>
-      <label class="fp-radio"><input type="radio" name="of-lu-mode" value="pick"${d.everything ? '' : ' checked'}> Only the channels I pick
+      <label class="fp-radio"><input type="radio" name="of-lu-mode" value="only"${checked('only')}> Only the channels I pick
         <span class="text-muted">A channel added to the output later is not added here. A picture-in-picture channel shows its two pictures whatever channels they come from.</span></label>
-      <div class="of-lu-pick"${d.everything ? ' hidden' : ''}>
+      <label class="fp-radio"><input type="radio" name="of-lu-mode" value="except"${checked('except')}> Everything except the channels I pick
+        <span class="text-muted">A channel added to the output later is included. A picture-in-picture channel you pick here takes its swapped copy with it.</span></label>
+      <div class="of-lu-pick"${d.mode === 'all' ? ' hidden' : ''}>
         <div class="of-lu-tools"><input class="search" type="search" placeholder="Search channels" aria-label="Search channels">
           <button class="btn btn-sm" type="button" data-lu="all">Pick all shown</button><button class="btn btn-sm" type="button" data-lu="none">Clear all shown</button>
           <span class="of-lu-n"></span></div>
@@ -514,18 +518,24 @@
       footer: [
         { label: 'Cancel', class: 'btn' },
         { label: 'Save', class: 'btn btn-primary', onClick: (close) => {
-          const all = $('input[name="of-lu-mode"]:checked', overlay).value === 'all';
+          const mode = $('input[name="of-lu-mode"]:checked', overlay).value;
           const ids = boxes().filter((b) => b.checked).map((b) => Number(b.value));
-          if (!all && !ids.length) {
-            showToast('Pick at least one channel, or turn the login off.', { type: 'error' });
+          if (mode !== 'all' && !ids.length) {
+            showToast(mode === 'except' ? 'Pick at least one channel to leave out, or choose Everything on the output.'
+              : 'Pick at least one channel, or turn the login off.', { type: 'error' });
             return false;
           }
-          post(`/api/iptv-output/logins/${tr.dataset.login}`, { lineup: all ? null : ids }).then((res) => {
+          const body = { lineup: mode === 'only' ? ids : null, lineup_except: mode === 'except' ? ids : null };
+          const said = {
+            all: 'gets every channel on the output.',
+            only: 'gets the channels you picked.',
+            except: 'gets every channel on the output except the ones you picked.',
+          };
+          post(`/api/iptv-output/logins/${tr.dataset.login}`, body).then((res) => {
             close();
             // No count here: the card counts what the player lists, which a picture-in-picture
             // pick (two channels) and a pick off the output make differ from the ticks.
-            return refresh(CARDS).then(() => showToast(`${all ? `${tr.dataset.name} gets every channel on the output.`
-              : `${tr.dataset.name} gets the channels you picked.`}${loginCutNote(res.ended)}`));
+            return refresh(CARDS).then(() => showToast(`${tr.dataset.name} ${said[mode]}${loginCutNote(res.ended)}`));
           }).catch(fail);
           return false;
         } },

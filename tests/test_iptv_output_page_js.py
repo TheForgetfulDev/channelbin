@@ -199,11 +199,22 @@ class IptvOutputScriptTests(FeedCase):
         self.assertEqual(lu['lu_heads_shown'], ['Sports'])
         self.assertEqual(lu['lu_after_pick_all'], {'picked': [2, 3], 'n': '2 picked'})
         self.assertEqual(lu['lu_post'], [{'path': f'/api/iptv-output/logins/{self.obs["login_id"]}',
-                                          'body': {'lineup': [2, 3]}}])
+                                          'body': {'lineup': [2, 3], 'lineup_except': None}}])
         self.assertTrue(lu['lu_closed'])
         self.assertEqual(lu['lu_empty'], {'posts': 0, 'open': True, 'toast': True})
         self.assertTrue(lu['lu_everything_hides_list'])
-        self.assertEqual(lu['lu_everything_post'], [{'lineup': None}])
+        self.assertEqual(lu['lu_everything_post'], [{'lineup': None, 'lineup_except': None}])
+
+    def test_choose_channels_everything_except_posts_the_channels_left_out(self):
+        """dev/changelog/1787: a login that gets everything but some channels opens on that
+        choice with those ticked; Save posts them as lineup_except, nothing ticked is refused
+        with its own words, and the choice shows the list from Everything."""
+        lu = self.obs
+        self.assertEqual(lu['lu_except_initial'], {'mode': 'except', 'picked': [4], 'pick_shown': True})
+        self.assertEqual(lu['lu_except_empty'], {'posts': 0, 'toast': True})
+        self.assertEqual(lu['lu_except_post'], [{'lineup': None, 'lineup_except': [3]}])
+        self.assertEqual(lu['lu_all_initial'], {'mode': 'all', 'pick_shown': False})
+        self.assertTrue(lu['lu_except_shows_list'])
 
 
     def test_choose_accounts_reads_the_logins_accounts_and_posts_ids(self):
