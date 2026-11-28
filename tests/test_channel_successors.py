@@ -22,11 +22,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import channel_successors as successors  # noqa: E402
 from app import db  # noqa: E402
+from app import output_feed  # noqa: E402
 from app.accounts import channel_unlisted, last_sync_bounds, unlisted_channel_expr  # noqa: E402
 from app.config import load_config  # noqa: E402
 from app.database import (  # noqa: E402
     AccountSyncLog, Channel, ChannelEvent, ChannelGroup, ChannelGroupEvent, ChannelGroupMember,
-    ChannelHealthExclusion, ChannelReplacement, ChannelTest, PipChannel, Provider, Recording,
+    ChannelHealthExclusion, ChannelReplacement, ChannelTest, OutputFeedLogin, PipChannel,
+    Provider, Recording,
     CHANNEL_HEALTH_HISTORY_CARRIED, CHANNEL_REPLACED, GROUP_MEMBER_PARTICIPATION,
     GROUP_MEMBER_REPLACED, PIP_SOURCE_CHANNEL, REPLACE_MATCH_PICKED, REPLACE_MATCH_STREAM_ID,
     REPLACE_MATCH_URL,
@@ -35,6 +37,7 @@ from app.health_recompute import (  # noqa: E402
     apply_rollback, observation_ledger, replay,
 )
 from tests.support import make_test_app, seed  # noqa: E402
+from tests.support import output_feed as output_rig  # noqa: E402
 
 ALL = successors.CARRY_PIECES
 
@@ -727,6 +730,115 @@ class DedupPathTests(_Base):
         self.assertEqual(ChannelReplacement.query.count(), 0)
         self.assertEqual(result['carried'][successors.CARRY_GUIDE], successors.CARRIED)
         self.assertNotIn(successors.CARRY_HEALTH, result['carried'])
+
+
+class OutputFeedIdTests(_Base):
+    """Section 8.3: a channel with its own guide row on the IPTV output changes feed id when it
+    is replaced, so the old id is answered with the new channel while the old row exists, and
+    each login's channel list has the old id swapped for the new one."""
+
+    app_kwargs = {'csrf': False}
+
+    def setUp(self):
+        super().setUp()
+        self.t.sandbox_config(output_rig.feed_cfg())
+        self.addCleanup(output_feed.stop_all)
+        self.old = self.old_channel(in_guide=True)
+        self.new = self.new_channel()
+        db.session.commit()
+        self.old_fid = output_feed.feed_id_for_channel(self.old.id)
+        self.new_fid = output_feed.feed_id_for_channel(self.new.id)
+
+    def head(self, feed_id):
+        return self.t.client.head(f'/live/{output_rig.USER}/{output_rig.PASS}/{feed_id}')
+
+    def delete_old(self):
+        ids = [self.old.id]
+        successors.before_channel_delete(ids, self.cfg)
+        ChannelEvent.query.filter(ChannelEvent.channel_id.in_(ids)).delete(synchronize_session=False)
+        Channel.query.filter(Channel.id.in_(ids)).delete(synchronize_session=False)
+        db.session.commit()
+        db.session.expire_all()
+
+    def test_the_old_id_plays_the_new_channel_while_the_old_row_exists(self):
+        output_rig.add_login()
+        self.assertEqual(self.head(self.old_fid).status_code, 200)
+        self.assertEqual(self.head(self.new_fid).status_code, 404)
+        self.accept(self.old, self.new)
+
+        self.assertEqual(output_feed.successor_feed_id(self.old_fid), self.new_fid)
+        self.assertEqual(self.head(self.old_fid).status_code, 200)
+        self.assertEqual(self.head(self.new_fid).status_code, 200)
+
+        self.delete_old()
+        self.assertEqual(output_feed.successor_feed_id(self.old_fid), self.old_fid)
+        self.assertEqual(self.head(self.old_fid).status_code, 404)
+
+    def test_no_answer_when_the_guide_row_did_not_move(self):
+        """The guide row left unchecked, or the new channel keeping a row of its own: the old id
+        names no channel that took its place."""
+        self.accept(self.old, self.new, options=set(ALL) - {successors.CARRY_GUIDE})
+        self.assertEqual(output_feed.successor_feed_id(self.old_fid), self.old_fid)
+
+    def test_a_new_channel_with_its_own_row_answers_nothing_for_the_old_id(self):
+        new = db.session.get(Channel, self.new.id)
+        new.in_guide = True
+        db.session.commit()
+        self.accept(self.old, self.new)
+        self.assertEqual(output_feed.successor_feed_id(self.old_fid), self.old_fid)
+
+    def test_the_answer_follows_a_chain_and_ends_at_an_undo(self):
+        self.accept(self.old, self.new)
+        b = db.session.get(Channel, self.new.id)
+        b.last_seen_at = self.sync_start - timedelta(minutes=30)
+        c = self.new_channel(name='ESPN 4K')
+        db.session.commit()
+        self.accept(b, c)
+        c_fid = output_feed.feed_id_for_channel(c.id)
+        self.assertEqual(output_feed.successor_feed_id(self.old_fid), c_fid)
+        self.assertEqual(output_feed.successor_feed_id(self.new_fid), c_fid)
+
+        self.accept(c, b)    # the undo of B by C
+        self.assertEqual(output_feed.successor_feed_id(self.old_fid), self.new_fid)
+
+    def test_a_channel_with_its_own_row_reads_no_replacement(self):
+        """A normal play pays nothing: the lookup runs only for a channel with no row."""
+        with mock.patch.object(successors, 'guide_successor_id') as lookup:
+            self.assertEqual(output_feed.successor_feed_id(self.old_fid), self.old_fid)
+            self.assertEqual(output_feed.successor_feed_id(output_feed.feed_id_for_group(5)),
+                             output_feed.feed_id_for_group(5))
+        lookup.assert_not_called()
+
+    def test_each_login_list_has_the_old_id_swapped_for_the_new(self):
+        only = output_rig.add_login('only', 'pw1', lineup=json.dumps([self.old_fid, 99]))
+        but = output_rig.add_login('but', 'pw2', lineup_except=json.dumps([self.old_fid]))
+        every = output_rig.add_login('every', 'pw3')
+        before = dict(output_feed._lineup_changes)
+
+        self.accept(self.old, self.new)
+
+        only, but, every = (db.session.get(OutputFeedLogin, r.id) for r in (only, but, every))
+        self.assertEqual(json.loads(only.lineup), sorted([self.new_fid, 99]))
+        self.assertEqual(json.loads(but.lineup_except), [self.new_fid])
+        self.assertIsNone(every.lineup)
+        self.assertIsNone(every.lineup_except)
+        # Handed to the live plays after the commit, as a save in the Logins dialog is.
+        for row in (only, but):
+            self.assertEqual(output_feed._lineup_changes.get(row.id, 0),
+                             before.get(row.id, 0) + 1)
+        self.assertNotIn(every.id, output_feed._lineup_changes)
+        # A narrowed login gets the channel on its old id too, since it is the new one's.
+        self.assertTrue(output_feed.lineup_offers(output_feed.lineup_of(only),
+                                                  output_feed.successor_feed_id(self.old_fid)))
+
+    def test_undo_swaps_the_lists_back(self):
+        only = output_rig.add_login('only', 'pw1', lineup=json.dumps([self.old_fid]))
+        self.accept(self.old, self.new)
+        self.assertEqual(json.loads(db.session.get(OutputFeedLogin, only.id).lineup),
+                         [self.new_fid])
+        self.accept(self.new, self.old)
+        self.assertEqual(json.loads(db.session.get(OutputFeedLogin, only.id).lineup),
+                         [self.old_fid])
 
 
 if __name__ == '__main__':

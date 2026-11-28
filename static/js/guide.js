@@ -1369,8 +1369,10 @@ function openChannelSheet(ch) {
     sheetLine('Stream', channelTechText(ch)) +
     sheetLine('Account', ch.account_name || '') +
     (ch.lifecycle === 'missing'
-      ? sheetLine('Status', `Missing since ${ch.lifecycle_date} - no longer seen in ${ch.account_name || 'this account'}'s synced feed.${repointHint(ch, true)}`)
-      : '') +
+      ? sheetLine('Status', `Missing since ${ch.lifecycle_date} - no longer seen in ${ch.account_name || 'this account'}'s synced feed.${replacementHint(ch, true)}`)
+      : ch.lifecycle_unlisted
+        ? sheetLine('Status', `Not in the last sync - ${ch.account_name || 'this account'}'s last sync did not list it.${replacementHint(ch, true)}`)
+        : '') +
     (ch.is_group ? sheetLine('Group', `${ch.member_count} feeds, recording from ${ch.active_channel_name || '-'}`) : '') +
     (ch.is_group ? sheetLine('Listings', groupListingsText(ch)) : '');
 
@@ -3079,11 +3081,21 @@ function renderLifecycleBadge(ch) {
   const badge = document.querySelector(`.guide-lifecycle-badge[data-channel-id="${ch.id}"]`);
   if (!badge) return;
   const isMissing = ch.lifecycle === 'missing';
-  badge.innerHTML = isMissing
-    ? `<span class="qbadge qbadge-warn tip-plain" data-tip="${escTipAttr(
-        `No longer seen in ${ch.account_name || 'this account'}'s synced feed since ${ch.lifecycle_date}.\n` +
-        'Still shown here because it is in your TV Guide.' + repointHint(ch, false))}">Missing</span>`
-    : '';
+  const acct = ch.account_name || 'this account';
+  if (isMissing) {
+    badge.innerHTML = `<span class="qbadge qbadge-warn tip-plain" data-tip="${escTipAttr(
+      `No longer seen in ${acct}'s synced feed since ${ch.lifecycle_date}.\n` +
+      'Still shown here because it is in your TV Guide.' + replacementHint(ch, false))}">Missing</span>`;
+  } else if (ch.lifecycle_unlisted) {
+    // Before the seven days "missing" takes: the account's last sync did not list it, which
+    // is what the group page and Replacements call "not in the last sync"
+    // (DESIGN-channel-successors.md section 9). It may still play, so the row is not dimmed.
+    badge.innerHTML = `<span class="qbadge qbadge-warn tip-plain" data-tip="${escTipAttr(
+      `${acct}'s last sync did not list this channel.\n` +
+      'It may still play, but nothing updates it.' + replacementHint(ch, false))}">Not in last sync</span>`;
+  } else {
+    badge.innerHTML = '';
+  }
   // Dims the row's other content AND the program cells alongside it (.guide-row) - the pill
   // itself is excluded from the dimming in CSS (.guide-lifecycle-badge is the one thing that
   // must stay full-strength, or the alert it's carrying gets lost in the dimming meant to
@@ -3093,16 +3105,18 @@ function renderLifecycleBadge(ch) {
   [row, progRow].forEach(el => { if (el) el.classList.toggle('is-removed', isMissing); });
 }
 
-// Shared by the "Missing" pill's tooltip and the mobile channel sheet's Status line
-// (openChannelSheet) so the two surfaces never disagree about whether a replacement
-// exists - both read the same server-computed lifecycle_repoint_available (dev/changelog/627),
-// never re-derive it client-side. Worded per surface: the sheet already has its own "Open
-// channel" button, desktop has to name the click target itself.
-function repointHint(ch, sheet) {
-  if (!ch.lifecycle_repoint_available) return '';
+// Shared by the pill's tooltip and the mobile channel sheet's Status line (openChannelSheet)
+// so the two surfaces never disagree about whether a replacement exists - both read the
+// server's replacement_count, the proposals the channel page's Replace offers
+// (channel_successors.guide_rows_view), never re-derived here. Worded per surface: the
+// sheet already has its own "Open channel" button, desktop has to name the click target.
+function replacementHint(ch, sheet) {
+  const n = ch.replacement_count || 0;
+  if (!n) return '';
+  const who = n === 1 ? 'Another channel carries' : `${n} channels carry`;
   return sheet
-    ? ' It is also a duplicate stream URL - tap Open channel below to replace it with the duplicate.'
-    : '\nIt is also a duplicate stream URL - click the channel name to open its page and replace it with the duplicate.';
+    ? ` ${who} the same stream - tap Open channel below to replace it.`
+    : `\n${who} the same stream - click the channel name to open its page and replace it.`;
 }
 
 // Where a group row's listings come from when that is anything other than the member it

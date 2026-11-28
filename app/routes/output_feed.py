@@ -218,7 +218,10 @@ def live(username, password, feed_id):
     not sent straight to the provider, a 302 to the member's provider URL otherwise, and a sports
     channel's waiting screen in every mode when it has nothing to play. A refusal's body names its
     whole reason to a login with full_refusals at home, and its kind only to everyone else.
-    A HEAD is answered without starting a play (output_feed.head_status)."""
+    A HEAD is answered without starting a play (output_feed.head_status). A replaced channel's
+    old id is answered as the channel that took its guide row, first, so the login's channel
+    list, the play and Recent plays all read the new one (output_feed.successor_feed_id)."""
+    feed_id = output_feed.successor_feed_id(feed_id)
     if request.method == 'HEAD':
         status = output_feed.head_status(feed_id, g.cfg, g.feed_login)
         if status != 200:

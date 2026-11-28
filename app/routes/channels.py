@@ -21,7 +21,7 @@ from ..database import (
 from ..accounts import (
     duplicate_groups_within, lifecycle_states_for_channels,
     NORM_DISABLED, resolve_normalization_mode, url_is_normalizable,
-    missing_channels_query, next_sync_map, repoint_candidates_for_channels,
+    missing_channels_query, next_sync_map,
 )
 from ..channel_groups import (clear_guide_listings_pins_on, group_channel_ids,
                               report_orphaned_guide_groups)
@@ -111,11 +111,6 @@ def _guide_conflicts(channel):
 #: call sites below still read as they did.
 _lifecycle_states_for_channels = lifecycle_states_for_channels
 
-#: The duplicate-repoint survivor lookup (DESIGN-sync-resilience.md §6). Moved to
-#: app/accounts.py beside lifecycle_states_for_channels when the TV Guide's channel column
-#: became its second caller (dev/changelog/627); kept under the old local name so the call
-#: sites below and tests/test_sync_repoint.py's import still read as they did.
-_repoint_candidates_for_channels = repoint_candidates_for_channels
 
 
 def _stream_url_view(channel, cfg) -> dict:
@@ -181,8 +176,7 @@ def _unnormalizable_channel_ids(channels, cfg) -> set:
 def _missing_delete_candidates(account_id, cfg, group_id=None, channel_ids=None):
     """(eligible, blocked_inuse, blocked_active) - the shared partitioning for both the
     missing-channel bulk-delete preview and the delete action itself, so the two can never
-    disagree about which channels are actually eligible (same shape as
-    _repoint_candidates_for_channels / repoint_channel's server-side recompute).
+    disagree about which channels are actually eligible.
 
     blocked_inuse: in_guide, or holds any ChannelGroupMember row (either kind) - excluded
     from the batch entirely rather than warned-and-allowed, since silently dropping

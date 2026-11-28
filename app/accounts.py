@@ -2410,48 +2410,6 @@ def lifecycle_states_for_channels(channels, cfg, accounts_by_id=None) -> dict:
     return out
 
 
-def repoint_candidates_for_channels(channels, cfg, lifecycle_by_channel):
-    """{missing_channel.id: survivor_channel} - the duplicate-repoint recovery target
-    (DESIGN-sync-resilience.md §6) for every channel in `channels` that is 'missing' and
-    duplicate-flagged. `is_duplicate_stream` is the cheap prefilter (skip the lookup
-    entirely when nothing in the batch is flagged); the survivor query itself is one batched
-    exact-URL lookup across ALL accounts, never per-row. Picks the oldest (lowest id)
-    non-missing channel sharing the URL, matching duplicate_groups_within's "oldest first"
-    convention. Nothing here is stored - recomputed at render/action time, same as
-    channel_lifecycle_state itself.
-
-    Moved here from app/routes/channels.py (dev/changelog/627) beside lifecycle_states_for_channels
-    when the TV Guide's channel column became its second caller, matching the DRY canonical-home
-    pattern already used for lifecycle_states_for_channels itself.
-    """
-    missing_channels = [
-        ch for ch in channels
-        if ch.is_duplicate_stream
-        and lifecycle_by_channel.get(ch.id, (None, None))[0] == 'missing'
-    ]
-    if not missing_channels:
-        return {}
-
-    urls = {ch.stream_url for ch in missing_channels}
-    candidates = Channel.query.filter(Channel.stream_url.in_(urls)).all()
-    candidate_lifecycle = lifecycle_states_for_channels(candidates, cfg)
-
-    by_url: dict[str, list] = {}
-    for c in candidates:
-        by_url.setdefault(c.stream_url, []).append(c)
-
-    result = {}
-    for ch in missing_channels:
-        survivors = sorted(
-            (c for c in by_url.get(ch.stream_url, [])
-             if c.id != ch.id and candidate_lifecycle.get(c.id, (None, None))[0] != 'missing'),
-            key=lambda c: c.id,
-        )
-        if survivors:
-            result[ch.id] = survivors[0]
-    return result
-
-
 def transfer_keeper_problem(source, keeper, *, member_ids=None, where: str = '',
                             same_stream=None):
     """Why `keeper` may not take `source`'s state in a Remove Duplicate Channels request,

@@ -54,16 +54,40 @@ def _seed_recordings(n):
     db.session.commit()
 
 
+def _strand(acc, channels):
+    """A finished sync of `acc` that did not list every other one of `channels`, each of those
+    with a listed copy carrying the same stream: the group page, the groups list and the guide
+    then ask the replacement helpers for real work at both sizes, rather than stopping at "no
+    sync known" (DESIGN-channel-successors.md section 9, dev/changelog/1801)."""
+    started = datetime.utcnow() - timedelta(hours=1)
+    acc.last_sync_at = started + timedelta(minutes=5)
+    db.session.add(AccountSyncLog(account_id=acc.id, started_at=started,
+                                  completed_at=acc.last_sync_at, status='SUCCESS'))
+    db.session.flush()
+    for i, ch in enumerate(channels):
+        ch.provider_stream_id = f'strand-{ch.id}'
+        if i % 2:
+            ch.last_seen_at = started + timedelta(minutes=1)
+            continue
+        ch.last_seen_at = started - timedelta(hours=2)
+        copy = seed.make_channel(acc, name=f'{ch.name} (new)')
+        copy.provider_stream_id = ch.provider_stream_id
+        copy.last_seen_at = started + timedelta(minutes=1)
+
+
 def _seed_groups(n):
     """n channel-kind groups (2 members each) - exercises the Groups tab (groups
     unification 4/4, changelog/238), which batches ChannelGroupMember/OnDemandTestJob
     lookups across all groups instead of the per-group `g.memberships`/`g.test_jobs`
     lazy-relationship access that would otherwise be an N+1 per row."""
     acc = seed.make_account()
+    members = []
     for i in range(n):
         ch1 = seed.make_channel(acc, name=f'Group {i} Member A')
         ch2 = seed.make_channel(acc, name=f'Group {i} Member B')
         seed.make_group(name=f'Group {i}', members=[ch1, ch2])
+        members += [ch1, ch2]
+    _strand(acc, members)
     db.session.commit()
 
 
@@ -92,6 +116,7 @@ def _seed_group_members(n):
         seed.make_channel_test(ch, all_null=False, status='COMPLETED',
                                resolution='1920x1080', fps=60.0, bitrate_kbps=4200.0)
     seed.make_group(name='Scaling Group', members=channels)
+    _strand(acc, channels)
     db.session.commit()
 
 
@@ -191,12 +216,15 @@ def _seed_alerts(n):
 
 def _seed_guide_channels(n):
     acc = seed.make_account()
+    rows = []
     for i in range(n):
         ch = seed.make_channel(acc, name=f'Channel {i}', in_guide=True)
+        rows.append(ch)
         db.session.add(seed.EPGEntry(
             channel_id=ch.id, title='Show',
             start_time=datetime.utcnow(),
             stop_time=datetime.utcnow() + timedelta(hours=1)))
+    _strand(acc, rows)
     db.session.commit()
 
 
