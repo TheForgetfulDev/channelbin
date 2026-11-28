@@ -5,9 +5,9 @@ catalog's own, the accounts, the sports channels' games, the listings on now for
 being watched, one page of Recent plays with its counts, and which version of the address
 notice was hidden. Nothing here writes; the page's actions are app/routes/iptv_output.py.
 
-The password never reaches this module's output. The Xtream card shows it through the settings
-reveal, and the two playlist addresses are handed over as templates with PASSWORD_SLOT where
-the password goes, so the page source holds no secret.
+No password reaches this module's output. The Connect card shows a login's through that login's
+own reveal route, and the two playlist addresses are handed over as templates with PASSWORD_SLOT
+where the password goes, so the page source holds no secret.
 """
 import json
 import logging
@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 STATE_ON = 'on'
 STATE_OFF = 'off'
-STATE_SETUP = 'setup'       # no username and password yet, so nothing can be turned on
+STATE_SETUP = 'setup'       # no login at all yet, so nothing can be turned on
 
 ADDRESS_SET = 'set'
 ADDRESS_UNSET = 'unset'
@@ -101,14 +101,18 @@ PUBLIC_OPEN_NO_URL = 'open-no-url'
 PUBLIC_FAILED = 'failed'
 PUBLIC_WAITING = 'waiting'
 PUBLIC_UNSET = 'unset'
+#: Added to the mode's help in mixed and redirect mode: who the mode sends to the provider
+#: (output_feed.relays_for, dev/changelog/1781).
+LOGIN_MODE_NOTE = (' Only a login you let play straight from your provider, with Change in its row, '
+                   'is ever sent there. Every other login plays through ChannelBin.')
 #: Added to the mode's help when the public port is open and the mode is not proxy.
 PUBLIC_MODE_NOTE = (' A play on the public port always goes through ChannelBin, whatever this says, '
                     'so your IPTV provider\'s login never reaches a player outside your home network.')
 _LOCAL_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
 
 
-def feed_state(fcfg: dict) -> str:
-    if not output_feed.credentials_set(fcfg):
+def feed_state(fcfg: dict, has_login: bool) -> str:
+    if not has_login:
         return STATE_SETUP
     return STATE_ON if output_feed.is_enabled(fcfg) else STATE_OFF
 
@@ -205,12 +209,18 @@ def address_notice_hidden() -> bool:
     return stored >= ADDRESS_NOTICE_VERSION
 
 
-def _connect(fcfg: dict, base: str) -> dict:
-    user = output_feed.feed_username(fcfg)
-    query = f'username={quote(user, safe="")}&password={PASSWORD_SLOT}'
-    return {'server': base, 'username': user,
-            'm3u': f'{base}/get.php?{query}&type=m3u_plus',
-            'xmltv': f'{base}/xmltv.php?{query}'}
+def _connect(logins: list, base: str) -> dict:
+    """The Connect card: the server address, and for each login (`logins`, _logins()'s views) its
+    username and its two playlist addresses with PASSWORD_SLOT for the password. The card shows one
+    login at a time, picked at its top (dev/changelog/1781)."""
+    out = []
+    for login in logins:
+        query = f'username={quote(login["username"], safe="")}&password={PASSWORD_SLOT}'
+        out.append({'id': login['id'], 'name': login['name'], 'username': login['username'],
+                    'on': login['on'],
+                    'm3u': f'{base}/get.php?{query}&type=m3u_plus',
+                    'xmltv': f'{base}/xmltv.php?{query}'})
+    return {'server': base, 'logins': out}
 
 
 _NO_SPORTS = (None, None, None, None)
@@ -822,7 +832,7 @@ def _accounts(rows, sessions, accounts: dict, cfg: dict, fcfg: dict) -> list:
 
 
 def _logins(sessions, rows, accounts: dict) -> list:
-    """The Logins for other users card: one query, each login's live plays counted from the
+    """The Logins card: one query, each login's live plays counted from the
     plays already in hand (dev/changelog/1760), its channels from the catalog already in hand
     (dev/changelog/1764), and its own accounts (dev/changelog/1765) named from `accounts`
     ({id: Account}, already loaded). A login's own accounts are applied to that catalog in
@@ -838,7 +848,9 @@ def _logins(sessions, rows, accounts: dict) -> list:
         lineup, own = output_feed.lineup_of(row), output_feed.accounts_of(row)
         view = {'id': row.id, 'name': row.name, 'username': row.username, 'on': row.enabled,
                 'max_streams': row.max_streams, 'playing': playing.get(row.id, 0),
-                'everything': lineup is None, 'own_accounts': own is not None}
+                'everything': lineup is None, 'own_accounts': own is not None,
+                'provider_direct': bool(row.provider_direct),
+                'full_refusals': bool(row.full_refusals)}
         if own is not None:
             names = sorted((accounts[a].name for a in own if a in accounts), key=str.lower)
             view['accounts_text'] = join_labels(names) if names else 'None'
@@ -912,7 +924,7 @@ def account_choices(cfg: dict, accounts) -> dict:
 
 def _public(fcfg: dict, connect_server: str, tz, h24) -> dict:
     """The public port, the address people outside use and the addresses locked out after
-    wrong logins, for the Logins for other users card (dev/changelog/1761). No query: the
+    wrong logins, for the Logins card (dev/changelog/1761). No query: the
     listener's status and the lockout counts are in memory."""
     listener = public_listener.status()
     url = output_feed.feed_public_url(fcfg)
@@ -990,7 +1002,7 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
     """Everything templates/iptv_output.html draws. `host_url` is the address the page was
     opened on, used only when ChannelBin's own address is not set; `proxy` is proxy_state()."""
     fcfg = output_feed.feed_config(cfg)
-    state = feed_state(fcfg)
+    state = feed_state(fcfg, output_feed.has_login())
     mode = output_feed.mode_of(fcfg)
     redirect = mode == output_feed.MODE_REDIRECT
     now = datetime.utcnow()
@@ -1006,7 +1018,8 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
                                         blocked=blocked, allowed=allowed)
     # In redirect mode the plays ChannelBin can see are its own pictures, a sports channel's
     # waiting screen and an Up next channel, its own stream there too (dev/changelog/1534, 1614),
-    # and every play on a login for another user, which is always relayed (dev/changelog/1760).
+    # and every play on a login not sent straight to the provider, which is always relayed
+    # (dev/changelog/1760, 1781).
     sessions = ([s for s in output_feed.live_sessions() if output_feed.seen_in_mode(s, mode)]
                 if state == STATE_ON else [])
     watching = {}
@@ -1022,7 +1035,7 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
     address = _address(cfg, host_url)
     max_viewers = int(fcfg.get('max_viewers') or 1)
     logins = _logins(output_feed.live_sessions() if state == STATE_ON else [], rows, accounts)
-    connect = _connect(fcfg, address['base'])
+    connect = _connect(logins, address['base'])
     public = _public(fcfg, connect['server'], tz, h24)
     # The public port relays every play on it, whatever the mode (dev/changelog/1761).
     public_relays = public['serving'] and mode != output_feed.MODE_PROXY
@@ -1030,9 +1043,10 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
         'state': state, 'is_on': state == STATE_ON, 'is_off': state == STATE_OFF,
         'needs_login': state == STATE_SETUP, 'mode': mode, 'redirect': redirect,
         'mixed': mode == output_feed.MODE_MIXED,
-        # A login for another user is relayed in every mode, so with one there is always
-        # something the relay's settings and counts apply to (dev/changelog/1760).
-        'relays_some': output_feed.relays_some(fcfg) or bool(logins) or public_relays,
+        # A login not sent straight to the provider is relayed in every mode, so with one there
+        # is always something the relay's settings and counts apply to (dev/changelog/1760, 1781).
+        'relays_some': (output_feed.relays_some(fcfg) or public_relays
+                        or any(not login['provider_direct'] for login in logins)),
         'redirects_some': output_feed.redirects_some(fcfg),
         'dormant': state != STATE_ON, 'mask': MASK_SENTINEL, 'bounds': output_feed.SETTING_BOUNDS,
         'address': address, 'proxy': proxy, 'channels_per_page': CHANNELS_PER_PAGE,
@@ -1060,5 +1074,6 @@ def page_context(cfg: dict, host_url: str, args, proxy: str = '') -> dict:
         'accounts': _accounts(rows, sessions, accounts, cfg, fcfg),
         'feedcfg': fcfg,
         'modes': MODE_LABELS,
-        'mode_help': MODE_HELP[mode] + (PUBLIC_MODE_NOTE if public_relays else ''),
+        'mode_help': (MODE_HELP[mode] + (LOGIN_MODE_NOTE if output_feed.redirects_some(fcfg) else '')
+                      + (PUBLIC_MODE_NOTE if public_relays else '')),
     }

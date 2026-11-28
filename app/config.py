@@ -131,6 +131,9 @@ RESTART_REQUIRED_KEYS = {
 }
 
 # Leaf paths whose values should never be written to the log verbatim (secrets/tokens).
+# integrations.output_feed.password is not a setting any more - every IPTV output login is a
+# row (dev/changelog/1781) - but a config.yaml from before the move, a restored backup, or prod's
+# copy on the dev box still carries it until app/__init__.py::_move_main_output_login runs.
 _SENSITIVE_EXACT_PATHS = {'flask.secret_key', 'auth.password_hash',
                           'integrations.home_assistant.api_key_hash',
                           'integrations.output_feed.password'}
@@ -552,14 +555,9 @@ _DEFAULTS = {
         # dev/docs/DESIGN-output-feed.md). The first optional module: off by default, one
         # switch, nothing runs or is written while it is off. Only public_port and public_host
         # need a restart - the blueprint is always registered and reads the rest per request.
+        # Its logins are rows of output_feed_logins, not settings (dev/changelog/1781).
         'output_feed': {
             'enabled': False,
-            'username': '',
-            # Plaintext, a sensitive leaf (masked on every read surface, round-tripped on
-            # write). Not a hash on purpose: the client sends the pair on every request,
-            # including the one that starts each play, and check_password_hash measured
-            # 147 ms per call where a constant-time compare is 1 us (design doc section 6.2).
-            'password': '',
             'mode': 'proxy',              # proxy | mixed | redirect - output_feed.MODES
             'accounts': [],               # account ids the feed may serve from; [] = all
             'held_seats': {},             # account id -> seats kept free for the IPTV player (redirect, mixed)

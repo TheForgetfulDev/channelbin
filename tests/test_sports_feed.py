@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
+from tests.support.output_feed import ensure_login
 from tests.support.seed import make_account, make_channel, make_guide_match  # noqa: E402
 
 import app.output_feed as feed  # noqa: E402
@@ -41,7 +42,7 @@ TEAMS = {BEARS: 'Ironvale Bears', GULLS: 'Harborview Gulls', PANTHERS: 'Northgat
 
 
 def _feed_cfg(mode='redirect', **overrides):
-    block = {'enabled': True, 'username': USER, 'password': PASS, 'reserve_seconds': 0, 'mode': mode}
+    block = {'enabled': True, 'reserve_seconds': 0, 'mode': mode}
     block.update(overrides)
     return {'integrations': {'output_feed': block},
             'display': {'timezone': 'America/New_York', 'time_format': '12h'}}
@@ -56,6 +57,7 @@ class _Case(unittest.TestCase):
         self.addCleanup(self.t.cleanup)
         self.addCleanup(feed.stop_all)
         self.t.sandbox_config(_feed_cfg())
+        ensure_login(USER, PASS)
         self.now = datetime.utcnow().replace(second=0, microsecond=0)
         self.league = SportsLeague(tsdb_id=9001, name='Pretend League', sport='Pretend Ball',
                                    current_season='2099', match_terms=json.dumps(['PFL']))

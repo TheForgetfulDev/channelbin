@@ -13,7 +13,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests.support.output_feed import FeedCase, feed_cfg  # noqa: E402
+from tests.support.output_feed import FeedCase  # noqa: E402
 
 import app.output_feed as feed  # noqa: E402
 from app import db  # noqa: E402
@@ -31,7 +31,7 @@ LAN = 'http://192.168.1.40:5000'
 
 @unittest.skipIf(shutil.which('node') is None or not os.path.isdir(JSDOM), 'node or jsdom not installed')
 class IptvOutputScriptTests(FeedCase):
-    FEED = feed_cfg(password=STORED)
+    PASSWORD = STORED
 
     def setUp(self):
         # One render and one harness run for the whole class; the rig builds its app per test.
@@ -56,7 +56,8 @@ class IptvOutputScriptTests(FeedCase):
         if proc.returncode != 0:
             raise AssertionError(f'harness failed:\n{proc.stdout}\n{proc.stderr[-4000:]}')
         _OBSERVED.update(json.loads(proc.stdout), alpha_feed=self.alpha_feed,
-                         login_id=OutputFeedLogin.query.one().id,
+                         login_id=OutputFeedLogin.query.filter_by(username='kim').one().id,
+                         login_ids={r.username: r.id for r in OutputFeedLogin.query},
                          beta_feed=feed.feed_id_for_channel(self.beta.id),
                          account_id=self.account.id, stored_in_page=STORED in html)
         self.obs = _OBSERVED
@@ -113,6 +114,15 @@ class IptvOutputScriptTests(FeedCase):
         self.assertEqual(self.obs['copied'][1], 'p&w=1')
         self.assertEqual(self.obs['copied'][2], LAN)
 
+    def test_the_connect_card_shows_the_login_picked_and_reveals_its_password(self):
+        """dev/changelog/1781: every login is a row, so the card shows one at a time."""
+        self.assertEqual(self.obs['conn_picker'], ['Kim', 'Main login'])
+        self.assertEqual(self.obs['conn_shown_first'], ['kim'])
+        self.assertEqual(self.obs['conn_shown_picked'], ['tv'])
+        tv = self.obs['login_ids']['tv']
+        self.assertEqual(self.obs['conn_reveal'],
+                         {'paths': [f'/api/iptv-output/logins/{tv}/password'], 'picked': str(tv)})
+
     def test_an_account_switch_posts_allow(self):
         self.assertEqual(self.obs['account_post'],
                          {'path': f'/api/iptv-output/accounts/{self.obs["account_id"]}',
@@ -136,10 +146,16 @@ class IptvOutputScriptTests(FeedCase):
         self.assertEqual(self.obs['stop_asks'], 'Stop this play?')
         self.assertRegex(self.obs['stop_posts'][0], r'^POST /api/iptv-output/plays/.+/stop$')
 
-    def test_change_login_prefills_the_username_and_never_a_password(self):
-        self.assertEqual(self.obs['login_prefill'], {'user': 'tv', 'pass': ''})
-        self.assertEqual(self.obs['login_post'],
-                         {'path': '/api/iptv-output/login', 'body': {'username': 'den', 'password': ''}})
+    def test_change_login_prefills_the_username_and_switches_and_never_a_password(self):
+        """dev/changelog/1781: every login is a row, the owner's own included, and its two
+        home-only switches are set in its Change dialog."""
+        self.assertEqual(self.obs['login_prefill'],
+                         {'user': 'tv', 'pass': '', 'direct': True, 'whole': True})
+        post = self.obs['login_post']
+        self.assertEqual(post['path'], f"/api/iptv-output/logins/{post['row']}")
+        self.assertNotIn('password', post['body'])
+        self.assertEqual((post['body']['provider_direct'], post['body']['full_refusals']),
+                         (False, True))
 
     def test_the_live_refresh_waits_for_an_open_dialog(self):
         self.assertEqual(self.obs['live_ms'], [15000])

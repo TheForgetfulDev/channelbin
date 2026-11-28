@@ -49,7 +49,7 @@ import threading
 from collections import namedtuple
 from datetime import datetime, timedelta
 
-from .fmt_utils import fmt_bytes, plural
+from .fmt_utils import counted, fmt_bytes, plural
 from .toolchain import CONSEQUENCE
 from .tz_utils import ago as _ago
 
@@ -609,8 +609,8 @@ def _check_auth_gate(ctx):
 
 
 def _check_output_feed(ctx):
-    """Evaluated only while the feed is on: a credential is stored, the ring holds the
-    reserve, something is served, and every held-seats account still exists. The detail
+    """Evaluated only while the feed is on: a login is on, the ring holds the reserve,
+    something is served, and every held-seats account still exists. The detail
     carries the URL to type into the IPTV player (DESIGN-output-feed.md section 8)."""
     from . import public_listener
     from .output_feed import MODE_MIXED, MODE_PROXY, MODE_REDIRECT, max_reserve_seconds
@@ -623,11 +623,15 @@ def _check_output_feed(ctx):
     url = public_url(ctx.cfg)
     detail = (f'In an IPTV player, add an Xtream Codes account with the server set to '
               f'{url or "this ChannelBin address"} and the login set on the IPTV Output page.')
-    if not feed['credentials_set'] and not feed['logins_on']:
+    if not feed['logins_on']:
         return Result(PROBLEM, tested,
-                      'The IPTV output is on but has no username or password, so every request '
-                      'is refused', detail=detail)
-    public = _output_public_port(feed, tested, detail, ctx.proxy_policy)
+                      'The IPTV output is on but no login is turned on, so every request is '
+                      'refused. Add or turn on a login on the IPTV Output page', detail=detail)
+    short = feed['short_passwords']
+    if short and ctx.pseudonymize:
+        # A login's name is who it is for; the bundle does not carry it (dev/changelog/1781).
+        short = [f'{len(short)} {plural(len(short), "login")}']
+    public = _output_public_port(feed, tested, detail, ctx.proxy_policy, short)
     if public is not None and public.status == PROBLEM:
         return public
     if not feed['reserve_fits']:
@@ -646,12 +650,19 @@ def _check_output_feed(ctx):
                       'The TV Guide is empty, so the IPTV player sees no channels', detail=detail)
     if public is not None:
         return public
+    # Only a login set to play straight from the provider is ever sent there (dev/changelog/1781).
+    direct = feed['direct_logins']
     if feed['mode'] == MODE_PROXY:
         mode = 'relayed through ChannelBin'
+    elif feed['mode'] in (MODE_MIXED, MODE_REDIRECT) and not direct:
+        mode = ('relayed through ChannelBin, since no login that is on is set to play straight '
+                'from the provider')
     elif feed['mode'] == MODE_MIXED:
-        mode = 'groups and sports channels relayed through ChannelBin, the rest played straight from the provider'
+        mode = (f'groups and sports channels relayed through ChannelBin, the rest played straight '
+                f'from the provider on {counted(direct, "login")} set to, and relayed on every other')
     elif feed['mode'] == MODE_REDIRECT:
-        mode = 'played straight from the provider'
+        mode = (f'played straight from the provider on {counted(direct, "login")} set to, and '
+                f'relayed on every other')
     else:
         raise ValueError(f'Unknown feed mode "{feed["mode"]}"')
     summary = f'{feed["served"]} {plural(feed["served"], "channel")} served, {mode}'
@@ -663,9 +674,11 @@ def _check_output_feed(ctx):
     return Result(READY, tested, summary, detail=detail)
 
 
-def _output_public_port(feed, tested, detail, proxy_policy):
+def _output_public_port(feed, tested, detail, proxy_policy, short=()):
     """The IPTV output's public port (app/public_listener.py, dev/changelog/1761): None when
-    there is nothing to say, else the Result to report."""
+    there is nothing to say, else the Result to report. `short` names the logins whose password
+    is shorter than a generated one, which the open port puts within reach of guessing from
+    anywhere (dev/changelog/1781)."""
     from .public_listener import STATE_FAILED, STATE_OFF, STATE_SERVING
     want = feed['public_port']
     listener = feed['listener']
@@ -702,6 +715,14 @@ def _output_public_port(feed, tested, detail, proxy_policy):
                       f'The public port {want} is open, but the address people outside your '
                       f'network use is not set, so the details the IPTV Output page copies for '
                       f'them name this one. Set it under Settings, IPTV output', detail=detail)
+    if short:
+        from .fmt_utils import join_labels
+        from .output_feed import STRONG_PASSWORD_LENGTH
+        return Result(ATTENTION, tested,
+                      f'The public port {want} is open, and the password of {join_labels(short)} '
+                      f'is shorter than {STRONG_PASSWORD_LENGTH} characters, so it is easier to '
+                      f'guess from anywhere. Change it to a longer one with Change in its row on '
+                      f'the IPTV Output page', detail=detail)
     return None
 
 

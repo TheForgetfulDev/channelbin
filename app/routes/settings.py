@@ -301,8 +301,7 @@ def _render_settings(yaml_text=None, yaml_problems=None):
         page_size_options=[(n, str(n)) for n in PAGE_SIZE_OPTIONS],
         page_size_value=configured_page_size(unmasked_cfg),
         timezone_options=timezone_options,
-        feed_credentials_set=output_feed.credentials_set(
-            (unmasked_cfg.get('integrations') or {}).get('output_feed') or {}),
+        feed_has_login=output_feed.has_login(),
         feed_held_seats_lines=[f'{a}: {n}' for a, n in sorted(
             output_feed.held_seats_map(
                 (unmasked_cfg.get('integrations') or {}).get('output_feed') or {}).items())],
@@ -556,32 +555,25 @@ def api_settings_field():
                                          'Assistant integration'}), 400
 
         # The output feed (app/output_feed.py). Same server-side shape as the Home Assistant
-        # gate above: the switch is disabled on the page until a credential exists, and the
-        # route refuses it too. The reserve must fit the ring whichever of the two moved, and
-        # held seats are typed as `account_id: seats` lines and stored as the map the model
-        # reads (DESIGN-output-feed.md 9).
+        # gate above: the switch is disabled on the page until a login exists, and the route
+        # refuses it too. The reserve must fit the ring whichever of the two moved, and held
+        # seats are typed as `account_id: seats` lines and stored as the map the model reads
+        # (DESIGN-output-feed.md 9).
         if path.startswith('integrations.output_feed.'):
             from .. import output_feed
             feed_cfg = cfg.get('integrations', {}).get('output_feed', {})
             leaf = path[len('integrations.output_feed.'):]
             if leaf == 'enabled' and value:
-                if not output_feed.credentials_set(feed_cfg):
-                    return jsonify({'error': 'Set a username and password before turning the '
-                                             'IPTV output on'}), 400
+                if not output_feed.has_login():
+                    return jsonify({'error': 'Add a login on the IPTV Output page before turning '
+                                             'the IPTV output on'}), 400
             if leaf == 'mode' and value not in output_feed.MODES:
                 return jsonify({'error': 'Pick one of ' + ', '.join(output_feed.MODES)}), 400
             if leaf in ('username', 'password'):
-                # The IPTV Output page saves the login whole; a save of one half is held to
-                # the same check, and a login cannot be emptied under an output that is on.
-                value = '' if value is None else str(value)
-                if leaf == 'username':
-                    value = value.strip()
-                problem = output_feed.login_problem(leaf, value)
-                if problem:
-                    return jsonify({'error': problem}), 400
-                if not value and output_feed.is_enabled(feed_cfg):
-                    return jsonify({'error': 'Turn the IPTV output off before clearing its '
-                                             'login'}), 400
+                # The logins are rows on the IPTV Output page, not settings: a leaf saved here
+                # would be moved into a login at the next start (dev/changelog/1781).
+                return jsonify({'error': 'IPTV output logins are added and changed on the IPTV '
+                                         'Output page'}), 400
             if leaf in output_feed.SETTING_BOUNDS:
                 try:
                     value = int(value)

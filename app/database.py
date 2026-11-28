@@ -4005,22 +4005,24 @@ class OutputFeedPlay(db.Model):
     # (dev/changelog/1676). Read by account_stats._fold_plays().
     account_seconds = db.Column(db.Text)
     # Which IPTV output login the play came in on: the OutputFeedLogin username as it was at
-    # the time, kept after the login is renamed or deleted. NULL is the main login in Settings
+    # the time, kept after the login is renamed or deleted. NULL is a play with no login (a
+    # preview), or one from before dev/changelog/1781 on the main login, which lived in Settings
     # (dev/changelog/1760).
     feed_login   = db.Column(db.String(60))
 
 
 class OutputFeedLogin(db.Model):
-    """A login for someone other than the owner on the IPTV output (app/output_feed.py,
-    dev/changelog/1760). This row says who may log in, whether they may right now, how many
-    streams they may hold at once, which of the output's channels they get (`lineup`) and which
-    IPTV accounts their plays come from (`accounts`).
+    """One login to the IPTV output (app/output_feed.py, dev/changelog/1760). Every login is a
+    row here, the owner's own included (dev/changelog/1781). This row says who may log in,
+    whether they may right now, how many streams they may hold at once, which of the output's
+    channels they get (`lineup`), which IPTV accounts their plays come from (`accounts`), and two
+    things its player gets only on the web UI's port: being sent straight to the IPTV provider
+    (`provider_direct`) and a refusal's whole reason (`full_refusals`).
 
     The password is plaintext for the reason dev/docs/DESIGN-output-feed.md 6.2 measured: an
     IPTV player sends it on every request, and a person types it into a TV with a remote, so it
     has to be readable back. It never reaches a page's source; the IPTV Output page reads it
-    through its own reveal route. A username is unique here and never equal to the main login's
-    (output_feed.login_taken)."""
+    through its own reveal route. A username is unique."""
     __tablename__ = 'output_feed_logins'
     # AUTOINCREMENT: an id is never reused, so a play or a count kept in memory for a deleted
     # login can never be read as a later login's (output_feed._login_changes).
@@ -4040,6 +4042,13 @@ class OutputFeedLogin(db.Model):
     # output's own `accounts` list; NULL is the output's list, whatever it is then
     # (output_feed.accounts_of(), dev/changelog/1765). Never written into the output's config.
     accounts    = db.Column(db.Text)
+    # Whether its player may be sent straight to the IPTV provider's stream in redirect or mixed
+    # mode, which hands that player the provider login. Never on the public port
+    # (output_feed.relays_for, dev/changelog/1781).
+    provider_direct = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
+    # Whether its player is told a refusal's whole sentence rather than only its kind. Never on
+    # the public port (routes/output_feed.py::live, dev/changelog/1770, 1781).
+    full_refusals   = db.Column(db.Boolean, nullable=False, default=False, server_default=db.text('0'))
 
 
 class SportsTeam(db.Model):

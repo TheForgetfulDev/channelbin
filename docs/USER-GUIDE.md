@@ -449,11 +449,12 @@ guide's own listings - instead of the provider's whole list. A group is one chan
 player, played from the member ChannelBin would record from right now, and if that member dies
 the picture moves to another one without the player noticing.
 
-Set it up on the **IPTV Output** page, under Channels & guide: choose a short username and
-password with **Set login**, then **Turn on**. The page's **Connect an IPTV player** card has
+Set it up on the **IPTV Output** page, under Channels & guide: **Add a login** with a username
+and password, then **Turn on**. Every IPTV player logs in with one of the **Logins**, yours
+included, and each person can have their own. The page's **Connect an IPTV player** card has
 what to type into the player, each with a Copy button: the server address, username and
 password for an Xtream Codes account, or the M3U playlist and XMLTV guide addresses for a
-player that takes those. Put a channel in the TV Guide and it is in the player at its next
+player that takes those, for the login picked at its top. Put a channel in the TV Guide and it is in the player at its next
 refresh. To keep a channel in your TV Guide but off the player, turn its switch off in the
 page's channel list; turn it back on and the player gets the same channel it had before.
 
@@ -465,7 +466,10 @@ connection is free. **Redirect** mode sends
 the IPTV player straight to the provider instead - no failover, and ChannelBin cannot see when it
 stops, so tell it how many connections recordings should leave alone, per account, on the
 IPTV Output page. **Mixed** mode plays channel groups and sports channels through ChannelBin and
-sends every other channel straight to the provider. The page's **Watching now** card shows who is playing what, with a way to
+sends every other channel straight to the provider. Either one only sends a player straight to
+the provider when its login is set to **Play straight from your IPTV provider at home**, with
+Change in the login's row. That is off for a new login, since it hands that player your provider
+login; every other login plays through ChannelBin in every mode. The page's **Watching now** card shows who is playing what, with a way to
 stop a play, and **Recent plays** keeps 30 days of plays that ended or were refused, each with
 its reason.
 

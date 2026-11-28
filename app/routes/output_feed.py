@@ -3,9 +3,9 @@ Guide (app/output_feed.py, dev/docs/DESIGN-output-feed.md).
 
 Gated per request on `integrations.output_feed.enabled` and the credential pair the client
 sends on every call - in the query for the three `.php` endpoints, in the path for a stream.
-The pair names the main login in Settings or one login for another user
-(output_feed.feed_login_for, dev/changelog/1760), and every URL an answer carries is built from
-that login's own pair. "Disabled", "no credential set" and "wrong credential" all answer the same 401 body, the
+The pair names one login on the IPTV Output page (output_feed.feed_login_for,
+dev/changelog/1760, 1781), and every URL an answer carries is built from that login's own pair.
+"Disabled", "no such login" and "wrong credential" all answer the same 401 body, the
 precedent app/routes/ha.py sets; app/auth.py::SELF_GATED_BLUEPRINTS names this blueprint so
 the interactive login gate does not also demand a browser login from an IPTV player. Registered
 always, so turning the feed on needs no restart.
@@ -207,10 +207,10 @@ def logo(username, password, channel_id):
 @output_feed_bp.route('/live/<username>/<password>/<int:feed_id>')
 def live(username, password, feed_id):
     """Play one feed id: a relayed MPEG-TS body when the mode relays it (proxy mode, and a
-    group or sports channel in mixed mode) and for every play on the public port or a login for
-    another user, a 302 to the member's provider URL otherwise, and
-    a sports channel's waiting screen in every mode when it has nothing to play. A refusal's body
-    names its whole reason to the main login at home, and its kind only to everyone else.
+    group or sports channel in mixed mode) and for every play on the public port or on a login
+    not sent straight to the provider, a 302 to the member's provider URL otherwise, and a sports
+    channel's waiting screen in every mode when it has nothing to play. A refusal's body names its
+    whole reason to a login with full_refusals at home, and its kind only to everyone else.
     A HEAD is answered without starting a play (output_feed.head_status)."""
     if request.method == 'HEAD':
         status = output_feed.head_status(feed_id, g.cfg, g.feed_login)
@@ -234,10 +234,11 @@ def live(username, password, feed_id):
                 return redirect(target, code=302)
     except output_feed.FeedRefused as exc:
         # The full sentence is written for the owner and names their pages, settings and
-        # folders; a player outside their home is told only what kind of refusal it is. The
-        # whole reason is in Recent plays and the log either way (dev/changelog/1770).
-        outside = public or not g.feed_login.is_main
-        return jsonify({'error': exc.short_message if outside else exc.message}), exc.status
+        # folders: only a login the owner turned full_refusals on for is told it, and never on
+        # the public port. The whole reason is in Recent plays and the log either way
+        # (dev/changelog/1770, 1781).
+        whole = g.feed_login.full_refusals and not public
+        return jsonify({'error': exc.message if whole else exc.short_message}), exc.status
     # The body runs after this request has ended, outside any request or app context, so
     # the stream holds no database session and no pool connection for as long as the IPTV player
     # watches. Everything it needs is on the session object.

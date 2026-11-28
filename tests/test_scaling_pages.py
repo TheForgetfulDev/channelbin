@@ -31,6 +31,7 @@ import app.config as config_mod  # noqa: E402
 import app.channel_search_rows as rows_mod  # noqa: E402
 import app.scheduler as scheduler_mod  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
+from tests.support.output_feed import ensure_login
 from tests.support.iocount import IOCounter, all_engines  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.search import unfolded_query  # noqa: E402
@@ -246,8 +247,8 @@ def _seed_guide_scope(n):
 
 
 def _enable_output_feed(t):
-    t.sandbox_config({'integrations': {'output_feed': {
-        'enabled': True, 'username': 'tv', 'password': 'tv'}}})
+    t.sandbox_config({'integrations': {'output_feed': {'enabled': True}}})
+    ensure_login('tv', 'tv')
 
 
 def _seed_pip_feed(n):
@@ -328,8 +329,8 @@ def _relays_stopped_after():
 
 def _enable_output_feed_wide(t):
     """The feed on with room for every seeded IPTV player, so the page draws them all."""
-    t.sandbox_config({'integrations': {'output_feed': {
-        'enabled': True, 'username': 'tv', 'password': 'tv', 'max_viewers': 500}}})
+    t.sandbox_config({'integrations': {'output_feed': {'enabled': True, 'max_viewers': 500}}})
+    ensure_login('tv', 'tv')
 
 
 def _seed_sports_feed(n):

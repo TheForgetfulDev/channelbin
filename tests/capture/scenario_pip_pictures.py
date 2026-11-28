@@ -30,6 +30,7 @@ from app import db
 from app.database import (FEED_PLAY_PICTURE, PIP_SOURCE_CHANNEL, PIP_SOURCE_GROUP, Alert, Channel,
                           ChannelGroup, OutputFeedPlay, REC_STATUS_COMPLETED)
 
+from ..support.output_feed import ensure_login
 from ..support.pip_engine import StandIn
 from .support import CaptureCase, at
 
@@ -64,7 +65,8 @@ class PipPicturesScenario(CaptureCase):
         super().setUp()
         self.stand_in = StandIn(self, ready_seconds=engine.READY_SECONDS)
         self.configure({'integrations': {'output_feed': {
-            'enabled': True, 'username': USER, 'password': PASS, 'max_viewers': 2, 'reserve_seconds': 0}}})
+            'enabled': True, 'max_viewers': 2, 'reserve_seconds': 0}}})
+        ensure_login(USER, PASS)
         self.addCleanup(feed.stop_all)
 
     def guide(self, ch):

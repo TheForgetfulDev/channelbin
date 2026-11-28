@@ -3,7 +3,8 @@
 What the page shows in each state of the output, that the password never reaches the page's
 source, and that each action is enforced by its route: taking a channel off cuts the play of
 it, an account switched off cuts the plays on it and the last one cannot go off, a number of
-connections above the account's own is refused, and a login is saved whole or not at all.
+connections above the account's own is refused. The logins themselves, the owner's own
+included, are tests/test_output_feed_logins.py and tests/test_output_feed_main_login.py.
 No dev/docs/BUGS.md entry: a feature.
 """
 import os
@@ -35,7 +36,7 @@ def _region(html: str, element_id: str) -> str:
 
 
 class _PageCase(_Case):
-    FEED = _cfg(password=SECRET)
+    PASSWORD = SECRET
 
     def page(self, query=''):
         resp = self.client.get('/iptv-output' + query)
@@ -72,17 +73,19 @@ class PageStateTests(_PageCase):
         self.assertIn('Channels it will offer', html)
         for card in ('of-channels', 'of-accounts'):
             self.assertIn(' inert', _region(html, card).split('>')[0], card)
-        # The login can still be changed while the output is off: only the card's body is inert.
-        connect = _region(html, 'of-connect')
-        self.assertNotIn(' inert', connect.split('>')[0])
-        self.assertLess(connect.index('data-act="login"'), connect.index(' inert'))
+        # The logins can still be changed while the output is off.
+        self.assertNotIn(' inert', _region(html, 'of-logins').split('>')[0])
         self.assertNotIn(' inert', _region(html, 'of-settings'))
 
-    def test_not_set_up_offers_the_login_and_hides_the_connection_details(self):
-        self.t.sandbox_config(_cfg(enabled=False, username='', password=''))
+    def test_not_set_up_offers_a_login_and_hides_the_connection_details(self):
+        from app.database import OutputFeedLogin
+        OutputFeedLogin.query.delete()
+        db.session.commit()
+        self.t.sandbox_config(_cfg(enabled=False))
         html = self.page()
         self.assertIn('The IPTV output is not set up yet', html)
-        self.assertIn('data-act="login" data-first="1"', html)
+        self.assertIn('<button class="btn btn-primary" data-act="login-add">Add a login</button>', html)
+        self.assertIn('id="of-logins"', html)
         self.assertNotIn('id="of-connect"', html)
         self.assertNotIn('id="of-recent"', html)
 
@@ -508,45 +511,6 @@ class AccountTests(_PageCase):
         self.assertEqual(feed.held_seats_map(self.feed_cfg()), {})
 
 
-class LoginTests(_PageCase):
-    def login(self, **body):
-        return self.post('/api/iptv-output/login', body)
-
-    def test_the_first_login_is_saved_and_does_not_turn_the_output_on(self):
-        self.t.sandbox_config(_cfg(enabled=False, username='', password=''))
-        resp = self.login(username=' den ', password='tv1')
-        self.assertEqual(resp.get_json(), {'success': True, 'first': True})
-        fcfg = self.feed_cfg()
-        self.assertEqual((fcfg['username'], fcfg['password'], fcfg['enabled']), ('den', 'tv1', False))
-        self.assertIn('The IPTV output is off', self.page())
-
-    def test_a_first_login_under_a_switch_left_on_does_not_start_serving(self):
-        self.t.sandbox_config(_cfg(enabled=True, username='', password=''))
-        self.assertIn('The IPTV output is not set up yet', self.page())
-        self.login(username='den', password='tv1')
-        self.assertFalse(self.feed_cfg()['enabled'])
-        self.assertIn('The IPTV output is off', self.page())
-
-    def test_changing_a_login_leaves_the_output_on(self):
-        self.login(username='den', password='tv2')
-        self.assertTrue(self.feed_cfg()['enabled'])
-
-    def test_a_blank_password_keeps_the_stored_one(self):
-        self.assertEqual(self.login(username='den', password='').get_json()['first'], False)
-        fcfg = self.feed_cfg()
-        self.assertEqual((fcfg['username'], fcfg['password']), ('den', SECRET))
-
-    def test_a_login_missing_a_half_or_holding_a_path_character_is_refused_whole(self):
-        self.assertEqual(self.login(username='', password='x').status_code, 400)
-        for bad in ({'username': 'a/b', 'password': 'x'}, {'username': 'tv', 'password': 'a b'},
-                    {'username': 'tv', 'password': 'a?b'}, {'username': 'x' * 61, 'password': 'p'}):
-            self.assertEqual(self.login(**bad).status_code, 400, bad)
-        self.t.sandbox_config(_cfg(enabled=False, username='', password=''))
-        self.assertEqual(self.login(username='den', password='').status_code, 400)
-        fcfg = self.feed_cfg()
-        self.assertEqual((fcfg['username'], fcfg['password']), ('', ''))
-
-
 class SettingsRouteTests(_PageCase):
     """What the page's Settings card and any other caller get from /api/settings/field."""
 
@@ -575,15 +539,15 @@ class SettingsRouteTests(_PageCase):
         for leaf, (low, high) in feed.SETTING_BOUNDS.items():
             self.assertRegex(settings, rf'min="{low}" max="{high}" value="\d+" data-setting-path="integrations.output_feed.{leaf}"')
 
-    def test_half_a_login_saved_through_settings_is_held_to_the_same_check(self):
-        self.assertEqual(self.field('username', 'a/b').status_code, 400)
-        self.assertEqual(self.field('password', 'a b').status_code, 400)
-        cleared = self.field('password', '')
-        self.assertEqual(cleared.status_code, 400)
-        self.assertIn('Turn the IPTV output off', cleared.get_json()['error'])
-        self.assertEqual(self.feed_cfg()['password'], SECRET)
-        self.t.sandbox_config(_cfg(password=SECRET, enabled=False))
-        self.assertTrue(self.field('password', '').get_json()['success'])
+    def test_a_login_is_never_saved_through_settings(self):
+        """Every login is a row on the IPTV Output page (dev/changelog/1781): a leaf written here
+        would be turned into a login at the next start."""
+        for leaf, value in (('username', 'den'), ('password', 'tv1'), ('password', '')):
+            resp = self.field(leaf, value)
+            self.assertEqual(resp.status_code, 400, leaf)
+            self.assertIn('IPTV Output page', resp.get_json()['error'])
+        self.assertNotIn('username', self.feed_cfg())
+        self.assertNotIn('password', self.feed_cfg())
 
     def test_the_readiness_check_sends_the_user_to_the_page(self):
         from app import readiness

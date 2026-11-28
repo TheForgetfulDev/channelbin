@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support import clips  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
+from tests.support.output_feed import add_login  # noqa: E402
 from tests.support.seed import (make_account, make_channel,  # noqa: E402
                                 make_epg_entry, make_group, make_guide_match, make_recording)
 
@@ -41,8 +42,7 @@ from app.database import (Alert, ChannelGroupEvent, RecordingEvent, XtreamAccoun
 
 _HAVE_FFMPEG = shutil.which('ffmpeg') is not None
 USER, PASS = 'tv', 'tv-secret'
-FEED_ON = {'integrations': {'output_feed': {'enabled': True, 'username': USER,
-                                            'password': PASS, 'reserve_seconds': 0}}}
+FEED_ON = {'integrations': {'output_feed': {'enabled': True, 'reserve_seconds': 0}}}
 
 
 def _wait(predicate, timeout=15.0, interval=0.1):
@@ -77,6 +77,7 @@ class _FeedCase(unittest.TestCase):
         self.addCleanup(self.t.cleanup)
         self.addCleanup(feed.stop_all)
         self.t.sandbox_config(self.FEED or FEED_ON)
+        self.login = add_login(USER, PASS)
         self.account = make_account('Acct', max_connections=1)
         db.session.commit()
 
@@ -135,33 +136,42 @@ class ConfigTests(unittest.TestCase):
         self.addCleanup(t.cleanup)
         block = load_config()['integrations']['output_feed']
         self.assertFalse(block['enabled'])
-        self.assertEqual((block['username'], block['password'], block['mode']), ('', '', 'proxy'))
+        self.assertEqual(block['mode'], 'proxy')
         self.assertEqual(block['held_seats'], {})
+        # The logins are rows, never settings (dev/changelog/1781).
+        self.assertNotIn('username', block)
+        self.assertNotIn('password', block)
+        self.assertFalse(feed.has_login())
 
     def test_the_password_is_a_sensitive_leaf_and_the_username_is_not(self):
         from app.config import _is_sensitive_path
         self.assertTrue(_is_sensitive_path('integrations.output_feed.password'))
         self.assertFalse(_is_sensitive_path('integrations.output_feed.username'))
 
-    def test_the_password_is_masked_on_the_settings_read_surfaces(self):
+    def test_a_password_left_in_config_yaml_is_still_masked_on_the_settings_read_surfaces(self):
+        """A config.yaml from before dev/changelog/1781, or a restored backup, carries the old
+        main login's password until the next start moves it."""
         from app.config import MASK_SENTINEL
         t = make_test_app()
         self.addCleanup(t.cleanup)
-        t.sandbox_config(FEED_ON)
+        t.sandbox_config({'integrations': {'output_feed': {'enabled': True, 'username': USER,
+                                                           'password': PASS}}})
         data = t.client.get('/api/settings').get_json()
         self.assertEqual(data['integrations']['output_feed']['password'], MASK_SENTINEL)
-        self.assertEqual(data['integrations']['output_feed']['username'], USER)
         page = t.client.get('/settings').get_data(as_text=True)
         self.assertNotIn(f'value="{PASS}"', page)
 
     def test_credentials_are_compared_as_a_pair(self):
-        fcfg = {'enabled': True, 'username': 'a', 'password': 'b'}
-        self.assertTrue(feed.credentials_ok(fcfg, 'a', 'b'))
-        self.assertFalse(feed.credentials_ok(fcfg, 'a', 'a'))
-        self.assertFalse(feed.credentials_ok(fcfg, 'b', 'a'))
-        self.assertFalse(feed.credentials_ok(fcfg, None, 'b'))
-        self.assertFalse(feed.credentials_ok(dict(fcfg, enabled=False), 'a', 'b'))
-        self.assertFalse(feed.credentials_ok(dict(fcfg, password=''), 'a', ''))
+        t = make_test_app()
+        self.addCleanup(t.cleanup)
+        add_login('a', 'b')
+        fcfg = {'enabled': True}
+        self.assertIsNotNone(feed.feed_login_for(fcfg, 'a', 'b'))
+        self.assertIsNone(feed.feed_login_for(fcfg, 'a', 'a'))
+        self.assertIsNone(feed.feed_login_for(fcfg, 'b', 'a'))
+        self.assertIsNone(feed.feed_login_for(fcfg, None, 'b'))
+        self.assertIsNone(feed.feed_login_for(dict(fcfg, enabled=False), 'a', 'b'))
+        self.assertIsNone(feed.feed_login_for(fcfg, 'a', ''))
 
     def test_the_reserve_must_fit_the_ring(self):
         self.assertTrue(feed.reserve_fits({'buffer_mb': 16, 'reserve_seconds': 3}))
@@ -247,9 +257,9 @@ class GateTests(unittest.TestCase):
 
     def test_off_no_credential_and_wrong_credential_are_one_401(self):
         off = self._bodies(f'username={USER}&password={PASS}')
-        self.t.sandbox_config(_feed_cfg(password=''))
-        unset = self._bodies(f'username={USER}&password=')
         self.t.sandbox_config(FEED_ON)
+        unset = self._bodies(f'username={USER}&password={PASS}')
+        add_login(USER, PASS)
         wrong = self._bodies(f'username={USER}&password=nope')
         missing = self._bodies('')
         for answers in (off, unset, wrong, missing):
@@ -263,6 +273,7 @@ class GateTests(unittest.TestCase):
 
     def test_the_right_pair_answers_every_endpoint(self):
         self.t.sandbox_config(FEED_ON)
+        add_login(USER, PASS)
         for ep, resp in self._bodies(f'username={USER}&password={PASS}').items():
             self.assertEqual(resp.status_code, 200, ep)
         self.assertEqual(self.client.get(f'/live/{USER}/{PASS}/2.ts').status_code, 404)
@@ -273,16 +284,20 @@ class GateTests(unittest.TestCase):
                                                    'password_hash': generate_password_hash('pw')}})
         from app.auth import refresh_auth
         refresh_auth(self.t.app)
+        add_login(USER, PASS)
         self.assertEqual(self.client.get('/settings').status_code, 302)
         self.assertEqual(
             self.client.get(f'/player_api.php?username={USER}&password={PASS}').status_code, 200)
 
-    def test_enabling_needs_a_credential_and_the_reserve_must_fit(self):
+    def test_enabling_needs_a_login_and_the_reserve_must_fit(self):
         post = lambda path, value: self.client.post(  # noqa: E731
             '/api/settings/field', json={'path': f'integrations.output_feed.{path}', 'value': value})
         self.assertEqual(post('enabled', True).status_code, 400)
-        self.assertEqual(post('username', USER).status_code, 200)
-        self.assertEqual(post('password', PASS).status_code, 200)
+        # A login is a row on the IPTV Output page, never a setting (dev/changelog/1781).
+        self.assertEqual(post('username', USER).status_code, 400)
+        self.assertEqual(post('password', PASS).status_code, 400)
+        self.assertNotIn('username', load_config()['integrations']['output_feed'])
+        add_login(USER, PASS)
         self.assertEqual(post('enabled', True).status_code, 200)
         self.assertTrue(load_config()['integrations']['output_feed']['enabled'])
         r = post('reserve_seconds', 60)
@@ -1833,12 +1848,6 @@ class RedirectModeTests(_FeedCase):
         self.assertNotIn('group ' + str(group.id) + ' (G)', html)
         self.assertIn('cannot see when a redirected play ends', html)
 
-    def test_a_numeric_login_in_a_hand_edited_config_still_works(self):
-        self.t.sandbox_config(_feed_cfg(mode='redirect', username=1, password=22))
-        self.assertEqual(self.client.get('/player_api.php?username=1&password=22').status_code, 200)
-        self.assertEqual(self.client.get('/player_api.php?username=1&password=2').status_code, 401)
-        self.assertEqual(self.client.get('/').status_code, 200)
-
     def test_held_seats_are_subtracted_where_a_connection_is_taken(self):
         self.t.sandbox_config(_feed_cfg(mode='redirect', held_seats={str(self.account.id): 1}))
         self.assertFalse(connlim.try_acquire(self.account.id, 'recording', 1))
@@ -2011,7 +2020,7 @@ class MixedModeRouteTests(_Relay):
         html = unescape(self.client.get('/iptv-output').get_data(as_text=True))
         self.assertIn('Through ChannelBin', html)
         self.assertIn('Straight from your IPTV provider', html)
-        self.assertIn('In mixed mode only channel groups, sports channels, Up next channels and every play on a login for another user go through ChannelBin', html)
+        self.assertIn('In mixed mode channel groups, sports channels, Up next channels and every play on a login that does not play straight from your provider go through ChannelBin', html)
         self.assertIn('Recordings leave alone', html)
         self.assertIn('Current streams', html)
         self.assertIn('<option value="mixed" selected>', html)
@@ -2035,12 +2044,13 @@ class ReadinessCheckTests(_FeedCase):
         self.t.sandbox_config({})
         self.assertEqual(self._result().status, NOTHING)
 
-    def test_on_with_no_credential_is_a_problem(self):
+    def test_on_with_no_login_on_is_a_problem(self):
         from app.readiness import PROBLEM
-        self.t.sandbox_config(_feed_cfg(password=''))
+        self.login.enabled = False
+        db.session.commit()
         r = self._result()
         self.assertEqual(r.status, PROBLEM)
-        self.assertIn('no username or password', r.found)
+        self.assertIn('no login is turned on', r.found)
 
     def test_a_reserve_the_ring_cannot_hold_is_a_problem(self):
         from app.readiness import PROBLEM
@@ -2096,7 +2106,6 @@ class DashboardAndBundleTests(_FeedCase):
         data = json.loads(zipfile.ZipFile(io.BytesIO(build_support_bundle()))
                           .read('output_feed.json'))
         self.assertTrue(data['enabled'])
-        self.assertTrue(data['credentials_set'])
         self.assertNotIn('username', data)
         self.assertNotIn('password', data)
         self.assertEqual(data['viewers_now'], 0)

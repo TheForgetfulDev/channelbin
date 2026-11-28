@@ -6,11 +6,11 @@
    chip and page. Clicks are delegated, since a swap rebuilds the nodes. The live regions are swapped
    again on a timer so Watching now and Recent plays keep up while the page is open.
 
-   The password is not in the page. The eye and Copy ask /api/settings/reveal for it, the same
-   gated read the Settings page's eye uses; a login for another user's comes from its own
-   gated read, /api/iptv-output/logins/<id>/password (dev/changelog/1760).
+   No password is in the page. The eye and Copy ask the login's own gated read for it,
+   /api/iptv-output/logins/<id>/password (dev/changelog/1760). Every login is a row, the owner's
+   own included, and the Connect card shows the one picked at its top (dev/changelog/1781).
 
-   Three sizes of swap. Turning the output on or off, the login and the mode change which cards
+   Three sizes of swap. Turning the output on or off, the first login and the mode change which cards
    exist, so they take everything. A switch or a stopped play takes the cards but not Settings,
    and a saved number takes only the state bar, so a number being typed in another settings
    row is never replaced by the save of the one before it. */
@@ -22,10 +22,10 @@
   // so a search in progress or a number being typed is never replaced under the person.
   const LIVE = ['#of-state', '#of-logins', '#of-watching', '#of-recent', '#of-accounts'];
   const LIVE_MS = 15 * 1000;
-  const PASSWORD_PATH = 'integrations.output_feed.password';
   const FIELD_URL = '/api/settings/field';
 
-  const view = { tab: 'xtream', q: '', cat: '', show: 'all', page: 1 };
+  // `login` is the Connect card's pick, '' for the first login.
+  const view = { tab: 'xtream', login: '', q: '', cat: '', show: 'all', page: 1 };
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
   const players = (n) => `${n} IPTV player${n === 1 ? '' : 's'}`;
@@ -40,6 +40,15 @@
       b.setAttribute('aria-selected', on ? 'true' : 'false');
     });
     $$('#of-connect [data-pane]').forEach((p) => { p.hidden = p.dataset.pane !== view.tab; });
+  }
+
+  function applyLogin() {
+    const pick = $('#of-conn-login');
+    const ids = $$('#of-connect [data-conn-login]').map((el) => el.dataset.connLogin);
+    // A login deleted since it was picked: back to the first.
+    if (!ids.includes(view.login)) view.login = ids[0] || '';
+    if (pick) pick.value = view.login;
+    $$('#of-connect [data-conn-login]').forEach((el) => { el.hidden = el.dataset.connLogin !== view.login; });
   }
 
   function rowMatches(tr) {
@@ -83,7 +92,7 @@
     });
   }
 
-  const applyView = () => { applyTab(); applyFilter(); };
+  const applyView = () => { applyTab(); applyLogin(); applyFilter(); };
 
   /* ---- Swapping ---------------------------------------------------------------------------
      One after another: a timed swap fetched before an action's must never land after it and
@@ -114,8 +123,9 @@
   };
 
   /* ---- The password, on request ---------------------------------------------------------- */
-  const fetchPassword = () => jsonFetch(`/api/settings/reveal?path=${encodeURIComponent(PASSWORD_PATH)}`)
-    .then((d) => d.value || '');
+  const passwordOf = (id) => jsonFetch(`/api/iptv-output/logins/${id}/password`).then((d) => d.password || '');
+  // The Connect card's rows are inside the login they belong to.
+  const fetchPassword = (el) => passwordOf(el.closest('[data-conn-login]').dataset.connLogin);
   const fill = (template, password) => template.split('{password}').join(encodeURIComponent(password));
 
   async function copyRow(btn) {
@@ -124,7 +134,7 @@
     if (btn.dataset.secret === undefined) {
       text = $('[data-copy-value]', row).textContent;
     } else {
-      const password = await fetchPassword();
+      const password = await fetchPassword(btn);
       // The Xtream password is typed as it is; inside an address it is percent-encoded.
       text = btn.dataset.secret === '{password}' ? password : fill(btn.dataset.secret, password);
     }
@@ -140,8 +150,8 @@
     if (value.dataset.masked === undefined) value.dataset.masked = value.textContent;
     if (shown) value.textContent = value.dataset.masked;
     // The Xtream password is shown as it is typed; inside an address it is percent-encoded.
-    else if (template === '{password}') value.textContent = await fetchPassword();
-    else value.textContent = fill(template, await fetchPassword());
+    else if (template === '{password}') value.textContent = await fetchPassword(btn);
+    else value.textContent = fill(template, await fetchPassword(btn));
     btn.dataset.shown = shown ? '' : '1';
     btn.innerHTML = icon(shown ? 'reveal' : 'conceal');
     btn.setAttribute('aria-label', `${shown ? 'Show' : 'Hide'} the password`);
@@ -242,40 +252,6 @@
       fail(err);
     }
     refresh(CARDS);
-  }
-
-  function openLogin(btn) {
-    const first = btn.dataset.first === '1';
-    const body = `<div class="of-login"><p>${first
-      ? 'An IPTV player sends these every time it asks for anything. Short is fine on your home network: they are typed with a remote. Never forward ChannelBin\'s own port to the internet. To share the IPTV output outside your home, use the public port in Settings, which answers an IPTV player and nothing else, and give that login a long password.'
-      : 'Every IPTV player using the old login is refused the next time it asks for anything, until the new one is typed into it. A play that is already running carries on until then.'}</p>
-      <label for="of-user">Username</label>
-      <input class="form-control" id="of-user" value="${escHtml(btn.dataset.user || '')}" autocomplete="off" maxlength="60">
-      <label for="of-pass">Password</label>
-      <input class="form-control" id="of-pass" autocomplete="off" maxlength="60"${first ? '' : ' placeholder="Leave empty to keep the password you have"'}>
-      <p class="card-note">Letters and numbers only keeps it easy to type on a TV. The password is kept as typed, so this page can show it back to you.</p></div>`;
-    const overlay = buildModal({
-      title: first ? 'Set the IPTV player\'s login' : 'Change the IPTV player\'s login',
-      body,
-      footer: [
-        { label: 'Cancel', class: 'btn' },
-        { label: 'Save', class: 'btn btn-primary', onClick: (close) => {
-          const username = $('#of-user', overlay).value.trim();
-          const password = $('#of-pass', overlay).value;
-          if (!username || (first && !password)) {
-            showToast('Both a username and a password are needed.', { type: 'error' });
-            return false;
-          }
-          post('/api/iptv-output/login', { username, password }).then((d) => {
-            close();
-            return refresh().then(() => showToast(d.first
-              ? 'Login set. Turn the output on when you are ready.'
-              : 'Login changed. Update it in each IPTV player.'));
-          }).catch(fail);
-          return false;
-        } },
-      ],
-    });
   }
 
   // The Settings card: each row saves its own key through the Settings page's own route,
@@ -386,9 +362,8 @@
     }
   }
 
-  /* ---- Logins for other users (dev/changelog/1760) -------------------------------------- */
-  const loginPassword = (tr) => jsonFetch(`/api/iptv-output/logins/${tr.dataset.login}/password`)
-    .then((d) => d.password || '');
+  /* ---- Logins (dev/changelog/1760, 1781) ------------------------------------------------- */
+  const loginPassword = (tr) => passwordOf(tr.dataset.login);
   // A username suggested from the name while the person has not typed one of their own: what
   // login_problem() takes, kept short for a remote.
   const suggestUser = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 20);
@@ -396,23 +371,28 @@
 
   function openLoginForm(tr) {
     const editing = Boolean(tr);
-    const btn = $('[data-act="login-add"]');
-    const min = Number(btn.dataset.min);
-    const max = Number(btn.dataset.max);
+    const card = $('#of-logins');
+    const min = Number(card.dataset.min);
+    const max = Number(card.dataset.max);
+    const checked = (on) => (on ? ' checked' : '');
     const body = `<div class="of-login"><p>${editing
       ? 'A new username or password cuts any play on this login now, and its IPTV player is refused until the new one is typed into it.'
-      : 'They type the server address in the details this card copies for them, with this username and password. Short is easier to type with a remote, but a login used from outside your home network should be long.'}</p>
+      : 'The server address goes into the IPTV player with this username and password. Short is easier to type with a remote, but a login used from outside your home network should be long: the password filled in here is.'}</p>
       <label for="of-l-name">Who it is for</label>
       <input class="form-control" id="of-l-name" value="${escHtml(editing ? tr.dataset.name : '')}" autocomplete="off" maxlength="100">
       <label for="of-l-user">Username</label>
       <input class="form-control" id="of-l-user" value="${escHtml(editing ? tr.dataset.user : '')}" autocomplete="off" maxlength="60">
       <label for="of-l-pass">Password</label>
-      <input class="form-control" id="of-l-pass" autocomplete="off" maxlength="60" value="${editing ? '' : escHtml(btn.dataset.password)}"${editing ? ' placeholder="Leave empty to keep the password it has"' : ''}>
+      <input class="form-control" id="of-l-pass" autocomplete="off" maxlength="60" value="${editing ? '' : escHtml(card.dataset.password)}"${editing ? ' placeholder="Leave empty to keep the password it has"' : ''}>
       <label for="of-l-streams">Streams at once</label>
       <input class="form-control" id="of-l-streams" type="number" min="${min}" max="${max}" value="${editing ? tr.dataset.streams : 1}">
-      <p class="card-note">Letters and numbers only keeps it easy to type on a TV. The password is kept as typed, so this page can show it back to you.</p></div>`;
+      <p class="card-note">Letters and numbers only keeps it easy to type on a TV. The password is kept as typed, so this page can show it back to you.</p></div>
+      <label class="check-row"><input type="checkbox" id="of-l-direct"${checked(editing && tr.dataset.direct)}> <span>Plays straight from your IPTV provider at home
+        <span class="text-muted">In redirect and mixed mode its IPTV player is sent to your provider's own stream, which hands it your provider login. Only for your own players. On the public port it always plays through ChannelBin.</span></span></label>
+      <label class="check-row"><input type="checkbox" id="of-l-whole"${checked(editing && tr.dataset.whole)}> <span>Tell its IPTV player the whole reason a play is refused
+        <span class="text-muted">The reason can name your pages, settings and folders. Off, its player is told only what kind of refusal it was, and the whole reason is still under Recent plays. On the public port it is always told only the kind.</span></span></label>`;
     const overlay = buildModal({
-      title: editing ? `Change ${tr.dataset.name}'s login` : 'Add a login for another user',
+      title: editing ? `Change ${tr.dataset.name}'s login` : 'Add a login',
       body,
       footer: [
         { label: 'Cancel', class: 'btn' },
@@ -421,15 +401,19 @@
             name: $('#of-l-name', overlay).value.trim(),
             username: $('#of-l-user', overlay).value.trim(),
             max_streams: Number($('#of-l-streams', overlay).value),
+            provider_direct: $('#of-l-direct', overlay).checked,
+            full_refusals: $('#of-l-whole', overlay).checked,
           };
           const password = $('#of-l-pass', overlay).value;
           if (password || !editing) data.password = password;
           const url = editing ? `/api/iptv-output/logins/${tr.dataset.login}` : '/api/iptv-output/logins';
           post(url, data).then((d) => {
             close();
-            return refresh(CARDS).then(() => showToast(editing
+            // The first login brings the other cards with it.
+            return refresh(d.first ? ALL : CARDS).then(() => showToast(editing
               ? `Saved.${loginCutNote(d.ended)}`
-              : `Login added for ${data.name}. Copy the details to send from its menu.`));
+              : d.first ? `Login added for ${data.name}. Turn the output on when you are ready.`
+                : `Login added for ${data.name}. Copy the details to send from its menu.`));
           }).catch(fail);
           return false;
         } },
@@ -459,17 +443,20 @@
 
   async function deleteLogin(tr) {
     const n = Number(tr.dataset.playing) || 0;
+    const last = $$('#of-logins tr[data-login]').length === 1;
     const ok = await confirmModal({
       title: `Delete ${tr.dataset.name}'s login?`,
       message: `The username ${tr.dataset.user} stops working, and its IPTV player is refused the next time it asks for anything.`,
-      consequence: `Its lines in Recent plays stay.${n ? ` ${players(n)} watching on it right now ${n === 1 ? 'is' : 'are'} cut.` : ''} To stop it for a while instead, turn it off.`,
+      consequence: `Its lines in Recent plays stay.${n ? ` ${players(n)} watching on it right now ${n === 1 ? 'is' : 'are'} cut.` : ''}${last ? ' It is the last login, so the IPTV output is turned off too.' : ''} To stop it for a while instead, turn it off.`,
       confirmLabel: 'Delete',
       danger: true,
     });
     if (!ok) return;
     const d = await jsonFetch(`/api/iptv-output/logins/${tr.dataset.login}`, { method: 'DELETE' });
-    await refresh(CARDS);
-    showToast(`${tr.dataset.name}'s login is deleted.${loginCutNote(d.ended)}`);
+    // The last login takes the other cards with it, as the first one brings them.
+    await refresh(d.last ? ALL : CARDS);
+    showToast(`${tr.dataset.name}'s login is deleted.${loginCutNote(d.ended)}${d.turned_off
+      ? ' It was the last login, so the IPTV output is turned off until you add one and turn it on.' : ''}`);
   }
 
   async function revealLogin(btn) {
@@ -628,7 +615,6 @@
     const act = t.dataset.act;
     if (act === 'copy') guarded(copyRow)(t);
     else if (act === 'reveal') guarded(revealAddress)(t);
-    else if (act === 'login') openLogin(t);
     else if (act === 'power') guarded(setPower)(t.dataset.to);
     else if (act === 'stop') stopPlay(t);
     else if (act === 'move-play') movePlay(t).then((asked) => { if (asked) refresh(CARDS); });
@@ -660,6 +646,7 @@
     else if (t.dataset.act === 'held') setHeld(t);
     else if (t.dataset.act === 'pip-twin') pipTwin(t);
     else if (t.dataset.act === 'login-on') setLoginOn(t);
+    else if (t.dataset.act === 'conn-login') { view.login = t.value; applyLogin(); }
     else if (t.dataset.settingPath) saveSetting(t);
     else if (t.id === 'of-cat') { view.cat = t.value; view.page = 1; applyFilter(); }
   });

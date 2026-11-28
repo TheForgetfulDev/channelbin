@@ -640,7 +640,8 @@ def dashboard():
         feed_mode = output_feed.mode_of(feed_cfg)
         feed = {'mode': feed_mode,
                 # In redirect mode the plays ChannelBin sees are its own pictures (a waiting
-                # screen, an Up next channel) and every play on a login for another user.
+                # screen, an Up next channel) and every play on a login not sent straight to
+                # the provider (output_feed.seen_in_mode).
                 'live': [s.to_dict() for s in output_feed.live_sessions()
                          if output_feed.seen_in_mode(s, feed_mode)],
                 'ended': [s.to_dict() for s in output_feed.recent_ended()][:5],

@@ -317,41 +317,7 @@ def set_account(account_id):
     return jsonify({'error': 'Nothing to change'}), 400
 
 
-@iptv_output_bp.route('/api/iptv-output/login', methods=['POST'])
-def set_login():
-    """The username and password an IPTV player logs in with, saved together. A blank
-    password keeps the stored one, since the page never holds it to send back. Setting a
-    login never turns the output on."""
-    data = request.get_json(silent=True) or {}
-    username = str(data.get('username') or '').strip()
-    password = str(data.get('password') or '')
-    with config_write_lock:
-        cfg, file_cfg = load_for_edit()
-        fcfg = output_feed.feed_config(cfg)
-        had = output_feed.credentials_set(fcfg)
-        if not password:
-            password = output_feed.feed_password(fcfg)
-        if not username or not password:
-            return jsonify({'error': 'Both a username and a password are needed.'}), 400
-        problem = (output_feed.login_problem('username', username)
-                   or output_feed.login_problem('password', password))
-        if problem:
-            return jsonify({'error': problem}), 400
-        if OutputFeedLogin.query.filter_by(username=username).first() is not None:
-            return jsonify({'error': f'"{username}" is already the username of a login for another '
-                                     f'user. Pick another one.'}), 409
-        set_nested(file_cfg, 'integrations.output_feed.username', username)
-        set_nested(file_cfg, 'integrations.output_feed.password', password)
-        if not had:
-            # A switch left on from before there was a login (a hand-edited config, a login
-            # cleared in the file) would start serving the moment the login is saved.
-            set_nested(file_cfg, 'integrations.output_feed.enabled', False)
-        save_config(file_cfg)
-    log.info('IPTV output: login %s', 'changed' if had else 'set')
-    return jsonify({'success': True, 'first': not had})
-
-
-# ── Logins for other users (dev/changelog/1760) ──────────────────────────────────────────────
+# ── Logins (dev/changelog/1760, 1781) ────────────────────────────────────────────────────────
 
 #: A username another save took between this one's check and its commit (the column is unique).
 _TAKEN = 'That username was just taken by another IPTV output login. Pick another one.'
@@ -359,7 +325,7 @@ _TAKEN = 'That username was just taken by another IPTV output login. Pick anothe
 LOGIN_NAME_MAX = 100
 
 
-def _login_fields(data: dict, fcfg: dict, login_id=None) -> tuple:
+def _login_fields(data: dict, login_id=None) -> tuple:
     """(fields to write, error) from a create or edit body. Only the keys present are read,
     so an edit changes what it names and nothing else."""
     out = {}
@@ -377,7 +343,7 @@ def _login_fields(data: dict, fcfg: dict, login_id=None) -> tuple:
         problem = output_feed.login_problem('username', username)
         if problem:
             return None, problem
-        if output_feed.login_taken(username, fcfg, except_login_id=login_id):
+        if output_feed.login_taken(username, except_login_id=login_id):
             return None, f'"{username}" is already in use by another IPTV output login. Pick another one.'
         out['username'] = username
     if 'password' in data:
@@ -393,10 +359,11 @@ def _login_fields(data: dict, fcfg: dict, login_id=None) -> tuple:
         if problem:
             return None, problem
         out['max_streams'] = int(data.get('max_streams'))
-    if 'enabled' in data:
-        if not isinstance(data.get('enabled'), bool):
-            return None, 'The switch takes true or false.'
-        out['enabled'] = data['enabled']
+    for key in ('enabled', 'provider_direct', 'full_refusals'):
+        if key in data:
+            if not isinstance(data.get(key), bool):
+                return None, 'The switch takes true or false.'
+            out[key] = data[key]
     if 'lineup' in data:
         ids, problem = output_feed.lineup_problem(data.get('lineup'))
         if problem:
@@ -413,16 +380,20 @@ def _login_fields(data: dict, fcfg: dict, login_id=None) -> tuple:
 
 @iptv_output_bp.route('/api/iptv-output/logins', methods=['POST'])
 def create_login():
-    """A new login for another user. A blank password is generated."""
+    """A new login. A blank password is generated. Both of its home-only switches start off
+    (dev/changelog/1781). The first login never turns the output on: a switch left on from before
+    there was a login (a hand-edited config, the last login deleted) is turned off, so the output
+    does not start serving the moment a login exists."""
     data = request.get_json(silent=True) or {}
     if not str(data.get('password') or ''):
         data['password'] = output_feed.generated_password()
     for key in ('name', 'username'):
         data.setdefault(key, '')
     data.setdefault('max_streams', 1)
-    fields, error = _login_fields(data, output_feed.feed_config(load_config()))
+    fields, error = _login_fields(data)
     if error:
         return jsonify({'error': error}), 400
+    first = not output_feed.has_login()
 
     @retry_on_locked()
     def _create():
@@ -436,8 +407,15 @@ def create_login():
     except IntegrityError:
         db.session.rollback()
         return jsonify({'error': _TAKEN}), 409
-    log.info('IPTV output: login %s added for another user', fields['username'])
-    return jsonify({'success': True, 'id': login_id})
+    log.info('IPTV output: login %s added', fields['username'])
+    if first:
+        with config_write_lock:
+            cfg, file_cfg = load_for_edit()
+            if output_feed.is_enabled(output_feed.feed_config(cfg)):
+                set_nested(file_cfg, 'integrations.output_feed.enabled', False)
+                save_config(file_cfg)
+                log.info('IPTV output: turned off, so the first login does not start it serving')
+    return jsonify({'success': True, 'id': login_id, 'first': first})
 
 
 @iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>', methods=['POST'])
@@ -447,7 +425,7 @@ def edit_login(login_id):
     channel list ends its plays of the channels the list leaves out, and new accounts its plays
     from outside them, after the commit too."""
     data = request.get_json(silent=True) or {}
-    fields, error = _login_fields(data, output_feed.feed_config(load_config()), login_id=login_id)
+    fields, error = _login_fields(data, login_id=login_id)
     if error:
         return jsonify({'error': error}), 400
     if not fields:
@@ -528,7 +506,9 @@ def login_accounts(login_id):
 
 @iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>', methods=['DELETE'])
 def delete_login(login_id):
-    """Delete a login and end its plays. Its lines in Recent plays keep its username."""
+    """Delete a login and end its plays. Its lines in Recent plays keep its username. Deleting
+    the last one turns the output off, as adding the first one does: an output that is on with no
+    login lets nobody in, and its page has no switch to turn it off (dev/changelog/1781)."""
     @retry_on_locked()
     def _delete():
         row = db.session.get(OutputFeedLogin, login_id)
@@ -545,13 +525,24 @@ def delete_login(login_id):
     ended = output_feed.stop_login(login_id)
     log.info('IPTV output: login %s deleted%s', username,
              f', {counted(ended, "play")} ended' if ended else '')
-    return jsonify({'success': True, 'ended': ended})
+    turned_off = False
+    if not output_feed.has_login():
+        with config_write_lock:
+            cfg, file_cfg = load_for_edit()
+            if output_feed.is_enabled(output_feed.feed_config(cfg)):
+                set_nested(file_cfg, 'integrations.output_feed.enabled', False)
+                save_config(file_cfg)
+                turned_off = True
+        if turned_off:
+            log.info('IPTV output: turned off, since its last login was deleted')
+    return jsonify({'success': True, 'ended': ended, 'last': not output_feed.has_login(),
+                    'turned_off': turned_off})
 
 
 @iptv_output_bp.route('/api/iptv-output/logins/<int:login_id>/password')
 def reveal_login_password(login_id):
     """The password of one login, for the page's eye and Copy buttons: the page's source never
-    holds it, as it never holds the main login's (/api/settings/reveal)."""
+    holds it."""
     row = db.session.get(OutputFeedLogin, login_id)
     if row is None:
         return jsonify({'error': 'That login no longer exists'}), 404

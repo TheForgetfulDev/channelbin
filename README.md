@@ -668,12 +668,13 @@ one dies.
 
 Go to the **IPTV Output** page, under Channels & guide:
 
-1. **Set login**: the username and password the IPTV player logs in with. They are typed on a
-   remote, so short is fine on your home network.
+1. **Add a login**: who it is for, and the username and password the IPTV player logs in with.
+   Every IPTV player uses one, yours included, and each person can have their own.
 2. **Turn on**.
 3. In the IPTV player, add an Xtream Codes account with the server address, username and
-   password from the page's **Connect an IPTV player** card (each has a Copy button). A player
-   that takes a playlist instead gets the M3U and XMLTV addresses from the same card.
+   password from the page's **Connect an IPTV player** card (each has a Copy button; pick the
+   login at the top when there is more than one). A player that takes a playlist instead gets
+   the M3U and XMLTV addresses from the same card.
 
 The page lists every channel the player gets, with a switch to take one off the output while it
 stays in your TV Guide.
@@ -695,6 +696,12 @@ Three ways the stream can reach the IPTV player, chosen by **How the IPTV player
   provider, as in Redirect. Each channel's row on the page says which way it plays, and
   **Recordings leave alone** applies here too.
 
+Redirect and Mixed only send a player straight to your provider when its login is set to
+**Play straight from your IPTV provider at home** (Change, in the login's row). That is off for a
+new login, since it hands that player your provider login; every other login plays through
+ChannelBin in every mode, and so does every play on the public port. A login you moved from an
+older version, where it was the one main login, has it on.
+
 The page's **Watching now** and **Recent plays** cards list each IPTV player playing and how every
 play ended or why it was refused, and the Readiness check says whether the IPTV output can serve. It is off by default
 and nothing of it runs while it is off.
@@ -702,7 +709,7 @@ and nothing of it runs while it is off.
 ### Sharing the IPTV output over the internet
 
 To let people outside your home watch, give each of them a login on the IPTV Output page's
-**Logins for other users** card, and put the IPTV output - only the IPTV output - on the internet
+**Logins** card, and put the IPTV output - only the IPTV output - on the internet
 through a reverse proxy. The web UI stays on your home network: **never forward ChannelBin's own
 port (5000) to the internet** (see [Network binding and exposure](#network-binding-and-exposure)).
 
@@ -713,8 +720,9 @@ plain 404 there, so a mistake in the proxy cannot expose the web UI. On the publ
 - Every play goes through ChannelBin, even in Redirect or Mixed mode, so your IPTV provider's
   username and password never reach a player outside your home.
 - A play that cannot start tells the player only what kind of problem it is, like "Nothing can
-  play this channel right now", never the reason written for you. The same goes for a login for
-  another user on either port. The whole reason is in Recent plays and the log.
+  play this channel right now", never the reason written for you. The same goes on the main port
+  for every login you have not set to be told the whole reason. The whole reason is in Recent
+  plays and the log.
 - An address that gets the login wrong 10 times in 15 minutes is locked out for 5 minutes, even
   with the right password. Each lockout of the same address is longer than its last: 15
   minutes, 30 minutes, 1 hour, 6 hours, 12 hours, then 24 hours every time after that. After 24
@@ -784,9 +792,10 @@ Steps:
    the proxy says a player has. With **Reverse proxy addresses** filled in, a player reaching
    the public port directly is not believed and is counted by its own address. With it empty,
    that player could claim a new address with every wrong password and never be locked out.
-7. Your own login (the one in the Connect card) works on the public port too. If you will use it
-   from outside, change it to a long password; the logins for other users get a 12-character
-   generated one.
+7. Every login works on the public port, yours included. A new login gets a 12-character
+   generated password; one you typed yourself may be shorter, and the Readiness check names
+   every login whose password is under 12 characters while the public port is open. If you will
+   use it from outside, change it to a long one with Change in its row.
 8. From outside your network (a phone off Wi-Fi), check it:
    `curl "https://tv.example.com/player_api.php?username=NAME&password=PASSWORD"` answers with the
    login's details, and `curl -i https://tv.example.com/` answers 404.

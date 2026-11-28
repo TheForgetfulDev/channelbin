@@ -16,6 +16,7 @@ import app.sports_screen as ss
 from app import db
 from tests.support import clips
 from tests.support.app import make_test_app
+from tests.support.output_feed import add_login
 from tests.support.seed import make_account, make_channel
 
 HAVE_FFMPEG = shutil.which('ffmpeg') is not None
@@ -23,7 +24,7 @@ USER, PASS = 'tv', 'tv-secret'
 
 
 def feed_cfg(**overrides):
-    block = {'enabled': True, 'username': USER, 'password': PASS, 'reserve_seconds': 0}
+    block = {'enabled': True, 'reserve_seconds': 0}
     block.update(overrides)
     return {'integrations': {'output_feed': block}}
 
@@ -61,6 +62,7 @@ class ClipPlayCase(unittest.TestCase):
         self.addCleanup(self.t.cleanup)
         self.addCleanup(feed.stop_all)
         self.t.sandbox_config(self.FEED)
+        self.login = add_login(USER, PASS)
         self.account = make_account('Acct', max_connections=1)
         db.session.commit()
         self.renders = []

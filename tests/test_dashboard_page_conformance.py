@@ -40,6 +40,7 @@ from app.routes.dashboard import (
     DASHBOARD_SECTIONS, DASHBOARD_SECTIONS_PREF, DASHBOARD_SECTION_ORDER, _section_state,
 )
 from tests.support.app import make_test_app
+from tests.support.output_feed import ensure_login
 from tests.support.seed import make_account, make_channel, make_recording
 
 
@@ -53,9 +54,9 @@ class DashboardPageConformanceTests(unittest.TestCase):
         # The output feed on, so its Watching-now section is on the page beside the five
         # that are always there; test_the_feed_section_exists_only_while_the_feed_is_on
         # covers the other state.
-        cls.t.sandbox_config({'integrations': {'output_feed': {
-            'enabled': True, 'username': 'tv', 'password': 'tv'}}})
+        cls.t.sandbox_config({'integrations': {'output_feed': {'enabled': True}}})
         with cls.t.app.app_context():
+            ensure_login('tv', 'tv')
             acc = make_account(name='Acct One')
             ch = make_channel(acc, name='Channel One')
             make_recording(status='SCHEDULED', name='Booked show', channel_id=ch.id)
@@ -137,8 +138,7 @@ class DashboardPageConformanceTests(unittest.TestCase):
         try:
             html = self.client.get('/').get_data(as_text=True)
         finally:
-            self.t.sandbox_config({'integrations': {'output_feed': {
-                'enabled': True, 'username': 'tv', 'password': 'tv'}}})
+            self.t.sandbox_config({'integrations': {'output_feed': {'enabled': True}}})
         self.assertNotIn(f'data-sec="{DASHBOARD_FEED_SECTION}"', html)
         defs = json.loads(re.search(r'id="dash-sections-pref">(.*?)</script>', html, re.S).group(1))
         self.assertNotIn(DASHBOARD_FEED_SECTION, defs['defs'])
