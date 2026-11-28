@@ -15,6 +15,15 @@
 #                               named scenario_*.py so the default discovery skips them, and
 #                               tests/test_capture_smoke.py is the short set the default run
 #                               does carry (DESIGN-simulator.md §4, dev/changelog/1223).
+#   ./run_tests.sh --select FILE   Only the modules a JSON file names, the ones it lists as
+#                               "first" (and the ones the last red run on this commit named)
+#                               before the rest, stopping when those are red. Recorded in the
+#                               untracked tests/.timing_selected.jsonl, never the history below.
+#   ./run_tests.sh --map PATH   The whole suite, also writing to PATH which repo files each
+#                               module read (tests/support/testmap.py); about 6% slower.
+#   ./run_tests.sh --history PATH   Keep the whole-suite timing record in PATH instead.
+#
+# How a change picks its modules is a dev tool's business, not this runner's (dev/changelog/1780).
 #
 # Every form runs the SAME tests: the split is by whole module, and a module that lands in
 # no shard is a hard error rather than a quietly smaller suite. Reach for `-j 1` when

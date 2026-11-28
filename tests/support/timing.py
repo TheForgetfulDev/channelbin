@@ -87,6 +87,17 @@ HISTORY_PATH = os.path.join(_REPO, 'tests', 'timing_history.jsonl')
 CAPTURE_HISTORY_PATH = os.path.join(_REPO, 'tests', 'capture', 'timing_history.jsonl')
 CAPTURE_DIR = os.path.join(_REPO, 'tests', 'capture')
 CAPTURE_PREFIX = 'scenario_'
+# Selected runs (`--select`), kept apart from the whole suite's for the same reason as the
+# capture tier's: a run of 40 modules says nothing about a baseline built from 646, and would
+# push whole-suite records out of the window. Gitignored, so a task's runs never become a
+# commit of their own (dev/changelog/1780).
+SELECTED_HISTORY_PATH = os.path.join(_REPO, 'tests', '.timing_selected.jsonl')
+FULL_TIER = '0-2'
+SELECTED_TIER = 'selected'
+# A selection that is this share of the suite's measured time runs the whole suite instead:
+# the saving is small, and a whole run leaves a record the baseline can use.
+PROMOTE_SHARE = 0.6
+FAILED_MODULE_RE = re.compile(r'\b(tests\.test_\w+)')
 
 # Rolling-baseline tolerance: flag a run that exceeds the recent median by more than this.
 TOL = 0.30
@@ -484,7 +495,7 @@ def _jobs_of(record):
     return record.get('jobs', 1)
 
 
-def _passing_same_tier(records, tier, jobs, shard_order='forward'):
+def _passing_same_tier(records, tier, jobs, shard_order='forward', mapped=False):
     """Prior passing runs comparable with this one.
 
     Filtered on `jobs` as well as `tier` for the same reason `tier` was there first: a
@@ -496,11 +507,16 @@ def _passing_same_tier(records, tier, jobs, shard_order='forward'):
     against 217.9s forward, measured). It is a correctness check, not a performance
     measurement, so its records must not drag the forward baseline up and mask a real
     regression. Records predating this key read as forward, which is what they were.
+
+    `mapped` segments a run that built the test map (`--map`): its recorder costs about 6% of
+    a whole run (dev/changelog/1780), so a mapped run against a plain baseline
+    would read as a slowdown, and a plain one against mapped runs would hide one.
     """
     return [
         r for r in records
         if r.get('tier') == tier and _jobs_of(r) == jobs
         and r.get('shard_order', 'forward') == shard_order
+        and bool(r.get('mapped')) == bool(mapped)
         and r.get('failures', 0) == 0 and r.get('errors', 0) == 0
     ]
 
@@ -572,32 +588,8 @@ def _status_line(record, prior_passing):
     # which is exactly what _passing_same_tier already enforces.
     charged = record.get('total_charged')
     jobs_txt = f", {jobs} shards, {charged:.1f}s charged" if jobs > 1 and charged else ''
-
-    # Named on every line, INFO included: wall clock grows when tests are added, so ms/test is
-    # the figure that says whether the suite got SLOWER rather than bigger, and six ceiling
-    # re-baselines in a row have said so in prose without anything printing the number.
-    # The foreign-CPU share rides in the same parenthesis and for the same reason: it is the
-    # other half of why a wall clock moves, and until it was measured a reader had no way to
-    # tell a contended run from a slow one.
     per_test = _ms_per_test(record)
-    share = record.get('foreign_cpu_share')
-    facts = ([f'{per_test:.1f}ms/test'] if per_test is not None else [])
-    if share is not None:
-        facts.append(f'{share * 100:.0f}% foreign CPU')
-    # The hypervisor's share rides next to it: it is the term foreign CPU cannot see on this
-    # kernel (see _cpu_snapshot), and the 2026-10-29 step from 76 to 89 ms/test at one commit
-    # was entirely this figure going from 1% to 17% (dev/changelog/1350).
-    stolen = record.get('steal_cpu_share')
-    if stolen is not None:
-        facts.append(f'{stolen * 100:.0f}% stolen by the host')
-    # A skip counts as a pass, so a suite that silently shrank reads OK with a normal-looking
-    # test count. Naming the skips on every line is what makes that visible even when a
-    # future gate lands without a run_tests.sh guard behind it (dev/changelog/1135). Records
-    # from before the key existed carry none, and a missing count is unknown, never zero.
-    skipped = record.get('skipped')
-    if skipped is not None:
-        facts.append(f'{skipped} skipped')
-    per_test_txt = f" ({', '.join(facts)})" if facts else ''
+    per_test_txt = _facts_text(record)
 
     window = prior_passing[-BASELINE_WINDOW:]
     if len(window) < MIN_BASELINE_RUNS:
@@ -648,6 +640,35 @@ def _status_line(record, prior_passing):
             f"{', '.join(reasons)}{movers_txt}")
 
 
+def _facts_text(record):
+    """` (ms/test, foreign CPU, stolen CPU, skipped)` for a status line, or ''."""
+    # Named on every line, INFO included: wall clock grows when tests are added, so ms/test is
+    # the figure that says whether the suite got SLOWER rather than bigger, and six ceiling
+    # re-baselines in a row have said so in prose without anything printing the number.
+    # The foreign-CPU share rides in the same parenthesis and for the same reason: it is the
+    # other half of why a wall clock moves, and until it was measured a reader had no way to
+    # tell a contended run from a slow one.
+    per_test = _ms_per_test(record)
+    share = record.get('foreign_cpu_share')
+    facts = ([f'{per_test:.1f}ms/test'] if per_test is not None else [])
+    if share is not None:
+        facts.append(f'{share * 100:.0f}% foreign CPU')
+    # The hypervisor's share rides next to it: it is the term foreign CPU cannot see on this
+    # kernel (see _cpu_snapshot), and the 2026-10-29 step from 76 to 89 ms/test at one commit
+    # was entirely this figure going from 1% to 17% (dev/changelog/1350).
+    stolen = record.get('steal_cpu_share')
+    if stolen is not None:
+        facts.append(f'{stolen * 100:.0f}% stolen by the host')
+    # A skip counts as a pass, so a suite that silently shrank reads OK with a normal-looking
+    # test count. Naming the skips on every line is what makes that visible even when a
+    # future gate lands without a run_tests.sh guard behind it (dev/changelog/1135). Records
+    # from before the key existed carry none, and a missing count is unknown, never zero.
+    skipped = record.get('skipped')
+    if skipped is not None:
+        facts.append(f'{skipped} skipped')
+    return f" ({', '.join(facts)})" if facts else ''
+
+
 # ── Sharding ──────────────────────────────────────────────────────────────────
 
 def _discover_modules():
@@ -686,7 +707,10 @@ def _module_weights(modules, history):
     """
     charged = {}
     for record in reversed(history):
-        if record.get('failures', 0) == 0 and record.get('errors', 0) == 0:
+        # A whole-suite record only: a selected run's record holds a few modules, and every
+        # other module would fall back to the mean.
+        if (record.get('failures', 0) == 0 and record.get('errors', 0) == 0
+                and record.get('tier', FULL_TIER) == FULL_TIER):
             charged = _charged(record)
             break
     if not charged:
@@ -775,15 +799,29 @@ def _pump(stream, tag, lock, log_fh=None):
         stream.close()
 
 
-def _run_worker(modules, emit_path):
-    """The worker half: run this shard's modules and write the result where the parent reads it."""
+def _run_worker(modules, emit_path, map_emit=None):
+    """The worker half: run this shard's modules and write the result where the parent reads it.
+
+    With `map_emit`, each module is imported and run inside its own testmap window and what
+    each read is written there too (tests/support/testmap.py)."""
     loader = unittest.TestLoader()
-    suite = unittest.TestSuite(loader.loadTestsFromNames(modules))
+    mapper = None
+    if map_emit:
+        from tests.support.testmap import MappedModule, ModuleMap
+        mapper = ModuleMap(_REPO)
+        mapper.start()
+        suite = unittest.TestSuite([MappedModule(m, mapper, loader) for m in modules])
+    else:
+        suite = unittest.TestSuite(loader.loadTestsFromNames(modules))
     runner = unittest.TextTestRunner(
         resultclass=_TimingResult, verbosity=2, stream=sys.stderr,
     )
     t0 = time.perf_counter()
     result = runner.run(suite)
+    if mapper is not None:
+        mapper.stop()
+        with open(map_emit, 'w', encoding='utf-8') as fh:
+            json.dump(mapper.as_dict(), fh)
     payload = {
         'wall': time.perf_counter() - t0,
         'test_count': result.testsRun,
@@ -802,10 +840,12 @@ def _run_worker(modules, emit_path):
     return 0 if result.wasSuccessful() else 1
 
 
-def _run_sharded(shards, log_dir=None):
+def _run_sharded(shards, log_dir=None, mapping=False, tag=''):
     """Spawn one worker per shard, relay their output, and merge their results.
 
-    Returns a dict shaped like the fields `main()` needs, plus `successful`.
+    Returns a dict shaped like the fields `main()` needs, plus `successful`, and with
+    `mapping` a `map` of what each module read. `tag` prefixes the shard labels and log
+    names, so a selected run's two phases stay apart.
     """
     tmpdir = tempfile.mkdtemp(prefix='dvr_suite_shards_')
     procs, emits, pumps = [], [], []
@@ -814,14 +854,17 @@ def _run_sharded(shards, log_dir=None):
     for i, shard in enumerate(shards):
         emit = os.path.join(tmpdir, f'shard{i}.json')
         emits.append(emit)
+        extra = ['--map-emit', emit + '.map'] if mapping else []
         proc = subprocess.Popen(
-            [sys.executable, '-m', 'tests.support.timing', '--worker', '--emit', emit] + shard,
+            [sys.executable, '-m', 'tests.support.timing', '--worker', '--emit', emit]
+            + extra + shard,
             cwd=_REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
         procs.append(proc)
         t = threading.Thread(target=_pump,
-                             args=(proc.stdout, i, lock, _open_log(log_dir, f'shard{i}.log')),
+                             args=(proc.stdout, f'{tag}{i}', lock,
+                                   _open_log(log_dir, f'{tag}shard{i}.log')),
                              daemon=True)
         t.start()
         pumps.append(t)
@@ -833,7 +876,7 @@ def _run_sharded(shards, log_dir=None):
 
     merged = {'test_count': 0, 'skipped': 0, 'failures': 0, 'errors': 0,
               'per_module': {}, 'fixtures': {}, 'failed_ids': [], 'successful': True,
-              'total_wall': total_wall}
+              'total_wall': total_wall, 'map': {} if mapping else None}
     for i, (proc, emit) in enumerate(zip(procs, emits)):
         if not os.path.exists(emit):
             # A worker that died without reporting means an unknown number of tests never
@@ -854,7 +897,14 @@ def _run_sharded(shards, log_dir=None):
         for key in ('per_module', 'fixtures'):
             for k, v in payload[key].items():
                 merged[key][k] = merged[key].get(k, 0.0) + v
-        print(f'{STATUS_PREFIX} shard {i}: {payload["test_count"]} tests '
+        if mapping:
+            try:
+                with open(emit + '.map', 'r', encoding='utf-8') as fh:
+                    merged['map'].update(json.load(fh))
+            except (OSError, ValueError) as e:
+                raise SystemExit(f'{STATUS_PREFIX} FATAL shard {i} wrote no test map ({e}); '
+                                 'a map missing a shard would silently select too little')
+        print(f'{STATUS_PREFIX} shard {tag}{i}: {payload["test_count"]} tests '
               f'({payload["skipped"]} skipped), {payload["wall"]:.1f}s, '
               f'{"OK" if payload["successful"] else "FAILED"}',
               file=sys.stderr, flush=True)
@@ -972,9 +1022,21 @@ def _parse_args(argv):
     p.add_argument('--scenario', action='append',
                    help='with --capture: run only this scenario module (repeatable), named '
                         'with or without its scenario_ prefix')
+    p.add_argument('--select', metavar='FILE',
+                   help='run the modules a JSON file names ({"first": [...], "modules": [...], '
+                        '"all": bool, "why": "..."}): "first" and the modules the last red run '
+                        'on this commit named, then the rest, stopping when the first part is '
+                        'red. Recorded apart from the whole suite (tests/.timing_selected.jsonl)')
+    p.add_argument('--map', metavar='PATH',
+                   help='run the whole suite and write to PATH which repo files each test '
+                        'module read (tests/support/testmap.py)')
+    p.add_argument('--history', metavar='PATH',
+                   help='keep the whole-suite timing record in PATH instead of '
+                        'tests/timing_history.jsonl; a new file starts as a copy of that one')
     # Internal: how the parent invokes a worker. Not for humans.
     p.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--emit', help=argparse.SUPPRESS)
+    p.add_argument('--map-emit', help=argparse.SUPPRESS)
     p.add_argument('modules', nargs='*', help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
@@ -982,68 +1044,45 @@ def _parse_args(argv):
 def main(argv=None):
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.worker:
-        sys.exit(_run_worker(args.modules, args.emit))
+        sys.exit(_run_worker(args.modules, args.emit, args.map_emit))
     if args.capture:
         _run_capture(args)
     if args.repeat != 1 or args.scenario:
         raise SystemExit(f'{STATUS_PREFIX} FATAL --repeat and --scenario apply to --capture only')
     if args.modules:
-        # This runner is whole-suite only: it exists to produce one comparable history
-        # record. Silently ignoring a named module would run the entire suite while the
-        # caller believed they had asked for one file - so say so instead.
+        # This runner never takes a bare module list: a whole run produces one comparable
+        # history record, and a selected run is asked for by --select, which says why it
+        # ran what it ran. Silently ignoring a named module would run the entire suite while
+        # the caller believed they had asked for one file - so say so instead.
         raise SystemExit(
             f'{STATUS_PREFIX} FATAL this runner takes no module arguments '
             f'(got {args.modules}). For one module: python3 -m unittest ' + args.modules[0])
+    if args.select and args.map:
+        raise SystemExit(f'{STATUS_PREFIX} FATAL --map describes the whole suite and cannot '
+                         'be built from a --select run')
 
-    tier = '0-2'
     jobs = max(1, args.jobs)
-    shard_order = 'reverse' if args.reverse_shards else 'forward'
-
     log_dir = _prepare_log_dir()
+    if args.select:
+        sys.exit(_run_selected(args, jobs, log_dir))
+    sys.exit(_run_full(args, jobs, log_dir))
 
-    # Brackets discovery and shard planning as well as the run itself. Both of those are our
-    # own CPU, which cancels out of the busy-minus-own subtraction, so the figure stays a
-    # measure of OTHER work - it is only the denominator (total_wall) that is a shade short.
-    started_utc = datetime.now(timezone.utc).isoformat(timespec='seconds')
-    cpu_before = _cpu_snapshot()
 
-    if jobs == 1:
-        # The original single-process path: one discover, one runner, no worker pipe. The
-        # only addition is the capture tee, since there is no `_pump` here to intercept.
-        loader = unittest.TestLoader()
-        suite = loader.discover(os.path.join(_REPO, 'tests'), pattern='test_*.py')
-        log_fh = _open_log(log_dir, 'run.log')
-        runner = unittest.TextTestRunner(
-            resultclass=_TimingResult, verbosity=2,
-            stream=_Tee(sys.stderr, log_fh) if log_fh is not None else sys.stderr,
-        )
-        t0 = time.perf_counter()
-        try:
-            result = runner.run(suite)
-        finally:
-            if log_fh is not None:
-                log_fh.close()
-        merged = {
-            'total_wall': time.perf_counter() - t0,
-            'test_count': result.testsRun,
-            'skipped': len(result.skipped),
-            'failures': len(result.failures),
-            'errors': len(result.errors),
-            'per_module': _per_module(result.timings),
-            'fixtures': {k: v for k, v in result.fixtures.items() if v >= 0.05},
-            'failed_ids': _failed_ids(result),
-            'successful': result.wasSuccessful(),
-        }
-    else:
-        modules = _discover_modules()
-        weights = _module_weights(modules, _load_history())
-        shards, load = _pack_shards(modules, jobs, weights, reverse=args.reverse_shards)
-        _assert_no_module_was_dropped(modules, shards)
-        print(f'{STATUS_PREFIX} {len(modules)} modules over {len(shards)} shards, '
-              f'planned {[round(x) for x in load]}s', file=sys.stderr, flush=True)
-        merged = _run_sharded(shards, log_dir)
-        jobs = len(shards)
+def _history_path(args):
+    """The whole-suite history this run reads and appends to. A `--history` file that does
+    not exist yet starts as a copy of the committed one, so its baseline is warm from the
+    first run (the nightly keeps its own, since its checkout is gone by morning)."""
+    path = getattr(args, 'history', None)
+    if not path:
+        return HISTORY_PATH
+    if not os.path.exists(path) and os.path.exists(HISTORY_PATH):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        shutil.copy(HISTORY_PATH, path)
+    return path
 
+
+def _measure(started_utc, cpu_before, merged):
+    """The record fields every run shares, measured now that `merged` has finished."""
     cpu_after = _cpu_snapshot()
     foreign = _foreign_cpu(cpu_before, cpu_after, merged['total_wall'])
     stolen = _stolen_cpu(cpu_before, cpu_after, merged['total_wall'])
@@ -1058,11 +1097,6 @@ def main(argv=None):
         'started_utc': started_utc,
         'git_commit': commit,
         'git_dirty': dirty,
-        'tier': tier,
-        'jobs': jobs,
-        # Only meaningful when jobs > 1. A reverse run is a correctness check, not a
-        # performance measurement - see _passing_same_tier.
-        'shard_order': shard_order,
         'host': platform.node(),
         'python': platform.python_version(),
         'total_wall': round(merged['total_wall'], 2),
@@ -1095,17 +1129,10 @@ def main(argv=None):
         # the full subTest suffix, which is what a developer debugging the red run needs,
         # while the committed file gets only bare ids.
         record['failed_ids'] = _history_safe_ids(failed_ids)[:MAX_FAILED_IDS]
+    return record
 
-    # Baseline is computed from prior runs only; this run is appended afterward so it does
-    # not compare against itself. A failed run is still recorded (for history) but never
-    # feeds a future baseline (_passing_same_tier filters it out).
-    prior_passing = _passing_same_tier(_load_history(), tier, jobs, shard_order)
-    line = _status_line(record, prior_passing)
-    try:
-        _append_history(record)
-    except OSError as e:
-        line += f"  (history write failed: {e})"
 
+def _report(line, failed_ids, log_dir):
     # Named before the status line, never folded into it: the status line is the one an
     # agent relays verbatim, and burying a failure list inside it would cost it that job.
     for tid in failed_ids:
@@ -1113,11 +1140,279 @@ def main(argv=None):
     if log_dir:
         print(f'{STATUS_PREFIX} output captured to '
               f'{os.path.relpath(log_dir, _REPO)}/', file=sys.stderr, flush=True)
-
     print(line, file=sys.stderr, flush=True)
 
+
+def _run_full(args, jobs, log_dir):
+    """The whole suite: one comparable record in the whole-suite history, and with `--map`
+    the test map. Returns the exit code."""
+    tier = FULL_TIER
+    shard_order = 'reverse' if args.reverse_shards else 'forward'
+    history_path = _history_path(args)
+    mapping = bool(getattr(args, 'map', None))
+
+    # Brackets discovery and shard planning as well as the run itself. Both of those are our
+    # own CPU, which cancels out of the busy-minus-own subtraction, so the figure stays a
+    # measure of OTHER work - it is only the denominator (total_wall) that is a shade short.
+    started_utc = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    cpu_before = _cpu_snapshot()
+
+    if jobs == 1 and not mapping:
+        # The original single-process path: one discover, one runner, no worker pipe. The
+        # only addition is the capture tee, since there is no `_pump` here to intercept.
+        loader = unittest.TestLoader()
+        suite = loader.discover(os.path.join(_REPO, 'tests'), pattern='test_*.py')
+        log_fh = _open_log(log_dir, 'run.log')
+        runner = unittest.TextTestRunner(
+            resultclass=_TimingResult, verbosity=2,
+            stream=_Tee(sys.stderr, log_fh) if log_fh is not None else sys.stderr,
+        )
+        t0 = time.perf_counter()
+        try:
+            result = runner.run(suite)
+        finally:
+            if log_fh is not None:
+                log_fh.close()
+        merged = {
+            'total_wall': time.perf_counter() - t0,
+            'test_count': result.testsRun,
+            'skipped': len(result.skipped),
+            'failures': len(result.failures),
+            'errors': len(result.errors),
+            'per_module': _per_module(result.timings),
+            'fixtures': {k: v for k, v in result.fixtures.items() if v >= 0.05},
+            'failed_ids': _failed_ids(result),
+            'successful': result.wasSuccessful(),
+        }
+    else:
+        modules = _discover_modules()
+        weights = _module_weights(modules, _load_history(history_path))
+        shards, load = _pack_shards(modules, jobs, weights, reverse=args.reverse_shards)
+        _assert_no_module_was_dropped(modules, shards)
+        print(f'{STATUS_PREFIX} {len(modules)} modules over {len(shards)} shards, '
+              f'planned {[round(x) for x in load]}s', file=sys.stderr, flush=True)
+        merged = _run_sharded(shards, log_dir, mapping=mapping)
+        jobs = len(shards)
+
+    record = _measure(started_utc, cpu_before, merged)
+    record['tier'] = tier
+    record['jobs'] = jobs
+    # Only meaningful when jobs > 1. A reverse run is a correctness check, not a
+    # performance measurement - see _passing_same_tier.
+    record['shard_order'] = shard_order
+    if mapping:
+        # The recorder costs a little; a record that carried it says so, so a reader can
+        # tell a mapped run from a plain one (the nightly's are mapped).
+        record['mapped'] = True
+
+    # Baseline is computed from prior runs only; this run is appended afterward so it does
+    # not compare against itself. A failed run is still recorded (for history) but never
+    # feeds a future baseline (_passing_same_tier filters it out).
+    prior_passing = _passing_same_tier(_load_history(history_path), tier, jobs, shard_order,
+                                       mapped=mapping)
+    line = _status_line(record, prior_passing)
+    try:
+        _append_history(record, history_path)
+    except OSError as e:
+        line += f"  (history write failed: {e})"
+    if mapping:
+        line += _write_map(args.map, merged, record)
+
+    _report(line, merged.get('failed_ids', []), log_dir)
     # Timing is non-fatal: exit code mirrors the unittest result, never the timing check.
-    sys.exit(0 if merged['successful'] else 1)
+    return 0 if merged['successful'] else 1
+
+
+def _tracked_files():
+    try:
+        out = subprocess.run(['git', 'ls-files', '-z'], cwd=_REPO, capture_output=True,
+                             timeout=60).stdout.decode('utf-8', 'replace')
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return set(filter(None, out.split('\0'))) or None
+
+
+MAP_VERSION = 2
+
+
+def _map_index(per_module, tracked):
+    """The workers' per-module records turned round: for each file, which modules touched it
+    at all (`any`), opened it as text (`open`) and ran each of its functions (`fn`); for each
+    listed folder, which modules listed it. A set of modules is a bitmask over the sorted
+    module list, written as hex - most functions are run by hundreds of modules, and a list
+    of names for each would make the map tens of megabytes."""
+    names = sorted(per_module)
+    files, dirs = {}, {}
+
+    def entry(f):
+        return files.setdefault(f, {'any': 0, 'open': 0, 'fn': {}})
+
+    for i, mod in enumerate(names):
+        bit = 1 << i
+        rec = per_module[mod]
+        for f in rec.get('opened', ()):
+            if tracked is None or f in tracked:
+                e = entry(f)
+                e['any'] |= bit
+                e['open'] |= bit
+        for f, quals in rec.get('code', {}).items():
+            if tracked is None or f in tracked:
+                e = entry(f)
+                e['any'] |= bit
+                for q in quals:
+                    e['fn'][q] = e['fn'].get(q, 0) | bit
+        for d in rec.get('dirs', ()):
+            dirs[d] = dirs.get(d, 0) | bit
+    return names, {
+        f: {'any': format(e['any'], 'x'), 'open': format(e['open'], 'x'),
+            'fn': {q: format(m, 'x') for q, m in sorted(e['fn'].items())}}
+        for f, e in sorted(files.items())}, {d: format(m, 'x') for d, m in sorted(dirs.items())}
+
+
+def _write_map(path, merged, record):
+    """Write the test map; the text appended to the status line saying it did, or why not."""
+    names, files, dirs = _map_index(merged.get('map') or {}, _tracked_files())
+    data = {'version': MAP_VERSION, 'built_utc': record['ts_utc'],
+            'commit': record['git_commit'], 'dirty': record['git_dirty'],
+            'test_count': record['test_count'],
+            'red': bool(record['failures'] or record['errors']),
+            'modules': names, 'files': files, 'dirs': dirs}
+    modules = names
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as e:
+        return f'; test map NOT written ({e})'
+    return f'; test map of {len(modules)} modules written to {path}'
+
+
+def _last_red_modules(head):
+    """Test modules the newest run named as red, when that run was on this commit: the ones a
+    retry must prove fixed first. Read from both histories, since either kind of run can be
+    the last. A red run on another commit belongs to other work and is ignored."""
+    newest = None
+    for path in (HISTORY_PATH, SELECTED_HISTORY_PATH):
+        for record in _load_history(path):
+            if newest is None or record.get('ts_utc', '') > newest.get('ts_utc', ''):
+                newest = record
+    if (not newest or not (newest.get('failures') or newest.get('errors'))
+            or newest.get('git_commit') != head):
+        return set()
+    found = set()
+    for tid in newest.get('failed_ids', []):
+        m = FAILED_MODULE_RE.search(tid)
+        if m:
+            found.add(m.group(1))
+    return found
+
+
+def _read_select(path):
+    try:
+        with open(path, encoding='utf-8') as fh:
+            spec = json.load(fh)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f'{STATUS_PREFIX} FATAL --select {path} could not be read ({e})')
+    if not isinstance(spec, dict):
+        raise SystemExit(f'{STATUS_PREFIX} FATAL --select {path} is not a JSON object')
+    return {'all': bool(spec.get('all')), 'first': list(spec.get('first') or []),
+            'modules': list(spec.get('modules') or []), 'why': str(spec.get('why') or '')}
+
+
+def _merge_phases(a, b):
+    out = dict(a)
+    for key in ('test_count', 'skipped', 'failures', 'errors', 'total_wall'):
+        out[key] = a[key] + b[key]
+    for key in ('per_module', 'fixtures'):
+        out[key] = dict(a[key])
+        for k, v in b[key].items():
+            out[key][k] = out[key].get(k, 0.0) + v
+    out['failed_ids'] = sorted(set(a['failed_ids']) | set(b['failed_ids']))
+    out['successful'] = a['successful'] and b['successful']
+    return out
+
+
+def _selected_line(record, n_modules, n_all, why, first, stopped):
+    total = record['total_wall']
+    text = (f"{STATUS_PREFIX} INFO selected run: {record['test_count']} tests from {n_modules} "
+            f"of {n_all} modules in {total:.1f}s{_facts_text(record)}")
+    if first:
+        text += f"; {first} run first{' and were red, so the rest did not run' if stopped else ''}"
+    return text + f" - {why}; a selected run is not judged against the whole suite's baseline"
+
+
+def _run_selected(args, jobs, log_dir):
+    """`--select`: the first part (the spec's own and the last red run's modules), then the
+    rest, as one record in the selected history. A first part that is red ends the run: the
+    rest would only take minutes to say nothing new. A selection that is most of the suite's
+    measured time, or `all`, runs the whole suite after the first part instead."""
+    spec = _read_select(args.select)
+    modules = _discover_modules()
+    known = set(modules)
+    unknown = sorted(m for m in spec['first'] + spec['modules'] if m not in known)
+    if unknown:
+        raise SystemExit(f'{STATUS_PREFIX} FATAL --select names modules that do not exist: '
+                         f'{unknown[:10]}')
+    commit, _dirty = _git_info()
+    red = _last_red_modules(commit) & known
+    first = sorted(set(spec['first']) | red)
+    weights = _module_weights(modules, _load_history(_history_path(args)))
+    chosen = set(first) | set(spec['modules'])
+    share = sum(weights[m] for m in chosen) / (sum(weights.values()) or 1.0)
+    promote = spec['all'] or share >= PROMOTE_SHARE
+    why = spec['why'] or 'selected'
+
+    started_utc = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    cpu_before = _cpu_snapshot()
+    merged = None
+    if first:
+        what = []
+        if red:
+            what.append(f'{len(red)} the last red run named')
+        if set(spec['first']) - red:
+            what.append(f'{len(set(spec["first"]) - red)} changed')
+        print(f'{STATUS_PREFIX} first: {len(first)} module(s) ({", ".join(what)})',
+              file=sys.stderr, flush=True)
+        shards, _load = _pack_shards(first, min(jobs, len(first)), weights)
+        merged = _run_sharded(shards, log_dir, tag='first-')
+        if not merged['successful']:
+            record = _measure(started_utc, cpu_before, merged)
+            record.update(tier=SELECTED_TIER, jobs=len(shards), modules=len(first))
+            line = _selected_line(record, len(first), len(modules), why, len(first), True)
+            try:
+                _append_history(record, SELECTED_HISTORY_PATH)
+            except OSError as e:
+                line += f'  (history write failed: {e})'
+            _report(line, merged['failed_ids'], log_dir)
+            return 1
+
+    if promote:
+        reason = ('asked for the whole suite' if spec['all'] else
+                  f'the selection is {share * 100:.0f}% of the suite\'s measured time')
+        print(f'{STATUS_PREFIX} running the whole suite: {reason} ({why})',
+              file=sys.stderr, flush=True)
+        return _run_full(args, jobs, log_dir)
+
+    rest = sorted(chosen - set(first))
+    if rest:
+        shards, load = _pack_shards(rest, min(jobs, len(rest)), weights)
+        print(f'{STATUS_PREFIX} {len(rest)} selected modules over {len(shards)} shards, '
+              f'planned {[round(x) for x in load]}s', file=sys.stderr, flush=True)
+        second = _run_sharded(shards, log_dir)
+        merged = second if merged is None else _merge_phases(merged, second)
+    if merged is None:
+        raise SystemExit(f'{STATUS_PREFIX} FATAL --select named no modules to run')
+    record = _measure(started_utc, cpu_before, merged)
+    record.update(tier=SELECTED_TIER, jobs=min(jobs, len(chosen)), modules=len(chosen))
+    line = _selected_line(record, len(chosen), len(modules), why, len(first), False)
+    try:
+        _append_history(record, SELECTED_HISTORY_PATH)
+    except OSError as e:
+        line += f'  (history write failed: {e})'
+    _report(line, merged['failed_ids'], log_dir)
+    return 0 if merged['successful'] else 1
 
 
 if __name__ == '__main__':
