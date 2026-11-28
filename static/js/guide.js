@@ -3094,15 +3094,15 @@ function renderLifecycleBadge(ch) {
 }
 
 // Shared by the "Missing" pill's tooltip and the mobile channel sheet's Status line
-// (openChannelSheet) so the two surfaces never disagree about whether a re-point recovery
+// (openChannelSheet) so the two surfaces never disagree about whether a replacement
 // exists - both read the same server-computed lifecycle_repoint_available (dev/changelog/627),
 // never re-derive it client-side. Worded per surface: the sheet already has its own "Open
 // channel" button, desktop has to name the click target itself.
 function repointHint(ch, sheet) {
   if (!ch.lifecycle_repoint_available) return '';
   return sheet
-    ? ' It is also a duplicate stream URL - tap Open channel below to re-point it to the duplicate.'
-    : '\nIt is also a duplicate stream URL - click the channel name to open its page and re-point it to the duplicate.';
+    ? ' It is also a duplicate stream URL - tap Open channel below to replace it with the duplicate.'
+    : '\nIt is also a duplicate stream URL - click the channel name to open its page and replace it with the duplicate.';
 }
 
 // Where a group row's listings come from when that is anything other than the member it

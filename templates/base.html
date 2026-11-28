@@ -117,6 +117,11 @@
     {# No separate Health Checks link (DESIGN.md §14.1) - health checks live on the
        Channel Groups tab now, alongside channel groups. #}
     <a class="nav-link{% if on['groups'] %} active{% endif %}" href="{{ url_for('channel_groups.groups_page') }}">{{ icon('group', 'nav-i') }}<span class="nav-t">Channel Groups</span></a>
+    {# Channels the last sync stopped listing, waiting to be replaced
+       (DESIGN-channel-successors.md section 9). Drawn only while there are some. #}
+    {% if nav_replacements or ep == 'replacements.review_page' %}
+    <a class="nav-link{% if ep == 'replacements.review_page' %} active{% endif %}" href="{{ url_for('replacements.review_page') }}">{{ icon('replace', 'nav-i') }}<span class="nav-t">Replacements</span> <span class="nav-count nav-count-replacements" data-tip="Channels in your groups or guide that their account's last sync did not list."{% if not nav_replacements %} style="display:none"{% endif %}>{{ nav_replacements }}</span></a>
+    {% endif %}
     {# Hide rules, under the name of what they do. The Channels hub's tabs are on their way
        out, so a tab there would be a destination with no menu entry (dev/changelog/782). #}
     <a class="nav-link{% if on['hide'] %} active{% endif %}" href="{{ url_for('channel_hide_rules.hide_rules_page') }}">{{ icon('nav-hide-rules', 'nav-i') }}<span class="nav-t">Hide Channels</span></a>

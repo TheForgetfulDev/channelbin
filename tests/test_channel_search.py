@@ -48,8 +48,8 @@ from app.database import (AccountSyncLog, Channel, ChannelGroup,  # noqa: E402
 from app.channel_search import (  # noqa: E402
     DEFAULT_FIELDS, DEFAULT_SORT, DEFAULT_STANDING, GRAIN_AIRINGS, GROUP_ANY,
     HEALTH_VALUES, MAX_PAGE_SIZE, OTHER_DUP_URL, OTHER_GUIDE_OWN_ROW, OTHER_GUIDE_VIA_GROUP,
-    OTHER_IN_GUIDE, OTHER_MONITORED, OTHER_NEW, OTHER_PROVIDER, OTHER_REMOVED,
-    OTHER_SOURCE_OVERRIDE, OTHER_VALUES,
+    OTHER_IN_GUIDE, OTHER_MONITORED, OTHER_NEW, OTHER_PROVIDER, OTHER_REMOVED, OTHER_REPLACED,
+    OTHER_SOURCE_OVERRIDE, OTHER_UNLISTED, OTHER_VALUES,
     STANDING_OPTIONS, DimensionFilter, SearchContext, SearchState, SearchStateError,
     search, standing_applied)
 from app.search_index import rebuild_search_indexes  # noqa: E402
@@ -1310,7 +1310,8 @@ class FacetCountTests(_EngineTestCase):
         self.assertEqual(sorted(empty['health']), sorted(HEALTH_VALUES))
         self.assertEqual(set(empty['health'].values()), {0})
         self.assertEqual(empty['other'],
-                         {OTHER_REMOVED: 0, OTHER_NEW: 0, OTHER_IN_GUIDE: 0,
+                         {OTHER_REMOVED: 0, OTHER_NEW: 0, OTHER_UNLISTED: 0, OTHER_REPLACED: 0,
+                          OTHER_IN_GUIDE: 0,
                           OTHER_GUIDE_OWN_ROW: 0, OTHER_GUIDE_VIA_GROUP: 0, OTHER_DUP_URL: 0,
                           OTHER_PROVIDER: 0, OTHER_MONITORED: 0, OTHER_SOURCE_OVERRIDE: 0})
         # Spelled out rather than built from OTHER_VALUES on purpose: this is the assertion

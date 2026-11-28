@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% from "_macros.html" import page_about %}
+{% block title %}Replacements - ChannelBin{% endblock %}
+
+{#  Replacements (DESIGN-channel-successors.md section 9, mockup 66 approved in
+    dev/changelog/1789). Proposals only: nothing moves until a person accepts, and every
+    accept is re-checked on the server (channel_successors.accept). One row per old channel,
+    not per membership, because a replacement moves every group the channel is in. The rows
+    are drawn by replacements.js from the boot block below, which the server reads in a fixed
+    number of queries (tests/test_scaling_pages.py). #}
+
+{% block content %}
+<div class="page-head">
+  <h1>Replacements</h1>
+</div>
+{% call page_about() %}
+  Channels in your groups that their account's last sync did not list. When a playlist changes
+  source or a provider renumbers its channels, every channel comes back as a new row, and your
+  groups stay on the old ones. Each one here is matched to a listed channel carrying the same
+  stream. Nothing changes until you accept, and the old channel is kept with its recordings and
+  tests.
+{% endcall %}
+
+<div id="rs-main">
+{% if not payload.rows %}
+<div class="empty-state">
+  <p>Every channel in your groups was in its account's last sync.</p>
+  <p class="text-muted">Nothing to replace.</p>
+</div>
+{% else %}
+<div class="card rs-carry">
+  <div class="card-head"><h2>When you accept</h2></div>
+  <div class="card-body">
+    <div class="rs-target">
+      <label for="rs-target">Replace with channels from</label>
+      <select class="form-control" id="rs-target">
+        {% for t in payload.targets %}<option value="{{ t.v }}">{{ t.label }}</option>{% endfor %}
+      </select>
+      <span class="text-faint small">Only accounts on the same provider are offered: two providers share stream ids by chance.</span>
+    </div>
+    <p class="page-intro">The new channel takes the old one's place in each of its groups, with its Recording and Health check switches. Also bring over:</p>
+    <div class="carry-grid">
+      {% for p in payload.carry %}
+      <label class="tip-plain" data-tip="{{ p.label }}.&#10;{{ p.tip }}"><input type="checkbox" data-carry="{{ p.k }}" checked> {{ p.label }}</label>
+      {% endfor %}
+    </div>
+    <p class="text-faint small">A value the new channel already has is never overwritten. Each row says what it would bring over and what the new channel keeps.</p>
+  </div>
+</div>
+
+<div class="toolbar">
+  <div class="chips" id="rs-filter-chips">
+    <div class="menu-wrap">
+      <button class="chip" data-menu type="button">+ Filter</button>
+      <div class="menu pop-left" id="rs-filter-menu"></div>
+    </div>
+  </div>
+  <span class="text-muted small rs-count" id="rs-count"></span>
+</div>
+<div class="toolbar rs-bar">
+  <label class="rs-all"><input type="checkbox" data-act="select-all"> Select all</label>
+  <button class="btn btn-sm btn-primary" data-act="accept-selected" disabled>Accept selected</button>
+  <button class="btn btn-sm tip-plain" data-act="accept-all" disabled
+          data-tip="Accept all.&#10;Accept every row with one replacement, under these filters. Rows that need a choice or have no match are skipped.">Accept all</button>
+  <span class="text-faint small" id="rs-stats"></span>
+</div>
+<div class="table-scroll">
+  <table class="tbl tbl-cards">
+    <thead><tr><th></th><th>Not in the last sync</th><th>In groups</th><th>Replace with</th><th>Brings over</th><th></th></tr></thead>
+    <tbody id="rs-tbody"></tbody>
+  </table>
+</div>
+{% endif %}
+</div>
+
+<script type="application/json" id="rs-boot">{{ {'payload': payload, 'group': group_filter} | tojson }}</script>
+
+<style>
+  .rs-carry { margin-bottom: 1rem; }
+  .rs-target { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 0.75rem; margin-bottom: 0.75rem; }
+  .rs-target label { font-weight: 600; }
+  .rs-target .form-control { width: auto; max-width: 100%; }
+  .rs-count { margin-left: auto; }
+  .rs-bar { flex-wrap: wrap; gap: 0.5rem; margin: 0.25rem 0 0.75rem; }
+  .rs-all { margin-right: 0.5rem; }
+  /* duplicated from templates/epg_source_review.html's .nm-group - the same account header row */
+  .rs-acct td { font-weight: 600; background: var(--bg2); }
+  .rs-acts { white-space: nowrap; }
+  .rs-choose { display: flex; flex-direction: column; gap: 0.25rem; }
+  .rs-choose-h { color: var(--warn); }
+  .rs-opt { display: block; }
+  .rs-opt input { margin-right: 0.35rem; }
+  .rs-pick, .rs-rechoose { margin-top: 0.3rem; }
+  .rs-picked td { background: var(--accent-soft); }
+  .rs-pick-list { list-style: none; margin: 0.5rem 0 0; padding: 0; max-height: 50vh; overflow-y: auto; }
+  .rs-pick-list li { padding: 0.35rem 0; border-top: 1px solid var(--border-soft); }
+  .rs-pick-list label { display: flex; gap: 0.5rem; align-items: baseline; }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/filter-bar.js') }}"></script>
+<script src="{{ url_for('static', filename='js/replacements.js') }}"></script>
+{% endblock %}

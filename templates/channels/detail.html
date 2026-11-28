@@ -27,6 +27,12 @@
    it used to be pinned at 88px here, which is a value coupled to guide.js's own
    computeRowHeight() and to .guide-program's height, and the approved design says the row
    sizes to its tallest cell like every other guide row does. */
+/* A test or recording of the channel this one replaced, counted while its history is
+   (DESIGN-channel-successors.md section 9), and the Count its history switch's label. */
+tr.cd-inherited td { background: var(--bg2); }
+.cd-switchlbl { display: inline-flex; align-items: center; gap: 0.5rem; }
+.cd-scores { display: flex; flex-wrap: wrap; gap: 0.75rem 2rem; margin: 0.5rem 0; }
+.cd-choose { display: flex; flex-direction: column; gap: 0.25rem; margin-bottom: 0.5rem; }
 
 /* Guide source card: Set key / Clear key under a source's key, and the Set key dialog's
    lookup results (static/js/channel-detail.js::openEpgKeyModal). */
@@ -292,13 +298,31 @@
    say so rather than reading the placeholder as a test that measured nothing
    (dev/changelog/1289). #}
 {% set testing_now = latest_test is not none and latest_test.id == in_progress_test_id %}
+{# Replacements (DESIGN-channel-successors.md section 9): replaced, then missing, then not in
+   the last sync - three facts, each named, ahead of the health states. #}
+{% set sr = succession.replaced_by %}
+{% set offer = succession.offer %}
 <div class="gd-actionbar" id="cd-statusbar" data-hc-sig="{{ hc_sig }}">
-  {% if lifecycle_state == 'missing' %}
+  {% if sr %}
+  <span class="badge b-auto">Replaced</span>
+  <span class="gd-ab-msg">
+    Replaced by {% if sr.new %}<a href="{{ url_for('channels.channel_detail', channel_id=sr.new.id) }}">{{ sr.new.name }}</a> on {{ sr.new.account.name if sr.new.account else 'a deleted account' }}{% else %}a deleted channel{% endif %}, {{ sr.accepted_at | local_date }}.
+    {% if sr.carried %}It brought over {{ sr.carried | join(', ') }}.{% endif %}
+    This channel keeps its recordings and tests.
+  </span>
+  {% elif lifecycle_state == 'missing' %}
   <span class="badge b-warn">Missing from feed</span>
   <span class="gd-ab-msg">
     {{ channel.account.name }} stopped listing this channel on {{ lifecycle_since | local_date }}.
-    {% if repoint_candidate %}The same stream is available elsewhere - see Recovery available below.
+    {% if offer and offer.matches %}The same stream is listed again - see Replacement available below.
     {% else %}The stored URL may still play, but it will not come back on its own.{% endif %}
+  </span>
+  {% elif offer is not none %}
+  <span class="badge b-warn">Not in last sync</span>
+  <span class="gd-ab-msg">
+    {{ channel.account.name }}'s last sync did not list this channel.
+    {% if offer.matches %}The same stream is listed again - see Replacement available below.
+    {% else %}The stored URL may still play, but nothing updates it.{% endif %}
   </span>
   {% elif latest_test is none and final_health_score is none %}
   <span class="badge b-abort">Never tested</span>
@@ -397,9 +421,9 @@
         {% else %}
         <button class="menu-item" data-act="hide-channel" data-override="true">Hide channel</button>
         {% endif %}
-        {% if repoint_candidate %}
+        {% if offer and offer.matches %}
         <div class="sep"></div>
-        <button class="menu-item" data-act="repoint">{{ icon('repoint') }} Re-point channel&hellip;</button>
+        <button class="menu-item" data-act="replace">{{ icon('replace') }} Replace channel&hellip;</button>
         {% endif %}
         {# Offered only while the provider has stopped listing this channel. Deleting one
            the provider still serves would be undone by the next sync, which upserts on
@@ -413,6 +437,26 @@
     </span>
   </div>
 </div>
+{# ── Continues the history of ... (DESIGN-channel-successors.md section 6) ──────────
+     One bar per replacement this channel took, with the link's health switch: the score
+     reads the old channel's history through the link, so turning it off replays the score
+     without it and turning it on brings it back. #}
+{% for cont in succession.continues %}
+<div class="gd-actionbar">
+  <span class="badge b-auto">{{ 'History carried' if cont.health_carried else 'History not counted' }}</span>
+  <span class="gd-ab-msg">
+    Continues the history of {% if cont.old %}<a href="{{ url_for('channels.channel_detail', channel_id=cont.old.id) }}">{{ cont.old_name }}</a>{% else %}{{ cont.old_name }}{% endif %}
+    on {{ cont.old_account_name }} since {{ cont.accepted_at | local_date }}{% if not cont.old %}, deleted since{% endif %}.
+    {% if cont.health_carried %}Its score counts that channel's tests and recordings up to then, listed below with its own.{% else %}Its score counts only its own tests and recordings.{% endif %}
+  </span>
+  <div class="gd-ab-actions">
+    <label class="cd-switchlbl tip-plain" data-tip="Count its history.&#10;On: this channel's score includes {{ cont.old_name }}'s tests and recordings up to {{ cont.accepted_at | local_date }}. Off: only its own. Nothing is deleted either way, so you can switch back.">
+      <span class="small">Count its history</span>
+      <span class="switch"><input type="checkbox" data-act="history" data-link-id="{{ cont.link_id }}"{% if cont.health_carried %} checked{% endif %} aria-label="Count the history of {{ cont.old_name }}"><span class="knob"></span></span>
+    </label>
+  </div>
+</div>
+{% endfor %}
 {# ── Hidden-state bar ───────────────────────────────────────────────────
      Rendered only when there is something to say. Reaching this page directly by id
      always works, hidden or not - this is where you un-hide, so it cannot be a page the
@@ -477,8 +521,8 @@
      builds itself from #cd-kebab's own items (channel-detail.js), so the two can never
      list different actions. #}
 <div class="cd-stickybar">
-  {% if repoint_candidate %}
-  <button type="button" class="btn btn-primary cd-sb-grow" data-act="repoint">{{ icon('repoint') }} Re-point</button>
+  {% if offer and offer.matches %}
+  <button type="button" class="btn btn-primary cd-sb-grow" data-act="replace">{{ icon('replace') }} Replace</button>
   <button type="button" class="btn" data-act="test-now"{% if testing_now %} disabled{% endif %}>{{ icon('test') }} Test</button>
   {% else %}
   <button type="button" class="btn btn-primary cd-sb-grow" data-act="test-now"{% if testing_now %} disabled{% endif %}>{{ icon('test') }} Test now</button>
@@ -491,23 +535,24 @@
   <button type="button" class="btn btn-icon" data-act="actions-sheet" aria-label="More actions">{{ icon('more') }}</button>
 </div>
 
-{# ── Recovery available (DESIGN-sync-resilience.md §6) ────────────────────
-     An accent-bordered card at the top of the body, not a banner (round 1). It is
-     conditional alert chrome, so it is not part of the reorderable set. #}
-{% if repoint_candidate %}
+{# ── Replacement available (DESIGN-channel-successors.md section 9, mockup 66) ─────
+     An accent-bordered card at the top of the body, not a banner. It is conditional alert
+     chrome, so it is not part of the reorderable set. #}
+{% if offer and offer.matches %}
+{% set first = offer.matches[0] %}
 <div class="recovery-card">
-  <div class="rc-head">{{ icon('repoint') }} Recovery available</div>
+  <div class="rc-head">{{ icon('replace') }} Replacement available</div>
   <div class="rc-body">
-    This channel is missing from {{ channel.account.name }}'s synced feed, but the same stream is
-    available as
-    <a href="{{ url_for('channels.channel_detail', channel_id=repoint_candidate.id) }}">{{ repoint_candidate.name }}</a>
-    on <strong>{{ repoint_candidate.account.name }}</strong>. Re-pointing puts that channel in this
-    one's place in its groups and the TV Guide, moves its scheduled recordings, lets its health score
-    count this channel's history, and brings over this channel's notes and settings where that
-    channel has none of its own.
+    {{ channel.account.name }}'s last sync did not list this channel, but the same stream is listed as
+    {% if offer.matches | length == 1 %}<a href="{{ url_for('channels.channel_detail', channel_id=first.id) }}">{{ first.name }}</a> on <strong>{{ first.account }}</strong>{% else %}{{ offer.matches | length }} channels{% endif %}.
+    {% if channel_kind_groups or channel.in_guide %}
+    Replacing puts it in this channel's place in {{ (channel_kind_groups | map(attribute='name') | join(', ')) if channel_kind_groups else 'the TV Guide' }}{{ ' and the TV Guide' if channel_kind_groups and channel.in_guide }}, and can bring over its health history and settings.
+    {% else %}
+    This channel is in no group and has no guide row of its own, so replacing it brings over only its health history and settings.
+    {% endif %}
   </div>
   <div class="rc-actions">
-    <button type="button" class="btn btn-primary btn-sm" data-act="repoint">{{ icon('repoint') }} Re-point to "{{ repoint_candidate.name }}"</button>
+    <button type="button" class="btn btn-primary btn-sm" data-act="replace">{{ icon('replace') }} Replace&hellip;</button>
   </div>
 </div>
 {% endif %}
@@ -1155,8 +1200,10 @@
           </thead>
           <tbody>
             {% for r in recording_observations %}
-            <tr>
-              <td data-label="Completed" class="text-muted small">{{ r.completed_at | local_time if r.completed_at else '--' }}</td>
+            {% set from_name = inherited_names.get(r.channel_id) if r.channel_id != channel.id else none %}
+            <tr{% if from_name %} class="cd-inherited"{% endif %}>
+              <td data-label="Completed" class="text-muted small">{{ r.completed_at | local_time if r.completed_at else '--' }}
+                {% if from_name %}<div class="tip-plain" data-tip="Inherited.&#10;A recording of {{ from_name }} before this channel replaced it. It counts toward this channel's score while Count its history is on.">On {{ from_name }}</div>{% endif %}</td>
               <td data-label="Recording"><a href="{{ url_for('recordings.recording_detail', recording_id=r.id) }}">{{ r.name }}</a></td>
               {#- Label, not the stored enum: this table said ABORTED where the Recordings
                   list said CANCELLED for the same row (dev/changelog/961). -#}
@@ -1222,8 +1269,10 @@
           </thead>
           <tbody>
             {% for t in test_history %}
-            <tr>
-              <td data-label="Tested" class="text-muted small">{{ t.test_started_at | local_time }}</td>
+            {% set from_name = inherited_names.get(t.channel_id) if t.channel_id != channel.id else none %}
+            <tr{% if from_name %} class="cd-inherited"{% endif %}>
+              <td data-label="Tested" class="text-muted small">{{ t.test_started_at | local_time }}
+                {% if from_name %}<div class="tip-plain" data-tip="Inherited.&#10;A test of {{ from_name }} before this channel replaced it. It counts toward this channel's score while Count its history is on; delete it from that channel's page.">On {{ from_name }}</div>{% endif %}</td>
               <td data-label="Status">
                 {% if t.id == in_progress_test_id %}
                 {{ m.status_badge('b-running', 'IN PROGRESS') }}
@@ -1298,7 +1347,7 @@
               <td class="num">
                 {# No delete while the check is still running against this row - the route
                    refuses it too (routes/channels.py::_deletable_test_or_error). #}
-                {% if t.id != in_progress_test_id %}
+                {% if t.id != in_progress_test_id and not from_name %}
                 <span class="menu-wrap">
                   <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for this health check">{{ icon('more') }}</button>
                   <div class="menu pop-left">
@@ -1385,17 +1434,16 @@ window.CHANNEL_DETAIL = {
   {# Drives whether the kebab offers Delete channel. The server re-derives it on both
      requests regardless (dev/changelog/772) - this only decides what is offered. #}
   isMissing: {{ (lifecycle_state == 'missing') | tojson }},
-  repoint: {% if repoint_candidate %}{
-    id: {{ repoint_candidate.id }},
-    name: {{ repoint_candidate.name | tojson }},
-    account: {{ repoint_candidate.account.name | tojson }}
-  }{% else %}null{% endif %},
+  {# The Replace confirm and the Count its history switch (DESIGN-channel-successors.md
+     section 9). The server re-checks every pairing on the accept. #}
+  replace: {{ replace_payload | tojson }},
   urls: {
     notes: '{{ url_for("channels.update_channel_notes", channel_id=channel.id) }}',
     defaultProfile: '{{ url_for("channels.update_channel_default_profile", channel_id=channel.id) }}',
     paceRealtime: '{{ url_for("channels.update_channel_pace_realtime", channel_id=channel.id) }}',
     healthAdjustment: '{{ url_for("channels.update_health_adjustment", channel_id=channel.id) }}',
-    repoint: '/channels/{{ channel.id }}/repoint',
+    replace: '{{ url_for("replacements.accept_api") }}',
+    replaceHealth: '/api/replacements/',  // + link id + /health
     sectionPref: '/api/user-prefs/channel_detail_sections',
     testNow: '/api/channels/{{ channel.id }}/test-now',
     screenshot: '{{ url_for("preview.capture_channel_screenshot", channel_id=channel.id) }}',

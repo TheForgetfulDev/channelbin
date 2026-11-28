@@ -454,6 +454,36 @@ def _seed_search_groups(n):
     db.session.commit()
 
 
+def _seed_replacements(n):
+    """n channels the account's last sync did not list, each with a listed row carrying the
+    same stream, a scheduled recording and an accepted EPG key; every other one is in a group
+    and the rest hold a guide row of their own - the Replacements page
+    (dev/docs/DESIGN-channel-successors.md section 9). Both halves of the stranded set, the
+    proposals, the group chips and every carry fact must be batched, never read per channel."""
+    from app.database import AccountSyncLog, EpgChannelKey, EPG_KEY_ACCEPTED, EPG_KEY_ORIGIN_MANUAL
+    acc = seed.make_account(name='Renumbered')
+    source = seed.make_epg_source(acc)
+    started = datetime.utcnow() - timedelta(hours=1)
+    acc.last_sync_at = started + timedelta(minutes=5)
+    db.session.add(AccountSyncLog(account_id=acc.id, started_at=started,
+                                  completed_at=acc.last_sync_at, status='SUCCESS'))
+    grouped = []
+    for i in range(n):
+        old = seed.make_channel(acc, name=f'Old {i}', notes=f'note {i}', in_guide=bool(i % 2))
+        old.provider_stream_id = str(5000 + i)
+        old.last_seen_at = started - timedelta(hours=2)
+        new = seed.make_channel(acc, name=f'New {i}')
+        new.provider_stream_id = str(5000 + i)
+        new.last_seen_at = started + timedelta(minutes=1)
+        seed.make_recording(status='SCHEDULED', channel_id=old.id)
+        db.session.add(EpgChannelKey(channel_id=old.id, source_id=source.id, key=f'old.{i}',
+                                     origin=EPG_KEY_ORIGIN_MANUAL, status=EPG_KEY_ACCEPTED))
+        if not i % 2:
+            grouped.append(old)
+    seed.make_group(name='Stranded', members=grouped)
+    db.session.commit()
+
+
 def _seed_tags(n):
     """n tags, each carrying two match patterns - the Tags list (dev/changelog/448). The
     patterns cell renders per row off `tag.patterns`, which is a lazy relationship: without
@@ -1230,6 +1260,9 @@ class PageScalingTests(unittest.TestCase):
     def test_tags_page(self):
         self._assert_row_independent(_seed_tags, '/tags')
 
+    def test_replacements_page(self):
+        self._assert_row_independent(_seed_replacements, '/channels/replacements')
+
     def test_hide_rules_page(self):
         self._assert_row_independent(_seed_hide_rules, '/channels/hide-rules')
 
@@ -1499,6 +1532,7 @@ COVERED = {
     'alerts.alert_center': 'test_alerts_page',
     'alerts.ignored_alerts': 'test_ignored_alerts_page',
     'tags.tags_list': 'test_tags_page',
+    'replacements.review_page': 'test_replacements_page',
     'channel_hide_rules.hide_rules_page': 'test_hide_rules_page',
     'auto_rules.rules_page': 'test_rules_page',
     'auto_rules.rule_page': 'test_rule_page',

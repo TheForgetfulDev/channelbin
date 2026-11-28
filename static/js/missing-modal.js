@@ -18,7 +18,8 @@
  *                 'in this group' / 'in this health check' (blank is fine)
  *   previewUrl - GET, returns {buckets, eligible_count, eligible_hidden_count,
  *                 blocked_inuse_count, blocked_inuse, blocked_active_count, blocked_active,
- *                 not_missing_count, not_missing}
+ *                 not_missing_count, not_missing, replacement_waiting_count, replaced_count,
+ *                 replacements_url}
  *   deleteUrl  - POST target for the actual delete
  *   deleteBody - object to JSON-stringify as the delete POST body
  *   emptyText  - the lead sentence when nothing is eligible, i.e. when this dialog is a
@@ -89,7 +90,22 @@ async function openMissingModal(opts) {
       + `${scope}that ${n === 1 ? 'has' : 'have'} not appeared in a sync in a while:</p>`
       + `<ul>${buckets}</ul>`
     : `<p>${escHtml(opts.emptyText || 'Nothing here can be deleted right now.')}</p>`;
-  body.innerHTML = lead + warn
+  /* First, before the count: a channel with a replacement waiting loses its place in its
+     groups and its health history with it, which Replace would have kept
+     (DESIGN-channel-successors.md section 9). A replaced one is said too, because its
+     history moves rather than goes. */
+  let first = '';
+  const waiting = data.replacement_waiting_count || 0;
+  if (waiting) {
+    first += `<div class="notice notice-warn"><strong>${nf(waiting)}</strong> ${waiting === 1 ? 'has' : 'have'} a replacement waiting. `
+      + `Deleting ${waiting === 1 ? 'it' : 'them'} takes ${waiting === 1 ? 'its' : 'their'} place in ${waiting === 1 ? 'its groups' : 'their groups'} and ${waiting === 1 ? 'its' : 'their'} health history with ${waiting === 1 ? 'it' : 'them'}. `
+      + `<a href="${escHtml(data.replacements_url)}">Replace ${waiting === 1 ? 'it' : 'them'} first ${icon('forward')}</a></div>`;
+  }
+  if (data.replaced_count) {
+    const r = data.replaced_count;
+    first += `<div class="notice notice-ok">${nf(r)} ${r === 1 ? 'was' : 'were'} replaced, and ${r === 1 ? 'its' : 'their'} history moves to the channel that replaced ${r === 1 ? 'it' : 'them'}.</div>`;
+  }
+  body.innerHTML = first + lead + warn
     + '<p class="text-muted small">Completed/failed/aborted recordings from these channels are kept '
     + '(name-only); scheduled or in-progress recordings block that channel from this batch entirely.</p>';
   const foot = modal.querySelector('.modal-foot');
