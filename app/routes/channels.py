@@ -22,7 +22,6 @@ from ..accounts import (
     duplicate_groups_within, lifecycle_states_for_channels,
     NORM_DISABLED, resolve_normalization_mode, url_is_normalizable,
     missing_channels_query, next_sync_map, repoint_candidates_for_channels,
-    transfer_channel_state,
 )
 from ..channel_groups import (clear_guide_listings_pins_on, group_channel_ids,
                               report_orphaned_guide_groups)
@@ -1121,10 +1120,13 @@ def toggle_channel(channel_id):
 
 @channels_bp.route('/channels/<int:channel_id>/repoint', methods=['POST'])
 def repoint_channel(channel_id):
-    """Duplicate-repoint recovery action (DESIGN-sync-resilience.md §6): transfer guide/
-    group/schedule/test-enrollment state from a missing-flagged channel to a surviving
-    channel sharing the same stream_url. Server re-validates everything from DB ids - the
-    POST body carries only survivor_channel_id, never DOM-derived state."""
+    """Re-point a missing channel onto a surviving channel with the same stream URL: a
+    replacement (channel_successors.accept(), dev/docs/DESIGN-channel-successors.md section
+    10) that stores its link like any other and carries every piece, the health history
+    included. The body carries only survivor_channel_id; the server re-derives the pairing
+    from database ids and refuses one that is no longer a missing channel and a listed one
+    with the same stream."""
+    from .. import channel_successors as successors
     missing = db.session.get(Channel, channel_id)
     if missing is None:
         return jsonify({'error': 'Channel not found'}), 404
@@ -1144,16 +1146,13 @@ def repoint_channel(channel_id):
     if lifecycle.get(survivor.id, (None, None))[0] == 'missing':
         return jsonify({'error': 'Survivor channel is also missing'}), 409
 
-    @retry_on_locked()
-    def _do_repoint_and_commit():
-        m = db.session.get(Channel, missing.id)
-        s = db.session.get(Channel, survivor.id)
-        result_message = transfer_channel_state(m, s, cfg)
-        db.session.commit()
-        return result_message
-
-    message = _do_repoint_and_commit()
-    return jsonify({'success': True, 'message': message})
+    try:
+        result = successors.accept(missing.id, survivor.id, successors.CARRY_PIECES, cfg=cfg,
+                                   surface=successors.SURFACE_REPOINT)
+    except successors.ReplaceRefused as err:
+        return jsonify({'error': str(err)}), 409
+    return jsonify({'success': True,
+                    'message': f'"{missing.name}" -> "{survivor.name}": {successors.summary(result)}.'})
 
 
 def _missing_days_bucket(days: int) -> str:
@@ -1403,6 +1402,13 @@ def missing_delete():
         if not ids:
             return 0, 0, [], set(), refusal, skipped
         touched_account_ids = {ch.account_id for ch in eligible}
+
+        # First: a replacement link naming one of these moves the history the channel that
+        # replaced it was counting onto that channel, before the tests and events below go
+        # (dev/docs/DESIGN-channel-successors.md section 7) - and before the screenshot paths
+        # are read, so a moved test keeps its file.
+        from ..channel_successors import before_channel_delete
+        before_channel_delete(ids, cfg)
 
         # Screenshot files aren't part of the DB and won't go away with the row
         # (CLAUDE.md "teardown releases everything the create path acquired"), so their

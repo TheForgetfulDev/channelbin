@@ -27,7 +27,7 @@ from ..database import (
 )
 from ..accounts import (
     lifecycle_states_for_channels,
-    tags_matching, transfer_channel_state, transfer_keeper_problem,
+    tags_matching, transfer_keeper_problem,
 )
 from ..channel_groups import (
     blocked_account_ids_now, effective_score, rank_members, suggest_candidates, group_reference_key,
@@ -1895,7 +1895,7 @@ def remove_members(group_id):
     (via `removals`/`transfer`) the Remove Duplicate Channels modal's dedup path, which
     can optionally transfer each removed channel's guide listing/group membership/
     scheduled recordings/health-check enrollment to the channel kept in its place
-    (transfer_channel_state(), the same transfer Re-point uses).
+    (channel_successors.replace() with DEDUP_PIECES, the same writer Re-point uses).
 
     Removing the last recording-enabled member is 15's breach path 3, and it takes the
     same _invariant_gate the two participation routes take - a member leaving empties the
@@ -1904,9 +1904,9 @@ def remove_members(group_id):
 
     The retried unit is the closure below, not the whole view: the removal, the transfer
     and the demotion share one commit, and a retry re-runs exactly that unit from a
-    rolled-back session. transfer_channel_state() is pure database work (guide flags,
-    membership rows, scheduled-recording repoints, event rows) and is safe to re-run from
-    inside it - its own docstring asks to be called only there. What a view-level decorator
+    rolled-back session. replace() is pure database work (guide flags, membership rows,
+    scheduled-recording repoints, event rows) and is safe to re-run from inside it - its
+    own docstring asks to be called only there; its side effects run after the commit. What a view-level decorator
     over a body with more than one commit would do is re-run work that had already landed,
     which is the duplicate-row defect the one-commit-per-closure rule exists for."""
     group = db.session.get(ChannelGroup, group_id)
@@ -1931,6 +1931,8 @@ def remove_members(group_id):
     if err is not None:
         return err
     demoting = bool(state['breaches'] and state['in_guide'])
+    from .. import channel_successors as successors
+    results = []
 
     # One commit, one closure: everything it touches is re-fetched inside, so a lock retry
     # re-runs the whole read-modify-write from fresh rows.
@@ -1941,6 +1943,7 @@ def remove_members(group_id):
         cfg = load_config() if transfer else None
         removed = []
         transferred = []
+        results.clear()     # a retried attempt names only what it moved
         transfer_skipped = []
         # Groups other than this one whose membership a transfer may have deleted - a
         # source channel can belong to several. Checked after the commit, never here.
@@ -1967,7 +1970,8 @@ def remove_members(group_id):
                     transfer_skipped.append({'channel_id': ch.id, 'reason': problem})
                 else:
                     touched_group_ids.update(mm.group_id for mm in ch.group_memberships)
-                    transfer_channel_state(ch, keeper, cfg)
+                    results.append(successors.replace(
+                        ch, keeper, successors.DEDUP_PIECES, successors.SURFACE_DEDUP, cfg=cfg))
                     transferred.append(ch.id)
                     did_transfer = True
             if not did_transfer:
@@ -1979,20 +1983,20 @@ def remove_members(group_id):
         # leave it for guide_listings_member() to ignore and the group page to name.
         if g.guide_listings_channel_id in {c.id for c in removed} | set(transferred):
             set_guide_listings_member(g, None, reason='removed')
-        # Transferred channels get their own event trail from transfer_channel_state()
-        # (guide/scheduled-recording events) - a plain "Removed from channel group" event
-        # here would misdescribe what happened to them, so only genuine removals count.
+        # Transferred channels get their own event trail from replace() (a group event
+        # naming both channels, guide and scheduled-recording events) - a plain "Removed
+        # from channel group" event here would misdescribe what happened to them.
         _grouping_events(removed, g, CHANNEL_UNGROUPED,
                          'Removed from channel group "{group_name}"')
         cancelled = _apply_demotion(g, state) if demoting else []
-        # Transferred channels are already covered - transfer_channel_state() recomputes
-        # both ends itself, because it moves guide rows as well as memberships.
+        # Transferred channels are already covered - replace() recomputes both ends
+        # itself, because it moves guide rows as well as memberships.
         channel_hiding.recompute([ch.id for ch in removed])
         # A transfer changes this group's member set too - the source's membership is
         # reassigned to the keeper or deleted - so the date moves for either outcome,
-        # not only for a plain removal. transfer_channel_state() also touches every
-        # group it moves a membership in, which covers the OTHER groups the source
-        # belonged to; this covers the one the request was aimed at.
+        # not only for a plain removal. replace() also touches every group it moves a
+        # membership in, which covers the OTHER groups the source belonged to; this
+        # covers the one the request was aimed at.
         if removed or transferred:
             touch_group(g)
         db.session.commit()
@@ -2000,6 +2004,7 @@ def remove_members(group_id):
                 touched_group_ids - {group_id})
 
     removed_ids, transferred, transfer_skipped, cancelled, touched = _remove()
+    successors.after_commit(results)
     deregister_cancelled_recordings(cancelled)
     # A transfer can also strip the last recording-enabled member out of some OTHER group
     # the source channel belonged to - one nobody is looking at and cannot be prompted

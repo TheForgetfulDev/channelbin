@@ -3392,7 +3392,7 @@ def live_count_for(feed_id: int) -> int:
 
 # ── The switch ─────────────────────────────────────────────────────────────────────────────
 
-def set_on_output(kind: str, row_id: int, on: bool):
+def set_on_output(kind: str, row_id: int, on: bool, why: str = None):
     """Take a channel, a group or a picture-in-picture channel off the IPTV output, or put it back: THE only writer of
     `on_output`, column and event together (the shape of channel_groups.set_participation).
     Mutates and adds the event without committing, so the caller owns the commit and keeps
@@ -3403,7 +3403,9 @@ def set_on_output(kind: str, row_id: int, on: bool):
     switch that did not move logs nothing. The feed id is the row's own and does not move,
     so an IPTV player that cached it finds the same channel when it comes back. A sports
     channel has its own switch (app/sports_feed.py) and is not handled here; a
-    picture-in-picture channel's is its row's, with no event (it has no timeline)."""
+    picture-in-picture channel's is its row's, with no event (it has no timeline). `why` replaces
+    "by hand" in the event when the switch moved as part of another act, such as a replacement
+    carrying it from the channel it replaced (app/channel_successors.py)."""
     from . import db
     from .database import (Channel, ChannelEvent, ChannelGroup, ChannelGroupEvent,
                            OUTPUT_FEED_SWITCHED, PipChannel)
@@ -3435,8 +3437,9 @@ def set_on_output(kind: str, row_id: int, on: bool):
     # followed by a second forget (routes/output_feed.py::_forget_kept_answers), so an ask
     # built between here and the commit is not kept either.
     forget_answers()
-    detail = ('Put back on the IPTV output by hand' if on
-              else 'Taken off the IPTV output by hand. It stays in the TV Guide')
+    how = f'- {why}' if why else 'by hand'
+    detail = (f'Put back on the IPTV output {how}' if on
+              else f'Taken off the IPTV output {how}. It stays in the TV Guide')
     extra = json.dumps({'on_output': on, 'source': 'user'})
     if kind == KIND_CHANNEL:
         db.session.add(ChannelEvent(channel_id=row.id, event_type=OUTPUT_FEED_SWITCHED,

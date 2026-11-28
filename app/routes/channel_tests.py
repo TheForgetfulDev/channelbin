@@ -19,7 +19,7 @@ from ..database import (
 )
 from ..accounts import (
     duplicates_within, duplicate_groups_within, lifecycle_states_for_channels,
-    transfer_channel_state, transfer_keeper_problem,
+    transfer_keeper_problem,
 )
 from ..channel_groups import (effective_score, check_target_channels,
                               set_participation, build_group_with_members,
@@ -1283,8 +1283,8 @@ def remove_duplicate_channels(job_id):
     """Bulk-remove losing duplicate channels from a job (and its ChannelTest history),
     optionally also removing them from the TV Guide, and optionally transferring each
     removed channel's guide listing/group membership/scheduled recordings/health-check
-    enrollment to the channel kept in its place (transfer_channel_state(), the same
-    transfer Re-point uses)."""
+    enrollment to the channel kept in its place (channel_successors.replace() with
+    DEDUP_PIECES, the same writer Re-point uses)."""
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
@@ -1309,15 +1309,18 @@ def remove_duplicate_channels(job_id):
 
     cfg = load_config()
 
+    from .. import channel_successors as successors
     from ..health_recompute import apply_tests_deletion
     from ..recorder import delete_files
+    results = []
 
     @retry_on_locked()
     def _remove_and_commit():
         guide_removed = []
         transferred = []
+        results.clear()     # a retried attempt names only what it moved
         transfer_skipped = []
-        # Transferred channels are not here: transfer_channel_state() recomputes both ends.
+        # Transferred channels are not here: replace() recomputes both ends.
         left_the_group = []
         for r in removals:
             cid = r.get('channel_id')
@@ -1333,7 +1336,8 @@ def remove_duplicate_channels(job_id):
                 if problem:
                     transfer_skipped.append({'channel_id': cid, 'reason': problem})
                 else:
-                    transfer_channel_state(ch, keeper, cfg)
+                    results.append(successors.replace(
+                        ch, keeper, successors.DEDUP_PIECES, successors.SURFACE_DEDUP, cfg=cfg))
                     transferred.append(cid)
                     did_transfer = True
             if not did_transfer:
@@ -1369,6 +1373,7 @@ def remove_duplicate_channels(job_id):
         return guide_removed, transferred, transfer_skipped, screenshot_paths
 
     guide_removed, transferred, transfer_skipped, screenshot_paths = _remove_and_commit()
+    successors.after_commit(results)
     delete_files(screenshot_paths)
     return jsonify({
         'success': True,

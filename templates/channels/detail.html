@@ -501,9 +501,10 @@
     This channel is missing from {{ channel.account.name }}'s synced feed, but the same stream is
     available as
     <a href="{{ url_for('channels.channel_detail', channel_id=repoint_candidate.id) }}">{{ repoint_candidate.name }}</a>
-    on <strong>{{ repoint_candidate.account.name }}</strong>. Re-pointing transfers the guide
-    listing, channel-group assignment, SCHEDULED recordings, and health-check enrollment to that
-    channel.
+    on <strong>{{ repoint_candidate.account.name }}</strong>. Re-pointing puts that channel in this
+    one's place in its groups and the TV Guide, moves its scheduled recordings, lets its health score
+    count this channel's history, and brings over this channel's notes and settings where that
+    channel has none of its own.
   </div>
   <div class="rc-actions">
     <button type="button" class="btn btn-primary btn-sm" data-act="repoint">{{ icon('repoint') }} Re-point to "{{ repoint_candidate.name }}"</button>

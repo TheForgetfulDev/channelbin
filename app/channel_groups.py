@@ -851,6 +851,9 @@ PARTICIPATION_SURFACES = {
     'group_page': None,
     'check_channel_list': "from the health check's channel list",
     'recording_page': "from a running recording's Switch channel dialog",
+    # Carried from the member a replacement merged away (app/channel_successors.py): the
+    # person accepting the replacement asked for it, and the switch only ever turns on.
+    'replace': 'carried over from the channel it replaced',
 }
 
 
@@ -1271,6 +1274,7 @@ GUIDE_LISTINGS_REASONS = {
     'user': 'by hand',
     'removed': 'because {previous} was removed from the group',
     'channel_deleted': 'because {previous} was deleted',
+    'replaced': 'because {previous} was replaced by it',
 }
 
 

@@ -4217,6 +4217,37 @@ def _m157_output_feed_login_lineup_except(conn, cur):
         cur.execute('ALTER TABLE output_feed_logins ADD COLUMN lineup_except TEXT')
     conn.commit()
 
+def _m158_channel_replacements(conn, cur):
+    """channel_replacements: a channel that took the place of one its playlist stopped listing,
+    and ix_channels_provider_stream_id, the index a replacement's candidates are found by
+    (dev/docs/DESIGN-channel-successors.md sections 4 and 5, dev/changelog/1794).
+
+    No backfill and no obligation to register (dev/changelog/686): a replacement is always the
+    user's act, so no row exists until one is accepted. IF NOT EXISTS on both, so re-runnable."""
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS channel_replacements (
+            id               INTEGER NOT NULL,
+            old_channel_id   INTEGER,
+            new_channel_id   INTEGER NOT NULL,
+            accepted_at      DATETIME NOT NULL,
+            match_kind       VARCHAR(16) NOT NULL,
+            health_carried   BOOLEAN NOT NULL,
+            carried          TEXT,
+            old_name         VARCHAR(512) NOT NULL,
+            old_account_name VARCHAR(255),
+            PRIMARY KEY (id),
+            UNIQUE (old_channel_id),
+            FOREIGN KEY(old_channel_id) REFERENCES channels (id),
+            FOREIGN KEY(new_channel_id) REFERENCES channels (id)
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_channel_replacements_new_channel_id '
+                'ON channel_replacements (new_channel_id)')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_channels_provider_stream_id '
+                'ON channels (provider_stream_id)')
+    conn.commit()
+
+
 #: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
 #: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
 #: time; the rebuild test holds step 148's output to this text, and the column list after
@@ -5106,6 +5137,8 @@ SCHEMA_MIGRATIONS = [
           'output login used to have alone', _m156_output_feed_login_switches),
     (157, 'output_feed_logins.lineup_except: the channels each IPTV output login is kept from',
      _m157_output_feed_login_lineup_except),
+    (158, 'channel_replacements + ix_channels_provider_stream_id: a channel that took the place of '
+          'one its playlist stopped listing', _m158_channel_replacements),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

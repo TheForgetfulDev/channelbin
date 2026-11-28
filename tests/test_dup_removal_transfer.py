@@ -4,8 +4,9 @@ Removing a duplicate channel used to just detach it (from a job, a channel group
 guide) with no side effects, silently orphaning its guide listing/group membership/
 scheduled recordings/health-check enrollment. The three removal endpoints now accept an
 optional `transfer` flag (`removals[].keep_channel_id` names the destination per removed
-channel) that reuses transfer_channel_state() - the same transfer Re-point already does -
-without requiring either channel to be lifecycle-'missing'.
+channel) that moves the channel's state through channel_successors.replace() - the same
+writer Re-point uses - without requiring either channel to be lifecycle-'missing'
+(dev/changelog/1794; transfer_channel_state() before it).
 
 Covers:
   - JobRemoveDuplicatesTransferTests: POST .../on-demand/<job_id>/remove-duplicates
@@ -26,7 +27,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
-from app.database import ChannelGroupMember  # noqa: E402
+from app.database import (ChannelGroupEvent, ChannelGroupMember,  # noqa: E402
+                          GROUP_MEMBER_PARTICIPATION, GROUP_MEMBER_REPLACED)
 from tests.support import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 
@@ -134,6 +136,46 @@ class GroupRemoveMembersTransferTests(unittest.TestCase):
 
         db.session.refresh(rec)
         self.assertEqual(rec.channel_id, b.id)
+
+    def test_a_merge_keeps_the_removed_members_switches_and_says_so(self):
+        """Guards dev/docs/BUGS.md 2026-11-28 (dedup merge): when the kept channel is already
+        in the group, the removed member's Recording switch is carried onto it through
+        set_participation() rather than dropped, and the group's timeline names both
+        channels."""
+        a, b = _pair(self.acc)
+        group = seed.make_group(name='G', members=[a, b], disabled={b.id}, in_guide=False)
+        db.session.commit()
+
+        resp = self.t.client.post(
+            f'/api/channel-groups/{group.id}/members/remove',
+            json={'removals': [{'channel_id': a.id, 'keep_channel_id': b.id}],
+                  'transfer': True, 'confirm': True})
+        self.assertEqual(resp.status_code, 200)
+        kept = ChannelGroupMember.query.filter_by(group_id=group.id, channel_id=b.id).one()
+        self.assertTrue(kept.recording_enabled)
+        self.assertEqual(ChannelGroupEvent.query.filter_by(
+            group_id=group.id, event_type=GROUP_MEMBER_PARTICIPATION).count(), 1)
+        self.assertEqual(ChannelGroupEvent.query.filter_by(
+            group_id=group.id, event_type=GROUP_MEMBER_REPLACED).count(), 1)
+
+    def test_a_moved_membership_gets_a_group_event(self):
+        """Guards dev/docs/BUGS.md 2026-11-28 (dedup merge): a membership moved onto the kept
+        channel in another group is on that group's timeline."""
+        a, b = _pair(self.acc)
+        group = seed.make_group(name='G', members=[a, b])
+        other = seed.make_group(name='Other', members=[a], in_guide=False)
+        db.session.commit()
+
+        resp = self.t.client.post(
+            f'/api/channel-groups/{group.id}/members/remove',
+            json={'removals': [{'channel_id': a.id, 'keep_channel_id': b.id}], 'transfer': True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(ChannelGroupMember.query.filter_by(
+            group_id=other.id, channel_id=b.id).count(), 1)
+        ev = ChannelGroupEvent.query.filter_by(group_id=other.id,
+                                               event_type=GROUP_MEMBER_REPLACED).one()
+        self.assertIn('Alpha', ev.detail)
+        self.assertIn('Beta', ev.detail)
 
     def test_plain_channel_ids_payload_still_works(self):
         """Backward compatibility: the plain remove-member action (not dedup) never sends
