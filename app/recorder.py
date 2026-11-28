@@ -1982,6 +1982,11 @@ def _resume_claimed_capture(app, recording_id: int, rec, state: RecordingState, 
                                      REC_STATUS_IN_PROGRESS):
                 db.session.rollback()
                 return False
+            # A wait ends one burst of failures and the next starts its own count. Carried
+            # over, the count gave up on prod recording 88 at its tenth failure with seven of
+            # its retries unused and two hours of its window left (dev/changelog/1793). The
+            # peak keeps the worst burst.
+            r.consecutive_failures = 0
             add_recording_event(recording_id, RECORDING_RESUMED,
                                 detail=f'Retry attempt {r.dead_stream_retry_count} - reconnecting')
             db.session.commit()
@@ -2823,6 +2828,75 @@ def _skipped_game_note(skipped, game) -> str:
             f'{game} at that time: {shown}{more}')
 
 
+@dataclass
+class GameChannels:
+    """game_failover_channels()' answer: the game a recording is of (None when it is of no game
+    played as it airs), its name, and the channels it may move to, in the order to try them."""
+    event: object = None
+    game: str = ''
+    channels: list = field(default_factory=list)
+
+
+def game_failover_channels(rec, exclude_ids=frozenset(), now=None, cfg=None) -> GameChannels:
+    """The channels a recording of a game may move to when its feed dies: the game's channels in
+    the order Record, a rule and a sports channel's play take them (auto_rules.game_sources(),
+    dev/changelog/1793), a group's showing standing for its members with Recording on whose guide
+    may carry the game, those whose guide shows it first and then by health, as the group picks
+    them. Channels act as a channel group for the game while it is on, with nothing stored.
+
+    Only the game as it is played (sports_match.recording_live_game()) and only live listings:
+    every channel here shows the same thing at the same moment, which is what makes it a copy.
+    The game's other listings count, not only the one the recording was made from - prod
+    recording 88 sat on the one channel of its listing while 95 others carried the race on a
+    wider one. A listing must still be on and start no later than GAME_LISTING_LOOK_AHEAD past
+    the recording's program start or now, whichever is later: one starting later shows
+    something else first. `exclude_ids` are left out. One search plus a few queries."""
+    from .auto_rules import PICK_EVENT, PICK_LIVE, game_sources
+    from .channel_groups import member_eager_options
+    from .database import ChannelGroup
+    from .sports_data import event_game_name
+    from .sports_match import recording_live_game
+    event = recording_live_game(rec)
+    if event is None:
+        return GameChannels()
+    game = event_game_name(event)
+    now = now or datetime.utcnow()
+    found = game_sources(event.id, now, cfg)
+    if found is None or found.pick.kind not in (PICK_LIVE, PICK_EVENT):
+        return GameChannels(event, game)
+    horizon = max(now, rec.program_start_time or rec.start_time or now) + GAME_LISTING_LOOK_AHEAD
+    showings = [s for s in found.sources
+                if s.start <= horizon and s.stop > now and s.start < rec.stop_time]
+    group_ids = sorted({s.group_id for s in showings if s.group_id is not None})
+    groups = ({g.id: g for g in ChannelGroup.query.options(*member_eager_options())
+               .filter(ChannelGroup.id.in_(group_ids))} if group_ids else {})
+    single_ids = sorted({s.channel_id for s in showings if s.group_id is None})
+    singles = ({c.id: c for c in Channel.query.filter(Channel.id.in_(single_ids))}
+               if single_ids else {})
+    out, seen = [], set(exclude_ids)
+    for s in showings:
+        if s.group_id is None:
+            picks = [singles.get(s.channel_id)]
+        elif s.group_id in groups:
+            carry = s.carriers or frozenset()
+            picks = sorted((ch for ch in recording_members(groups[s.group_id].memberships)
+                            if s.members is None or ch.id in s.members),
+                           key=lambda ch: (ch.id not in carry, -effective_score(ch)))
+        else:
+            continue
+        for ch in picks:
+            if ch is not None and ch.id not in seen:
+                seen.add(ch.id)
+                out.append(ch)
+    return GameChannels(event, game, out)
+
+
+#: How far past a recording's program start, or now when that is later, a listing of its game may
+#: start and still be one to move to (game_failover_channels()). Two guides can list one game a
+#: few minutes apart, the same allowance a group member's guide gets (sports_match.MEMBER_LOOK_AHEAD).
+GAME_LISTING_LOOK_AHEAD = timedelta(minutes=15)
+
+
 def _members_near(channel, members) -> tuple:
     """(avoid, same_login): the members that share a backend with `channel`. `avoid` is the
     id sets a feed-death failover keeps away from, widest first: everything on its account's
@@ -3088,7 +3162,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
     """
     with app.app_context():
         rec = db.session.get(Recording, recording_id)
-        if rec is None or rec.group_id is None or rec.group is None:
+        if rec is None:
             return False
         state = get_state(recording_id)
         if state is None:
@@ -3096,6 +3170,16 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
 
         manual = target_channel_id is not None
         old_channel = rec.channel
+        if rec.group_id is None or rec.group is None:
+            # No group: a recording of a game still has the game's other channels
+            # (dev/changelog/1793). Only a dead feed moves it; the voluntary moves stay a
+            # group's.
+            if demote or block_move or manual:
+                return False
+            if rec.channel_id is not None:
+                state.failed_member_ids.add(rec.channel_id)
+            return _fail_over_to_game_channel(app, rec, state, reason, old_channel,
+                                              load_config(), score_departure)
         if rec.channel_id is not None and not block_move and not manual:
             if demote:
                 state.demoted_member_ids.add(rec.channel_id)
@@ -3244,7 +3328,10 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
                 return False
             log.warning('Recording %d: group "%s" has no untried members left (%s)',
                         recording_id, rec.group.name, reason)
-            return False
+            # A group recording of a game goes on to the game's channels outside the group
+            # (dev/changelog/1793).
+            return _fail_over_to_game_channel(app, rec, state, reason, old_channel, cfg,
+                                              score_departure)
         # `members` already excludes the failed ones (see above), so this is only the
         # busy-and-not-chosen filter.
         skipped_busy = [ch for ch in members if ch.id in busy and ch.id != best.id]
@@ -3448,6 +3535,163 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
             'manual': manual,
         })
         return True
+
+
+def _fail_over_to_game_channel(app, rec, state, reason: str, old_channel, cfg,
+                               score_departure: bool = True) -> bool:
+    """Move a recording of a game whose feed died onto the next channel carrying the game
+    (game_failover_channels(), dev/changelog/1793): a recording outside a group, or a group
+    recording whose members are used up. True when it moved; the caller relaunches. False when
+    there is no game or nowhere left, and the caller takes its wait or its give-up.
+
+    The order is the game's own, with no ranking of its own beyond the seat a move costs: a free
+    connection first, then one that pauses a picture-in-picture picture, then one that cuts an
+    IPTV player off, as a group's failover prefers. Left out: a channel whose feed already died
+    this run, one on a blocked or switched-off account, and one whose account has no connection
+    this recording could take. A channel failing its health checks is taken only when nothing
+    else is left, and the recording's format pin filters as it does for a group,
+    overridden when nothing matches. No group membership, participation or format lock is
+    read or written: the game's channels are no group. The channel moved off is scored as a
+    group member that died is (apply_failover_health_observation), and the move is a
+    GROUP_FAILOVER event carrying the game, so everything that reads a recording's moves -
+    the health score's per-channel share among them - reads this one too."""
+    from . import connection_limits as connlim
+    from .account_blocks import blocked_account_ids, split_blocked
+    from .account_links import unusable_reasons
+    from .accounts import normalize_url
+    from .routes.channel_tests import _latest_tests_by_channel
+    recording_id = rec.id
+    tried = set(state.failed_member_ids)
+    if rec.channel_id is not None:
+        tried.add(rec.channel_id)
+    if rec.group is not None:
+        # Its own members were the group's to choose, and it chose none of them.
+        tried |= {m.channel_id for m in rec.group.memberships}
+    found = game_failover_channels(rec, frozenset(tried), cfg=cfg)
+    if found.event is None:
+        return False
+    members = found.channels
+    account_ids = {ch.account_id for ch in members}
+    members, skipped_blocked = split_blocked(members, blocked_account_ids(account_ids))
+    switched_off = unusable_reasons(account_ids)
+    standing = connlim.seat_standing(account_ids, 'recording',
+                                     exclude_holder=('recording', recording_id))
+    old_account_id = old_channel.account_id if old_channel is not None else None
+
+    def _can_seat(ch):
+        return ch.account_id == old_account_id or (
+            ch.account_id not in switched_off
+            and standing.get(ch.account_id) != connlim.SEAT_NONE)
+
+    no_seat = [ch for ch in members if not _can_seat(ch)]
+    members = [ch for ch in members if _can_seat(ch)]
+    latest = _latest_tests_by_channel([ch.id for ch in members])
+    pin = recording_format_pin(recording_id)
+    members, pin_override = _pin_eligible_members(members, pin, latest)
+    streak = cfg.get('channel_testing', {}).get('failing_streak_threshold',
+                                                DEFAULT_FAILING_STREAK_THRESHOLD)
+    # Inside the game's order, a channel whose account has a connection free goes first, then
+    # one that pauses a picture-in-picture picture, then one that cuts an IPTV player off - the
+    # group failover's preference (_pick_by_tiers) - and a failing streak only when nothing
+    # else is left. The recording's own account keeps its seat, so it costs nobody anything.
+    seat_rank = {connlim.SEAT_FREE: 0, connlim.SEAT_BY_PAUSING_PICTURE: 1,
+                 connlim.SEAT_BY_CUTTING_VIEWER: 2}
+
+    def _rank(ch):
+        seat = (0 if ch.account_id == old_account_id
+                else seat_rank.get(standing.get(ch.account_id), len(seat_rank)))
+        return (is_streaking(ch, streak), seat)
+
+    order = sorted(members, key=_rank)
+    best = None
+    for ch in order:
+        if old_account_id is not None and ch.account_id != old_account_id:
+            target = ch.account_id
+
+            def _move_seat(target=target):
+                return connlim.move_seat('recording', recording_id, old_account_id, target)
+
+            if not _try_acquire_slot_with_preemption(app, recording_id, target,
+                                                     acquire=_move_seat):
+                no_seat.append(ch)
+                continue
+        best = ch
+        break
+    old_name = old_channel.name if old_channel is not None else '?'
+    if best is None:
+        why = (f'{counted(len(no_seat), "channel")} carrying it had no connection free'
+               if no_seat else 'every channel carrying it was already tried'
+               if not skipped_blocked else 'the rest are on blocked accounts')
+        log.warning('Recording %d: no other channel carrying %s to move to from "%s" - %s (%s)',
+                    recording_id, found.game, old_name, why, reason)
+        return False
+    took_streaking = is_streaking(best, streak)
+    head = (f'Group "{rec.group.name}" has no member left to move to. ' if rec.group is not None
+            else '')
+    detail = (f'{head}Feed "{old_name}" died ({reason}) - moving to "{best.name}" '
+              f'({best.account.name}, score {effective_score(best)}), another channel carrying '
+              f'{found.game}')
+    if took_streaking:
+        detail += (' - it is failing its health checks, but no other channel carrying the game '
+                   'is left')
+    if pin_override:
+        detail += (f' - no channel carrying the game is still recording at {format_label(pin)}, '
+                   f'so this recording changes format part-way through rather than stopping here')
+    if no_seat:
+        detail += (' - passed over for no free connection: '
+                   + ', '.join(f'"{ch.name}" ({ch.account.name})' for ch in no_seat[:3])
+                   + (f' and {len(no_seat) - 3} more' if len(no_seat) > 3 else ''))
+    if skipped_blocked:
+        detail += (' - skipped on a blocked account: '
+                   + ', '.join(f'"{ch.name}" ({ch.account.name})'
+                               for ch in skipped_blocked[:3])
+                   + (f' and {len(skipped_blocked) - 3} more' if len(skipped_blocked) > 3 else ''))
+    log.warning('Recording %d: %s', recording_id, detail)
+
+    @retry_on_locked()
+    def _switch_to_game_channel_and_commit():
+        r = db.session.get(Recording, recording_id)
+        snapshot = {'total_stall_count': r.total_stall_count or 0,
+                    'total_restart_count': r.total_restart_count or 0,
+                    'consecutive_failures_peak': r.consecutive_failures_peak or 0,
+                    'total_downtime_seconds': r.total_downtime_seconds or 0}
+        r.channel_id = best.id
+        r.url = normalize_url(best.stream_url, best.account)
+        r.consecutive_failures = 0
+        add_recording_event(recording_id, GROUP_FAILOVER, detail=detail,
+                            extra={'group_id': r.group_id, 'reason': reason,
+                                   'game_event_id': found.event.id,
+                                   'game_tsdb_id': found.event.tsdb_id,
+                                   'from_channel_id': old_channel.id if old_channel else None,
+                                   'to_channel_id': best.id,
+                                   'to_effective_score': effective_score(best),
+                                   'took_streaking': took_streaking,
+                                   'format_pin': list(pin) if pin else None,
+                                   'pin_override': pin_override,
+                                   'demoted': False, 'block_move': False, 'manual': False,
+                                   'skipped_no_seat_channel_ids': [ch.id for ch in no_seat],
+                                   'skipped_blocked_channel_ids': [
+                                       ch.id for ch in skipped_blocked],
+                                   # Through the channel just left, before the reset above, so
+                                   # the terminal observation scores the last channel on its own
+                                   # share (health_score._final_member_success_quality).
+                                   'counters_at_failover': snapshot})
+        db.session.commit()
+
+    _switch_to_game_channel_and_commit()
+    if old_channel is not None and score_departure:
+        from .health_score import apply_failover_health_observation
+        apply_failover_health_observation(app, old_channel.id, recording_id, reason=reason)
+    ev.publish(recording_id, GROUP_FAILOVER, {
+        'group_id': rec.group_id,
+        'from_channel': old_name,
+        'to_channel': best.name,
+        'reason': reason,
+        'demoted': False,
+        'manual': False,
+        'game': found.game,
+    })
+    return True
 
 
 def _preempt_sync_for_recording(recording_id: int, account_id: int):

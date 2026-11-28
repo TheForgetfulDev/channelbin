@@ -1990,7 +1990,6 @@ def recording_detail(recording_id):
         'delete_source': bool(pp_cfg.get('delete_source', True)),
         'settings_url': url_for('settings.settings', q='recording.post_process.enabled'),
     }
-    max_dead_stream_retry_attempts = load_config()['watchdog'].get('dead_stream_max_retry_attempts', 10)
     # The auto-record rule that made this recording, if it still owns it. Deleting a rule
     # clears rule_id on every recording it keeps, so a set rule_id always names a live rule
     # (dev/changelog/1186); the RECORDING_RULE_SCHEDULED event keeps the name either way.
@@ -2013,7 +2012,6 @@ def recording_detail(recording_id):
         play_offer=play_offer,
         conversion_max_attempts=conversion_max_attempts,
         after_join=after_join,
-        max_dead_stream_retry_attempts=max_dead_stream_retry_attempts,
         now=now,
         concat_prog=concat_prog, joinable_count=joinable_count, join_left_out=join_left_out,
         restart_attempts=restart_attempts, story=story,

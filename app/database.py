@@ -30,9 +30,9 @@ CONCATENATION_DONE     = 'CONCATENATION_DONE'
 CONCATENATION_FAILED   = 'CONCATENATION_FAILED'
 RECORDING_FAILED                    = 'RECORDING_FAILED'
 RECORDING_FAILED_DEAD_STREAM        = 'RECORDING_FAILED_DEAD_STREAM'
-# Dead-stream fast-fail tripped but the retry budget (watchdog.dead_stream_max_retry_attempts)
-# and the recording's own window both still have room - status -> RETRYING instead of an
-# immediate RECORDING_FAILED_DEAD_STREAM. See app/watchdog.py's dead-stream give-up branch and
+# Dead-stream fast-fail or the consecutive-failure limit tripped with the recording's window
+# still open - status -> RETRYING instead of an immediate failure, until the window is over
+# (dev/changelog/1793). See app/watchdog.py's dead-stream give-up branch and
 # Product Principle 2 ("complete the recording at almost all costs").
 RECORDING_RETRY_SCHEDULED           = 'RECORDING_RETRY_SCHEDULED'
 # The capture ran out of things to try before its stop time, holding data, so it ended there and
@@ -1102,10 +1102,10 @@ class Recording(db.Model):
     # One of CANCEL_REASONS - set by every writer of REC_STATUS_ABORTED, cleared when a Retry
     # takes the row out of ABORTED (dev/changelog/1054)
     cancel_reason            = db.Column(db.String(64))
-    # Dead-stream fast-fail retry budget (watchdog.dead_stream_max_retry_attempts). Counts
-    # attempts scheduled, not just fired - incremented when status -> RETRYING, never reset
-    # (a mid-window recovery that later dies again keeps counting against the same budget, so
-    # a flapping stream cannot re-arm 10 fresh attempts per trip). next_retry_at is not the
+    # Dead-stream retry count: attempts scheduled, not just fired - incremented when status ->
+    # RETRYING, never reset, so the ladder's waits keep growing across a mid-window recovery
+    # that later dies again. There is no cap: retries run until the window is over
+    # (dev/changelog/1793). next_retry_at is not the
     # timer (the retry_<id> APScheduler job is); it is shown on the page, and clearing it is
     # the record that the wait was charged to downtime (watchdog.close_retry_wait).
     dead_stream_retry_count   = db.Column(db.Integer, nullable=False, default=0,

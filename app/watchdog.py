@@ -49,16 +49,31 @@ _BLOCK_CHECK_SECONDS = 15
 _BLOCK_STAY_RECHECK_SECONDS = 300
 
 # Dead-stream retry backoff (Product Principle 2). The ladder is fixed (2026-08-12); what is
-# configurable is the attempt cap (watchdog.dead_stream_max_retry_attempts) and the longest
-# wait (watchdog.dead_stream_retry_max_delay_minutes, default 10), which the ladder never
-# exceeds. Uncapped, its hourly steps checked prod recording 26's channel twice in the last
-# two and a half hours of a live race (dev/changelog/1264).
+# configurable is the longest wait (watchdog.dead_stream_retry_max_delay_minutes, default 10),
+# which the ladder never exceeds. Uncapped, its hourly steps checked prod recording 26's
+# channel twice in the last two and a half hours of a live race (dev/changelog/1264). There is
+# no cap on attempts: a recording keeps trying until its window is over, since prod recording
+# 88 gave up six minutes before its race started with two hours of its window left
+# (dev/changelog/1793).
 _DEAD_STREAM_RETRY_DELAYS_MINUTES = [1, 2, 5, 15]  # then 60 for every attempt after the 4th
+
+# The least of a window worth one more attempt: a wait that would end past the stop time is
+# brought forward to leave this much to capture, and less than this is never waited for.
+_LAST_RETRY_LEFT = timedelta(minutes=1)
 
 # What _schedule_dead_stream_retry() did, for the caller to act on.
 RETRY_SCHEDULED = 'scheduled'
-RETRY_PAST_WINDOW = 'past_window'   # attempts were left, but the next would come after stop
-RETRY_NONE = 'none'                 # out of attempts, retrying off, or the window is over
+RETRY_PAST_WINDOW = 'past_window'   # too little of the window is left for another attempt
+RETRY_NONE = 'none'                 # the window is over
+
+
+def _window_left_note(rec) -> str:
+    """The clause a capture that ends without another try adds: its window is over, or what is
+    left is too short for one (_LAST_RETRY_LEFT)."""
+    left = (rec.stop_time - datetime.utcnow()).total_seconds()
+    if left <= 0:
+        return ', and the window is over'
+    return f', and the window ends in {max(1, round(left))} s, before another retry could come'
 
 
 def _dead_stream_retry_delay_minutes(attempt_number: int, max_delay_minutes=None) -> int:
@@ -1195,10 +1210,9 @@ class WatchdogThread(threading.Thread):
                         # give-up point instead of aborting; the abort paths run only
                         # once every member has failed (ffmpeg is already dead here -
                         # killed in the stall handling above).
-                        # 0 turns the trip-wire off, as it does for stall_move_count and
-                        # dead_stream_max_retry_attempts; without the guard a 0 aborted on
-                        # the first early failure, the opposite of what the sibling fields
-                        # mean by it (dev/changelog/1242).
+                        # 0 turns the trip-wire off, as it does for stall_move_count; without
+                        # the guard a 0 aborted on the first early failure, the opposite of
+                        # what the sibling fields mean by it (dev/changelog/1242).
                         if (is_early_failure and early_fail_abort_count > 0
                                 and len(early_fail_times) >= early_fail_abort_count):
                             from .recorder import failover_group_member, _launch_segment
@@ -1222,42 +1236,27 @@ class WatchdogThread(threading.Thread):
                             streak = len(early_fail_times)
                             outcome = self._schedule_dead_stream_retry(
                                 rec, streak, early_fail_abort_window,
-                                cfg['watchdog']['dead_stream_max_retry_attempts'],
                                 cfg['watchdog']['dead_stream_retry_max_delay_minutes'], cause,
                                 early_fail_window)
                             if outcome == RETRY_SCHEDULED:
                                 return
-                            if outcome == RETRY_PAST_WINDOW:
-                                # Nothing more will be tried, so the capture ends now rather
-                                # than idling to its stop time. What it captured is joined,
-                                # as the stop job would have; with nothing at all it is the
-                                # dead stream it looks like (dev/changelog/1264).
-                                from .recorder import _capture_produced_data
-                                minutes_left = max(1, round(
-                                    (rec.stop_time - datetime.utcnow()).total_seconds() / 60))
-                                why = (f'{streak} consecutive early failures within '
-                                       f'{early_fail_abort_window}s - stream appears dead, and '
-                                       f'the window ends in {minutes_left} min, before another '
-                                       f'retry could come')
-                                if _capture_produced_data(self.recording_id):
-                                    self._end_capture_no_retry_left(
-                                        why + (f' - {cause}' if cause else ''))
-                                    return
-                                self._give_up(lambda: self._fail_recording_dead_stream(
-                                    rec, streak, early_fail_abort_window, cause=cause,
-                                    window_note=(f', and the window ends in {minutes_left} '
-                                                 f'min, before another retry could come')))
-                                return
-                            tried = (f'after {rec.dead_stream_retry_count} retry attempt(s)'
-                                     if rec.dead_stream_retry_count else 'with no retry left')
-                            if self._end_capture_gave_up(
-                                    FAILURE_DEAD_STREAM_DETECTED,
-                                    f'{streak} consecutive early failures within '
-                                    f'{early_fail_abort_window}s - stream appears dead, {tried}',
-                                    cause=cause):
+                            # RETRY_PAST_WINDOW or RETRY_NONE: the window is over or too little
+                            # of it is left to try again, so the capture ends now rather than
+                            # idling to its stop time. What it captured is joined, as the stop
+                            # job would have; with nothing at all it is the dead stream it
+                            # looks like (dev/changelog/1264). Never earlier: a dead stream is
+                            # retried for as long as the window is open (dev/changelog/1793).
+                            from .recorder import _capture_produced_data
+                            note = _window_left_note(rec)
+                            why = (f'{streak} consecutive early failures within '
+                                   f'{early_fail_abort_window}s - stream appears dead{note}')
+                            if _capture_produced_data(self.recording_id):
+                                self._end_capture_no_retry_left(
+                                    why + (f' - {cause}' if cause else ''))
                                 return
                             self._give_up(lambda: self._fail_recording_dead_stream(
-                                rec, streak, early_fail_abort_window, cause=cause))
+                                rec, streak, early_fail_abort_window, cause=cause,
+                                window_note=note))
                             return
 
                         # Check failure limit before attempting restart
@@ -1268,16 +1267,18 @@ class WatchdogThread(threading.Thread):
                                 failover_gap_start = time.monotonic()
                                 _launch_segment(self.app, self.recording_id, seg_num + 1)
                                 break
+                            # The limit ends a burst of restarts, never the recording while
+                            # its window is open: it waits as a dead stream does and tries
+                            # again (dev/changelog/1793).
+                            if self._wait_after_failure_limit(
+                                    rec, max_failures, stderr_cause(stderr_tail), cfg,
+                                    early_fail_window):
+                                return
                             # Same reasoning as the dead-stream give-up above: pass the
                             # already-collected cause through rather than rely on _give_up's
                             # redundant (and by now empty) re-collection.
-                            if self._end_capture_gave_up(
-                                    FAILURE_MAX_CONSECUTIVE_FAILURES,
-                                    f'{max_failures} consecutive restarts got no data',
-                                    cause=stderr_cause(stderr_tail)):
-                                return
-                            self._give_up(lambda: self._fail_recording(
-                                rec, max_failures, cause=stderr_cause(stderr_tail)))
+                            self._end_at_failure_limit(rec, max_failures,
+                                                       stderr_cause(stderr_tail))
                             return
 
                         # ── Stall-rate demotion (dev/changelog/889) ─────────────
@@ -1520,13 +1521,12 @@ class WatchdogThread(threading.Thread):
                                 from .recorder import _close_active_segment
                                 tail = _close_active_segment(self.app, self.recording_id,
                                                              exit_reason='ERROR')
-                                if self._end_capture_gave_up(
-                                        FAILURE_MAX_CONSECUTIVE_FAILURES,
-                                        f'{max_failures} consecutive restarts got no data',
-                                        cause=stderr_cause(tail)):
+                                if self._wait_after_failure_limit(
+                                        rec2, max_failures, stderr_cause(tail), cfg,
+                                        early_fail_window):
                                     return
-                                self._give_up(lambda: self._fail_recording(
-                                    rec2, max_failures, cause=stderr_cause(tail)))
+                                self._end_at_failure_limit(rec2, max_failures,
+                                                           stderr_cause(tail))
                                 return
                             # Hand the verdict to the next outer-loop pass rather than
                             # letting it start a fresh GrowthMonitor and spend another
@@ -2073,7 +2073,20 @@ class WatchdogThread(threading.Thread):
             _active.pop(self.recording_id, None)
         return True
 
-    def _fail_recording(self, rec, max_failures, cause=None):
+    def _end_at_failure_limit(self, rec, max_failures, cause):
+        """End a capture at watchdog.max_consecutive_failures when no wait could be scheduled,
+        which is only with the window over or too little of it left (_wait_after_failure_limit).
+        What it captured is joined, as the stop job would have; with nothing it fails."""
+        from .recorder import _capture_produced_data
+        note = _window_left_note(rec)
+        if _capture_produced_data(self.recording_id):
+            self._end_capture_no_retry_left(f'{max_failures} consecutive restarts got no data{note}'
+                                            + (f' - {cause}' if cause else ''))
+            return
+        self._give_up(lambda: self._fail_recording(rec, max_failures, cause=cause,
+                                                   window_note=note))
+
+    def _fail_recording(self, rec, max_failures, cause=None, window_note=''):
         from .database import RECORDING_FAILED
         marked = self._mark_recording_failed(
             rec,
@@ -2081,7 +2094,7 @@ class WatchdogThread(threading.Thread):
             failure_reason=FAILURE_MAX_CONSECUTIVE_FAILURES,
             log_msg=('Recording "%s" (#%d): max consecutive failures (%d) reached, aborting'
                       % (rec.name, self.recording_id, max_failures)),
-            detail=f'Aborting: {max_failures} consecutive failures',
+            detail=f'Aborting: {max_failures} consecutive failures{window_note}',
             sse_extra={
                 'consecutive_failures': rec.consecutive_failures,
                 'max_failures': max_failures,
@@ -2250,17 +2263,40 @@ class WatchdogThread(threading.Thread):
             connlim.release(rec.channel.account_id, 'recording', self.recording_id)
         return marked
 
-    def _schedule_dead_stream_retry(self, rec, streak, window_seconds, max_attempts,
-                                    max_delay_minutes, cause, clear_after_seconds) -> str:
-        """Instead of giving up on a dead-stream trip immediately, back off and try again
-        later (Product Principle 2). Returns RETRY_SCHEDULED when it did; otherwise nothing
-        was written and the caller ends the capture - RETRY_PAST_WINDOW when attempts were
-        left but the next one would come at or after the stop time, RETRY_NONE when the
-        budget, the setting or the window itself leaves nothing to try.
+    def _wait_after_failure_limit(self, rec, max_failures, cause, cfg, clear_after_seconds) -> bool:
+        """At watchdog.max_consecutive_failures with the window still open, wait on the
+        dead-stream ladder and try again rather than give up (dev/changelog/1793). True when
+        the caller is done and returns: the wait is scheduled, or a Stop, a Pause, an abort or
+        a shutdown already owns the capture (the stop event, or a status no longer open), whose
+        own path ends it - ending it here as well would join it twice or join a Pause. False
+        leaves the caller's end to run, which only happens with too little of the window left
+        for another attempt. The count starts again when the wait ends
+        (recorder._resume_claimed_capture)."""
+        from . import db
+        from .database import Recording
+        r = db.session.get(Recording, self.recording_id, populate_existing=True)
+        if r is None or self.state.stop_event.is_set() or r.status not in WINDOW_OPEN_STATUSES:
+            log.info('Recording %d: at the consecutive-failure limit, but another path already '
+                     'owns the capture - leaving it to that path', self.recording_id)
+            return True
+        outcome = self._schedule_dead_stream_retry(
+            r, max_failures, 0, cfg['watchdog']['dead_stream_retry_max_delay_minutes'], cause,
+            clear_after_seconds, why=f'{max_failures} consecutive restarts got no data')
+        return outcome == RETRY_SCHEDULED
 
-        A retry past the window is not scheduled (dev/changelog/1264): an attempt that can
-        never fire is no attempt, and announcing one promised the user a retry after the
-        recording had ended (dev/docs/BUGS.md 2026-10-21 10:45 PM).
+    def _schedule_dead_stream_retry(self, rec, streak, window_seconds, max_delay_minutes,
+                                    cause, clear_after_seconds, why=None) -> str:
+        """Instead of giving up on a dead stream, back off and try again later (Product
+        Principle 2), for as long as the window is open (dev/changelog/1793). Returns
+        RETRY_SCHEDULED when it did; otherwise nothing was written and the caller ends the
+        capture - RETRY_PAST_WINDOW when less than _LAST_RETRY_LEFT of the window is left,
+        RETRY_NONE when the window is over. `why` names the trip when it is not the
+        early-failure streak: the consecutive-failure limit's.
+
+        A wait that would end past the stop time is brought forward to leave _LAST_RETRY_LEFT
+        to capture, and one that cannot leave that much is not scheduled (dev/changelog/1264):
+        an attempt that can never fire is no attempt, and announcing one promised the user a
+        retry after the recording had ended (dev/docs/BUGS.md 2026-10-21 10:45 PM).
 
         Deliberately does NOT go through _give_up(): that call is for a TERMINAL abandonment
         (it dings the channel's health score and persists a "final" thumbnail), and entering
@@ -2274,14 +2310,18 @@ class WatchdogThread(threading.Thread):
         from .scheduler import schedule_dead_stream_retry
 
         now = datetime.utcnow()
-        if max_attempts <= 0 or rec.dead_stream_retry_count >= max_attempts or rec.stop_time <= now:
+        if rec.stop_time <= now:
             return RETRY_NONE
 
         delay_minutes = _dead_stream_retry_delay_minutes(rec.dead_stream_retry_count + 1,
                                                          max_delay_minutes)
         next_at = now + timedelta(minutes=delay_minutes)
-        if next_at >= rec.stop_time:
-            return RETRY_PAST_WINDOW
+        if next_at > rec.stop_time - _LAST_RETRY_LEFT:
+            next_at = rec.stop_time - _LAST_RETRY_LEFT
+            if next_at <= now:
+                return RETRY_PAST_WINDOW
+            delay_minutes = max(1, round((next_at - now).total_seconds() / 60))
+        trip = why or f'{streak} consecutive early failures within {window_seconds}s'
 
         @retry_on_locked()
         def _mark_retrying_and_commit():
@@ -2289,14 +2329,13 @@ class WatchdogThread(threading.Thread):
             r.status = REC_STATUS_RETRYING
             r.dead_stream_retry_count += 1
             r.next_retry_at = next_at
-            detail = (f'{streak} consecutive early failures within {window_seconds}s - stream '
-                      f'appears dead. Retrying (attempt {r.dead_stream_retry_count}/{max_attempts}) '
-                      f'in {delay_minutes} min' + (f' - {cause}' if cause else ''))
+            detail = (f'{trip} - stream appears dead. Retrying (attempt '
+                      f'{r.dead_stream_retry_count}) in {delay_minutes} min'
+                      + (f' - {cause}' if cause else ''))
             add_recording_event(self.recording_id, RECORDING_RETRY_SCHEDULED, detail=detail,
                                 # streak and cause let the recording page word the trip
                                 # the way the alert does (recording_story.what_happened).
                                 extra={'attempt': r.dead_stream_retry_count,
-                                       'max_attempts': max_attempts,
                                        'delay_minutes': delay_minutes,
                                        'streak': streak,
                                        'cause': cause or None})
@@ -2304,8 +2343,8 @@ class WatchdogThread(threading.Thread):
             return r
 
         r = _mark_retrying_and_commit()
-        log.warning('Recording "%s" (#%d): dead-stream trip, retrying (attempt %d/%d) in %d min',
-                    r.name, self.recording_id, r.dead_stream_retry_count, max_attempts, delay_minutes)
+        log.warning('Recording "%s" (#%d): %s, retrying (attempt %d) in %d min',
+                    r.name, self.recording_id, trip, r.dead_stream_retry_count, delay_minutes)
         if r.channel_id and r.channel:
             connlim.release(r.channel.account_id, 'recording', self.recording_id)
         schedule_dead_stream_retry(self.recording_id, next_at)
@@ -2316,7 +2355,6 @@ class WatchdogThread(threading.Thread):
             # handleStatus ignores a frame without one; dev/changelog/663, 1023).
             'status': REC_STATUS_RETRYING,
             'attempt': r.dead_stream_retry_count,
-            'max_attempts': max_attempts,
             'next_retry_at': next_at.strftime('%Y-%m-%dT%H:%M:%S'),
         })
         raise_recording_retrying_alert(r, streak, delay_minutes, max_delay_minutes, cause,

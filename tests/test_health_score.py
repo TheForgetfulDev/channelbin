@@ -319,9 +319,18 @@ class FinalMemberShareTests(unittest.TestCase):
         self.assertNotIn('member_share', bd)
         self.assertEqual(score, score_recording_metrics_quality(400, 30, 7200, _CFG)[0])
 
-    def test_single_channel_recording_scores_the_whole_recording(self):
+    def test_a_recording_outside_a_group_that_moved_scores_its_last_channels_share(self):
+        """A game's recording moves to another channel with no group (dev/changelog/1793);
+        the channel it ends on is scored on its own share, as a group's last member is."""
         rec = self._recording(downtime=400, restarts=30, group=False)
         self._failover(rec, at_minutes=90, downtime=400, restarts=30)
+        score, bd = _final_member_success_quality(rec, _CFG)
+        self.assertEqual(bd['member_share']['downtime_seconds'], 0)
+        self.assertEqual(bd['member_share']['restarts'], 0)
+        self.assertEqual(score, 100)
+
+    def test_a_recording_outside_a_group_that_never_moved_scores_the_whole_recording(self):
+        rec = self._recording(downtime=400, restarts=30, group=False)
         score, bd = _final_member_success_quality(rec, _CFG)
         self.assertNotIn('member_share', bd)
         self.assertEqual(score, score_recording_metrics_quality(400, 30, 7200, _CFG)[0])

@@ -343,6 +343,7 @@ class NoDataGiveUpClosesTheRowTests(RestartHarness):
                                   {'watchdog': {'max_consecutive_failures': 2}})
 
     def _run_until_failed(self, timeout=30):
+        self._window_too_short_to_retry()
         self._exited_capture()
         with mock.patch.object(cfgmod, 'load_config', return_value=self._cfg(5)), \
              mock.patch.object(recorder, '_launch_segment',

@@ -1269,7 +1269,9 @@ _KINDS = (
     _kind('close_mid_stream', SCOPE_CONNECTION, LAYER_STREAM, (EP_STREAM,), OBSERVED,
           'capture stderr in DIAGNOSTICS events (dev/changelog/430): "Stream ends prematurely" '
           'then "Will reconnect ... error=Input/output error" in 23% of prod\'s segment tails '
-          'and 1.7% of dev\'s; observed in prod',
+          'and 1.7% of dev\'s; observed in prod. At `after_bytes` 0 it is prod recording 88\'s '
+          'event channel, "Stream ends prematurely at 0" on every connection until the event '
+          'came on (BUGS.md 2026-11-28, dev/changelog/1793)',
           'after `after_bytes`, the server closes the connection as if the stream had ended',
           {'after_bytes': (1_048_576, _count(0))}, forms=(FORM_TS,)),
     _kind('keeps_dropping', SCOPE_CONNECTION, LAYER_STREAM, (EP_STREAM,), MEASURED,

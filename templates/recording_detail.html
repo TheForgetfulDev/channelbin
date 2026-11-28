@@ -347,7 +347,7 @@
   <span class="fx">{{ icon('retrying') }}</span>
   <span>The stream kept failing right after each reconnect - waiting to try again
     {%- if rec.next_retry_at %} at <b>{{ rec.next_retry_at | local_time_sec }}</b>{% endif %}
-    (attempt <b>{{ rec.dead_stream_retry_count }}</b> of <b>{{ max_dead_stream_retry_attempts }}</b>)</span>
+    (attempt <b>{{ rec.dead_stream_retry_count }}</b>; it keeps trying until the window ends)</span>
   <span class="sep-dot">·</span>
   <span>Stop keeps what was captured; Abort, in the {{ icon('more') }} menu, discards it</span>
 </div>
@@ -502,7 +502,7 @@
      stat'ed by the route; the template cannot reach the filesystem. #}
   <span>Failed{% if rec.completed_at %} at <b>{{ rec.completed_at | local_time_sec }}</b>{% endif %} -
     {% if rec.failure_reason == 'FAST_DELIVERY_DETECTED' %}the feed kept delivering video faster than real time, which means it was not showing live content, and there was no other channel to record from instead
-    {%- elif rec.failure_reason == 'DEAD_STREAM_DETECTED' %}the stream reconnected but immediately died each time, so it was aborted automatically rather than looping forever
+    {%- elif rec.failure_reason == 'DEAD_STREAM_DETECTED' %}the stream reconnected but immediately died each time, and it was still dead when the window ended
     {%- elif rec.failure_reason == 'MAX_CONSECUTIVE_FAILURES' %}<b>{{ rec.consecutive_failures_peak }} consecutive restart attempts</b> produced no data (max consecutive failures reached)
     {%- elif rec.failure_reason == 'LAUNCH_FAILED' %}the failure budget ran out on an attempt where <b>ffmpeg itself could not be started</b>, which is a problem on this machine rather than with the stream
     {%- elif rec.failure_reason == 'CONVERSION_COLLISION' %}it <b>never started</b>: it waited for a running mp4 conversion to finish (collision policy: wait), and its own window ended first

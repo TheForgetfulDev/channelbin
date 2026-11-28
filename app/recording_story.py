@@ -351,8 +351,9 @@ def what_happened(rec, restart_attempts=0, stderr_tails=None, open_segment_bytes
     failovers = sum(1 for e in rec.events if e.event_type == GROUP_FAILOVER)
     if failovers:
         trouble = True
-        lines.append(f'It moved to another channel in its group '
-                     f'{fmt_utils.counted(failovers, "time")}.')
+        # A group's member, or another channel carrying the recording's game
+        # (dev/changelog/1793): the activity log names each.
+        lines.append(f'It moved to another channel {fmt_utils.counted(failovers, "time")}.')
 
     # Only a clause that lost something asks who was at fault: a file a few seconds longer
     # than its capture, with nothing else wrong, drew "Nothing ChannelBin saw says whether

@@ -345,8 +345,9 @@ def apply_test_health_observation(app, test_id: int):
 
 @retry_on_locked()
 def apply_failover_health_observation(app, channel_id: int, recording_id: int, reason: str = ''):
-    """Blend a fail-floor observation into a group member abandoned mid-recording
-    by group failover (app/recorder.py::failover_group_member) - its feed
+    """Blend a fail-floor observation into a channel abandoned mid-recording by a
+    failover (app/recorder.py::failover_group_member, a group member or another channel
+    carrying the recording's game - dev/changelog/1793) - its feed
     demonstrably died while being recorded, which is exactly the signal the
     recording fail floor represents. Unlike apply_recording_health_observation
     this never touches the Recording row: the recording itself is still running
@@ -389,8 +390,8 @@ def apply_failover_health_observation(app, channel_id: int, recording_id: int, r
             score_note = f'score set to {new_score:.0f}'
         else:
             score_note = f'health score {blend_breakdown["old_score"]:.0f} -> {new_score:.0f}'
-        detail = (f'Feed died mid-recording ({reason}) and failed over to another group '
-                  f'member - {score_note}')
+        detail = (f'Feed died mid-recording ({reason}) and the recording moved to another '
+                  f'channel - {score_note}')
         db.session.add(ChannelEvent(
             channel_id=channel_id,
             timestamp=observed_at,
@@ -650,18 +651,15 @@ def apply_stall_demotion_health_observation(app, channel_id: int, recording_id: 
 def _final_member_success_quality(recording, cfg: dict) -> Tuple[int, dict]:
     """Quality score for the channel a COMPLETED recording *ended* on.
 
-    For a group-backed recording that failed over, the recording's cumulative
-    downtime/restart counters span every member it went through - blaming the final
-    feed for downtime on the dead feeds it escaped. Score the final member from only its
-    own share (cumulative minus the snapshot stored in the last GROUP_FAILOVER event).
-    Non-group recordings, and group recordings that never failed over, score from the
-    whole recording (share == cumulative) - identical to the pre-fix behavior.
+    For a recording that failed over - a group's, or a game's onto another channel carrying
+    it (dev/changelog/1793) - the recording's cumulative downtime/restart counters span every
+    channel it went through, blaming the final feed for downtime on the dead feeds it
+    escaped. Score the final channel from only its own share (cumulative minus the snapshot
+    stored in the last GROUP_FAILOVER event). A recording that never failed over scores from
+    the whole recording (share == cumulative).
     """
     from .database import RecordingEvent, GROUP_FAILOVER
     from datetime import datetime
-
-    if recording.group_id is None:
-        return score_recording_success_quality(recording, cfg)
 
     last = (RecordingEvent.query
             .filter_by(recording_id=recording.id, event_type=GROUP_FAILOVER)

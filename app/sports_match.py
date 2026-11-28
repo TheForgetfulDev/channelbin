@@ -2119,6 +2119,29 @@ def recording_game(rec):
     return db.session.get(SportsEvent, events.pop()) if len(events) == 1 else None
 
 
+def recording_live_game(rec):
+    """The SportsEvent a recording is of when what it records is the game as it is played, or
+    None. Read from the listing it was made from (recording_game()), else from the event its
+    snapshot names (recording_sports), which is how a recording made from a channel's name is
+    known. A snapshot a person removed is None, and so is a replay: it shows the game at another
+    time, so no channel carrying the game live is a copy of it (recorder.game_failover_channels(),
+    dev/changelog/1793). Four queries at most."""
+    from .database import RecordingSports
+    snap = db.session.get(RecordingSports, rec.id)
+    if snap is not None and (snap.removed_at is not None or snap.airing == SPORTS_AIRING_REPLAY):
+        return None
+    event = recording_game(rec)
+    if event is None:
+        return (SportsEvent.query.filter_by(tsdb_id=snap.tsdb_event_id).first()
+                if snap is not None else None)
+    if snap is None and _live_matches().filter(
+            SportsMatch.channel_id == rec.source_channel_id,
+            SportsMatch.program_start_time == rec.program_start_time,
+            SportsMatch.airing == SPORTS_AIRING_REPLAY).first() is not None:
+        return None
+    return event
+
+
 #: What the listings dialog calls each airing. Every value of the vocabulary is named here.
 AIRING_LABELS = {SPORTS_AIRING_FIRST: 'Live', SPORTS_AIRING_REPLAY: 'Replay', SPORTS_AIRING_UNKNOWN: 'Not known'}
 #: The badge an event channel's row carries for its airing. An unknown airing gets none: a name that
