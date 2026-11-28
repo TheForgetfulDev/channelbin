@@ -88,7 +88,8 @@ class AlwaysRelayedTests(_PublicCase):
     FEED = feed_cfg(mode=feed.MODE_REDIRECT)
 
     def test_relays_for_relays_the_public_port_in_every_mode(self):
-        main = feed.main_login(feed_cfg()['integrations']['output_feed'])
+        # The rig's login is the moved main one, sent to the provider at home (dev/changelog/1781).
+        main = feed.feed_login_for(feed.feed_config(feed_cfg()), USER, PASS)
         fid = feed.feed_id_for_channel(self.alpha.id)
         for mode in (feed.MODE_REDIRECT, feed.MODE_MIXED):
             self.assertFalse(feed.relays_for({'mode': mode}, fid, main), mode)
@@ -231,6 +232,9 @@ class PageTests(FeedCase):
 
 
 class ReadinessTests(FeedCase):
+    # Long enough that the open port does not name it (dev/changelog/1781).
+    PASSWORD = 'a-generated-length-password'
+
     def check(self, status, behind_proxy=True, **over):
         from app import readiness
         self.t.sandbox_config(feed_cfg(**over))

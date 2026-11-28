@@ -395,6 +395,9 @@ ALERT_TYPES = {
     # A setting a user had turned on no longer exists, so what it did has stopped. Raised once,
     # when startup removes the key from config.yaml (dev/changelog/1498).
     'SETTING_REMOVED': {'label': 'Setting Removed', 'severity': 'WARN'},
+    # A setting startup moved somewhere else, where it still does what it did. Raised once,
+    # when the key leaves config.yaml (the main IPTV output login, dev/changelog/1781).
+    'SETTING_MOVED': {'label': 'Setting Moved', 'severity': 'INFO'},
     'HEALTH_CHECK_COMPLETE': {'label': 'Health Check Completed', 'severity': 'INFO'},
     # A repeating health check whose row has no hour or minute, so it was not scheduled
     # and will never run on its own (dev/changelog/1110). Registering it anyway would fire

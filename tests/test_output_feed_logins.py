@@ -1,5 +1,6 @@
-"""Logins for other users on the IPTV output (app/output_feed.py FeedLogin, the routes in
-app/routes/iptv_output.py, dev/changelog/1760).
+"""Logins on the IPTV output (app/output_feed.py FeedLogin, the routes in
+app/routes/iptv_output.py, dev/changelog/1760). The owner's own login is one of them since
+dev/changelog/1781 (tests/test_output_feed_main_login.py).
 
 What these hold is that the gate tells the logins apart, that every URL an answer carries is
 the asking login's own, that a login's stream limit is held under the one lock, that two logins
@@ -195,8 +196,9 @@ class RelayTests(_LoginCase):
             fcfg = {'mode': mode}
             fid = feed.feed_id_for_channel(self.alpha.id)
             self.assertTrue(feed.relays_for(fcfg, fid, self.friend()), mode)
-            self.assertFalse(feed.relays_for(fcfg, fid, feed.main_login(feed_cfg()['integrations']['output_feed'])),
-                             mode)
+            # The rig's own login is the moved main one, whose switch is on (dev/changelog/1781).
+            main = feed.feed_login_for(feed.feed_config(feed_cfg()), USER, PASS)
+            self.assertFalse(feed.relays_for(fcfg, fid, main), mode)
 
     def test_the_live_route_relays_a_login_in_redirect_mode(self):
         self.t.sandbox_config(feed_cfg(mode=feed.MODE_REDIRECT))
@@ -222,8 +224,6 @@ class LoginRouteTests(_LoginCase):
         for taken in (USER, FRIEND):
             resp = self.client.post('/api/iptv-output/logins', json={'name': 'X', 'username': taken})
             self.assertEqual(resp.status_code, 400, taken)
-        resp = self.client.post('/api/iptv-output/login', json={'username': FRIEND, 'password': 'x'})
-        self.assertEqual(resp.status_code, 409)
 
     def test_bad_fields_are_refused(self):
         for body in ({'name': '', 'username': 'a'}, {'name': 'A', 'username': 'a b'},
@@ -236,7 +236,7 @@ class LoginRouteTests(_LoginCase):
         resp = self.client.get(f'/api/iptv-output/logins/{self.login.id}/password')
         self.assertEqual(resp.get_json()['password'], FRIEND_PASS)
         page = self.client.get('/iptv-output').get_data(as_text=True)
-        self.assertIn('Logins for other users', page)
+        self.assertIn('<h2>Logins <span class="cnt">2</span></h2>', page)
         self.assertIn(FRIEND, page)
         self.assertNotIn(FRIEND_PASS, page)
 
@@ -566,9 +566,9 @@ class LineupPlayTests(_LineupCase):
             resp = self.client.get(f'/live/{FRIEND}/{FRIEND_PASS}/{self.fid_beta}.ts')
         self.assertEqual(resp.status_code, 503)    # the output's own cap, past the lineup
 
-    def test_the_main_login_is_never_held_to_a_lineup(self):
+    def test_another_login_is_not_held_to_one_logins_lineup(self):
         self.set_lineup([self.fid_beta])
-        main = feed.main_login(feed_cfg()['integrations']['output_feed'])
+        main = feed.feed_login_for(feed.feed_config(feed_cfg()), USER, PASS)
         self.assertTrue(main.offers(self.fid_alpha))
 
     def test_the_logo_route_refuses_a_channel_outside_the_lineup(self):

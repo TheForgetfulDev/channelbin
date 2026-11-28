@@ -1067,7 +1067,8 @@ class OutputLoginAndAddressSweepTests(_BundleTestCase):
         self.assertIn('Viewer 12 from <address 2> on login <former login 2>: Alpha playing', tail)
         self.assertIn('IPTV output: login <former login 1> added for another user', tail)
         self.assertIn("IPTV output: <address 1> is locked out", tail)
-        self.assertIn("(user '<main login>',", tail)
+        # A username still in config.yaml's old place is a former login (dev/changelog/1781).
+        self.assertIn("(user '<former login 3>',", tail)
         self.assertIn('Viewer from <address 2>: Gamma ended', tail)
         # A home address, a timestamp and a version number are not addresses to hide.
         self.assertIn('Viewer from 192.168.1.40 started channel 9 (agent Chrome/120.0.0.0)', tail)
@@ -1093,9 +1094,11 @@ class OutputLoginAndAddressSweepTests(_BundleTestCase):
         self.assertEqual(redactions['internet_addresses_masked'], 2)
         self.assertIn('<address N>', redactions['internet_address_note'])
 
-    def test_the_main_login_in_config_is_swept_too(self):
+    def test_a_username_left_in_config_is_swept_too(self):
+        """The main login moved into a row at startup (dev/changelog/1781); a backup restored
+        since then puts the old leaf back until the next start, and it is still a login."""
         config = json.loads(_unzip(self._bundle()).read('config.yaml'))
-        self.assertEqual(config['integrations']['output_feed']['username'], '<main login>')
+        self.assertEqual(config['integrations']['output_feed']['username'], '<former login 3>')
 
 
 class PartialFailureTests(_BundleTestCase):

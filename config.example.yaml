@@ -272,23 +272,23 @@ integrations:
   # The output feed: ChannelBin as an Xtream Codes source an IPTV player (TiviMate and the like)
   # adds as an account. The player then sees the TV Guide - every channel and group in it
   # that was not taken off the output, with the guide's listings - and a group plays as one
-  # channel with failover. Off by default; set its login and turn it on from the IPTV Output
-  # page, which explains every key below.
+  # channel with failover. Off by default; add a login and turn it on from the IPTV Output
+  # page, which explains every key below. The logins themselves are kept in the database,
+  # not here.
   # No restart needed for any of these.
   output_feed:
     enabled: false
-    username: ''
-    password: ''            # stored as typed, not hashed: the IPTV player sends it on every request
     mode: proxy             # proxy (relayed through ChannelBin, with failover and a held seat),
-                            # mixed (groups and sports channels relayed, the rest redirected)
-                            # or redirect (the IPTV player plays straight from the provider)
+                            # mixed (groups and sports channels relayed, the rest redirected
+                            # for a login allowed to play straight from the provider)
+                            # or redirect (such a login's player plays straight from the provider)
     accounts: []            # account ids the feed may play from; empty = all
     held_seats: {}          # redirect and mixed modes: account id -> seats kept free for the IPTV
                             # player; a play relayed in mixed mode uses one of them first
     buffer_mb: 64           # proxy and mixed: the most memory one IPTV player's stream may wait in; it has to hold the
                             # 13 to 29 seconds a provider sends at once when a play starts
     reserve_seconds: 3      # proxy and mixed: how far behind live the IPTV player plays; 0 = pass-through
-    max_viewers: 3          # streams relayed at once: proxy and mixed, and logins for other users in every mode
+    max_viewers: 3          # streams relayed at once: every play through ChannelBin, in any mode
     idle_seconds: 30        # proxy and mixed: an IPTV player that read nothing for this long is gone
     max_session_hours: 12   # proxy and mixed: the hard cap on one play
     xmltv_days: 3           # listings depth in xmltv.php

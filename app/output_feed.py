@@ -281,38 +281,6 @@ def is_enabled(fcfg: dict) -> bool:
     return bool(fcfg.get('enabled'))
 
 
-def _cred(value) -> str:
-    """A stored credential as text. A hand-edited config.yaml with `username: 1` parses it
-    as an int, and a short login is exactly what the help text invites."""
-    return '' if value is None else str(value).strip()
-
-
-def feed_username(fcfg: dict) -> str:
-    return _cred(fcfg.get('username'))
-
-
-def feed_password(fcfg: dict) -> str:
-    return '' if fcfg.get('password') is None else str(fcfg.get('password'))
-
-
-def credentials_set(fcfg: dict) -> bool:
-    return bool(feed_username(fcfg)) and bool(feed_password(fcfg))
-
-
-def credentials_ok(fcfg: dict, username, password) -> bool:
-    """Enabled, a credential is stored, and the pair matches - each checked, none inferred
-    from another (the shape app/routes/ha.py::_ha_key_ok sets). Constant-time on the pair:
-    the client sends it on every request, and a hash check measured 147 ms per call
-    (design doc section 6.2)."""
-    if not is_enabled(fcfg) or not credentials_set(fcfg):
-        return False
-    if not isinstance(username, str) or not isinstance(password, str):
-        return False
-    want = f'{feed_username(fcfg)}\0{feed_password(fcfg)}'.encode()
-    got = f'{username}\0{password}'.encode()
-    return hmac.compare_digest(want, got)
-
-
 #: A stream address is built by the player as /live/<username>/<password>/<id>.ts, so neither
 #: half of the login may hold what ends or splits a path.
 LOGIN_BREAKERS = '/?#%\\'
@@ -332,57 +300,55 @@ def login_problem(label: str, value: str) -> str:
 
 # ── Logins ─────────────────────────────────────────────────────────────────────────────────
 
-#: The most streams one login for another user may hold at once, and the fewest.
+#: The most streams one login may hold at once, and the fewest.
 MAX_STREAMS_BOUNDS = (1, 20)
 #: Characters a generated password is made of: no LOGIN_BREAKERS, and none that read alike on
 #: a TV keyboard (0/O, 1/l/I).
 _PASSWORD_ALPHABET = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 GENERATED_PASSWORD_LENGTH = 12
+#: A login's password shorter than this is called out by readiness while the public port is open:
+#: a generated one is this long, and a typed one may be anything (dev/changelog/1781).
+STRONG_PASSWORD_LENGTH = GENERATED_PASSWORD_LENGTH
 
 
 @dataclass(frozen=True)
 class FeedLogin:
-    """Who an IPTV player logged in as: the main login in Settings (`feed_login_id` None) or one
-    OutputFeedLogin row (dev/changelog/1760). Every URL the output serves this player is built
-    from these credentials, never another login's."""
+    """Who an IPTV player logged in as: one OutputFeedLogin row (dev/changelog/1760, 1781).
+    Every URL the output serves this player is built from these credentials, never another
+    login's."""
     username: str
     password: str
-    feed_login_id: Optional[int] = None
+    feed_login_id: int
     name: str = ''
-    # How many plays it may have at once; None is no limit of its own (the main login, which
-    # only the output's own "IPTV players at once" holds).
-    max_streams: Optional[int] = None
+    # How many plays it may have at once, inside the output's own "IPTV players at once".
+    max_streams: int = 1
     # How many times stop_login() had run for this login when the gate read it: a play started
     # on an older count is refused when it registers (_LoginRoom.still_good_locked).
     generation: int = 0
-    # The feed ids it gets (lineup_of()), None for everything the output offers: the main login
-    # always, and a login for another user nobody narrowed (dev/changelog/1764).
+    # The feed ids it gets (lineup_of()), None for everything the output offers: a login nobody
+    # narrowed (dev/changelog/1764).
     lineup: Optional[frozenset] = None
     # And how many times set_login_lineup() had run for it, as `generation` is for stop_login().
     lineup_generation: int = 0
-    # The IPTV accounts its plays come from (accounts_of()), None for the output's own list: the
-    # main login always, and a login for another user nobody tied to accounts (dev/changelog/1765).
+    # The IPTV accounts its plays come from (accounts_of()), None for the output's own list: a
+    # login nobody tied to accounts (dev/changelog/1765).
     accounts: Optional['LoginAccounts'] = None
     # And how many times set_login_accounts() had run for it, as `generation` is for stop_login().
     accounts_generation: int = 0
-
-    @property
-    def is_main(self) -> bool:
-        return self.feed_login_id is None
+    # OutputFeedLogin.provider_direct and full_refusals: each holds on the web UI's port only
+    # (relays_for, routes/output_feed.py::live, dev/changelog/1781).
+    provider_direct: bool = False
+    full_refusals: bool = False
 
     def offers(self, feed_id: int) -> bool:
         """Whether `feed_id` is one of this login's channels."""
         return lineup_offers(self.lineup, feed_id)
 
     @property
-    def log_name(self) -> Optional[str]:
-        """What a line of Recent plays stores in its `feed_login`: the username, None for the main
-        login."""
-        return None if self.is_main else self.username
-
-
-def main_login(fcfg: dict) -> FeedLogin:
-    return FeedLogin(feed_username(fcfg), feed_password(fcfg))
+    def log_name(self) -> str:
+        """What a line of Recent plays stores in its `feed_login`: the username. A line written
+        before dev/changelog/1781 by the main login, which lived in config.yaml, holds None."""
+        return self.username
 
 
 def _feed_login_of(row, counts: tuple) -> FeedLogin:
@@ -392,7 +358,9 @@ def _feed_login_of(row, counts: tuple) -> FeedLogin:
                      max_streams=max(1, int(row.max_streams or 1)),
                      generation=generation.get(row.id, 0), lineup=lineup_of(row),
                      lineup_generation=lineup_generation.get(row.id, 0), accounts=accounts_of(row),
-                     accounts_generation=accounts_generation.get(row.id, 0))
+                     accounts_generation=accounts_generation.get(row.id, 0),
+                     provider_direct=bool(row.provider_direct),
+                     full_refusals=bool(row.full_refusals))
 
 
 def _login_generation() -> tuple:
@@ -457,7 +425,7 @@ def lineup_problem(value) -> tuple:
 
 
 class LoginAccounts(frozenset):
-    """A login for another user's own account list (accounts_of()): the set a play's walk is
+    """A login's own account list (accounts_of()): the set a play's walk is
     handed in place of the output's (allowed_account_ids()). Its type is what tells a refusal to
     name the login's accounts rather than the output's (_drop_allowed), so the walk's own
     signatures stay one `allowed` set (dev/changelog/1765)."""
@@ -528,15 +496,12 @@ login_failures = FailureTracker(LOGIN_MAX_FAILURES, LOGIN_LOCKOUT_WINDOW,
 def feed_login_for(fcfg: dict, username, password) -> Optional[FeedLogin]:
     """The login an IPTV player's credentials name, or None. None for every cause - the output
     off, an unknown username, a login turned off, a wrong password - so the caller answers them
-    all alike (section 6.1). A login for another user works whether or not the main login is
-    set. Every path compares a password in constant time; an unknown username still costs the
-    same database lookup a known one does."""
+    all alike (section 6.1). Every path compares a password in constant time; an unknown
+    username still costs the same database lookup a known one does."""
     if not is_enabled(fcfg):
         return None
     if not isinstance(username, str) or not isinstance(password, str):
         return None
-    if credentials_ok(fcfg, username, password):
-        return main_login(fcfg)
     from .database import OutputFeedLogin
     # Read BEFORE the row: a change committed after the row was read moves the count after
     # this read too, so a play this login starts is refused when it registers (_LoginRoom).
@@ -548,12 +513,17 @@ def feed_login_for(fcfg: dict, username, password) -> Optional[FeedLogin]:
     return _feed_login_of(row, counts)
 
 
-def login_taken(username: str, fcfg: dict, except_login_id: Optional[int] = None) -> bool:
-    """Whether `username` is already the main login's or another login's. Two logins with one
-    username could not be told apart by the gate."""
+def has_login() -> bool:
+    """Whether there is any login at all, on or off: the output cannot be turned on with none,
+    and its page is "not set up yet" until there is one (dev/changelog/1781)."""
     from .database import OutputFeedLogin
-    if username == feed_username(fcfg):
-        return True
+    return OutputFeedLogin.query.first() is not None
+
+
+def login_taken(username: str, except_login_id: Optional[int] = None) -> bool:
+    """Whether `username` is already another login's. Two logins with one username could not be
+    told apart by the gate."""
+    from .database import OutputFeedLogin
     q = OutputFeedLogin.query.filter_by(username=username)
     if except_login_id is not None:
         q = q.filter(OutputFeedLogin.id != except_login_id)
@@ -604,15 +574,15 @@ def _tuning_accounts() -> Optional[frozenset]:
 
 def _on_login(name: Optional[str]) -> str:
     """The fragment every Viewer log line puts after the player's address to say who it was:
-    ' on login <username>' for a login for another user, '' for the main login."""
+    ' on login <username>', or '' for a play with no login (a preview, a picture of its own)."""
     return f' on login {name}' if name else ''
 
 
 def _tuning_always_relayed() -> bool:
-    """Whether the tune-in on this thread is relayed in every mode: a login for another user's
-    or one on the public port (relays_for)."""
+    """Whether the tune-in on this thread is relayed in every mode: one on the public port, or
+    on a login not sent straight to the provider (relays_for)."""
     login = _tuning_login.get()
-    return _tuning_public.get() or (login is not None and not login.is_main)
+    return _tuning_public.get() or (login is not None and not login.provider_direct)
 
 
 #: The lowest and highest value each numeric setting takes. A number outside is moved to the
@@ -726,18 +696,20 @@ def relays(fcfg: dict, feed_id: int) -> bool:
 
 
 def relays_for(fcfg: dict, feed_id: int, login: FeedLogin, public: bool = False) -> bool:
-    """relays() for one login's tune-in. A login for another user is always relayed, whatever
-    the mode, and so is any tune-in on the public port (`public`, app/public_listener.py): a
-    redirect sends the player to the provider's own stream URL, which carries the owner's
-    provider username and password, and puts the provider account on that player's address
-    (dev/changelog/1760, 1761)."""
-    return public or not login.is_main or relays(fcfg, feed_id)
+    """relays() for one login's tune-in. A login is always relayed, whatever the mode, unless its
+    owner turned on `provider_direct` for it, and any tune-in on the public port
+    (`public`, app/public_listener.py) is relayed whatever the login says: a redirect sends the
+    player to the provider's own stream URL, which carries the owner's provider username and
+    password, and puts the provider account on that player's address (dev/changelog/1760, 1761,
+    1781)."""
+    return public or not login.provider_direct or relays(fcfg, feed_id)
 
 
 def seen_in_mode(session: 'RelaySession', mode: str) -> bool:
     """Whether Watching now lists `session` in `mode`. In redirect mode ChannelBin's own
-    pictures, a login for another user's plays and every play on the public port are relayed
-    all the same; anything else live then is from before a change of mode."""
+    pictures, the plays of every login not sent straight to the provider and every play on the
+    public port are relayed all the same; anything else live then is from before a change of
+    mode."""
     if mode in (MODE_PROXY, MODE_MIXED):
         return True
     if mode == MODE_REDIRECT:
@@ -1272,13 +1244,10 @@ def auth_payload(fcfg: dict, login: FeedLogin, host: str, port: str, scheme: str
     """The bare player_api.php answer: what accounts.check_xtream_auth() needs (`auth`,
     `status`, `exp_date`) and a server_info naming the host the request arrived on. Never
     an account's base_url - the feed's stream endpoint is ChannelBin itself (section 3.5).
-    The login and its connection counts are `login`'s: a login for another user is told its
-    own limit and its own plays, the main login the output's (dev/changelog/1760)."""
+    The login and its connection counts are `login`'s own limit and plays (dev/changelog/1760,
+    1781)."""
     now = datetime.utcnow()
-    if login.is_main:
-        active, most = len(live_sessions()), int(fcfg.get('max_viewers') or 1)
-    else:
-        active, most = len(login_plays(login.feed_login_id)), login.max_streams
+    active, most = len(login_plays(login.feed_login_id)), login.max_streams
     return {
         'user_info': {
             'username': login.username, 'password': login.password,
@@ -1497,17 +1466,17 @@ def forget_answers() -> None:
 
 def login_key(login: FeedLogin) -> tuple:
     """What a catalog answer depends on about the login that asked: its lineup and accounts.
-    The main login and every login nobody narrowed share one key."""
+    Every login nobody narrowed shares one key."""
     return (login.lineup, login.accounts)
 
 
 # ── Picking what a feed id plays ───────────────────────────────────────────────────────────
 
-#: What a refused play tells a player that is not the owner's own at home - one on the public
-#: port or on a login for another user - by HTTP status. `FeedRefused.message` is written for the
+#: What a refused play tells a player by HTTP status: every play on the public port, and one on a
+#: login without `full_refusals` on the web UI's port. `FeedRefused.message` is written for the
 #: owner (page and setting names, how the guide matched a game, a folder path), so it stays in
-#: Recent plays, the alert and the log, and only the owner's own player at home is sent it
-#: (dev/changelog/1770).
+#: Recent plays, the alert and the log, and only a login its owner turned `full_refusals` on for
+#: is sent it, at home (dev/changelog/1770, 1781).
 SHORT_REFUSALS = {
     401: AUTH_FAILED_MESSAGE,
     404: 'No such channel on the IPTV output',
@@ -2074,13 +2043,17 @@ class RelaySession:
     # The feed id of the play this one ended when it took over from its player's last one
     # (_take_over), None if it never did.
     replaced_feed_id: Optional[int] = None
-    # The IPTV output login the play came in on (FeedLogin.feed_login_id): None for the main
-    # login, a browser preview and a picture of ChannelBin's own. Never read as the player's
+    # The IPTV output login the play came in on (FeedLogin.feed_login_id): None for a browser
+    # preview, a picture of ChannelBin's own, and a waiting screen redirect mode streams
+    # (redirect_play), which takes no seat. Never read as the player's
     # address - two users behind one address are two logins - and never the seat holder id
     # some functions call `viewer_id` (dev/changelog/1760).
     feed_login_id: Optional[int] = None
-    # That login's username as it was, for Watching now and Recent plays; '' for the main one.
+    # That login's username as it was, for Watching now and Recent plays; '' with no login.
     feed_login: str = ''
+    # That login's FeedLogin.provider_direct as it was: a play on a login that may be sent
+    # straight to the provider is not relayed in every mode (always_relayed).
+    provider_direct: bool = False
     # Tuned in on the public port (app/public_listener.py), which is always relayed. Never read
     # as which login it is or where the player is.
     public: bool = False
@@ -2139,9 +2112,10 @@ class RelaySession:
 
     @property
     def always_relayed(self) -> bool:
-        """On a login for another user or the public port: relayed in every mode, so never
-        handled as a redirected play (relays_for, dev/changelog/1760, 1761)."""
-        return self.feed_login_id is not None or self.public
+        """On the public port, or on a login not sent straight to the provider: relayed in every
+        mode, so never handled as a redirected play (relays_for, dev/changelog/1760, 1761,
+        1781)."""
+        return self.public or (self.feed_login_id is not None and not self.provider_direct)
 
     @property
     def own_picture(self) -> bool:
@@ -2351,10 +2325,10 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
     limit) and 500 when ffmpeg could not start. Requires an app context; the returned session
     is registered and reaped. `preview` is a browser preview's play (RelaySession.preview), in
     every mode. `player` is RelaySession.player: the address when it names one IPTV player,
-    else ''. `login` is the login the player came in on, None for the main one. `public` is
-    RelaySession.public.
+    else ''. `login` is the login the player came in on, None for a browser preview. `public`
+    is RelaySession.public.
     """
-    room = _LoginRoom(login) if login is not None and not login.is_main else None
+    room = _LoginRoom(login) if login is not None else None
     token = _tuning_login.set(login)
     public_token = _tuning_public.set(public)
     try:
@@ -2373,6 +2347,8 @@ def start_session(feed_id: int, client: str, cfg=None, preview: bool = False,
             if room is not None:
                 if session.feed_login_id is None:
                     session.feed_login_id, session.feed_login = login.feed_login_id, login.username
+                # Every play on a login, whoever built it (dev/changelog/1781).
+                session.provider_direct = login.provider_direct
                 if session.replaced_feed_id is None:
                     session.replaced_feed_id = room.replaced_feed_id
                 gone = not room.still_good_locked()
@@ -2474,7 +2450,7 @@ class _LoginRoom:
         _refuse(play.feed_id, play.label,
                 f'The IPTV output login "{self.login.username}" is already playing as many streams '
                 f'as it may at once ({counted(most, "stream")}). Stop one on that login\'s IPTV player, '
-                f'or raise its limit under Logins for other users on the IPTV Output page.',
+                f'or raise its limit under Logins on the IPTV Output page.',
                 503, f'login-{login_id}', client, alert=alert)
 
     def release(self) -> None:
@@ -2568,7 +2544,7 @@ def _not_in_lineup(play: 'Play', login: FeedLogin, client: str):
     before its channels were chosen again, or an id typed by hand. Named in the refused plays
     and the log, and no alert: nothing is broken."""
     message = (f'{play.label} is not one of the channels of IPTV output login "{login.username}". '
-               f'Its channels are chosen under Logins for other users on the IPTV Output page.')
+               f'Its channels are chosen under Logins on the IPTV Output page.')
     _note_refused(play.feed_id, play.label, client, message)
     log.info('Viewer from %s%s refused: %s', client, _on_login(login.log_name), message)
     raise FeedRefused(message, 404)
@@ -2580,7 +2556,7 @@ def _outside_login_accounts(play: 'Play', login: FeedLogin, client: str):
     a picture-in-picture channel. Named in the refused plays and the log with the login, and no
     alert: nothing is broken, and its player asks again every half minute (dev/changelog/1765)."""
     message = (f'Nothing to play for {play.label} on IPTV output login "{login.username}": '
-               f'{play.why_none}. Its accounts are chosen under Logins for other users on the IPTV '
+               f'{play.why_none}. Its accounts are chosen under Logins on the IPTV '
                f'Output page.')
     _note_refused(play.feed_id, play.label, client, message)
     log.info('Viewer from %s%s refused: %s', client, _on_login(login.log_name), message)
@@ -2605,7 +2581,7 @@ def _start_session(feed_id: int, client: str, cfg, preview: bool, player: str,
     if room is not None:
         room.claim(play, client, player, alert=not preview)
     login_id = login.feed_login_id if login is not None else None
-    login_name = login.username if login is not None and not login.is_main else ''
+    login_name = login.username if login is not None else ''
     if play.up_next is not None:
         return start_showing(play, client, cfg)
     combine_off = ''
@@ -4254,8 +4230,7 @@ def _screen_mod():
 
 def _screen_of(play: Play, cfg: dict, held: str = None, always_relayed: bool = False):
     """The waiting screen `play` shows now. A few queries (sports_screen.screen_for).
-    `always_relayed` is a play on a login for another user or on the public port, which is
-    relayed in every mode (relays_for)."""
+    `always_relayed` is a play relayed in every mode (relays_for)."""
     fcfg = feed_config(cfg)
     before, _after = sports_window(fcfg)
     # The screen's words follow how this play is delivered, so mixed mode's sports channel,
@@ -5080,15 +5055,15 @@ def redirect_play(feed_id: int, client: str, cfg=None, login: Optional[FeedLogin
     ChannelBin's own bytes and so is streamed in this mode too: it never takes a seat and never
     sends a provider login to the player (dev/changelog/1534). It ends when its game's window
     opens (REASON_WINDOW_OPENED), and the next tune-in is the 302. Requires an app context.
-    Raises FeedRefused as redirect_target() does. Only the main login is ever redirected
-    (relays_for); `login` names it on the lines this writes."""
+    Raises FeedRefused as redirect_target() does. Only a login with `provider_direct` is ever
+    redirected, and never on the public port (relays_for); `login` names it on the lines this
+    writes."""
     from .config import load_config
     cfg = cfg or load_config()
     token = _tuning_login.set(login)
     try:
-        # Only the main login is redirected, and it has no lineup or accounts of its own; both
-        # are asked anyway, so a change to relays_for() can never send a narrowed login's player
-        # to a channel outside its list or on an account outside its own.
+        # A redirected login may have a lineup and accounts of its own: a channel outside its
+        # list is refused, and a play outside its accounts is never chosen.
         play = resolve_play(feed_id, cfg, accounts=login.accounts if login is not None else None)
         if play is not None and login is not None and not login.offers(feed_id):
             _not_in_lineup(play, login, client)
@@ -5145,15 +5120,20 @@ def readiness_facts(cfg=None) -> dict:
     fcfg = feed_config(cfg)
     from . import public_listener
     from .database import OutputFeedLogin
-    facts = {'enabled': is_enabled(fcfg), 'mode': mode_of(fcfg),
-             'credentials_set': credentials_set(fcfg), 'reserve_fits': reserve_fits(fcfg),
-             'served': 0, 'missing_held_accounts': [], 'logins_on': 0,
+    facts = {'enabled': is_enabled(fcfg), 'mode': mode_of(fcfg), 'reserve_fits': reserve_fits(fcfg),
+             'served': 0, 'missing_held_accounts': [], 'logins_on': 0, 'short_passwords': [],
+             'direct_logins': 0,
              'public_port': public_listener.public_port(fcfg),
              'public_url': feed_public_url(fcfg),
              'listener': public_listener.status()}
     if not facts['enabled']:
         return facts
-    facts['logins_on'] = OutputFeedLogin.query.filter_by(enabled=True).count()
+    on = OutputFeedLogin.query.filter_by(enabled=True).order_by(OutputFeedLogin.id).all()
+    facts['logins_on'] = len(on)
+    facts['direct_logins'] = sum(1 for r in on if r.provider_direct)
+    # Names only, never a password: readiness says which login to change (dev/changelog/1781).
+    facts['short_passwords'] = [r.name or r.username for r in on
+                                if len(r.password or '') < STRONG_PASSWORD_LENGTH]
     facts['served'] = len(catalog(cfg))
     held = held_seats_map(fcfg)
     if held and redirects_some(fcfg):
@@ -5163,12 +5143,12 @@ def readiness_facts(cfg=None) -> dict:
 
 
 def bundle_facts(cfg=None) -> dict:
-    """The support bundle's view: config minus the credentials, the live count and the
-    last ended sessions by reason. Ids only, never a name - the sanitizer never sees this
-    module's labels."""
+    """The support bundle's view: config, the live count and the last ended sessions by reason.
+    Ids only, never a name - the sanitizer never sees this module's labels. The logins are rows,
+    not config (dev/changelog/1781); a username or password left in the block by hand is still
+    never copied."""
     fcfg = feed_config(cfg)
     out = {k: v for k, v in fcfg.items() if k not in ('username', 'password')}
-    out['credentials_set'] = credentials_set(fcfg)
     out['viewers_now'] = len(live_sessions())
     out['recent_ended'] = [{
         'feed_id': s.feed_id, 'group_id': s.group_id, 'channel_id': s.channel_id,

@@ -7,9 +7,9 @@
     number of queries. static/js/iptv-output.js swaps #of-state and the cards after an action
     and on a timer, so this template stays the one renderer.
 
-    The password is never in this page's source: the Xtream card and the playlist addresses
-    carry `password_slot` in a data attribute, which the script fills from
-    /api/settings/reveal only when the eye or Copy is used. #}
+    No password is in this page's source: the Connect card and the playlist addresses carry
+    `password_slot` in a data attribute, which the script fills from the login's own reveal
+    route only when the eye or Copy is used. #}
 
 {% macro switch(act, id, on, label, disabled=false, tip='', extra='') -%}
 <label class="switch{{ ' tip-plain' if tip else '' }}"{% if tip %} data-tip="{{ tip }}"{% endif %}><input type="checkbox" data-act="{{ act }}" data-id="{{ id }}" aria-label="{{ label }}"{{ ' checked' if on else '' }}{{ ' disabled' if disabled else '' }}{{ extra }}><span class="knob"></span></label>
@@ -46,8 +46,8 @@
     <button class="btn btn-primary" data-act="power" data-to="on">Turn on</button></div>
   {% elif needs_login %}
   <div class="notice-banner notice-banner-warn of-banner">{{ icon('warning', 'of-banner-i') }}
-    <div class="notice-banner-body"><div class="notice-banner-title">The IPTV output is not set up yet</div><div class="notice-banner-sub">Choose the username and password an IPTV player will log in with. After that it can be turned on.</div></div>
-    <button class="btn btn-primary" data-act="login" data-first="1">Set login</button></div>
+    <div class="notice-banner-body"><div class="notice-banner-title">The IPTV output is not set up yet</div><div class="notice-banner-sub">Add a login: the username and password an IPTV player will log in with. After that it can be turned on.</div></div>
+    <button class="btn btn-primary" data-act="login-add">Add a login</button></div>
   {% elif is_on %}
   {% if at_limit %}
   <div class="notice notice-warn"><div><strong>{{ max_viewers }} IPTV player{{ ' is' if max_viewers == 1 else 's are' }} watching, which is the most allowed at once.</strong> One more is refused until one of these stops, and a sports channel shows its waiting screen until then. A player on a waiting screen or an Up next channel is not counted. The limit is "IPTV players at once" under Settings on this page.</div></div>
@@ -66,11 +66,15 @@
 <div class="gd-sections" id="of-sections">
   {% if not needs_login %}
   <div class="card" id="of-connect">
-    <div class="card-head"><h2>Connect an IPTV player</h2>
-      <div class="card-head-actions"><button class="btn btn-sm" data-act="login" data-user="{{ connect.username }}">Change login</button></div></div>
-    {#- Only the body goes quiet while nothing is offered: the login can still be changed. #}
+    <div class="card-head"><h2>Connect an IPTV player</h2></div>
     <div class="card-body{{ ' of-inert' if dormant else '' }}"{{ ' inert' if dormant else '' }}>
       <p class="card-note">Add ChannelBin to an IPTV player (like TiviMate) the way you would add any IPTV provider. You can add it as an Xtream account or a standard m3u/xml playlist.</p>
+      {#- One login's details at a time (dev/changelog/1781). The script keeps the pick across
+          a swap; the first login is shown until then. -#}
+      {% if connect.logins | length > 1 %}
+      <div class="of-conn"><label class="k" for="of-conn-login">Login</label>
+        <span class="v"><select class="form-control" id="of-conn-login" data-act="conn-login">{% for c in connect.logins %}<option value="{{ c.id }}">{{ c.name }}{{ '' if c.on else ' (off)' }}</option>{% endfor %}</select></span></div>
+      {% endif %}
       {#- Only this notice can be hidden: the details work from other devices, so it is news,
           not a fault. The localhost one below stays, since its details do not. Hidden by
           version (output_feed_view.ADDRESS_NOTICE_VERSION), and the foot line still says
@@ -95,17 +99,25 @@
         <p class="card-note">What most players default to. Pick "Xtream Codes" (or "Xtream account") in the player and type these three.</p>
         <div class="of-conn"><span class="k">Server address</span><span class="v" data-copy-value>{{ connect.server }}</span>
           <span class="a"><button class="btn btn-sm" data-act="copy" data-label="Server address">{{ icon('copy') }}Copy</button></span></div>
-        <div class="of-conn"><span class="k">Username</span><span class="v" data-copy-value>{{ connect.username }}</span>
+        {% for c in connect.logins %}
+        <div data-conn-login="{{ c.id }}"{{ ' hidden' if not loop.first else '' }}>
+        <div class="of-conn"><span class="k">Username</span><span class="v" data-copy-value>{{ c.username }}</span>
           <span class="a"><button class="btn btn-sm" data-act="copy" data-label="Username">{{ icon('copy') }}Copy</button></span></div>
         <div class="of-conn"><span class="k">Password</span><span class="v" data-secret-text="{{ password_slot }}">{{ mask }}</span>
           <span class="a"><button class="btn btn-sm btn-icon" data-act="reveal" aria-label="Show the password">{{ icon('reveal') }}</button><button class="btn btn-sm" data-act="copy" data-secret="{{ password_slot }}" data-label="Password">{{ icon('copy') }}Copy</button></span></div>
+        </div>
+        {% endfor %}
         <p class="card-note of-conn-foot">{% if address.state == 'set' %}The address is ChannelBin's address from Settings. {% elif address_notice.hidden %}The address is the one this page was opened on, since ChannelBin's address is not set in Settings. {% endif %}This login is only for IPTV players. It is not ChannelBin's own login, and a player is never asked for that one.</p>
       </div>
       <div class="of-conn-pane" role="tabpanel" data-pane="playlist" hidden>
         <p class="card-note">For a player that takes a playlist address instead. Paste the first as the playlist and the second as the guide (EPG). Use these or the Xtream account, not both.</p>
-        {% for label, value in (('M3U playlist', connect.m3u), ('XMLTV guide', connect.xmltv)) %}
+        {% for c in connect.logins %}
+        <div data-conn-login="{{ c.id }}"{{ ' hidden' if not loop.first else '' }}>
+        {% for label, value in (('M3U playlist', c.m3u), ('XMLTV guide', c.xmltv)) %}
         <div class="of-conn"><span class="k">{{ label }}</span><span class="v" data-secret-text="{{ value }}">{{ value | replace(password_slot, mask) }}</span>
           <span class="a"><button class="btn btn-sm btn-icon" data-act="reveal" aria-label="Show the password">{{ icon('reveal') }}</button><button class="btn btn-sm" data-act="copy" data-secret="{{ value }}" data-label="{{ label }}">{{ icon('copy') }}Copy</button></span></div>
+        {% endfor %}
+        </div>
         {% endfor %}
         <p class="card-note of-conn-foot">{% if address.state == 'set' %}The address is ChannelBin's address from Settings. {% elif address_notice.hidden %}The address is the one this page was opened on, since ChannelBin's address is not set in Settings. {% endif %}Both addresses have the password inside them, so treat a copied one like the password itself.</p>
       </div>
@@ -113,12 +125,12 @@
   </div>
   {% endif %}
 
-  {% if not needs_login %}
-  <div class="card" id="of-logins" data-server="{{ public.server }}">
-    <div class="card-head"><h2>Logins for other users{% if logins %} <span class="cnt">{{ logins | length }}</span>{% endif %}</h2>
-      <div class="card-head-actions"><button class="btn btn-sm" data-act="login-add" data-password="{{ login_password }}" data-min="{{ login_streams[0] }}" data-max="{{ login_streams[1] }}">{{ icon('add') }}Add a login</button></div></div>
+  {#- Drawn while the output is not set up too: Add a login is how it gets set up. -#}
+  <div class="card" id="of-logins" data-server="{{ public.server }}" data-password="{{ login_password }}" data-min="{{ login_streams[0] }}" data-max="{{ login_streams[1] }}">
+    <div class="card-head"><h2>Logins{% if logins %} <span class="cnt">{{ logins | length }}</span>{% endif %}</h2>
+      <div class="card-head-actions"><button class="btn btn-sm" data-act="login-add">{{ icon('add') }}Add a login</button></div></div>
     <div class="card-body">
-      <p class="card-note">Give someone else their own login to this IPTV output. They type the server address in the details you copy for them, with their own username and password, and get the same channels and guide as you, or only the channels you choose for them with Choose channels in their row's menu. Their plays come from the output's accounts, or only from the accounts you pick with Choose accounts. Each login can be turned off or deleted without touching the others or yours. A play on one of these logins always goes through ChannelBin, even in redirect or mixed mode, so your IPTV provider's login is never sent to their player. Their plays count against "IPTV players at once" as well as their own limit.</p>
+      <p class="card-note">Every IPTV player logs in with one of these, yours included. Each login gets every channel on the output, or only the ones you choose with Choose channels in its row's menu, and plays from the output's accounts, or only from the ones you pick with Choose accounts. Each can be turned off, changed or deleted without touching the others. A play on a login goes through ChannelBin, even in redirect or mixed mode, so your IPTV provider's login is never sent to its player, unless you let that login play straight from your provider at home with Change. Its plays count against "IPTV players at once" as well as its own limit.</p>
       {#- The public port (app/public_listener.py, dev/changelog/1761). -#}
       {% if public.say == 'open' %}
       <p class="card-note">From outside your home network they use <strong>{{ public.url }}</strong>, which your reverse proxy sends to ChannelBin's public port, {{ public.port }}. The details you copy below name that address. The public port answers an IPTV player and nothing else, and every play on it goes through ChannelBin.</p>
@@ -162,8 +174,8 @@
         <thead><tr><th>Name</th><th>Username</th><th>Password</th><th class="tip-plain" data-tip="How many channels this login may play at once, and how many it is playing now.">Streams</th><th class="tip-plain" data-tip="The channels its IPTV player lists. Choose them with Choose channels in the row's menu.">Channels</th><th class="tip-plain" data-tip="The IPTV accounts its plays come from. Choose them with Choose accounts in the row's menu.">Accounts</th><th>On</th><th></th></tr></thead>
         <tbody>
           {% for l in logins %}
-          <tr{{ ' class="of-off"' | safe if not l.on else '' }} data-login="{{ l.id }}" data-name="{{ l.name }}" data-user="{{ l.username }}" data-streams="{{ l.max_streams }}" data-playing="{{ l.playing }}">
-            <td data-label="Name" class="rl-prog"><span class="t">{{ l.name }}</span></td>
+          <tr{{ ' class="of-off"' | safe if not l.on else '' }} data-login="{{ l.id }}" data-name="{{ l.name }}" data-user="{{ l.username }}" data-streams="{{ l.max_streams }}" data-playing="{{ l.playing }}" data-direct="{{ '1' if l.provider_direct else '' }}" data-whole="{{ '1' if l.full_refusals else '' }}">
+            <td data-label="Name" class="rl-prog"><span class="t">{{ l.name }}</span>{% if l.provider_direct %}<span class="s tip-plain" data-tip="In redirect and mixed mode its IPTV player at home is sent straight to your IPTV provider, which hands it your provider login. On the public port it is always played through ChannelBin.">Plays straight from your provider at home</span>{% endif %}{% if l.full_refusals %}<span class="s tip-plain" data-tip="When a play is refused, its IPTV player at home is told the whole reason, which can name your pages, settings and folders. On the public port it is told only what kind of refusal it is.">Told the whole reason at home</span>{% endif %}</td>
             <td data-label="Username">{{ l.username }}</td>
             <td data-label="Password"><span data-secret-text="{password}">{{ mask }}</span> <button class="btn btn-sm btn-icon" data-act="login-reveal" aria-label="Show the password">{{ icon('reveal') }}</button></td>
             <td data-label="Streams">{% if l.playing %}{{ l.playing }} of {{ l.max_streams }} playing{% else %}Up to {{ l.max_streams }}{% endif %}</td>
@@ -182,20 +194,19 @@
           {% endfor %}
         </tbody></table></div>
       {% else %}
-      <p class="card-note">None yet. Add a login to give someone their own.</p>
+      <p class="card-note">None yet. Add one for each person who will use the IPTV output, yourself included.</p>
       {% endif %}
     </div>
   </div>
-  {% endif %}
 
   {% if is_on %}
   <div class="card" id="of-watching">
     <div class="card-head"><h2>Watching now{% if watching %} <span class="cnt">{{ watching | length }}</span>{% endif %}</h2></div>
     <div class="card-body">
       {% if redirect %}
-      <p class="card-note">In redirect mode an IPTV player on your login plays straight from your IPTV provider, so ChannelBin sees each time it tunes in and never when it stops. It cannot say who is watching now. The tune-ins are under Recent plays.{% if watching %} The plays it can see are listed here: its own pictures (a sports channel's waiting screen or an Up next channel), and plays on logins for other users, which always go through ChannelBin.{% endif %}</p>
+      <p class="card-note">In redirect mode an IPTV player on a login that plays straight from your provider is sent to your IPTV provider, so ChannelBin sees each time it tunes in and never when it stops, and cannot say whether it is still watching. Those tune-ins are under Recent plays.{% if watching %} The plays it can see are listed here: its own pictures (a sports channel's waiting screen or an Up next channel), and plays on every other login and on the public port, which always go through ChannelBin.{% endif %}</p>
       {% elif mixed %}
-      <p class="card-note">In mixed mode only channel groups, sports channels, Up next channels and every play on a login for another user go through ChannelBin, and those are listed here. Any other channel plays straight from your IPTV provider, so ChannelBin sees it tune in and never sees it stop. Those tune-ins are under Recent plays.</p>
+      <p class="card-note">In mixed mode channel groups, sports channels, Up next channels and every play on a login that does not play straight from your provider go through ChannelBin, and those are listed here. Any other channel on a login that does plays straight from your IPTV provider, so ChannelBin sees it tune in and never sees it stop. Those tune-ins are under Recent plays.</p>
       {% endif %}
       {% if watching %}
       <div class="table-scroll"><table class="tbl tbl-cards rl-tbl">
@@ -354,7 +365,7 @@
   <div class="card{{ ' of-inert' if dormant else '' }}" id="of-accounts"{{ ' inert' if dormant else '' }}>
     <div class="card-head"><h2>Accounts it may play from</h2></div>
     <div class="card-body">
-      <p class="card-note">While someone watches, the play uses one connection of one of your IPTV accounts, and a recording that needs that connection takes it. Switch an account off to keep the IPTV output away from it: a channel on it leaves the output, and a group plays from its channels on the other accounts. A login for another user can be given accounts of its own with Choose accounts in its row's menu, and those take the place of these switches for that login.</p>
+      <p class="card-note">While someone watches, the play uses one connection of one of your IPTV accounts, and a recording that needs that connection takes it. Switch an account off to keep the IPTV output away from it: a channel on it leaves the output, and a group plays from its channels on the other accounts. A login can be given accounts of its own with Choose accounts in its row's menu, and those take the place of these switches for that login.</p>
       {% if mixed %}
       <p class="card-note">In mixed mode a channel that is not a group or a sports channel plays straight from your IPTV provider, and ChannelBin cannot see whether an IPTV player is still watching it, so it cannot take that connection back when a recording needs it. If a recording starts on an account whose connections are all in use, your IPTV provider refuses one of the two. To keep that from happening, tell recordings to leave a connection alone on the accounts players watch from. A group or sports channel playing through ChannelBin uses one of those connections first, so the same player is never counted twice. "None" is how it starts: recordings may use every connection. Leaving all of them alone means nothing records from that account. Whether the output may use an account at all is the switch, not this.</p>
       {% elif redirect %}
@@ -408,7 +419,7 @@
         {{ number_setting('sports_before_minutes', 'Sports channels: start early by (minutes)', 'A sports channel plays the channel listing its game this long before the listing starts, so tuning in early gets the pregame show. A game no guide lists, played from a channel whose name mentions it, starts this long before the time that name gives. 0 starts at the listing.') }}
         {{ number_setting('sports_after_minutes', 'Sports channels: keep playing after (minutes)', 'And this long after the listing ends, because games run long. A game played from a channel\'s name has no listing to run past, so it stops where a recording of it would. 0 stops at the listing\'s end. A play already running is never cut, even when its channel fails and it moves to another one carrying the game.') }}
         {% if relays_some %}
-        {{ number_setting('max_viewers', 'IPTV players at once', 'One more than this is refused, and the refusal says so. ' ~ ('In mixed mode only plays through ChannelBin count: a channel sent straight to your IPTV provider is never seen. ' if mixed else '') ~ ('In redirect mode only plays on logins for other users and on the public port count: they always go through ChannelBin. ' if redirect else '') ~ 'A player on a sports channel\'s waiting screen is not counted until its game comes on, and one on an Up next channel is not counted at all.') }}
+        {{ number_setting('max_viewers', 'IPTV players at once', 'One more than this is refused, and the refusal says so. ' ~ ('In mixed mode only plays through ChannelBin count: a channel sent straight to your IPTV provider is never seen. ' if mixed else '') ~ ('In redirect mode only plays through ChannelBin count: those on a login that does not play straight from your provider, and every play on the public port. ' if redirect else '') ~ 'A player on a sports channel\'s waiting screen is not counted until its game comes on, and one on an Up next channel is not counted at all.') }}
         {{ number_setting('reserve_seconds', 'Seconds behind live', 'How much of the stream ChannelBin holds before the IPTV player gets it. A short dropout plays through without the picture freezing.') }}
         {{ number_setting('idle_seconds', 'Cut when the player reads nothing for (seconds)', 'A player that has stopped reading the stream has usually gone away without saying so. Its connection is freed after this long.') }}
         {{ number_setting('max_session_hours', 'Longest single play (hours)', 'So a player left on a channel for a week does not hold a connection for a week. It can tune in again right away.') }}

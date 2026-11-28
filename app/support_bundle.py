@@ -265,27 +265,29 @@ _IPV6_RE = re.compile(r'(?<![\w:.])(?=[0-9A-Fa-f:.]*:[0-9A-Fa-f]*:)[0-9A-Fa-f:.]
 # from the log tail itself so a login deleted before the play log kept its name is found too.
 _LOGIN_IN_LINE_RES = (
     re.compile(r'(\bon login )(\S+?)([:,.)]?)(?=[\s"\']|$)'),
-    re.compile(r'(IPTV output: login )(\S+?)( (?:added for another user|deleted|now gets |'
-               r'now plays from |has an? ))'),
+    re.compile(r'(IPTV output: login )(\S+?)( (?:added|deleted|now gets |now plays from |has an? |'
+               r'moved from |was already |in config\.yaml ))'),
 )
 
 
 def _login_pseudonyms(cfg, log_text=''):
-    """(username, pseudonym) for every IPTV output login a bundle may name: the main login,
-    each login for another user by its id, and a former login's name that output_feed_plays
-    or a line of `log_text` still carries, since its old lines are still in the log."""
+    """(username, pseudonym) for every IPTV output login a bundle may name: each login by its
+    id, and a former login's name that output_feed_plays or a line of `log_text` still carries,
+    since its old lines are still in the log. The owner's own login is a row like any other
+    since dev/changelog/1781, so it is a <login N> too; a username still in config.yaml's old
+    place (a backup restored since the last start, which moves it) is a former login."""
     from .database import OutputFeedLogin, OutputFeedPlay
-    from .output_feed import feed_config, feed_username
     pairs = []
-    main = feed_username(feed_config(cfg))
-    if main:
-        pairs.append((main, '<main login>'))
-    known = {main}
+    known = set()
+    feed = (cfg.get('integrations') or {}).get('output_feed') or {}
+    left = '' if feed.get('username') is None else str(feed.get('username')).strip()
     for row in OutputFeedLogin.query.order_by(OutputFeedLogin.id).all():
         pairs.append((row.username, f'<login {row.id}>'))
         known.add(row.username)
     former = {name for (name,) in db.session.query(OutputFeedPlay.feed_login)
               .filter(OutputFeedPlay.feed_login.isnot(None)).distinct()}
+    if left:
+        former.add(left)
     for pattern in _LOGIN_IN_LINE_RES:
         # A bare number after 'on login' is an id in another module's line, never a name read
         # back from a line ChannelBin wrote about a login.
@@ -830,11 +832,10 @@ def _redaction_disclosure(sanitizer):
         'iptv_output_login_usernames_swept_only_where_a_line_names_a_login':
             sanitizer.logins_context_only,
         'iptv_output_login_note': (
-            'Every IPTV output login username (integrations.output_feed.username, '
-            'output_feed_logins.username, and a former login\'s name that '
-            'output_feed_plays.feed_login or a log line still carries) is replaced as a whole '
-            'word wherever it appears, in both modes: <main login>, <login N> by the login\'s '
-            f'id, <former login N>. A username shorter than {sanitizer.MIN_LOGIN_SWEEPABLE_LEN} '
+            'Every IPTV output login username (output_feed_logins.username, and a former '
+            'login\'s name that output_feed_plays.feed_login or a log line still carries) is '
+            'replaced as a whole word wherever it appears, in both modes: <login N> by the '
+            f'login\'s id, <former login N>. A username shorter than {sanitizer.MIN_LOGIN_SWEEPABLE_LEN} '
             'characters or made only of digits would match ordinary words and numbers, so it is '
             'replaced only where a line names it as a login ("on login <name>"), and counted '
             'above. A username someone typed wrongly is not a login, and is not swept.'),

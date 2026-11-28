@@ -264,6 +264,7 @@ def create_app(config_overrides=None, start_scheduler=True):
         duplicate_streams.install_listener()
         _ensure_system_health_job()
         _retire_sports_file_names()
+        _move_main_output_login()
         if tags_table_is_new:
             _seed_default_tags()
         if fresh:
@@ -709,6 +710,99 @@ def _retire_sports_file_names():
         from .alerts import create_alert
         create_alert('SETTING_REMOVED', title='"Name matched games from TheSportsDB" was removed',
                      body=SPORTS_FILE_NAMES_REMOVED, source='startup')
+
+
+#: What the IPTV output login moved out of config.yaml is called on the Logins card.
+MOVED_LOGIN_NAME = 'Main login'
+MAIN_LOGIN_MOVED = (
+    'The IPTV output\'s main login is now a row in the Logins card on the IPTV Output page, '
+    'called "{name}", with the same username and password, so no IPTV player has to be set up '
+    'again. It keeps every channel, the output\'s accounts, playing straight from your IPTV '
+    'provider in redirect and mixed mode, and the whole reason when a play is refused. What is '
+    'new: it can hold at most {streams} streams at once, which you can change there, and it '
+    'follows the same rules as every other login, on the public port too.')
+MAIN_LOGIN_DROPPED = (
+    'config.yaml held an IPTV output login (username "{username}") that a login on the IPTV '
+    'Output page already uses with another password, so it could not be moved there and was '
+    'removed. An IPTV player set up with it is refused until it is given that login\'s password, '
+    'or a new login.')
+
+
+def _move_main_output_login():
+    """Move `integrations.output_feed.username`/`password` into a row of output_feed_logins and
+    remove them from config.yaml (dev/changelog/1781).
+
+    The leaves in config.yaml are the obligation: they leave the file only after the row is
+    committed, so a start that dies between the two finds the row (same username and password)
+    on the next start, says so in a WARNING, only removes the leaves, and raises the alert the
+    first start never reached. The row keeps the pair
+    exactly, so no TV is set up again; it gets every channel, the output's accounts, and both
+    switches on, which is what the main login had, and a stream limit of "IPTV players at once"
+    held to the most a login may have. A pair whose username a row already has with another
+    password cannot be moved (a hand-edited config; the page never allowed it) and is dropped
+    with an alert. Not a CONFIG_MIGRATIONS step: it writes the database, which migrate_config()
+    runs before. The config lock is never held across the database write."""
+    from .config import config_write_lock, _load_config_file, _write_config_file, load_config
+    from .database import OutputFeedLogin
+    from .db_utils import retry_on_locked
+    from . import output_feed
+    log = logging.getLogger(__name__)
+    raw = _load_config_file()
+    feed = ((raw or {}).get('integrations') or {}).get('output_feed')
+    if not isinstance(feed, dict) or not ({'username', 'password'} & set(feed)):
+        return
+    username = '' if feed.get('username') is None else str(feed.get('username')).strip()
+    password = '' if feed.get('password') is None else str(feed.get('password'))
+    low, high = output_feed.MAX_STREAMS_BOUNDS
+    try:
+        most = int(output_feed.feed_config(load_config()).get('max_viewers') or low)
+    except (TypeError, ValueError):
+        most = low
+    streams = min(high, max(low, most))
+
+    @retry_on_locked()
+    def _add_row():
+        row = OutputFeedLogin.query.filter_by(username=username).first()
+        if row is not None:
+            return 'resumed' if row.password == password else 'clash'
+        db.session.add(OutputFeedLogin(name=MOVED_LOGIN_NAME, username=username,
+                                       password=password, max_streams=streams,
+                                       provider_direct=True, full_refusals=True))
+        db.session.commit()
+        return 'moved'
+
+    outcome = _add_row() if username and password else 'empty'
+    with config_write_lock:
+        raw = _load_config_file(round_trip=True)
+        feed = ((raw or {}).get('integrations') or {}).get('output_feed')
+        if isinstance(feed, dict):
+            feed.pop('username', None)
+            feed.pop('password', None)
+            _write_config_file(raw)
+    from .alerts import create_alert
+    if outcome in ('moved', 'resumed'):
+        # The alert is raised after config.yaml is written, so a start that stopped before that
+        # never raised it: the retry does, and the leaves being gone keeps it to once.
+        create_alert('SETTING_MOVED', title='The IPTV output\'s main login moved to the Logins card',
+                     body=MAIN_LOGIN_MOVED.format(name=MOVED_LOGIN_NAME, streams=streams),
+                     source='startup')
+    if outcome == 'moved':
+        log.info('IPTV output: login %s moved from config.yaml into the Logins card as "%s" '
+                 '(%d streams at once)', username, MOVED_LOGIN_NAME, streams)
+    elif outcome == 'resumed':
+        log.warning('IPTV output: login %s was already moved into the Logins card by a start that '
+                    'stopped before removing it from config.yaml; removed it from config.yaml now',
+                    username)
+    elif outcome == 'clash':
+        log.warning('IPTV output: login %s in config.yaml is a username another login already uses '
+                    'with another password; removed it from config.yaml without moving it', username)
+        create_alert('SETTING_REMOVED', title='An IPTV output login in config.yaml was removed',
+                     body=MAIN_LOGIN_DROPPED.format(username=username), source='startup')
+    elif outcome == 'empty':
+        log.info('Removed an empty IPTV output username or password from config.yaml; the logins '
+                 'are on the IPTV Output page')
+    else:
+        raise ValueError(f'Unknown outcome "{outcome}"')
 
 
 def _ensure_system_health_job():

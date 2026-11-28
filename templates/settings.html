@@ -782,14 +782,14 @@
       </div>
 
       {#- The output feed (app/output_feed.py, DESIGN-output-feed.md 9): one switch, and the
-          rest only reads while it is on. The switch is disabled until a credential exists -
+          rest only reads while it is on. The switch is disabled until a login exists -
           the route refuses it too. The help text says what is served and that a recording
           always wins a seat; in redirect and mixed modes it says what ChannelBin cannot see. -#}
       {% set feedcfg = cfg.get('integrations', {}).get('output_feed', {}) %}
       {% call field_shell('integrations.output_feed.enabled', 'IPTV output',
          'When enabled, an IPTV player such as TiviMate can connect to ChannelBin as if it were an IPTV provider and gets the TV Guide: every channel and group in it that has not been taken off the output, in the guide\'s order, with the guide\'s own listings. A group plays as one channel from the member ChannelBin would record from, and moves to another member if that one dies. A recording always wins: an IPTV player holding the connection a recording needs moves to another channel of its group or game that has a connection free, and when there is none it is cut and told why on the Alerts page. The login a player uses, the details to type into it, which channels it gets and who is watching are on the IPTV Output page, which has these same settings.', false, false, 'output feed tivimate xtream m3u xmltv iptv player app client username password login', tier='basic') %}
-      <label class="switch{{ ' tip-plain' if not feed_credentials_set else '' }}"{% if not feed_credentials_set %} data-tip="Set the IPTV player's login on the IPTV Output page first"{% endif %}>
-        <input type="checkbox" data-setting-path="integrations.output_feed.enabled"{{ ' checked' if feedcfg.get('enabled') else '' }}{{ ' disabled' if not feed_credentials_set else '' }}>
+      <label class="switch{{ ' tip-plain' if not feed_has_login else '' }}"{% if not feed_has_login %} data-tip="Add a login on the IPTV Output page first"{% endif %}>
+        <input type="checkbox" data-setting-path="integrations.output_feed.enabled"{{ ' checked' if feedcfg.get('enabled') else '' }}{{ ' disabled' if not feed_has_login else '' }}>
         <span class="knob"></span>
       </label>
       <a class="btn btn-sm" href="{{ url_for('iptv_output.page') }}">IPTV Output {{ icon('forward') }}</a>
@@ -837,7 +837,7 @@
          'Turn this on when a reverse proxy is in front of the public port, which is how the port is meant to be used. With it off, ChannelBin sees the proxy in place of every IPTV player that comes in there: a few wrong passwords from anyone lock everyone out, and every play is listed under the proxy\'s address. It covers the public port only; the web UI\'s port has its own switch under System, so you can leave that one off when you open ChannelBin\'s pages straight at home. With it on, ChannelBin takes the visitor\'s address from whoever connects to the port, so also put your proxy\'s address in "Reverse proxy addresses" under System: then nobody but the proxy is believed.',
          feedcfg.get('public_behind_proxy', False), restart=True, tier='advanced') }}
       {{ field_text('integrations.output_feed.public_url', 'Address for people outside your network',
-         'The address people outside your home network type into their IPTV player as the server: your reverse proxy\'s, starting with https://. The Logins for other users card puts it in the details it copies for them. Only handed out, never where ChannelBin listens.',
+         'The address people outside your home network type into their IPTV player as the server: your reverse proxy\'s, starting with https://. The Logins card puts it in the details it copies for them. Only handed out, never where ChannelBin listens.',
          feedcfg.get('public_url', ''), tier='advanced', placeholder='https://tv.example.com',
          examples=['https://tv.example.com']) }}
 

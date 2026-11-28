@@ -20,6 +20,7 @@ from app import db
 from app.database import Channel, FEED_PLAY_ENDED, OutputFeedPlay
 from sim.content import PROFILES
 
+from ..support.output_feed import ensure_login
 from .support import CAPTURE_WORLD, CHANNEL_LOOP, CaptureCase
 
 USER, PASS = 'tv', 'sofa'
@@ -35,9 +36,10 @@ class ViewerOpeningBurstScenario(CaptureCase):
     world_source = WORLD
 
     def _feed(self, **over):
-        block = {'enabled': True, 'username': USER, 'password': PASS, 'max_viewers': 1}
+        block = {'enabled': True, 'max_viewers': 1}
         block.update(over)
         self.configure({'integrations': {'output_feed': block}})
+        ensure_login(USER, PASS)
 
     def _tune_in(self):
         ch = self.channel()

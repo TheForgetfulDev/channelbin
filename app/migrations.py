@@ -4193,6 +4193,19 @@ def _m155_login_hosts(conn, cur):
     ''')
     conn.commit()
 
+
+def _m156_output_feed_login_switches(conn, cur):
+    """output_feed_logins.provider_direct and full_refusals: whether a login's player may be sent
+    straight to the IPTV provider at home, and whether its player is told a refusal's whole
+    reason there (dev/changelog/1781). Both off for every row: before this step only the main
+    login in config.yaml had either, and app/__init__.py::_move_main_output_login moves that one
+    in with both on. Re-runnable from the top: each ADD COLUMN asks PRAGMA table_info first."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(output_feed_logins)').fetchall()}
+    for col in ('provider_direct', 'full_refusals'):
+        if cols and col not in cols:
+            cur.execute(f'ALTER TABLE output_feed_logins ADD COLUMN {col} BOOLEAN NOT NULL DEFAULT 0')
+    conn.commit()
+
 #: epg_sources as of step 148: owner_account_id nullable, owner_provider_id beside it and
 #: exactly one of the two set, is_account_guide. Frozen here, compiled from the model at the
 #: time; the rebuild test holds step 148's output to this text, and the column list after
@@ -5078,6 +5091,8 @@ SCHEMA_MIGRATIONS = [
     (154, 'output_feed_logins.accounts: the IPTV accounts each login for another user plays from',
      _m154_output_feed_login_accounts),
     (155, 'login_hosts: the hosts of the reseller who sold a login', _m155_login_hosts),
+    (156, 'output_feed_logins.provider_direct + full_refusals: per-login switches the main IPTV '
+          'output login used to have alone', _m156_output_feed_login_switches),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support import clips  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
+from tests.support.output_feed import ensure_login
 from tests.support.seed import make_account, make_channel  # noqa: E402
 
 import app.connection_limits as connlim  # noqa: E402
@@ -43,7 +44,7 @@ USER, PASS = 'tv', 'tv-secret'
 
 
 def _cfg(**overrides):
-    block = {'enabled': True, 'username': USER, 'password': PASS, 'reserve_seconds': 0}
+    block = {'enabled': True, 'reserve_seconds': 0}
     block.update(overrides)
     return {'integrations': {'output_feed': block}}
 
@@ -340,6 +341,7 @@ class CatalogTests(_Leagues, unittest.TestCase):
         self.t = make_test_app(csrf=False)
         self.addCleanup(self.t.cleanup)
         self.t.sandbox_config(_cfg())
+        ensure_login(USER, PASS)
         self.seed()
 
     def test_feed_ids_decode_to_their_kind(self):
@@ -378,9 +380,9 @@ class CatalogTests(_Leagues, unittest.TestCase):
         db.session.commit()
         rows = feed.catalog()
         self.assertEqual({r.kind for r in rows}, {feed.KIND_UP_NEXT, feed.KIND_SPORTS})
-        fcfg = {'username': 'u', 'password': 'p'}
+        login = feed.FeedLogin('u', 'p', feed_login_id=1)
         for row in rows:
-            self.assertEqual(feed.logo_url(row, 'http://box:5000', feed.main_login(fcfg)),
+            self.assertEqual(feed.logo_url(row, 'http://box:5000', login),
                              f'http://box:5000{feed.OWN_LOGO_PATH}', row.name)
         resp = self.t.client.get(feed.OWN_LOGO_PATH)
         self.assertEqual((resp.status_code, resp.mimetype), (200, 'image/png'))
@@ -416,6 +418,7 @@ class ClipCacheTests(_Leagues, unittest.TestCase):
         self.t = make_test_app(csrf=False)
         self.addCleanup(self.t.cleanup)
         self.t.sandbox_config(_cfg())
+        ensure_login(USER, PASS)
         self.seed()
         self.renders = []
         patcher = mock.patch.object(ss, 'render_clip', self._fake_render)
@@ -537,6 +540,7 @@ class PlayTests(_Leagues, unittest.TestCase):
         self.addCleanup(self.t.cleanup)
         self.addCleanup(feed.stop_all)
         self.t.sandbox_config(self.FEED)
+        ensure_login(USER, PASS)
         self.seed()
         self.game(self.nhl, 3, 1)
         self.renders = []

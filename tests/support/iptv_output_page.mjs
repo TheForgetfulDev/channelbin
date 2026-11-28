@@ -49,7 +49,7 @@ w.fetch = (url, opts = {}) => {
   requests.push({ method, path, body });
   const json = (status, payload) => Promise.resolve({ ok: status < 400, status, statusText: 'x',
     json: () => Promise.resolve(payload), text: () => Promise.resolve(HTML) });
-  if (path.startsWith('/api/settings/reveal')) return json(200, { success: true, value: PASSWORD });
+  if (/^\/api\/iptv-output\/logins\/\d+\/password$/.test(path)) return json(200, { success: true, password: PASSWORD });
   if (REFUSE.has(path)) return json(400, { error: 'Refused by the server.' });
   if (/^\/api\/iptv-output\/logins\/\d+\/channels$/.test(path)) return json(200, CHANNELS);
   if (/^\/api\/iptv-output\/logins\/\d+\/accounts$/.test(path)) return json(200, ACCOUNTS);
@@ -157,6 +157,20 @@ out.xtream_masked_again = pw.querySelector('.v').textContent;
 await click(d.querySelector('[data-pane="xtream"] [data-secret] '));
 await click(d.querySelector('[data-pane="xtream"] [data-act="copy"]'));
 out.copied = copied.slice();
+
+/* The Connect card shows one login at a time, and the picker at its top swaps which; the eye
+   asks for the password of the login shown (dev/changelog/1781). */
+const connPick = d.getElementById('of-conn-login');
+const shownUsers = () => Array.from(d.querySelectorAll('#of-connect [data-pane="xtream"] [data-conn-login]'))
+  .filter((el) => !el.hidden).map((el) => el.querySelector('[data-copy-value]').textContent);
+out.conn_picker = connPick ? Array.from(connPick.options).map((o) => o.textContent) : null;
+out.conn_shown_first = shownUsers();
+connPick.value = connPick.options[1].value;
+await change(connPick);
+out.conn_shown_picked = shownUsers();
+mark = requests.length;
+await click(d.querySelector('#of-connect [data-pane="xtream"] [data-conn-login]:not([hidden]) [data-act="reveal"]'));
+out.conn_reveal = { paths: requests.slice(mark).map((r) => r.path), picked: connPick.value };
 
 /* Accounts */
 mark = requests.length;
@@ -290,14 +304,18 @@ await click(modalButton('Save'));
 await wait(40);
 out.la_output_post = requests.slice(mark).filter((r) => r.method === 'POST').map((r) => r.body);
 
-/* Change login: an empty password is sent as empty, never a mask. */
+/* Change a login: prefilled but never with its password, which an empty field keeps, and its two
+   home-only switches shown as they are and sent as they are left (dev/changelog/1781). */
 mark = requests.length;
-await click(d.querySelector('[data-act="login"]'));
-out.login_prefill = { user: d.getElementById('of-user').value, pass: d.getElementById('of-pass').value };
-d.getElementById('of-user').value = 'den';
+const loginRow = d.querySelector('#of-logins tr[data-login][data-user="tv"]');
+await click(loginRow.querySelector('[data-act="login-edit"]'));
+out.login_prefill = { user: d.getElementById('of-l-user').value, pass: d.getElementById('of-l-pass').value,
+  direct: d.getElementById('of-l-direct').checked, whole: d.getElementById('of-l-whole').checked };
+d.getElementById('of-l-direct').checked = false;
 await click(modalButton('Save'));
 await wait(40);
-out.login_post = requests[mark] ? { path: requests[mark].path, body: requests[mark].body } : null;
+const loginPost = requests.slice(mark).find((r) => r.method === 'POST');
+out.login_post = loginPost ? { path: loginPost.path, body: loginPost.body, row: loginRow.dataset.login } : null;
 
 /* The live refresh swaps only what moves, and waits while a dialog is open. */
 mark = requests.length;

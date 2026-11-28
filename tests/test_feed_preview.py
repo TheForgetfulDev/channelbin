@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support import clips  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
+from tests.support.output_feed import ensure_login
 from tests.support.seed import make_account, make_channel, make_group, make_guide_match  # noqa: E402
 
 import app.connection_limits as connlim  # noqa: E402
@@ -40,7 +41,7 @@ USER, PASS = 'tv', 'tv-secret'
 
 
 def _cfg(**overrides):
-    block = {'enabled': True, 'username': USER, 'password': PASS, 'reserve_seconds': 0}
+    block = {'enabled': True, 'reserve_seconds': 0}
     block.update(overrides)
     return {'integrations': {'output_feed': block}}
 
@@ -171,6 +172,7 @@ class _FeedPreview(unittest.TestCase):
         self.addCleanup(feed.stop_all)
         self.addCleanup(preview.stop_all)
         self.t.sandbox_config(self.FEED)
+        ensure_login(USER, PASS)
         self.account = make_account('Acct', max_connections=1)
         db.session.commit()
         patcher = mock.patch.object(ss, 'render_clip', self._fake_render)
