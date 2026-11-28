@@ -175,24 +175,25 @@ class GuideEpgApiTests(unittest.TestCase):
         missing_row = self._row_for(data, missing_ch.id)
         self.assertEqual(missing_row['lifecycle'], 'missing')
         self.assertEqual(missing_row['lifecycle_date'], since.strftime('%Y-%m-%d'))
-        self.assertFalse(missing_row['lifecycle_repoint_available'],
-                         'no duplicate exists for this channel, so no repoint target either')
+        self.assertEqual(missing_row['replacement_count'], 0,
+                         'no other channel carries this stream, so nothing to replace it with')
 
         healthy_row = self._row_for(data, self.ch.id)
         self.assertIsNone(healthy_row['lifecycle'])
         self.assertEqual(healthy_row['lifecycle_date'], '')
-        self.assertFalse(healthy_row['lifecycle_repoint_available'])
+        self.assertEqual(healthy_row['replacement_count'], 0)
+        self.assertFalse(healthy_row['lifecycle_unlisted'])
 
         group_row = self._row_for(data, f'g{group.id}')
         self.assertIsNone(group_row['lifecycle'],
                           "a group's lifecycle isn't a single member channel's to report")
 
-    def test_missing_duplicate_channel_reports_repoint_availability(self):
-        """dev/changelog/627 - the guide's Missing pill only offers the click-to-re-point
-        hint when a real recovery target exists (accounts.repoint_candidates_for_channels,
-        the same lookup the channel detail page's Re-point action uses), not guessed from a
-        cheaper guide-scoped signal. The plain-missing case in the test above (no duplicate)
-        already proves the False side."""
+    def test_missing_duplicate_channel_reports_a_replacement(self):
+        """dev/changelog/627 - the guide's Missing pill only offers the replace hint when a
+        real replacement exists: the proposals the channel page's Replace offers
+        (channel_successors.guide_rows_view, DESIGN-channel-successors.md section 9), not
+        guessed from a cheaper guide-scoped signal. The plain-missing case in the test above
+        (no duplicate) already proves the zero side."""
         since = self.anchor - timedelta(days=30)
         missing_ch = seed.make_channel(self.acc, stream_id=2, name='Gone Ch', in_guide=True,
                                        last_seen_at=since, duplicate_cluster_id=1)
@@ -205,7 +206,7 @@ class GuideEpgApiTests(unittest.TestCase):
 
         missing_row = self._row_for(self._get_window(), missing_ch.id)
         self.assertEqual(missing_row['lifecycle'], 'missing')
-        self.assertTrue(missing_row['lifecycle_repoint_available'])
+        self.assertEqual(missing_row['replacement_count'], 1)
 
     def test_group_row_ids_are_numeric(self):
         """BUGS.md 2026-07-17 07:02 AM - programs carry a numeric channel_id (active

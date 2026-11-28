@@ -307,5 +307,99 @@ class SearchValueTests(_Base):
         self.assertEqual(self.ids(OTHER_REPLACED), {old.id})
 
 
+class GroupPageTests(_Base):
+    """Section 9: the group page's notice line and member badges, and the groups list's badge.
+    The server decides who is stranded and what replaces them; group-detail.js only draws."""
+
+    def setUp(self):
+        super().setUp()
+        self.old = self.old_channel()                       # one replacement
+        self.new = self.new_channel()
+        self.lone = self.old_channel(name='CNN', psid='2002')  # none
+        self.ok = self.new_channel(name='Fine', psid='3003')
+        self.group = seed.make_group(name='Sports', members=[self.old, self.lone, self.ok])
+        db.session.commit()
+
+    def rows(self, group_id):
+        r = self.client.get(f'/api/channel-groups/{group_id}/detail-rows')
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()
+
+    def test_the_rows_name_each_stranded_member_and_its_replacements(self):
+        data = self.rows(self.group.id)
+        self.assertEqual(set(data['stranded']), {str(self.old.id), str(self.lone.id)})
+        old = data['stranded'][str(self.old.id)]
+        self.assertEqual([m['id'] for m in old['matches']], [self.new.id])
+        self.assertEqual(old['matches'][0]['account'], 'Account A')
+        self.assertEqual(old['account'], 'Account A')
+        self.assertIsNotNone(old['account_synced'])
+        self.assertEqual(data['stranded'][str(self.lone.id)]['matches'], [])
+
+    def test_the_page_boots_with_them(self):
+        r = self.client.get(f'/channel-groups/{self.group.id}')
+        self.assertEqual(r.status_code, 200)
+        html = r.get_data(as_text=True)
+        self.assertIn('id="gd-stranded-banner"', html)
+        self.assertIn(f'stranded: {{"{self.old.id}": ', html)
+        self.assertIn(f'replacementsUrl: "/channels/replacements?group={self.group.id}"', html)
+
+    def test_a_group_whose_members_are_all_listed_says_nothing(self):
+        clean = seed.make_group(name='Clean', members=[self.ok])
+        db.session.commit()
+        self.assertEqual(self.rows(clean.id)['stranded'], {})
+
+    def test_a_replaced_member_is_no_longer_stranded(self):
+        successors.accept(self.old.id, self.new.id, successors.CARRY_PIECES, cfg=load_config())
+        db.session.expire_all()
+        self.assertEqual(set(self.rows(self.group.id)['stranded']), {str(self.lone.id)})
+
+    def test_the_groups_list_counts_stranded_members_and_waiting_replacements(self):
+        seed.make_group(name='Clean', members=[self.ok])
+        db.session.commit()
+        html = self.client.get('/channel-groups').get_data(as_text=True)
+        self.assertEqual(html.count('not in last sync</span>'), 1)
+        self.assertIn('2 not in last sync', html)
+        self.assertIn('1 has a replacement waiting', html)
+
+
+class GuideRowTests(_Base):
+    """Section 9: the guide's channel rows say "not in the last sync" before the seven days
+    "missing" takes, and say when another channel carries the stream, from the same proposals
+    the channel page's Replace offers."""
+
+    def row(self, channel_id):
+        fmt = '%Y-%m-%dT%H:%M:%S'
+        r = self.client.get(f'/api/guide/epg?start={self.now.strftime(fmt)}'
+                            f'&end={(self.now + timedelta(hours=3)).strftime(fmt)}')
+        self.assertEqual(r.status_code, 200)
+        return next(c for c in r.get_json()['channels'] if c['id'] == channel_id)
+
+    def test_an_unlisted_guide_row_with_a_replacement(self):
+        old = self.old_channel(in_guide=True)
+        self.new_channel()
+        lone = self.old_channel(name='CNN', psid='2002', in_guide=True)
+        ok = self.new_channel(name='Fine', psid='3003', in_guide=True)
+        db.session.commit()
+        row = self.row(old.id)
+        self.assertTrue(row['lifecycle_unlisted'])
+        self.assertEqual(row['replacement_count'], 1)
+        row = self.row(lone.id)
+        self.assertTrue(row['lifecycle_unlisted'])
+        self.assertEqual(row['replacement_count'], 0)
+        row = self.row(ok.id)
+        self.assertFalse(row['lifecycle_unlisted'])
+        self.assertEqual(row['replacement_count'], 0)
+
+    def test_a_proposal_matched_on_the_stream_id_counts_not_only_the_url(self):
+        """The old hint saw only a missing channel sharing the exact URL; a renumbered stream
+        keeps its provider stream id on a new URL."""
+        old = self.old_channel(in_guide=True)
+        new = self.new_channel()
+        new.stream_url = 'http://example.test/live/renumbered'
+        db.session.commit()
+        self.assertNotEqual(old.stream_url, new.stream_url)
+        self.assertEqual(self.row(old.id)['replacement_count'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

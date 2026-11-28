@@ -484,6 +484,51 @@ def forget_lineup_ids(feed_ids) -> int:
     return changed
 
 
+def swap_lineup_id(old_feed_id: int, new_feed_id: int) -> list:
+    """Put `new_feed_id` in place of `old_feed_id` in every login's `lineup` and
+    `lineup_except`: a channel's guide row moved to the channel that replaced it, so a login
+    that got the old one gets the new one, and one that left it out leaves the new one out
+    (DESIGN-channel-successors.md 8.3). A list that already names the new id just loses the
+    old one. A list that cannot be read is left as it is (lineup_of() logs it). Mutates without
+    committing: called inside the replacement's own unit. Returns the ids of the logins whose
+    lists changed, for set_login_lineup() after the commit."""
+    from .database import OutputFeedLogin
+    old_key, new_key = lineup_key(old_feed_id), lineup_key(new_feed_id)
+    changed = []
+    for row in OutputFeedLogin.query.filter((OutputFeedLogin.lineup.isnot(None))
+                                            | (OutputFeedLogin.lineup_except.isnot(None))).all():
+        moved = False
+        for column in ('lineup', 'lineup_except'):
+            raw = getattr(row, column)
+            if raw is None:
+                continue
+            try:
+                ids = _stored_ids(raw)
+            except (TypeError, ValueError):
+                continue
+            if old_key not in ids:
+                continue
+            setattr(row, column, json.dumps(sorted((ids - {old_key}) | {new_key})))
+            moved = True
+        if moved:
+            changed.append(row.id)
+    return changed
+
+
+def relineup_logins(login_ids) -> int:
+    """set_login_lineup() for each of `login_ids`, with the lists as now committed: after a
+    write that changed them without the Logins dialog (swap_lineup_id()). How many plays it
+    ended. Requires an app context."""
+    from . import db
+    from .database import OutputFeedLogin
+    ended = 0
+    for login_id in sorted(set(login_ids)):
+        row = db.session.get(OutputFeedLogin, login_id)
+        if row is not None:
+            ended += set_login_lineup(login_id, lineup_of(row), excluded_of(row))
+    return ended
+
+
 def lineup_problem(value, leaving_out: bool = False) -> tuple:
     """(feed ids to store, error) for a lineup a save sends: None for everything, else a
     non-empty list of feed ids, each one stored as lineup_key() names it. `leaving_out` words
@@ -960,6 +1005,44 @@ def decode_feed_id(feed_id: int):
     if feed_id % 2:
         return KIND_GROUP, (feed_id - 1) // 2
     return KIND_CHANNEL, feed_id // 2
+
+
+#: The longest chain of replacements successor_feed_id() follows (A by B, then B by C, ...).
+SUCCESSOR_HOPS = 8
+
+
+def successor_feed_id(feed_id: int) -> int:
+    """The feed id a play of `feed_id` is answered on: `feed_id` itself, unless it names a
+    channel that gave its own guide row to the channel that replaced it, when it is that
+    channel's, followed through a chain (DESIGN-channel-successors.md 8.3). A player's
+    favorites are keyed on the id, so a replaced channel keeps playing for a player that has
+    not reloaded its list; the catalog lists only the new id. The answer ends when the old row
+    is deleted (its link no longer names it, and the id may be re-issued) or the replacement is
+    undone (the link is gone). A channel with its own guide row returns at the first read, which
+    resolve_play() then finds in the session, so a normal play pays nothing. Requires an app
+    context."""
+    kind, row_id = decode_feed_id(feed_id)
+    if kind != KIND_CHANNEL:
+        return feed_id
+    from . import db
+    from .channel_successors import guide_successor_id
+    from .database import Channel
+    seen, current = {row_id}, row_id
+    for _ in range(SUCCESSOR_HOPS):
+        ch = db.session.get(Channel, current)
+        if ch is None or ch.in_guide:  # guide-flag-read-ok: a channel's feed id is its own guide row and nothing else
+            break
+        nxt = guide_successor_id(current)
+        if nxt is None or nxt in seen:
+            break
+        seen.add(nxt)
+        current = nxt
+    if current == row_id:
+        return feed_id
+    new_id = feed_id_for_channel(current)
+    log.info('IPTV output: feed id %d is channel %d, which was replaced - answered with channel '
+             '%d (feed id %d)', feed_id, row_id, current, new_id)
+    return new_id
 
 
 # ── The catalog ────────────────────────────────────────────────────────────────────────────

@@ -52,6 +52,7 @@ from ..channel_groups import (
     build_group_with_members, group_name_conflict, serving_member, touch_group,
     schedule_is_live,
 )
+from ..channel_successors import group_stranded_view, stranded_match_counts
 from ..config import load_config
 from ..db_utils import retry_on_locked
 from ..output_arrangement import forget_items
@@ -733,8 +734,16 @@ def groups_page():
     # Auto-record rules that name each group, for the delete confirm: deleting the group
     # stops them (DESIGN-autoschedule.md §3.2). One query for the page.
     rules_by_group = _rules_by_group()
+    # The "not in last sync" badge: members whose account's last sync did not list them, and
+    # how many of those have a replacement waiting (DESIGN-channel-successors.md section 9).
+    # Asked once for every group, then counted per row from the memberships already loaded.
+    match_counts = stranded_match_counts()
     for row in group_rows:
         row['auto_rules'] = rules_by_group.get(row['name'], [])
+        here = [match_counts[m.channel_id] for m in memberships_by_group.get(row['id'], [])
+                if m.channel_id in match_counts]
+        row['stranded'] = ({'count': len(here), 'ready': sum(1 for n in here if n)}
+                           if here else None)
 
     # For the Create-group modal's client-side name-conflict check and its Manual format
     # mode. Both are per-request, never per row. No health-check profile payload and no
@@ -1218,10 +1227,15 @@ def group_detail_rows(group, job):
         for ch in channels
         if lifecycle_by_channel.get(ch.id, (None, None))[0] == 'missing'
     ]
+    # Members whose account's last sync did not list them, with any channel that carries the
+    # same stream now (DESIGN-channel-successors.md section 9). Nothing on the system group,
+    # whose members are guide rows rather than memberships a replacement moves.
+    stranded = group_stranded_view(group.id) if stored else {}
     return {
         'rows': rows,
         'dup_groups': dup_groups,
         'missing_channels': missing_channels,
+        'stranded': {str(cid): view for cid, view in stranded.items()},
         'counts': counts,
         'total': len(channel_ids),
         'reference_key': ref_key,

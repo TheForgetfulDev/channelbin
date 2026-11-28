@@ -7,8 +7,6 @@ Groups unification), SCHEDULED (non-group-backed) recordings, and channel-test e
 to the survivor. The missing channel row itself is always kept (soft state).
 
 Covers:
-  - RepointCandidateDetectionTests: _repoint_candidates_for_channels() - the batched
-    survivor-lookup helper (prefilter, missing-vs-missing exclusion, oldest-first pick).
   - RepointTransferTests: channel_successors.replace() with the pieces the Remove Duplicate
     Channels paths carry - the actual move, one behavior at a time (it replaced
     transfer_channel_state(), dev/changelog/1794). See tests/test_channel_successors.py for
@@ -33,9 +31,6 @@ from app.database import (  # noqa: E402
     CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE,
 )
 from app import channel_successors as successors  # noqa: E402
-from app.routes.channels import (  # noqa: E402
-    _repoint_candidates_for_channels, _lifecycle_states_for_channels,
-)
 from tests.support import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 
@@ -60,74 +55,6 @@ def _mark_missing(channel, account, days_gone=10, synced_days_ago=1):
     now = datetime.utcnow()
     channel.last_seen_at = now - timedelta(days=days_gone)
     account.last_sync_at = now - timedelta(days=synced_days_ago)
-
-
-class RepointCandidateDetectionTests(unittest.TestCase):
-    def setUp(self):
-        self.t = make_test_app()
-        self.account = seed.make_account(name='Acct A')
-        db.session.commit()
-
-    def tearDown(self):
-        self.t.cleanup()
-
-    def _lifecycle(self, channels):
-        return _lifecycle_states_for_channels(channels, CFG)
-
-    def test_missing_duplicate_flagged_channel_finds_survivor(self):
-        missing = _make_channel(self.account, 1, 'Missing Ch', duplicate_cluster_id=1)
-        survivor = _make_channel(self.account, 2, 'Survivor Ch', duplicate_cluster_id=1)
-        _mark_missing(missing, self.account)
-        db.session.commit()
-
-        lifecycle = self._lifecycle([missing, survivor])
-        candidates = _repoint_candidates_for_channels([missing, survivor], CFG, lifecycle)
-        self.assertEqual(candidates.get(missing.id), survivor)
-        self.assertNotIn(survivor.id, candidates)  # survivor is not itself missing
-
-    def test_prefilter_skips_channel_not_flagged_duplicate(self):
-        """is_duplicate_stream_url is the cheap prefilter - a missing channel that isn't
-        flagged is skipped even though a URL-sharing survivor exists."""
-        missing = _make_channel(self.account, 1, 'Missing Ch', duplicate_cluster_id=None)
-        _make_channel(self.account, 2, 'Survivor Ch', duplicate_cluster_id=None)
-        _mark_missing(missing, self.account)
-        db.session.commit()
-
-        lifecycle = self._lifecycle([missing])
-        candidates = _repoint_candidates_for_channels([missing], CFG, lifecycle)
-        self.assertEqual(candidates, {})
-
-    def test_survivor_also_missing_is_excluded(self):
-        missing = _make_channel(self.account, 1, 'Missing Ch', duplicate_cluster_id=1)
-        also_missing = _make_channel(self.account, 2, 'Also Missing', duplicate_cluster_id=1)
-        _mark_missing(missing, self.account)
-        _mark_missing(also_missing, self.account)
-        db.session.commit()
-
-        lifecycle = self._lifecycle([missing, also_missing])
-        candidates = _repoint_candidates_for_channels([missing, also_missing], CFG, lifecycle)
-        self.assertEqual(candidates, {})
-
-    def test_multiple_survivors_picks_oldest_by_id(self):
-        missing = _make_channel(self.account, 1, 'Missing Ch', duplicate_cluster_id=1)
-        older = _make_channel(self.account, 2, 'Older Survivor', duplicate_cluster_id=1)
-        newer = _make_channel(self.account, 3, 'Newer Survivor', duplicate_cluster_id=1)
-        self.assertLess(older.id, newer.id)
-        _mark_missing(missing, self.account)
-        db.session.commit()
-
-        lifecycle = self._lifecycle([missing, older, newer])
-        candidates = _repoint_candidates_for_channels([missing, older, newer], CFG, lifecycle)
-        self.assertEqual(candidates.get(missing.id), older)
-
-    def test_non_missing_channel_has_no_candidate(self):
-        ch = _make_channel(self.account, 1, 'Healthy Ch', duplicate_cluster_id=1)
-        _make_channel(self.account, 2, 'Other', duplicate_cluster_id=1)
-        db.session.commit()
-
-        lifecycle = self._lifecycle([ch])
-        candidates = _repoint_candidates_for_channels([ch], CFG, lifecycle)
-        self.assertEqual(candidates, {})
 
 
 def transfer(missing, survivor, cfg):

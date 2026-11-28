@@ -142,6 +142,9 @@
    renderDupBanner() in group-detail.js, so the load-time and post-refresh states cannot
    drift apart. #}
 <div id="gd-dup-banner" class="notice-banner" style="display:none;"></div>
+{# Members their account's last sync did not list (DESIGN-channel-successors.md section 9).
+   Sole updater is renderStrandedBanner() in group-detail.js, same contract as above. #}
+<div id="gd-stranded-banner" class="notice-banner" style="display:none;"></div>
 {# Sole updater for this region is renderMissingBanner() in group-detail.js, same
    contract as the duplicates banner above. #}
 <div id="gd-missing-banner" class="notice-banner" style="display:none;"></div>
@@ -590,6 +593,8 @@ window.GROUP_DETAIL = {
   total: {{ payload.total }},
   dupGroups: {{ payload.dup_groups | tojson }},
   missingChannels: {{ payload.missing_channels | tojson }},
+  stranded: {{ payload.stranded | tojson }},
+  replacementsUrl: {{ url_for('replacements.review_page', group=group.id) | tojson }},
   missingPreviewUrl: {{ url_for('channels.missing_delete_preview') | tojson }},
   missingDeleteUrl: {{ url_for('channels.missing_delete') | tojson }},
   referenceLabel: {{ payload.reference_label | tojson }},

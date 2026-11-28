@@ -18,6 +18,9 @@
   let ROWS = G.rows.slice();
   let DUP_GROUPS = G.dupGroups.slice();
   let MISSING_CHANNELS = G.missingChannels.slice();
+  // {channel id: its account, last sync, last listing and replacements} for each member its
+  // account's last sync did not list (channel_successors.group_stranded_view).
+  let STRANDED = G.stranded || {};
   let COUNTS = G.counts;
   let TOTAL = G.total;
   // Everything section 16's banners are gated and counted on, decided server-side in
@@ -770,6 +773,34 @@
       : `<span class="badge ${w.cls} gd-offpill tip-plain" data-tip="${escHtml(w.title)}&#10;${escHtml(w.detail)}">${escHtml(w.pill)}</span>`);
   }
 
+  // "Not in last sync" and, when another channel carries the same stream, "Replacement
+  // available" linking to the review filtered to this group (DESIGN-channel-successors.md
+  // section 9). One builder for the desktop name cell and the phone card.
+  const atIso = (iso) => new Date(iso + 'Z');
+  // Mid-sentence, so "today", not "Today".
+  const whenIso = (iso) => (iso
+    ? `${tzDayLabel(atIso(iso)).replace(/^(Today|Tomorrow|Yesterday)$/, (w) => w.toLowerCase())} ` +
+      `${fmtDateTz(atIso(iso), { hour: 'numeric', minute: '2-digit' })}`
+    : 'at an unknown time');
+  const dayIso = (iso) => (iso ? fmtDateTz(atIso(iso), { month: 'short', day: 'numeric' }) : 'never');
+
+  function strandedBadges(r) {
+    const s = STRANDED[String(r.channel_id)];
+    if (!s) return [];
+    const out = [`<span class="badge b-warn gd-offpill tip-plain" data-tip="Not in the last sync.&#10;` +
+      `${escHtml(s.account)}'s last sync, ${escHtml(whenIso(s.account_synced))}, did not list this channel. ` +
+      `It was last listed ${escHtml(dayIso(s.last_seen))}. It may still play, but nothing updates it.">Not in last sync</span>`];
+    const ms = s.matches;
+    if (ms.length) {
+      const tip = ms.length === 1
+        ? `${ms[0].name} on ${ms[0].account} carries the same stream. Replacements moves this member onto it, in this place, with its switches.`
+        : `${ms.length} channels carry the same stream. Replacements lets you pick one.`;
+      out.push(`<a class="badge b-auto tip-plain" href="${escHtml(G.replacementsUrl)}" ` +
+        `data-tip="Replacement available.&#10;${escHtml(tip)}">Replacement available</a>`);
+    }
+    return out;
+  }
+
   function nameCell(r) {
     const st = rowStatus(r);
     // The name dims when this member is switched ON for recording and would not be used by
@@ -791,6 +822,7 @@
     // winning and hiding the other.
     h += rowFlags(r).join('');
     h += dupBadge(r);
+    h += strandedBadges(r).join('');
     h += missingBadge(r);
     // "No schedule reaches this feed" is a different fact from "this group's Health check
     // switch is off", but they read as the same words - so the note is suppressed when a
@@ -1172,6 +1204,7 @@
     }
     flags.push(...rowFlags(r));
     if (dupBadge(r)) flags.push(dupBadge(r));
+    flags.push(...strandedBadges(r));
     if (r.lifecycle === 'missing') flags.push(missingBadge(r));
     const pillSaysUnmonitored = G.hasChannel && r.recording_enabled && !r.test_enabled;
     if (G.hasChannel && !r.monitored && !pillSaysUnmonitored) {
@@ -2095,6 +2128,32 @@
   // stopped sending in a sync for a while (channel_lifecycle_state() 'missing') -
   // scoped delete of the same mechanism channel search's own "Delete Missing
   // Channels" uses, via the shared static/js/missing-modal.js (dev/changelog/653).
+
+  // Sole updater for #gd-stranded-banner: members their account's last sync did not list,
+  // how many have a replacement waiting, and the way to the review (section 9).
+  function renderStrandedBanner() {
+    const el = byId('gd-stranded-banner');
+    if (!el) return;
+    const ids = Object.keys(STRANDED);
+    if (!ids.length) { el.style.display = 'none'; return; }
+    const n = ids.length;
+    const ready = ids.filter(id => STRANDED[id].matches.length).length;
+    const recOn = ids.filter(id => (rowById(Number(id)) || {}).recording_enabled).length;
+    let sub;
+    if (!ready) sub = 'No channel carries the same stream yet.';
+    else if (ready === n) sub = `${n === 1 ? 'It has' : 'Each has'} a replacement waiting.`;
+    else sub = `${ready} ${ready === 1 ? 'has' : 'have'} a replacement waiting.`;
+    if (recOn) sub += ` ${recOn} of them ${recOn === 1 ? 'has' : 'have'} Recording on.`;
+    if (ready) sub += ' Nothing moves until you accept.';
+    el.className = 'notice-banner notice-banner-warn';
+    el.innerHTML =
+      `<div class="notice-banner-body">` +
+      `<div class="notice-banner-title">${icon('warning')} ${counted(n, 'channel')} in this group ` +
+      `${n === 1 ? 'was' : 'were'} not in the last sync</div>` +
+      `<div class="notice-banner-sub">${escHtml(sub)}</div></div>` +
+      `<a class="btn btn-sm" href="${escHtml(G.replacementsUrl)}">Replacements ${icon('forward')}</a>`;
+    el.style.display = '';
+  }
 
   function renderMissingBanner() {
     const el = byId('gd-missing-banner');
@@ -3104,6 +3163,7 @@
         ROWS = data.rows;
         DUP_GROUPS = data.dup_groups;
         MISSING_CHANNELS = data.missing_channels;
+        STRANDED = data.stranded || {};
         COUNTS = data.counts;
         TOTAL = data.total;
         // The lock can move under a refresh (a check run re-evaluates the strategy), and
@@ -3127,6 +3187,7 @@
         renderBanners();
         renderSettingsBar();
         renderDupBanner();
+        renderStrandedBanner();
         renderMissingBanner();
         // The rows just changed underneath the bar, so its account values are re-derived
         // and any filter that no longer matches anything present is dropped with its chip.
@@ -3463,6 +3524,7 @@
   renderSummary();
   renderBanners();
   renderDupBanner();
+  renderStrandedBanner();
   renderMissingBanner();
   renderList();
   initBarReveal();

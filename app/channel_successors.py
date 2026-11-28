@@ -120,6 +120,22 @@ def replaced_old_ids(channel_ids=None) -> set:
     return out
 
 
+def guide_successor_id(channel_id):
+    """The channel that took `channel_id`'s own guide row in a live replacement, or None: no
+    replacement, or one where the new channel kept a row of its own or the user left the guide
+    row unchecked. What output_feed.successor_feed_id() answers an old feed id with
+    (section 8.3)."""
+    link = ChannelReplacement.query.filter_by(old_channel_id=channel_id).first()
+    if link is None:
+        return None
+    try:
+        carried = json.loads(link.carried or '{}')
+    except ValueError:
+        log.warning('Replacement %d: unreadable carried record', link.id)
+        return None
+    return link.new_channel_id if carried.get(CARRY_GUIDE) == CARRIED else None
+
+
 def stranded_channels(bounds=None, *, group_id=None):
     """Channels that are unlisted (accounts.channel_unlisted) and still hold something a
     replacement would move - a group membership or a guide row - and have not been replaced.
@@ -340,12 +356,17 @@ def _carry_guide(old, new, result):
     if not old.in_guide:
         return None
     from .output_arrangement import carry_item
-    from .output_feed import KIND_CHANNEL, feed_id_for_channel, set_on_output
+    from .output_feed import KIND_CHANNEL, feed_id_for_channel, set_on_output, swap_lineup_id
     # Its place on the IPTV output too, so the player's number and folder hold; a new channel
     # that already had a place keeps its own (DESIGN-output-feed.md 16.1, dev/changelog/1797).
     carry_item(feed_id_for_channel(old.id), feed_id_for_channel(new.id))
     state = KEPT_OWN
     if not new.in_guide:
+        # Each login's channel list follows the row; a new channel that already had a row of
+        # its own has its own place in them, and the old id leaves them when its row is
+        # deleted (output_arrangement.forget_items()).
+        result['lineup_logins'] = swap_lineup_id(feed_id_for_channel(old.id),
+                                                 feed_id_for_channel(new.id))
         new.in_guide = True  # hidden-recompute-ok: replace() recomputes both channels after every move
         new.guide_sort_order = old.guide_sort_order
         db.session.add(ChannelEvent(
@@ -475,7 +496,7 @@ def replace(old, new, options, surface, *, cfg, link=None, health=None):
     options = set(options or ())
     result = {
         'surface': surface, 'old_id': old.id, 'new_id': new.id, 'groups': [],
-        'carried': {}, 'waiting': [], 'pip_rows': set(), 'old_feed_ids': [],
+        'carried': {}, 'waiting': [], 'pip_rows': set(), 'old_feed_ids': [], 'lineup_logins': [],
         'on_output': False, 'moved_recordings': [], 'epg_touched': False,
     }
     carried = result['carried']
@@ -600,11 +621,12 @@ def after_commit(results) -> None:
     findings recheck. Each is logged and never undoes the replacement."""
     if isinstance(results, dict):
         results = [results]
-    groups, pip_rows, feed_ids, epg = set(), set(), set(), False
+    groups, pip_rows, feed_ids, logins, epg = set(), set(), set(), set(), False
     for r in results:
         groups.update(g['id'] for g in r['groups'])
         pip_rows.update(r['pip_rows'])
         feed_ids.update(r['old_feed_ids'])
+        logins.update(r.get('lineup_logins', ()))
         epg = epg or r['epg_touched']
     from .channel_groups import DEFAULT_FAILING_STREAK_THRESHOLD, evaluate_and_reconcile_group
     if groups:
@@ -635,6 +657,11 @@ def after_commit(results) -> None:
     except Exception:                                   # noqa: BLE001 - never undoes the replacement
         log.exception('Output plays of replaced channels %s not ended after a replacement',
                       sorted(feed_ids))
+    try:
+        output_feed.relineup_logins(logins)
+    except Exception:                                   # noqa: BLE001 - never undoes the replacement
+        log.exception('IPTV output logins %s not handed their channel lists after a replacement',
+                      sorted(logins))
     if epg:
         from .epg_scorecard import recheck_soon
         try:
@@ -1057,6 +1084,66 @@ def stranded_count(bounds=None) -> int:
     """How many channels stranded_channels() would list: the number the menu
     and the Dashboard show while it is above zero."""
     return len(stranded_ids(bounds))
+
+
+def _load_accounts(channels) -> None:
+    """Every account of `channels` in one query, so reading `.account` on each one below is an
+    identity-map hit rather than a query per row."""
+    ids = sorted({c.account_id for c in channels if c.account_id is not None})
+    for chunk in chunked(ids, 400):
+        Account.query.filter(Account.id.in_(chunk)).all()
+
+
+def group_stranded_view(group_id, bounds=None) -> dict:
+    """What a group page says about its stranded members (section 9): {channel id: the
+    account's name and last sync, when the channel was last listed, and each proposal's id,
+    name and account}. A fixed number of queries whatever the group's size, and only the one
+    that found nothing for a group whose members are all listed."""
+    if bounds is None:
+        bounds = last_sync_bounds()
+    olds = stranded_channels(bounds, group_id=group_id)
+    if not olds:
+        return {}
+    props = proposals(olds, bounds)
+    _load_accounts(olds + [m for rows in props.values() for m, _ in rows])
+    return {c.id: {
+        'account': _account_name(c),
+        # The start of the sync that found it unlisted (last_sync_bounds()), not
+        # Account.last_sync_at, which a later failed sync can move.
+        'account_synced': iso_or_none(bounds.get(c.account_id)),
+        'last_seen': iso_or_none(c.last_seen_at),
+        'matches': [{'id': m.id, 'name': m.name, 'account': _account_name(m)}
+                    for m, _ in props.get(c.id, [])],
+    } for c in olds}
+
+
+def guide_rows_view(channels, lifecycle, bounds=None) -> dict:
+    """What the TV Guide says about its own channel rows (section 9): {channel id:
+    {'unlisted': its account's last sync did not list it, 'matches': how many channels carry
+    the same stream}} for each of `channels` that is unlisted or missing (`lifecycle`, from
+    accounts.lifecycle_states_for_channels) and not already replaced - the channels the
+    channel page offers Replace on. A fixed number of queries whatever the guide's size."""
+    if bounds is None:
+        bounds = last_sync_bounds()
+    targets = [c for c in channels
+               if channel_unlisted(c, bounds) or lifecycle.get(c.id, (None, None))[0] == 'missing']
+    if not targets:
+        return {}
+    replaced = replaced_old_ids([c.id for c in targets])
+    targets = [c for c in targets if c.id not in replaced]
+    props = proposals(targets, bounds)
+    return {c.id: {'unlisted': channel_unlisted(c, bounds), 'matches': len(props.get(c.id, []))}
+            for c in targets}
+
+
+def stranded_match_counts(bounds=None) -> dict:
+    """{channel id: how many proposals} for every stranded channel: the groups list's badge
+    counts its members against this (section 9). A fixed number of queries."""
+    if bounds is None:
+        bounds = last_sync_bounds()
+    olds = stranded_channels(bounds)
+    props = proposals(olds, bounds)
+    return {c.id: len(props.get(c.id, [])) for c in olds}
 
 
 def carried_labels(link) -> list:

@@ -12,7 +12,6 @@ from ..database import (Account, Channel, ChannelEvent, ChannelGroup, EPGEntry, 
                         REC_STATUS_ABORTED, REC_STATUS_FAILED)
 from ..accounts import (normalize_url, render_filename_template, split_sports_name,
                         duplicates_within, lifecycle_states_for_channels,
-                        repoint_candidates_for_channels,
                         transfer_keeper_problem,
                         # Moved beside render_filename_template so the channel search's
                         # airing grain can render a suggested name too (changelog 412).
@@ -28,6 +27,7 @@ from ..epg_sources import (Listing, listing_agreement, keys_read, case_sensitive
                            AGREE_DOUBLED, AGREE_PAST, AGREE_REFERENCE, COMPARE_VERDICTS)
 from .. import channel_hiding
 from ..channel_search import mark_labels
+from ..channel_successors import guide_rows_view
 from ..fmt_utils import iso_seconds_or_none
 from ..recording_story import partial_note, stopped_early_note
 from ..config import load_config
@@ -815,13 +815,11 @@ def epg_api():
     # lifecycle isn't a single channel's to report.
     lifecycle = lifecycle_states_for_channels(
         [obj for kind, obj, _ in row_entries if kind == 'channel'], cfg)
-    # Whether a 'missing' channel above also has a Re-point recovery target (the same
-    # detection the channel detail page's Re-point action uses) - lets the guide's tooltip
-    # say so accurately instead of guessing from a cheaper, guide-scoped signal like
-    # dup_titles above (which only sees in_guide channels and would miss a survivor that
-    # isn't itself in the guide).
-    repoint_candidates = repoint_candidates_for_channels(
-        [obj for kind, obj, _ in row_entries if kind == 'channel'], cfg, lifecycle)
+    # Whether each channel row's account's last sync listed it, and whether another channel
+    # carries the same stream now: the proposals the channel page's Replace offers, so the
+    # pill's tooltip and the page cannot disagree (DESIGN-channel-successors.md section 9).
+    replacing = guide_rows_view(
+        [obj for kind, obj, _ in row_entries if kind == 'channel'], lifecycle)
     all_tags = _load_tags()
     # Hoisted beside all_tags rather than derived per cell: the grid renders thousands of
     # program cells and render_filename_template would otherwise issue its own Tag query
@@ -964,7 +962,10 @@ def epg_api():
             'duplicate_title': dup_titles.get(ch.id) if group is None else None,
             'lifecycle': lifecycle_state,
             'lifecycle_date': lifecycle_since.strftime('%Y-%m-%d') if lifecycle_since else '',
-            'lifecycle_repoint_available': group is None and ch.id in repoint_candidates,
+            # Section 9: unlisted by its account's last sync (the group page's "Not in last
+            # sync"), and how many channels carry the same stream. Channel rows only, as above.
+            'lifecycle_unlisted': group is None and replacing.get(ch.id, {}).get('unlisted', False),
+            'replacement_count': replacing.get(ch.id, {}).get('matches', 0) if group is None else 0,
         }
         if group is not None:
             row.update({
