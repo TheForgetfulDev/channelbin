@@ -953,5 +953,259 @@ class ShardedRunCarriesTheEvidenceTests(unittest.TestCase):
         self.assertIn('deliberate', captured)
 
 
+_MAP_MODULE = '''
+import os
+import unittest
+
+from tests.support import timing
+
+REPO = timing._REPO
+
+
+class Reads(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(REPO, 'run_tests.sh')) as fh:
+            fh.read(10)
+
+    def test_reads_ranks_and_lists(self):
+        with open(os.path.join(REPO, 'README.md')) as fh:
+            fh.read(10)
+        self.assertEqual(timing._median([1, 2, 3]), 2)
+        os.listdir(os.path.join(REPO, 'sim'))
+'''
+
+
+class MappedRunTests(unittest.TestCase):
+    """`--map` end to end over a real worker: what a module read reaches the map, the
+    setUpClass half included (tests/support/testmap.py, dev/changelog/1780)."""
+
+    def test_a_mapped_shard_reports_what_each_module_read(self):
+        tmp = tempfile.mkdtemp(prefix='timing_map_')
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with open(os.path.join(tmp, 'synthetic_map_mod.py'), 'w') as fh:
+            fh.write(_MAP_MODULE)
+        env_patch = mock.patch.dict(
+            os.environ, {'PYTHONPATH': tmp + os.pathsep + os.environ.get('PYTHONPATH', '')})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        with mock.patch.object(timing.sys, 'stderr', io.StringIO()):
+            merged = timing._run_sharded([['synthetic_map_mod']], None, mapping=True)
+        self.assertTrue(merged['successful'])
+        entry = merged['map']['synthetic_map_mod']
+        self.assertIn('run_tests.sh', entry['opened'])      # opened in setUpClass
+        self.assertIn('README.md', entry['opened'])         # opened in a test
+        self.assertIn('_median', entry['code']['tests/support/timing.py'])  # a function it ran
+        self.assertIn('sim', entry['dirs'])
+        self.assertFalse([f for f in list(entry['opened']) + list(entry['code'])
+                          if f.endswith('.pyc') or '__pycache__' in f])
+
+    def test_the_written_map_keeps_tracked_files_only_and_says_when_and_where(self):
+        tmp = tempfile.mkdtemp(prefix='timing_map_')
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, 'out', 'test-map.json')
+        merged = {'map': {
+            'tests.test_b': {'opened': ['README.md'], 'dirs': ['app'],
+                             'code': {'app/x.py': ['f', 'C.m'], 'dvr/untracked.py': ['g']}},
+            'tests.test_a': {'opened': [], 'dirs': [], 'code': {'app/x.py': ['f']}}}}
+        record = {'ts_utc': '2026-11-27T08:00:00+00:00', 'git_commit': 'abc1234',
+                  'git_dirty': False, 'test_count': 3, 'failures': 1, 'errors': 0}
+        with mock.patch.object(timing, '_tracked_files', return_value={'README.md', 'app/x.py'}):
+            tail = timing._write_map(path, merged, record)
+        self.assertIn('test map of 2 modules written to', tail)
+        with open(path) as fh:
+            data = json.load(fh)
+        self.assertEqual((data['version'], data['built_utc'], data['red']),
+                         (timing.MAP_VERSION, record['ts_utc'], True))
+        # Bit 0 is tests.test_a, bit 1 tests.test_b: the sorted module list.
+        self.assertEqual(data['modules'], ['tests.test_a', 'tests.test_b'])
+        self.assertEqual(data['files'], {
+            'README.md': {'any': '2', 'open': '2', 'fn': {}},
+            'app/x.py': {'any': '3', 'open': '0', 'fn': {'C.m': '2', 'f': '3'}}})
+        self.assertEqual(data['dirs'], {'app': '2'})
+
+
+class TestMapRecorderTests(unittest.TestCase):
+    """The audit half of the recorder, driven directly."""
+
+    def setUp(self):
+        from tests.support.testmap import ModuleMap
+        self.m = ModuleMap(timing._REPO)
+        self.m.current = 'tests.test_x'
+        self.m.files['tests.test_x'] = set()
+        self.m.code['tests.test_x'] = {}
+        self.m.dirs['tests.test_x'] = set()
+
+    def audit(self, event, *args):
+        self.m._on_audit(event, args)
+
+    def test_opens_inside_the_repo_are_kept_and_outside_dropped(self):
+        self.audit('open', os.path.join(timing._REPO, 'README.md'), 'r', 0)
+        self.audit('open', '/etc/hostname', 'r', 0)
+        self.audit('open', os.path.join(timing._REPO, 'node_modules', 'x.js'), 'r', 0)
+        self.audit('open', 7, 'r', 0)
+        self.assertEqual(self.m.files['tests.test_x'], {'README.md'})
+
+    def test_a_git_ls_files_covers_the_whole_tree(self):
+        self.audit('subprocess.Popen', 'git', ['git', 'ls-files', '-z'], timing._REPO, None)
+        self.assertEqual(self.m.dirs['tests.test_x'], {'**'})
+
+    def test_a_repo_file_in_a_childs_argv_counts_as_opened(self):
+        """node reads a jsdom driver itself, where no hook of ours can see it."""
+        self.audit('subprocess.Popen', 'node',
+                   ['node', 'tests/support/guide_live.mjs', '/tmp/x'], timing._REPO, None)
+        self.assertEqual(self.m.files['tests.test_x'], {'tests/support/guide_live.mjs'})
+
+    def test_a_recursive_glob_covers_the_folder_below(self):
+        self.audit('glob.glob', os.path.join(timing._REPO, 'app', '**', '*.py'), True)
+        self.audit('glob.glob', os.path.join(timing._REPO, 'static', '*.css'), False)
+        self.assertEqual(self.m.dirs['tests.test_x'], {'app/**', 'static'})
+
+    def test_nothing_is_recorded_outside_a_module_window(self):
+        self.m.current = None
+        self.audit('open', os.path.join(timing._REPO, 'README.md'), 'r', 0)
+        self.assertEqual(self.m.files['tests.test_x'], set())
+
+
+class SelectedRunTests(unittest.TestCase):
+    """`--select` (dev/changelog/1780): a red first part stops the run, a selection that is
+    most of the suite runs the whole suite, and a selected run never touches the whole
+    suite's history."""
+
+    MODULES = ['tests.test_a', 'tests.test_b', 'tests.test_c', 'tests.test_d', 'tests.test_e']
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='timing_select_')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.full = os.path.join(self.tmp, 'timing_history.jsonl')
+        self.selected = os.path.join(self.tmp, 'selected.jsonl')
+        self.runs = []
+        self.red = set()
+        for target, value in (
+                ('HISTORY_PATH', self.full), ('SELECTED_HISTORY_PATH', self.selected),
+                ('_discover_modules', lambda: list(self.MODULES)),
+                ('_module_weights', lambda mods, hist: {m: 1.0 for m in mods}),
+                ('_git_info', lambda: ('abc1234', True)),
+                ('_run_sharded', self._fake_run),
+                ('_run_full', self._fake_full)):
+            p = mock.patch.object(timing, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(timing.sys, 'stderr', io.StringIO())
+        self.err = p.start()
+        self.addCleanup(p.stop)
+        self.full_runs = 0
+
+    def _fake_run(self, shards, log_dir=None, mapping=False, tag=''):
+        mods = sorted(m for s in shards for m in s)
+        self.runs.append(mods)
+        bad = sorted(self.red & set(mods))
+        return {'test_count': len(mods), 'skipped': 0, 'failures': len(bad), 'errors': 0,
+                'per_module': {}, 'fixtures': {}, 'total_wall': 1.0, 'map': None,
+                'failed_ids': [f'{m}.T.test_x' for m in bad], 'successful': not bad}
+
+    def _fake_full(self, args, jobs, log_dir):
+        self.full_runs += 1
+        return 0
+
+    def run_select(self, spec):
+        path = os.path.join(self.tmp, 'select.json')
+        with open(path, 'w') as fh:
+            json.dump(spec, fh)
+        args = timing._parse_args(['--select', path])
+        return timing._run_selected(args, 4, None)
+
+    def test_the_first_part_runs_before_the_rest(self):
+        code = self.run_select({'first': ['tests.test_a'], 'modules': ['tests.test_a',
+                                                                        'tests.test_b']})
+        self.assertEqual(code, 0)
+        self.assertEqual(self.runs, [['tests.test_a'], ['tests.test_b']])
+        rec = timing._load_history(self.selected)[-1]
+        self.assertEqual((rec['tier'], rec['modules'], rec['test_count']), ('selected', 2, 2))
+        self.assertFalse(os.path.exists(self.full), 'a selected run wrote the suite history')
+        self.assertIn('[SUITE-TIMING] INFO selected run: 2 tests from 2 of 5 modules',
+                      self.err.getvalue())
+
+    def test_a_red_first_part_ends_the_run_and_says_so(self):
+        self.red = {'tests.test_a'}
+        code = self.run_select({'first': ['tests.test_a'], 'modules': ['tests.test_a',
+                                                                        'tests.test_b']})
+        self.assertEqual(code, 1)
+        self.assertEqual(self.runs, [['tests.test_a']])
+        out = self.err.getvalue()
+        self.assertIn('[SUITE-TIMING] FAILED tests.test_a.T.test_x', out)
+        self.assertIn('were red, so the rest did not run', out)
+        self.assertEqual(timing._load_history(self.selected)[-1]['failures'], 1)
+
+    def test_the_last_red_run_on_this_commit_goes_first(self):
+        timing._append_history({'ts_utc': '2026-11-27T01:00:00+00:00', 'git_commit': 'abc1234',
+                                'failures': 1, 'errors': 0,
+                                'failed_ids': ['tests.test_c.T.test_y']}, self.selected)
+        self.run_select({'modules': ['tests.test_b']})
+        self.assertEqual(self.runs, [['tests.test_c'], ['tests.test_b']])
+
+    def test_a_red_run_on_another_commit_is_someone_elses(self):
+        timing._append_history({'ts_utc': '2026-11-27T01:00:00+00:00', 'git_commit': 'fff0000',
+                                'failures': 1, 'errors': 0,
+                                'failed_ids': ['tests.test_c.T.test_y']}, self.full)
+        self.run_select({'modules': ['tests.test_b']})
+        self.assertEqual(self.runs, [['tests.test_b']])
+
+    def test_most_of_the_suite_runs_the_whole_suite(self):
+        self.run_select({'first': [], 'modules': self.MODULES[:3]})   # 3 of 5 = 60%
+        self.assertEqual((self.full_runs, self.runs), (1, []))
+
+    def test_all_runs_the_first_part_then_the_whole_suite(self):
+        self.run_select({'all': True, 'first': ['tests.test_e']})
+        self.assertEqual(self.runs, [['tests.test_e']])
+        self.assertEqual(self.full_runs, 1)
+
+    def test_a_module_that_does_not_exist_is_refused(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_select({'modules': ['tests.test_nope']})
+        self.assertIn('do not exist', str(cm.exception))
+
+    def test_a_bare_module_list_is_still_refused(self):
+        with self.assertRaises(SystemExit) as cm:
+            timing.main(['tests.test_a'])
+        self.assertIn('takes no module arguments', str(cm.exception))
+
+
+class SelectedAndMappedRecordsStayApartTests(unittest.TestCase):
+
+    def test_shard_weights_come_from_a_whole_suite_record_only(self):
+        # Real modules, since weights are read from each module's own class names.
+        a, b = 'tests.test_closeout', 'tests.test_nightly_check'
+        whole = {'tier': '0-2', 'failures': 0, 'errors': 0,
+                 'per_module': {'test_closeout.RunCloseoutTests': 10.0,
+                                'test_nightly_check.SummaryLineTests': 2.0}}
+        selected = {'tier': 'selected', 'failures': 0, 'errors': 0,
+                    'per_module': {'test_nightly_check.SummaryLineTests': 30.0}}
+        weights = timing._module_weights([a, b], [whole, selected])
+        self.assertEqual((weights[a], weights[b]), (10.0, 2.0))
+
+    def test_a_mapped_run_is_judged_only_against_mapped_runs(self):
+        plain = {'tier': '0-2', 'jobs': 4, 'failures': 0, 'errors': 0}
+        mapped = dict(plain, mapped=True)
+        self.assertEqual(timing._passing_same_tier([plain, mapped], '0-2', 4), [plain])
+        self.assertEqual(timing._passing_same_tier([plain, mapped], '0-2', 4, mapped=True),
+                         [mapped])
+
+    def test_a_new_history_file_starts_as_a_copy_of_the_committed_one(self):
+        tmp = tempfile.mkdtemp(prefix='timing_hist_')
+        self.addCleanup(shutil.rmtree, tmp, True)
+        committed = os.path.join(tmp, 'committed.jsonl')
+        with open(committed, 'w') as fh:
+            fh.write('{"tier": "0-2"}\n')
+        target = os.path.join(tmp, 'nightly', 'suite_history.jsonl')
+        args = timing._parse_args(['--history', target])
+        with mock.patch.object(timing, 'HISTORY_PATH', committed):
+            self.assertEqual(timing._history_path(args), target)
+        with open(target) as fh:
+            self.assertEqual(fh.read(), '{"tier": "0-2"}\n')
+        self.assertEqual(timing._history_path(timing._parse_args([])), timing.HISTORY_PATH)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
