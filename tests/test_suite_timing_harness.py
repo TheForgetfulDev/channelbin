@@ -1175,13 +1175,16 @@ class SelectedRunTests(unittest.TestCase):
 class SelectedAndMappedRecordsStayApartTests(unittest.TestCase):
 
     def test_shard_weights_come_from_a_whole_suite_record_only(self):
-        # Real modules, since weights are read from each module's own class names.
-        a, b = 'tests.test_closeout', 'tests.test_nightly_check'
+        # Real modules, since weights are read from each module's own class names. Both
+        # must ship publicly: a dev-only module is absent from the public checkout, so its
+        # weight falls back to 1.0 there and this test goes red only on the public CI.
+        a, b = 'tests.test_suite_timing_harness', 'tests.test_static_invariants'
         whole = {'tier': '0-2', 'failures': 0, 'errors': 0,
-                 'per_module': {'test_closeout.RunCloseoutTests': 10.0,
-                                'test_nightly_check.SummaryLineTests': 2.0}}
+                 'per_module': {
+                     'test_suite_timing_harness.SelectedAndMappedRecordsStayApartTests': 10.0,
+                     'test_static_invariants.TaskFileReferenceTests': 2.0}}
         selected = {'tier': 'selected', 'failures': 0, 'errors': 0,
-                    'per_module': {'test_nightly_check.SummaryLineTests': 30.0}}
+                    'per_module': {'test_static_invariants.TaskFileReferenceTests': 30.0}}
         weights = timing._module_weights([a, b], [whole, selected])
         self.assertEqual((weights[a], weights[b]), (10.0, 2.0))
 
