@@ -279,6 +279,7 @@ class Ask:
     backend: str | None = None     # and its backend
     stage: str | None = None       # serve, or redirect for a 302 to a play URL
     form: str | None = None        # ts, hls_playlist, hls_segment, hls_master or radio
+    credentialed: bool = False     # a stream request carrying a login, not a play URL's token
 
 
 def _aims_at(fault: Fault, ask: Ask) -> bool:
@@ -925,6 +926,13 @@ def _login_status(ask, f):
     ask.status = f.params['status']
 
 
+def _usernames(value, where):
+    if (not isinstance(value, (list, tuple)) or not value
+            or not all(isinstance(v, str) and v for v in value)):
+        raise FaultError(f'{where} must be a list of one or more usernames, not {value!r}')
+    return tuple(value)
+
+
 def _login_rate_limit(ask, f):
     # assumed: no provider has been seen rate limiting a sync, so the policy is the simplest
     # one that names both halves - refuse a login over its allowance, ban it after repeats.
@@ -1210,6 +1218,17 @@ _KINDS = (
           {'syncs': (1, _count(1)), 'window_seconds': (3600.0, _seconds),
            'status': (429, _status), 'ban_after': (2, _count(0))},
           apply=_login_rate_limit),
+    _kind('wrong_reseller_login', SCOPE_HOST, LAYER_LOGIN, (EP_STREAM,), ASSUMED,
+          'DESIGN-account-providers.md §3.1 and §14.1 (dev/changelog/1775, 1778): a reseller\'s '
+          'hosts serve the logins it sold and no other reseller\'s, from a user\'s description '
+          'of their resellers; never measured, because ChannelBin sent no login to another '
+          'reseller\'s host before a login could carry hosts of its own',
+          'a stream host that serves only the logins in `accepts`: a stream request carrying '
+          'any other login is answered as unknown credentials (401); a play URL the backend '
+          'redirected to is not asked again',
+          {'accepts': (_REQUIRED, _usernames)}, apply=_login_refused,
+          condition=lambda f, ask: (ask.credentialed and ask.login is not None
+                                    and ask.login not in f.params['accepts'])),
 
     # --- streams (sim/stream_faults.py applies these) -----------------------------------------
     _kind('silent_socket', SCOPE_CONNECTION, LAYER_STREAM, (EP_STREAM,), MEASURED,
@@ -1357,8 +1376,10 @@ CATALOG = {k.name: k for k in _KINDS}
 # kick_oldest was seen once on a real login (DESIGN-simulator.md §3.10, dev/changelog/1220).
 # A scenario names the ones its world triggers in PROVIDER_BEHAVIORS (dev/changelog/1388).
 OVER_LIMIT_BASIS = {'refuse': ASSUMED, 'kick_oldest': MEASURED, 'allow_then_ban': ASSUMED}
-SYNC_KINDS = tuple(k.name for k in _KINDS if k.scope not in STREAM_SCOPES)
-STREAM_KINDS = tuple(k.name for k in _KINDS if k.scope in STREAM_SCOPES)
+# Split by what a kind hits, not by its scope: a host's login kind that answers only stream
+# requests (wrong_reseller_login) is read back with the stream kinds, since no sync meets it.
+STREAM_KINDS = tuple(k.name for k in _KINDS if k.endpoints == (EP_STREAM,))
+SYNC_KINDS = tuple(k.name for k in _KINDS if k.name not in STREAM_KINDS)
 
 
 def check_catalog() -> list[str]:

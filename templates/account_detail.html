@@ -239,6 +239,16 @@
   because a host is swapped only when it stops resolving. Make another host active on the Hosts card to move now.
 </div>
 {% endif %}
+{# The same for a login's own active host (DESIGN-account-providers.md §14.7): shown on every
+   account holding the login, and moved from the login's Hosts... dialog. #}
+{% if login_hosts_not_answering %}
+<div class="notice notice-warn" id="acct-login-host-not-answering">
+  <strong>{{ icon('warning') }} {{ "A login's active host isn't answering" if login_hosts_not_answering | length == 1 else "Some logins' active hosts aren't answering" }}</strong><br>
+  {% for name, host in login_hosts_not_answering %}<code>{{ host }}</code> on login "{{ name }}"{{ ', ' if not loop.last }}{% endfor %} didn't answer at its last check.
+  Streams on {{ 'that login' if login_hosts_not_answering | length == 1 else 'those logins' }} still use it, because a host is swapped only when it stops resolving.
+  Make another of the login's hosts active under Hosts... on the Logins card to move now.
+</div>
+{% endif %}
 {% if not account.sync_enabled and st != ACCOUNT_STATUS.UNSYNCED %}
 <div class="notice notice-info">
   <strong>Automatic sync is off for this account</strong><br>
@@ -960,15 +970,16 @@
           </div>
         </div>
         {% elif e.kind == 'switch' %}
-        {# A host or login the user turned on or off (account_links.set_host_enabled /
-           set_login_enabled): the user's own choice, a faint dot like a block. Named as the
+        {# A host, login or login's own host the user turned on or off
+           (account_links.set_host_enabled / set_login_enabled / set_login_host_enabled): the
+           user's own choice, a faint dot like a block. Named as the
            row is now; a sync that makes the row name another host or login clears the time,
            so the line never names one the user did not switch. Not "the playlist's": that
            mark can move to another row after the flip. #}
         <div class="acct-act">
           <span class="acct-act-dot faint"></span>
           <div class="acct-act-body">
-            <div class="acct-act-line">{% if e.what == 'host' %}Host <code>{{ e.name }}</code>{% else %}Login "{{ e.name }}"{% endif %} turned {{ 'on' if e.on else 'off' }}{% if e.what == 'login' %} for this account{% endif %}. {{ 'New streams can use it.' if e.on else "New streams don't use it." }}</div>
+            <div class="acct-act-line">{% if e.what == 'host' %}Host <code>{{ e.name }}</code> turned {{ 'on' if e.on else 'off' }}.{% elif e.what == 'login_host' %}Host <code>{{ e.name }}</code> on login "{{ e.login }}" turned {{ 'on' if e.on else 'off' }}.{% elif e.what == 'login' %}Login "{{ e.name }}" turned {{ 'on' if e.on else 'off' }} for this account.{% else %}A switch of an unknown kind ({{ e.what }}) moved.{% endif %} {{ 'New streams can use it.' if e.on else "New streams don't use it." }}</div>
             <div class="acct-act-when">{{ e.ts | local_time }}</div>
           </div>
         </div>

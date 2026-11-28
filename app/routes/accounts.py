@@ -255,6 +255,7 @@ def accounts_list():
         conn_limits=account_limits(account_ids, cfg),
         providers=providers_section(accounts),
         host_summaries=host_checks.account_summaries(account_ids),
+        login_hosts_not_answering=host_checks.not_answering_logins(account_ids),
         host_progress=host_checks.progress_view(),
         host_spacing=round(host_checks.spacing_seconds(cfg)),
     )
@@ -704,6 +705,7 @@ def account_detail(account_id):
         host_progress=host_checks.progress_view([h['host'] for h in hosts]),
         host_spacing=round(host_checks.spacing_seconds(cfg)),
         host_not_answering=host_checks.not_answering_accounts([account.id]).get(account.id),
+        login_hosts_not_answering=host_checks.not_answering_logins([account.id]).get(account.id, []),
         unlisted_host=unlisted_stream_host(account, hosts),
         playlist_host_off=playlist_host if playlist_host and not playlist_host['enabled'] else None,
         playlist_login_off=(playlist_login if playlist_login and not playlist_login['enabled']

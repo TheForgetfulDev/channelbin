@@ -164,7 +164,7 @@ Sync cancelled before it finished.
        data-href="{{ url_for('accounts.account_detail', account_id=account.id) }}">
     <span class="a-title">
       <a class="a-name" href="{{ url_for('accounts.account_detail', account_id=account.id) }}">{{ account.name }}</a>
-      <span class="a-badges">{{ m.account_type_badge(acct_type, tip=false) }}{{ m.account_extra_badges(account, tip=false) }}{{ m.account_block_badge(blocks.get(account.id, []), tip=false) }}{% set po = playlist_off.get(account.id) %}{% if po %}{{ m.account_playlist_badge(po.host, po.login, tip=false) }}{% endif %}{% set hs = host_summaries.get(account.id) %}{% if hs and hs.active_not_answering %}<span class="badge b-warn">Active host not answering</span>{% endif %}</span>
+      <span class="a-badges">{{ m.account_type_badge(acct_type, tip=false) }}{{ m.account_extra_badges(account, tip=false) }}{{ m.account_block_badge(blocks.get(account.id, []), tip=false) }}{% set po = playlist_off.get(account.id) %}{% if po %}{{ m.account_playlist_badge(po.host, po.login, tip=false) }}{% endif %}{% set hs = host_summaries.get(account.id) %}{% if hs and hs.active_not_answering %}<span class="badge b-warn">Active host not answering</span>{% endif %}{% if login_hosts_not_answering.get(account.id) %}<span class="badge b-warn">Login host not answering</span>{% endif %}</span>
       <span class="a-meta">
         {% if account.last_sync_at %}Synced {{ account.last_sync_at | time_ago }}{% else %}Never synced{% endif %}{% if hs and hs.tested %} &middot; hosts: {{ hs.answering }} of {{ hs.tested }} answer{{ 's' if hs.answering == 1 }}{% endif %}
         {{ sparkline(logs_by_account.get(account.id, [])) }}

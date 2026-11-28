@@ -9,10 +9,12 @@ the recent story of everything, cut down by the history-filter chips (app/histor
 Since dev/changelog/1665 it also lists the account's finished stream checks, and since
 dev/changelog/1671 the last time the user turned each of its hosts and logins on or off - the
 row's own `switched_at`, so a switch moved twice shows its latest move only. Since
-dev/changelog/1672 it lists the blocks set on a login the account holds, too.
+dev/changelog/1672 it lists the blocks set on a login the account holds, too, and since
+DESIGN-account-providers.md §14.9 the switches of a host on such a login's own list.
 
-Eight queries however long the account's history - the syncs, the account's login ids, the
-alerts, the blocks, the login blocks, the stream checks and the host and login switches, all
+Nine queries however long the account's history - the syncs, the account's login ids, the
+alerts, the blocks, the login blocks, the stream checks and the host, login and login-host
+switches, all
 over the last
 `ACTIVITY_DAYS` days - plus one for the recordings a block was tied to. Every entry is
 `{'kind', 'ts', 'obj', ...}` with `kind` one of `KINDS`; the template branches on it
@@ -27,7 +29,8 @@ from sqlalchemy import or_
 from . import db
 from .account_blocks import NO_END
 from .database import (Account, AccountBlock, AccountHost, AccountLogin, AccountStreamCheck,
-                       AccountSyncLog, Alert, Login, LoginBlock, Recording, STREAM_CHECK_DONE)
+                       AccountSyncLog, Alert, Login, LoginBlock, LoginHost, Recording,
+                       STREAM_CHECK_DONE)
 from .history_filter import ALL
 
 #: How far back the card reaches. Beyond it the Sync history table has the syncs and the
@@ -159,6 +162,16 @@ def entries(account: Account, now: datetime | None = None) -> list:
               .all())
     out += [{'kind': KIND_SWITCH, 'ts': at, 'what': 'login', 'name': name, 'on': on}
             for at, on, name in logins]
+    # A host on a login's own list is switched per login, so every account holding the login
+    # lists the move (DESIGN-account-providers.md §14.9).
+    login_hosts = (db.session.query(LoginHost.switched_at, LoginHost.enabled, LoginHost.host,
+                                    Login.name)
+                   .join(Login, Login.id == LoginHost.login_id)
+                   .join(AccountLogin, AccountLogin.login_id == LoginHost.login_id)
+                   .filter(AccountLogin.account_id == account.id, LoginHost.switched_at >= since)
+                   .all())
+    out += [{'kind': KIND_SWITCH, 'ts': at, 'what': 'login_host', 'name': host, 'login': login,
+             'on': on} for at, on, host, login in login_hosts]
 
     out.sort(key=lambda e: e['ts'], reverse=True)
     return out

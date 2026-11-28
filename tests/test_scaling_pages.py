@@ -776,6 +776,16 @@ def _seed_accounts(n):
         login = account_links.add_login(ids[i], f'main{i}', f'user{i}', 'pw', 1)
         account_links.share_login(login.id, ids[i + 1])
         account_links.add_host(ids[i + 1], f'h{i}.scaling.example')
+        # The shared login brings hosts of its own, its active one failing its last full
+        # check, so the list's "Login host not answering" badge (DESIGN-account-providers.md
+        # §14.7) runs its batched path for every pair.
+        account_links.add_login_host(login.id, f'own{i}.scaling.example')
+        account_links.add_login_host(login.id, f'spare{i}.scaling.example')
+        from app.database import HOST_CHECK_REFUSED, HOST_PROBE_FULL, HostCheck
+        db.session.add(HostCheck(host=f'own{i}.scaling.example', checked_at=datetime.utcnow(),
+                                 kind=HOST_PROBE_FULL, trigger='manual',
+                                 status=HOST_CHECK_REFUSED, error='refused'))
+        db.session.commit()
 
 
 def _seed_account_history(n):

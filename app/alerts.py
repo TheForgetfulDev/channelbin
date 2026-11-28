@@ -69,6 +69,11 @@ LOGIN_HOST_ROLLED = 'LOGIN_HOST_ROLLED'
 #: dev/changelog/1674). Named because host_checks raises and clears it by type, per account.
 ACCOUNT_HOST_NOT_ANSWERING = 'ACCOUNT_HOST_NOT_ANSWERING'
 
+#: The active host on a LOGIN's own list did not answer at its last full check
+#: (DESIGN-account-providers.md §14.7). Keyed on the login, so it shows on every account
+#: holding it; not ACCOUNT_HOST_NOT_ANSWERING, whose source and words are one account's.
+LOGIN_HOST_NOT_ANSWERING = 'LOGIN_HOST_NOT_ANSWERING'
+
 #: A standby host on the account started or stopped answering between two full checks. Named
 #: because host_checks raises it by type; one per change, so each is a line on Activity.
 ACCOUNT_HOST_ANSWER_CHANGED = 'ACCOUNT_HOST_ANSWER_CHANGED'
@@ -334,6 +339,11 @@ ALERT_TYPES = {
     # finds it answering, or the account moving to another active host, dismisses it.
     ACCOUNT_HOST_NOT_ANSWERING: {
         'label': 'Account Active Stream Host Not Answering', 'severity': 'WARN', 'self_clearing': True},
+    # The same for a login's own active host: streams seated on the login still use it on
+    # every account holding it. Self-clearing: a full check that finds it answering, or the
+    # login moving to another active host, dismisses it.
+    LOGIN_HOST_NOT_ANSWERING: {
+        'label': 'Login Active Stream Host Not Answering', 'severity': 'WARN', 'self_clearing': True},
     # A standby host started or stopped answering. INFO: nothing streams from it, so it is a
     # line on the account's Activity card, not a problem; the user dismisses it.
     ACCOUNT_HOST_ANSWER_CHANGED: {
