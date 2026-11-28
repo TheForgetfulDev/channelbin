@@ -256,13 +256,18 @@ class QueryPlanTests(_TwoAccounts):
         def _grab(conn, cursor, statement, params, context, executemany):
             if 'epg_entries' in statement and 'channel_id' in statement and not executemany:
                 seen.append((statement, params))
-        engine = db.engine
-        event.listen(engine, 'before_cursor_execute', _grab)
+        # Every pool's engine: a call made outside a request runs on the background pool,
+        # unless a transaction the outer session left open happens to pin it to the UI one.
+        from tests.support.iocount import all_engines
+        engines = all_engines()
+        for engine in engines:
+            event.listen(engine, 'before_cursor_execute', _grab)
         try:
             fn()
         finally:
-            event.remove(engine, 'before_cursor_execute', _grab)
-        raw = engine.raw_connection()
+            for engine in engines:
+                event.remove(engine, 'before_cursor_execute', _grab)
+        raw = db.engine.raw_connection()
         try:
             cur = raw.cursor()
             return [(s, cur.execute('EXPLAIN QUERY PLAN ' + s, p).fetchall()) for s, p in seen

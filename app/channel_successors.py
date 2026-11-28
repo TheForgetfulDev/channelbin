@@ -309,7 +309,11 @@ def _carry_guide(old, new, result):
     longer lists records nothing. The IPTV output switch goes with the row (section 8.3)."""
     if not old.in_guide:
         return None
-    from .output_feed import KIND_CHANNEL, set_on_output
+    from .output_arrangement import carry_item
+    from .output_feed import KIND_CHANNEL, feed_id_for_channel, set_on_output
+    # Its place on the IPTV output too, so the player's number and folder hold; a new channel
+    # that already had a place keeps its own (DESIGN-output-feed.md 16.1, dev/changelog/1797).
+    carry_item(feed_id_for_channel(old.id), feed_id_for_channel(new.id))
     state = KEPT_OWN
     if not new.in_guide:
         new.in_guide = True  # hidden-recompute-ok: replace() recomputes both channels after every move

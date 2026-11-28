@@ -417,6 +417,9 @@ def remove(row_id: int) -> Optional[str]:
         if row is None:
             return None
         name = row.name
+        from .output_arrangement import forget_items
+        from .output_feed import feed_id_for_pip
+        forget_items(feed_ids=[feed_id_for_pip(row_id)])
         db.session.delete(row)
         db.session.commit()
         return name

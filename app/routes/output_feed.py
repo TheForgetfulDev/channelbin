@@ -106,8 +106,15 @@ def _forget_kept_answers(response):
     """Whatever the owner changes in the web UI - a switch, a login, the output's accounts, a
     sports or picture-in-picture channel, a group, the guide - reaches the next ask of the
     channel list or guide at once rather than up to a minute later (output_feed.kept_answer).
-    After the request, so after its commit. An IPTV player only ever GETs."""
+    After the request, so after its commit. An IPTV player only ever GETs.
+
+    The same write may have added something the output can list - a channel or group put in the
+    guide, a league followed, a picture-in-picture channel made - so the arrangement records its
+    place first (output_arrangement.reconcile(), DESIGN-output-feed.md 16.4). Every write rather
+    than a list of routes, so a new route cannot be missed."""
     if request.method not in ('GET', 'HEAD', 'OPTIONS') and response.status_code < 400:
+        from ..output_arrangement import reconcile_guarded
+        reconcile_guarded(f'{request.method} {request.path}')
         output_feed.forget_answers()
     return response
 

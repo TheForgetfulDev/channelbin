@@ -661,7 +661,7 @@ and it answers the same way in either case, so a switch left off looks exactly l
 
 ChannelBin can be an Xtream Codes source itself. Turn the IPTV output on and an IPTV player such as
 TiviMate adds ChannelBin as an account the way it adds a provider - and then sees exactly the
-TV Guide: every channel and group in it, in the guide's order, with the guide's own listings,
+TV Guide: every channel and group in it, filed by category in the guide's order, with the guide's own listings,
 instead of the provider's twenty-thousand-channel list. A group plays as one channel, from the
 member ChannelBin would record from right now, and moves to another member mid-stream if that
 one dies.

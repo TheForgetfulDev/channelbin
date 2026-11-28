@@ -441,6 +441,37 @@ def excluded_of(row) -> frozenset:
         return frozenset()
 
 
+def forget_lineup_ids(feed_ids) -> int:
+    """Take `feed_ids` (lineup keys of rows being deleted) out of every login's `lineup` and
+    `lineup_except`, so a later channel, group or league handed a reused id is not given to or
+    kept from a login by its predecessor's place in the list (DESIGN-output-feed.md 16.1). A
+    `lineup_except` left empty becomes NULL, "none left out"; a `lineup` left empty stays an
+    empty list, "no channels", which is what it gave. A list that cannot be read is left as it
+    is (lineup_of() logs it). Mutates without committing: called inside the delete's own unit.
+    How many lists changed."""
+    from .database import OutputFeedLogin
+    gone = {lineup_key(f) for f in feed_ids}
+    if not gone:
+        return 0
+    changed = 0
+    for row in OutputFeedLogin.query.filter((OutputFeedLogin.lineup.isnot(None))
+                                            | (OutputFeedLogin.lineup_except.isnot(None))).all():
+        for column in ('lineup', 'lineup_except'):
+            raw = getattr(row, column)
+            if raw is None:
+                continue
+            try:
+                ids = _stored_ids(raw)
+            except (TypeError, ValueError):
+                continue
+            if not ids & gone:
+                continue
+            kept = sorted(ids - gone)
+            setattr(row, column, None if column == 'lineup_except' and not kept else json.dumps(kept))
+            changed += 1
+    return changed
+
+
 def lineup_problem(value, leaving_out: bool = False) -> tuple:
     """(feed ids to store, error) for a lineup a save sends: None for everything, else a
     non-empty list of feed ids, each one stored as lineup_key() names it. `leaving_out` words
@@ -947,6 +978,9 @@ class FeedRow:
     # The channel a play would start from right now, for the page's view only (`everything`):
     # the channel itself, or the member a group would pick. None when nothing would play.
     plays: object = field(default=None, repr=False)
+    # The output category it is in (output_arrangement.arrange()): the `category_id` a player is
+    # sent and caches. 0 until arranged.
+    category_id: int = 0
 
     @property
     def offered(self) -> bool:
@@ -1091,12 +1125,14 @@ def _group_lead(group, members, latest_by_channel, blocked):
 
 
 def catalog(cfg=None, everything: bool = False, login: Optional[FeedLogin] = None) -> list:
-    """Every feed row in the guide's order: the in-guide channels and the in-guide groups,
-    interleaved by their shared guide_sort_order (channel_groups.guide_row_sort_key), then
-    ChannelBin's own channels, Up next and sports, by league (_own_rows). A fixed number
-    of queries whatever the guide holds: the channels, the groups with their members and
-    accounts, the members' latest health checks, the blocked accounts, the Up next channels, the
-    sports channels.
+    """Every feed row in the output's arrangement (output_arrangement.arrange(),
+    DESIGN-output-feed.md 16): categories in their order, each one's channels in theirs, every
+    row carrying its category's fixed id. The rows are built in the guide's order - the in-guide
+    channels and groups by their shared guide_sort_order (channel_groups.guide_row_sort_key),
+    then ChannelBin's own channels (_own_rows) - which is what something not yet arranged keeps.
+    A fixed number of queries whatever the guide holds: the channels, the groups with their
+    members and accounts, the members' latest health checks, the blocked accounts, the Up next
+    channels, the sports channels, and the arrangement's two tables.
 
     A channel on an account the allowlist excludes is not served; a group is served even
     when nothing in it is playable right now - the play is what refuses, by name
@@ -1112,9 +1148,10 @@ def catalog(cfg=None, everything: bool = False, login: Optional[FeedLogin] = Non
     is the row's whatever the login. It also leaves out what the login's own accounts would
     (FeedLogin.accounts, left_out_for_login(), dev/changelog/1765). Ignored with `everything`,
     which is the owner's view."""
+    from .output_arrangement import arrange
     fcfg = feed_config(cfg)
     accounts = None if everything or login is None else login.accounts
-    rows = guide_rows(fcfg, plays=everything, accounts=accounts) + _own_rows(everything, fcfg)
+    rows = arrange(guide_rows(fcfg, plays=everything, accounts=accounts) + _own_rows(everything, fcfg))
     if accounts is not None:
         for row in rows:
             row.left_out = left_out_for_login(row, accounts)
@@ -1123,6 +1160,14 @@ def catalog(cfg=None, everything: bool = False, login: Optional[FeedLogin] = Non
     for n, row in enumerate(offered, start=1):
         row.num = n
     return rows if everything else offered
+
+
+def unarranged_rows(cfg=None) -> list:
+    """Every feed row, offered or not, in the guide's order and with the category each arrives
+    in, before any arrangement: what migration 159's backfill records as the first arrangement
+    (output_arrangement.backfill())."""
+    fcfg = feed_config(cfg)
+    return guide_rows(fcfg) + _own_rows(True, fcfg)
 
 
 def left_out_for_login(row: 'FeedRow', accounts: Optional[frozenset]) -> str:
@@ -1247,13 +1292,16 @@ def _own_rows(everything: bool, fcfg: dict) -> list:
 
 
 def categories(rows) -> list:
-    """[(category_id, name)] over `rows`, deduplicated by name in first-seen order, so the
-    same id answers get_live_categories and the streams' category_id from one catalog."""
-    names = []
+    """[(category_id, name)] over arranged `rows`, one per category in the order its rows come,
+    which is the arrangement's category order. The id is the category's stored row id
+    (output_arrangement), the same for every login and after any reorder, never its position in
+    this answer; a category with nothing in `rows` is not listed."""
+    out, seen = [], set()
     for row in rows:
-        if row.category not in names:
-            names.append(row.category)
-    return [(str(i), name) for i, name in enumerate(names, start=1)]
+        if row.category_id not in seen:
+            seen.add(row.category_id)
+            out.append((str(row.category_id), row.category))
+    return out
 
 
 def category_payload(rows) -> list:
@@ -1265,14 +1313,13 @@ def live_streams_payload(rows, base_url: str, login: FeedLogin) -> list:
     """get_live_streams: what ChannelBin's own XtreamClient reads plus what the measured
     client needs (section 3.4). `direct_source` is empty: the capture showed the client
     ignores it. `epg_channel_id` is the feed id's string, which is what xmltv.php names."""
-    ids = {name: cid for cid, name in categories(rows)}
     out = []
     for row in rows:
         out.append({
             'num': row.num, 'name': row.name, 'stream_type': 'live', 'stream_id': row.feed_id,
             'stream_icon': logo_url(row, base_url, login),
             'epg_channel_id': str(row.feed_id), 'added': '0', 'is_adult': '0',
-            'category_id': ids[row.category], 'category_ids': [int(ids[row.category])],
+            'category_id': str(row.category_id), 'category_ids': [row.category_id],
             'custom_sid': '', 'tv_archive': 0, 'direct_source': '', 'tv_archive_duration': 0,
         })
     return out
@@ -1456,6 +1503,18 @@ _answer_builds: dict = {}
 #: How many times forget_answers() has run: a build that started before the last one read the
 #: database as it was before the change, and is handed to its own ask but not kept.
 _answers_generation = 0
+#: The flag a kept_answer() build in progress on this thread clears to say its answer must not be
+#: kept (answer_not_kept()); None outside a build.
+_keep_this_answer = contextvars.ContextVar('output_feed_keep_this_answer', default=None)
+
+
+def answer_not_kept() -> None:
+    """Called inside a kept_answer() build: hand this answer to its ask but do not keep it, so
+    the next ask builds again. For an answer built around something that should have been
+    recorded and was not (output_arrangement.arrange()). Does nothing outside a build."""
+    flag = _keep_this_answer.get()
+    if flag is not None:
+        flag[0] = False
 
 
 def kept_answer(key: tuple, build):
@@ -1464,7 +1523,8 @@ def kept_answer(key: tuple, build):
     accounts, and for an answer carrying URLs the address and the login's own pair - so two
     asks share an answer only when it would come out the same. What every login shares is
     dropped by forget_answers() when the owner changes something, and is otherwise at most
-    ANSWER_KEEP_SECONDS old (a guide import). An answer that raised is not kept."""
+    ANSWER_KEEP_SECONDS old (a guide import). An answer that raised is not kept, nor one whose
+    build called answer_not_kept()."""
     with _answers_lock:
         hit = _answers.get(key)
         if hit is not None and time.monotonic() - hit[0] < ANSWER_KEEP_SECONDS:
@@ -1476,12 +1536,17 @@ def kept_answer(key: tuple, build):
             if hit is not None and time.monotonic() - hit[0] < ANSWER_KEEP_SECONDS:
                 return hit[1]
             generation = _answers_generation
-        value = build()
+        keep = [True]
+        token = _keep_this_answer.set(keep)
+        try:
+            value = build()
+        finally:
+            _keep_this_answer.reset(token)
         now = time.monotonic()
         with _answers_lock:
             for old in [k for k, (built, _) in _answers.items() if now - built >= ANSWER_KEEP_SECONDS]:
                 del _answers[old]
-            if generation == _answers_generation:
+            if generation == _answers_generation and keep[0]:
                 _answers[key] = (now, value)
             for old in sorted(_answers, key=lambda k: _answers[k][0])[:max(0, len(_answers) - MAX_KEPT_ANSWERS)]:
                 del _answers[old]

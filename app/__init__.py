@@ -261,6 +261,11 @@ def create_app(config_overrides=None, start_scheduler=True):
         # Migration 143's: the per-account rule counts are refresh_rule_stats(), ORM code
         # (dev/changelog/1678).
         channel_hiding.backfill_rule_account_counts()
+        # Migration 159's: today's order is the output's catalog, ORM code; then anything the
+        # last process added without recording it gets its place (dev/changelog/1797).
+        from . import output_arrangement
+        output_arrangement.backfill(cfg)
+        output_arrangement.reconcile_guarded('startup')
         duplicate_streams.install_listener()
         _ensure_system_health_job()
         _retire_sports_file_names()

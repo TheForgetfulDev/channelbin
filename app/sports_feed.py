@@ -1224,11 +1224,16 @@ def place_all_guarded(now: Optional[datetime], horizon: timedelta) -> int:
     matcher. A failure is logged with its traceback and the games stay unplaced, which the next
     run reads from feed_number and places."""
     try:
-        return place_all(now, horizon)
+        placed = place_all(now, horizon)
     except Exception:  # noqa: BLE001 - a watch-only layout must never stop a schedule update or a match run
         db.session.rollback()
         log.exception('Sports channels: placing games on league channels failed; the next run tries again')
         return 0
+    # A league's numbered channels are made here, with no request, so this is where its item on
+    # the output's arrangement can first be recorded (DESIGN-output-feed.md 16.4).
+    from .output_arrangement import reconcile_guarded
+    reconcile_guarded('placing games on league channels')
+    return placed
 
 
 # ---------------------------------------------------------------------------
@@ -1293,8 +1298,17 @@ def set_league_channels(league_id: int, enabled: bool, horizon: timedelta) -> Op
 def delete_for_league(league_id: int):
     """Inside sports_data.delete_league()'s unit: the league's sports channels and its Up next
     channel go with it. Their ids are never issued again (AUTOINCREMENT), so an IPTV player's cached
-    id cannot land on another channel."""
+    id cannot land on another channel. Their places on the output's arrangement go too, and the
+    league's own item, since a league's id is reused (dev/changelog/1797)."""
+    from .database import SportsUpNextChannel
+    from .output_arrangement import forget_items
+    from .output_feed import feed_id_for_sports, feed_id_for_up_next
     from .sports_up_next import delete_for_league as delete_up_next
+    feed_ids = [feed_id_for_sports(i) for (i,) in db.session.query(SportsFeedChannel.id)
+                .filter(SportsFeedChannel.league_id == league_id)]
+    feed_ids += [feed_id_for_up_next(i) for (i,) in db.session.query(SportsUpNextChannel.id)
+                 .filter(SportsUpNextChannel.league_id == league_id)]
+    forget_items(feed_ids=feed_ids, league_ids=[league_id])
     SportsFeedChannel.query.filter_by(league_id=league_id).delete(synchronize_session=False)
     delete_up_next(league_id)
 
