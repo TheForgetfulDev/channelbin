@@ -412,6 +412,17 @@ CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED = 'CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED'
 # (epg_sources.place_stretches(), dev/changelog/1722). The first source changing is
 # CHANNEL_EPG_SOURCE_CHANGED; a seam that only moved with a refresh writes nothing.
 CHANNEL_EPG_FILL_CHANGED = 'CHANNEL_EPG_FILL_CHANGED'
+# A replacement was accepted (app/channel_successors.py, dev/docs/DESIGN-channel-successors.md):
+# written on both rows, the old channel and the new one, and extra_data['role'] says which
+# side this row is. extra_data also names the other channel, the link row and what each piece
+# of carried state did ('carried', 'kept_own', 'not_asked'). Replacing back, the undo, writes
+# it again with extra_data['undo'] set.
+CHANNEL_REPLACED = 'CHANNEL_REPLACED'
+# The new channel's score started or stopped counting the old channel's history: the link's
+# health switch (ChannelReplacement.health_carried) moved, at the accept or later on the
+# channel page. Carries the score before and after, since the score moves with no
+# observation behind it (dev/docs/DESIGN-channel-successors.md section 6).
+CHANNEL_HEALTH_HISTORY_CARRIED = 'CHANNEL_HEALTH_HISTORY_CARRIED'
 
 # ── Channel group event type constants ────────────────────────────────────────
 #
@@ -479,6 +490,12 @@ GROUP_GUIDE_BROKEN              = 'GROUP_GUIDE_BROKEN'
 # app/channel_groups.py::set_guide_listings_member). Carries the pinned channel_id when there
 # is one; extra_data names the previous pin and why it moved (dev/changelog/1116).
 GROUP_GUIDE_LISTINGS_SET        = 'GROUP_GUIDE_LISTINGS_SET'
+# A member's channel was replaced by the channel that took its place
+# (app/channel_successors.py::replace). Carries the NEW channel's id; extra_data names both
+# channels and says whether the two were merged (the new channel was already a member, so the
+# old membership went and its switches were carried by set_participation). Position and both
+# switches are the member row's and do not move on a swap, so nothing else is written for them.
+GROUP_MEMBER_REPLACED           = 'GROUP_MEMBER_REPLACED'
 # The group's default recording profile was set, changed or cleared
 # (ChannelGroup.default_profile_id, written only by
 # app/channel_groups.py::set_default_profile). extra_data names the new and previous
@@ -614,6 +631,8 @@ EVENT_LABELS = {
     CHANNEL_EPG_KEY_CHANGED: 'Guide id changed',
     CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED: 'Guide source chosen by hand',
     CHANNEL_EPG_FILL_CHANGED: 'Guide continued from another source',
+    CHANNEL_REPLACED: 'One channel took another\'s place',
+    CHANNEL_HEALTH_HISTORY_CARRIED: 'Health history carried over',
     # Group events
     GROUP_MEMBER_PARTICIPATION: 'Participation changed',
     CHANNEL_GROUP_FORMAT_MISMATCH: 'Format mismatch',
@@ -626,6 +645,7 @@ EVENT_LABELS = {
     GROUP_GUIDE_REMOVED: 'Removed from the TV Guide',
     GROUP_GUIDE_BROKEN: 'In the guide with nothing to record',
     GROUP_GUIDE_LISTINGS_SET: 'Guide listings changed',
+    GROUP_MEMBER_REPLACED: 'Channel replaced',
     GROUP_DEFAULT_PROFILE_SET: 'Default profile changed',
     GROUP_EXAMPLE_KEPT: 'No longer an example',
     OUTPUT_FEED_SWITCHED: 'IPTV output switch changed',
@@ -2892,6 +2912,11 @@ class Channel(db.Model):
         # re-renders it every minute (dev/changelog/1029). A sync touches it only on the
         # rows it already rewrites, whose SET list includes epg_channel_id anyway.
         db.Index('ix_channels_account_epg', 'account_id', 'epg_channel_id'),
+        # A replacement's candidates are every listed channel sharing an unlisted one's
+        # provider stream id (channel_successors.proposals(), one IN query over a few hundred
+        # ids); without this that is a read of every channel row per review
+        # (dev/docs/DESIGN-channel-successors.md section 4).
+        db.Index('ix_channels_provider_stream_id', 'provider_stream_id'),
         # The channel grain's DEFAULT sort key, so the landing page can walk this index and
         # stop at LIMIT 100 instead of pouring every surviving row into a temp B-tree:
         # measured 105.5ms -> 9.0ms on 138k channels (dev/changelog/699). The expression must
@@ -3092,7 +3117,10 @@ class ChannelHealthExclusion(db.Model):
     source_kind = db.Column(db.String(32), nullable=False)
     source_id   = db.Column(db.Integer, nullable=False)
     excluded_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    #: 'reset' or 'step_back' - which action excluded it, for the timeline's benefit.
+    #: 'reset' or 'step_back' - which action excluded it, for the timeline's benefit - or
+    #: 'past_cutoff': a recording's post-process check that landed after a replacement's accept,
+    #: when the recording moved onto the new channel at the old one's delete
+    #: (channel_successors.EXCLUDED_PAST_CUTOFF, dev/changelog/1794).
     action      = db.Column(db.String(16), nullable=False)
 
     __table_args__ = (
@@ -3101,6 +3129,47 @@ class ChannelHealthExclusion(db.Model):
         db.UniqueConstraint('channel_id', 'source_kind', 'source_id',
                             name='uq_health_exclusion'),
     )
+
+
+#: `ChannelReplacement.match_kind` - why the new channel was proposed for the old one
+#: (dev/docs/DESIGN-channel-successors.md section 4). `picked` means nothing but the user
+#: says the two are the same stream.
+REPLACE_MATCH_STREAM_ID = 'stream_id'
+REPLACE_MATCH_URL       = 'url'
+REPLACE_MATCH_PICKED    = 'picked'
+REPLACE_MATCH_KINDS = (REPLACE_MATCH_STREAM_ID, REPLACE_MATCH_URL, REPLACE_MATCH_PICKED)
+
+
+class ChannelReplacement(db.Model):
+    """One accepted replacement: the new channel took the old one's place
+    (dev/docs/DESIGN-channel-successors.md section 5). Written only by
+    app/channel_successors.py.
+
+    "Replaced" is this one fact: a channel is replaced when it is the old_channel_id of a row
+    here. It is not a lifecycle state, not a meaning of missing, and not is_duplicate_loser.
+    The row outlives the old channel: a delete of the old row sets old_channel_id to NULL
+    (channel_successors.before_channel_delete(), which also moves the history the new channel
+    was counting), and old_name / old_account_name keep naming it. Channel ids are re-issued,
+    so no path may delete a channel without that step.
+
+    health_carried is the user's answer and stays live: the new channel's ledger reads the old
+    one's observations up to accepted_at only while it is on (health_recompute.py)."""
+    __tablename__ = 'channel_replacements'
+
+    id               = db.Column(db.Integer, primary_key=True)
+    # UNIQUE: one live replacement per old channel. SQLite lets any number of rows hold NULL,
+    # which is every row whose old channel has been deleted.
+    old_channel_id   = db.Column(db.Integer, db.ForeignKey('channels.id'), unique=True)
+    new_channel_id   = db.Column(db.Integer, db.ForeignKey('channels.id'), nullable=False,
+                                 index=True)
+    accepted_at      = db.Column(db.DateTime, nullable=False)   # naive UTC
+    match_kind       = db.Column(db.String(16), nullable=False)  # REPLACE_MATCH_*
+    health_carried   = db.Column(db.Boolean, nullable=False, default=True)
+    # JSON {piece: state}: channel_successors.CARRY_PIECES, each 'carried', 'kept_own' or
+    # 'not_asked'. What both channel pages and the events read back.
+    carried          = db.Column(db.Text)
+    old_name         = db.Column(db.String(512), nullable=False)
+    old_account_name = db.Column(db.String(255))
 
 
 #: `ChannelHideRule.target` - what the pattern is matched against, and how.

@@ -12,7 +12,7 @@ from ..database import (Account, Channel, ChannelEvent, ChannelGroup, EPGEntry, 
                         REC_STATUS_ABORTED, REC_STATUS_FAILED)
 from ..accounts import (normalize_url, render_filename_template, split_sports_name,
                         duplicates_within, lifecycle_states_for_channels,
-                        repoint_candidates_for_channels, transfer_channel_state,
+                        repoint_candidates_for_channels,
                         transfer_keeper_problem,
                         # Moved beside render_filename_template so the channel search's
                         # airing grain can render a suggested name too (changelog 412).
@@ -675,12 +675,11 @@ def remove_channels_from_guide():
 
 
 @guide_bp.route('/api/guide/channels/remove-duplicates', methods=['POST'])
-@retry_on_locked()
 def remove_duplicate_channels_from_guide():
     """Bulk-remove losing duplicate channels from the TV Guide (sets in_guide=False),
     optionally transferring each removed channel's guide listing/group membership/
     scheduled recordings/health-check enrollment to the channel kept in its place
-    (transfer_channel_state(), the same transfer Re-point uses)."""
+    (channel_successors.replace() with DEDUP_PIECES, the same writer Re-point uses)."""
     data = request.get_json(force=True, silent=True) or {}
     # `removals` (dedup path) carries a keep_channel_id per entry; a bare channel_ids
     # list is normalized into the same shape here.
@@ -691,10 +690,29 @@ def remove_duplicate_channels_from_guide():
         return jsonify({'error': 'No channels specified'}), 400
     transfer = bool(data.get('transfer'))
 
+    from .. import channel_successors as successors
     cfg = load_config() if transfer else None
-    removed = []
-    transferred = []
-    transfer_skipped = []
+    results = []
+
+    # One unit, one commit; replace()'s side effects run after it (after_commit below).
+    @retry_on_locked()
+    def _remove_and_commit():
+        results.clear()     # a retried attempt names only what it moved
+        removed, transferred, transfer_skipped = [], [], []
+        _remove_from_guide(removals, transfer, cfg, results, removed, transferred,
+                           transfer_skipped)
+        db.session.commit()
+        return removed, transferred, transfer_skipped
+
+    removed, transferred, transfer_skipped = _remove_and_commit()
+    successors.after_commit(results)
+    return jsonify({'success': True, 'removed': removed, 'transferred': transferred,
+                    'transfer_skipped': transfer_skipped})
+
+
+def _remove_from_guide(removals, transfer, cfg, results, removed, transferred, transfer_skipped):
+    """The body of the guide's Remove Duplicate Channels: mutates and does not commit."""
+    from .. import channel_successors as successors
     for r in removals:
         cid = r.get('channel_id')
         ch = db.session.get(Channel, cid)
@@ -708,7 +726,8 @@ def remove_duplicate_channels_from_guide():
             if problem:
                 transfer_skipped.append({'channel_id': cid, 'reason': problem})
             else:
-                transfer_channel_state(ch, keeper, cfg)
+                results.append(successors.replace(ch, keeper, successors.DEDUP_PIECES,
+                                                  successors.SURFACE_DEDUP, cfg=cfg))
                 transferred.append(cid)
                 did_transfer = True
         if not did_transfer:
@@ -720,9 +739,6 @@ def remove_duplicate_channels_from_guide():
     channel_hiding.recompute([r.get('channel_id') for r in removals if r.get('channel_id')]
                              + [r.get('keep_channel_id') for r in removals
                                 if r.get('keep_channel_id')])
-    db.session.commit()
-    return jsonify({'success': True, 'removed': removed, 'transferred': transferred,
-                    'transfer_skipped': transfer_skipped})
 
 
 @guide_bp.route('/api/guide/epg')

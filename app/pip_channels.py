@@ -318,6 +318,21 @@ def detach_refs(kind: str, ids) -> set:
     return touched
 
 
+def repoint_refs(old_channel_id: int, new_channel_id: int) -> set:
+    """Point every picture of the old channel at the channel that replaced it
+    (app/channel_successors.py, dev/docs/DESIGN-channel-successors.md section 8.2). A picture
+    names one channel, so there is nothing to merge. Mutates without committing, inside the
+    accept's unit; returns the row ids it changed, for output_feed.refresh_pip() after that
+    commit."""
+    touched = set()
+    for role in ROLES:
+        kind_col, ref_col = getattr(PipChannel, f'{role}_kind'), getattr(PipChannel, f'{role}_ref')
+        hit = PipChannel.query.filter(kind_col == PIP_SOURCE_CHANNEL, ref_col == old_channel_id)
+        touched.update(row_id for (row_id,) in hit.with_entities(PipChannel.id))
+        hit.update({f'{role}_ref': new_channel_id}, synchronize_session=False)
+    return touched
+
+
 def refresh_detached(row_ids, what: str) -> None:
     """After the commit of a delete that detach_refs() unlinked pictures in, the last thing the
     delete does: say so, and refresh each row's live plays (output_feed.refresh_pip), which

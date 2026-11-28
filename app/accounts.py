@@ -33,14 +33,13 @@ from . import admission, db, duplicate_streams
 from .account_links import (clear_rolled_alert_after_sync, host_list, list_playlist_rows,
                             note_playlist_changes, playlist_facts, render_host,
                             rerender_stream_urls)
-from .channel_groups import touch_group
 from .database import (
-    Account, Alert, Channel, ChannelEvent, ChannelGroupMember, EPGEntry, AccountSyncLog,
+    Account, Alert, Channel, ChannelEvent, EPGEntry, AccountSyncLog,
     EpgAlternateEntry, EpgSource, EpgSourceRefresh, EPG_SOURCE_PROVIDER, EPG_SOURCE_URL,
     EPG_STATUS_FAILED, EPG_STATUS_OK, EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED,
-    Recording, add_recording_event,
-    CHANNEL_URL_CHANGED, CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE,
-    RECORDING_REPOINTED, REC_STATUS_IN_PROGRESS, REC_STATUS_SCHEDULED,
+    Recording,
+    CHANNEL_URL_CHANGED,
+    REC_STATUS_IN_PROGRESS, REC_STATUS_SCHEDULED,
     ACCOUNT_STATUS_SYNCING, ACCOUNT_STATUS_OK, ACCOUNT_STATUS_ERROR, ACCOUNT_STATUS_UNSYNCED,
     SYNC_LOG_IN_PROGRESS, SYNC_LOG_SUCCESS, SYNC_LOG_PARTIAL, SYNC_LOG_ERROR,
     SYNC_LOG_CANCELLED, SYNC_LOG_SKIPPED, SYNC_LOG_IMPORTED,
@@ -2470,106 +2469,6 @@ def transfer_keeper_problem(source, keeper, *, member_ids=None, where: str = '',
     return None
 
 
-def transfer_channel_state(source: Channel, dest: Channel, cfg: dict) -> str:
-    """Transfer guide/group/schedule/test-enrollment state from `source` to `dest`
-    (DESIGN-sync-resilience.md §6). `source` is kept (soft state) - it just no longer
-    holds guide/group/schedule state. Returns a plain-English summary of what moved, for
-    the caller to show as a toast/response message.
-
-    Shared by two callers with different validation needs: the repoint recovery route
-    (`app/routes/channels.py::repoint_channel`, which additionally requires `source` to be
-    lifecycle-'missing' and `dest` not to be) and "Remove Duplicate Channels" removal with
-    transfer (`app/routes/channel_tests.py`, `channel_groups.py`, `guide.py`, no lifecycle
-    requirement). This function itself only assumes `source` and `dest` are two distinct
-    Channel rows that are the same stream - one stream_url, or for the group page one stored
-    duplicate cluster (dev/changelog/1175) - callers own their own validation and are
-    expected to call this only from inside their own retry_on_locked commit closure, after
-    re-fetching fresh rows.
-    """
-    moved = []
-
-    # 1. Guide membership - only meaningful if the source channel was actually a guide
-    # row; a dest that's already in the guide is left alone (nothing to move).
-    if source.in_guide:
-        if not dest.in_guide:
-            dest.in_guide = True
-            dest.guide_sort_order = source.guide_sort_order
-            db.session.add(ChannelEvent(
-                channel_id=dest.id, event_type=CHANNEL_ADDED_TO_GUIDE,
-                detail=f'Added to guide via transfer from "{source.name}"',
-            ))
-            moved.append('guide listing')
-        source.in_guide = False
-        db.session.add(ChannelEvent(
-            channel_id=source.id, event_type=CHANNEL_REMOVED_FROM_GUIDE,
-            detail=f'Removed from guide - transferred to "{dest.name}"',
-        ))
-
-    # 2. Group membership - M:N since Groups unification, so this transfers EVERY group
-    # the source channel belongs to, one at a time.
-    # A group the dest already belongs to is skipped and named in the summary - no
-    # silent partial transfer.
-    skipped_groups = []
-    transferred_groups = 0
-    for m in list(source.group_memberships):
-        already_member = ChannelGroupMember.query.filter_by(
-            group_id=m.group_id, channel_id=dest.id).first()
-        # Either branch changes which channels that group holds, and the group may not
-        # be the one the user is looking at - a source channel can belong to several.
-        touch_group(m.group)
-        if already_member is not None:
-            skipped_groups.append(m.group.name)
-            db.session.delete(m)
-        else:
-            m.channel_id = dest.id
-            transferred_groups += 1
-    if transferred_groups:
-        moved.append('group membership')
-    if skipped_groups:
-        moved.append(f'group membership skipped (survivor already in '
-                      f'{", ".join(skipped_groups)})')
-
-    # 3. SCHEDULED recordings only - never IN_PROGRESS or terminal rows (never rewrite
-    # history). Group-backed recordings are excluded: their channel_id is owned by the
-    # group's own member-selection/failover logic (app/recorder.py), not this helper.
-    scheduled_recs = Recording.query.filter_by(
-        channel_id=source.id, status=REC_STATUS_SCHEDULED, group_id=None).all()
-    fresh_url = normalize_url(dest.stream_url, dest.account, cfg)
-    for rec in scheduled_recs:
-        old_channel_name, old_url = source.name, rec.url
-        rec.channel_id = dest.id
-        rec.url = fresh_url
-        add_recording_event(
-            rec.id, RECORDING_REPOINTED,
-            detail=(f'Channel "{old_channel_name}" ({source.account.name}) removed as a '
-                    f'duplicate; recording transferred to "{dest.name}" '
-                    f'({dest.account.name}) ({mask_creds(old_url)} -> {mask_creds(fresh_url)})'),
-            extra={'old_channel_id': source.id, 'new_channel_id': dest.id,
-                   'old_url': mask_creds(old_url), 'new_url': mask_creds(fresh_url)})
-    if scheduled_recs:
-        moved.append(f'{len(scheduled_recs)} scheduled recording'
-                      f'{"s" if len(scheduled_recs) != 1 else ""}')
-
-    # 4. Channel-test enrollment - dest keeps True if already enabled.
-    if source.test_enabled and not dest.test_enabled:
-        # participation-write-ok: Channel.test_enabled, the channel-wide off switch, not
-        # the group-scoped ChannelGroupMember column.
-        dest.test_enabled = True
-        moved.append('channel-test enrollment')
-
-    # 5. Both channels' hidden state, because steps 1 and 2 just moved the two things that
-    # protect a channel from being hidden. The source can have given up its last protection
-    # (a deferred hide now takes effect) and the dest can have gained its first. Recomputed
-    # rather than reasoned about: this runs inside the caller's own retry_on_locked commit
-    # closure, which is exactly where a recompute belongs.
-    from . import channel_hiding
-    channel_hiding.recompute([source.id, dest.id])
-
-    if not moved:
-        return f'"{source.name}": nothing to transfer to "{dest.name}".'
-    return f'"{source.name}" -> "{dest.name}": moved {", ".join(moved)}.'
-
-
 def missing_channel_expr(cfg, joined: bool = False):
     """The 'missing' branch of channel_lifecycle_state() as one SQL predicate on Channel -
     the spelling every query that needs "has the provider stopped listing this" composes
@@ -2632,6 +2531,50 @@ def _previous_sync_started_at(account_id: int, previous_last_sync_at) -> datetim
     previous_log = AccountSyncLog.query.filter_by(
         account_id=account_id, completed_at=previous_last_sync_at).first()
     return previous_log.started_at if previous_log else None
+
+
+def last_sync_bounds(account_ids=None) -> dict:
+    """{account_id: started_at of the sync that stamped Account.last_sync_at}, the bound a
+    channel is "unlisted" against (dev/docs/DESIGN-channel-successors.md section 3). The same
+    bound _previous_sync_started_at() reads, for every account in one query. An account that
+    has never synced, or whose log row for that sync has been pruned, is left out: its
+    channels are "not known", and channel_unlisted() / unlisted_channel_expr() read that as
+    listed, so nothing is proposed from a guess.
+
+    Keyed on account id by the GROUP BY. Two log rows cannot honestly share an account's
+    completed_at, but MAX() makes the answer one value per account whatever the table holds."""
+    q = (db.session.query(Account.id, func.max(AccountSyncLog.started_at))
+         .join(AccountSyncLog, db.and_(AccountSyncLog.account_id == Account.id,
+                                       AccountSyncLog.completed_at == Account.last_sync_at))
+         .filter(Account.last_sync_at.isnot(None)))
+    if account_ids is not None:
+        ids = list(account_ids)
+        if not ids:
+            return {}
+        q = q.filter(Account.id.in_(ids))
+    return {aid: started for aid, started in q.group_by(Account.id).all() if started is not None}
+
+
+def channel_unlisted(channel: Channel, bounds: dict) -> bool:
+    """Whether the account's last imported sync did not list `channel`
+    (dev/docs/DESIGN-channel-successors.md section 3). A separate fact from missing, which
+    needs channel_missing_after_days to pass: a missing channel is always unlisted, and an
+    unlisted one becomes missing a week later. `bounds` is last_sync_bounds(), read once per
+    request. Kept parallel to unlisted_channel_expr() below - if one changes, so must the
+    other."""
+    bound = bounds.get(channel.account_id)
+    return bound is not None and channel.last_seen_at is not None and channel.last_seen_at < bound
+
+
+def unlisted_channel_expr(bounds: dict):
+    """channel_unlisted() as one SQL predicate on Channel, over the same precomputed bounds.
+    One branch per account that has a known last sync, which is a handful: each seeks the
+    last_seen_at index inside its account. A NULL last_seen_at compares as unknown in SQL and
+    as not unlisted in Python, so the two agree on it."""
+    if not bounds:
+        return db.false()
+    return db.or_(*[db.and_(Channel.account_id == aid, Channel.last_seen_at < bound)
+                    for aid, bound in sorted(bounds.items())])
 
 
 def _category_tallies(account_id: int, seen_since: datetime) -> dict[str, int]:

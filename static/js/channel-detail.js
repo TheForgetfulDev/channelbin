@@ -265,9 +265,12 @@
     if (!r) return;
     if (!(await confirmModal({
       title: 'Re-point channel',
-      message: `The guide listing, channel-group assignment, scheduled recordings and health ` +
-        `check enrollment move from "${C.channelName}" to "${r.name}" on ${r.account}.`,
-      consequence: `"${C.channelName}" will no longer appear in the guide or be tested.`,
+      message: `"${r.name}" on ${r.account} takes the place of "${C.channelName}" in its ` +
+        `groups and the TV Guide, its scheduled recordings move, and its health score counts ` +
+        `"${C.channelName}"'s history. Notes and settings come across where "${r.name}" has ` +
+        `none of its own.`,
+      consequence: `"${C.channelName}" keeps its recordings and tests but leaves its groups ` +
+        `and the guide.`,
       confirmLabel: 'Re-point',
     }))) return;
     jsonFetch(C.urls.repoint, {

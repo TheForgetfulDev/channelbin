@@ -619,6 +619,26 @@ def _model_lineup_change(view, f):
     view.rows = rows
 
 
+def _model_renumber(view, f):
+    """Every channel keeps its name, category, guide id and the id inside its stream URL, and
+    comes back under a new playlist id: the catalog's stream_id, and CUID on an M3U panel,
+    which is where an M3U playlist's id comes from. With `url_id: new` the URL's id moves too,
+    so nothing on the account still names the stream the old rows did."""
+    offset = f.params['offset']
+    rows = []
+    for row in view.rows:
+        ch = row.channel
+        if ch.kind in TRIPLET_KINDS and not isinstance(row, FaultRow):
+            fields = {k: getattr(ch, k) for k in BackendChannel.__slots__}
+            fields['stream_id'] = ch.stream_id + offset
+            row = _row(row, channel=BackendChannel(*(fields[k] for k in BackendChannel.__slots__)))
+        rows.append(row)
+    view.rows = rows
+    view.cuid = True
+    if f.params['url_id'] == 'same':
+        view.url_id_offset = -offset
+
+
 def _model_duplicate_ids(view, f):
     picks = [row for row in view.rows if row.channel.kind in TRIPLET_KINDS
              and not isinstance(row, FaultRow)]
@@ -1074,6 +1094,14 @@ _KINDS = (
           'channels gone, new and renamed since the last sync',
           {'drop': (0.0, _share), 'add': (0, _count(0)), 'rename': (0.0, _share)},
           apply=_model_lineup_change),
+    _kind('renumber', SCOPE_PANEL, LAYER_MODEL, _ROWS, OBSERVED,
+          'dev/changelog/1788, DESIGN-channel-successors.md section 2: a playlist-rewriting '
+          'service kept each stream\'s id inside its URL and replaced the playlist\'s own '
+          'channel ids, so 500 group members were left on rows no sync updates; observed in prod',
+          'every channel comes back under a new playlist id, keeping its name and the id in its '
+          'stream URL (or, with url_id new, losing that too)',
+          {'offset': (500_000, _count(1)), 'url_id': ('same', _choice('same', 'new'))},
+          apply=_model_renumber),
     _kind('duplicate_ids', SCOPE_PANEL, LAYER_MODEL, _ROWS, MEASURED,
           'BUGS.md 2026-08-30 10:23 AM, dev/changelog/871, DESIGN-account-providers.md §2; 625 '
           'and 214 repeats on two accounts',

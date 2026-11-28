@@ -91,11 +91,15 @@ class Observation:
     `excluded` is the stored user decision; `quality` and `weight` are what the replay
     feeds blend_health_score. `label` is UI copy - it is what the confirm dialog and the
     ChannelEvent name, so it has to identify the observation to a human on its own.
+    `channel_id` is the channel the row belongs to, which is another channel for an
+    observation read through a replacement link; `label` then names it.
     """
 
-    __slots__ = ('kind', 'source_id', 'observed_at', 'quality', 'weight', 'label', 'excluded')
+    __slots__ = ('kind', 'source_id', 'observed_at', 'quality', 'weight', 'label', 'excluded',
+                 'channel_id')
 
-    def __init__(self, kind, source_id, observed_at, quality, weight, label, excluded=False):
+    def __init__(self, kind, source_id, observed_at, quality, weight, label, excluded=False,
+                 channel_id=None):
         self.kind = kind
         self.source_id = source_id
         self.observed_at = observed_at
@@ -103,6 +107,7 @@ class Observation:
         self.weight = weight
         self.label = label
         self.excluded = excluded
+        self.channel_id = channel_id
 
     @property
     def key(self):
@@ -165,18 +170,41 @@ def _test_label(test):
     return label
 
 
-def excluded_keys(channel_id):
-    """{(kind, source_id)} the user has taken out of this channel's score."""
+def _chain(channel_id, through_links):
+    """[(old channel id, cutoff, old name)] whose observations this channel's score counts
+    through a replacement link (app/channel_successors.py::carried_chain), or [] when asked
+    for the channel's own observations only."""
+    if not through_links:
+        return []
+    from .channel_successors import carried_chain
+    return carried_chain(channel_id)
+
+
+def excluded_keys(channel_id, chain=None):
+    """{(kind, source_id)} the user has taken out of this channel's score - its own exclusion
+    rows and those of every channel its score reads through a replacement link. Source ids are
+    table ids that do not repeat across channels, so an old channel's exclusions apply as they
+    are (dev/docs/DESIGN-channel-successors.md section 6)."""
     from .database import ChannelHealthExclusion
-    rows = ChannelHealthExclusion.query.filter_by(channel_id=channel_id).all()
+    if chain is None:
+        chain = _chain(channel_id, True)
+    ids = [channel_id] + [c[0] for c in chain]
+    rows = ChannelHealthExclusion.query.filter(ChannelHealthExclusion.channel_id.in_(ids)).all()
     return {(r.source_kind, r.source_id) for r in rows}
 
 
-def observation_ledger(channel_id, cfg) -> List[Observation]:
+def observation_ledger(channel_id, cfg, *, through_links=True) -> List[Observation]:
     """Every observation that has ever been blended into this channel's score, oldest first.
 
-    Fixed query count regardless of how many observations a channel has - three queries,
-    none of them per row (CLAUDE.md, no hidden I/O in per-row loops).
+    With `through_links` (the default, and what every score replay reads), a channel that
+    replaced another with its health history carried also counts that channel's observations
+    up to the accept, and so on down the chain (dev/docs/DESIGN-channel-successors.md
+    section 6). Off, it is the channel's own rows only, which is what moving them at a delete
+    reads.
+
+    Fixed query count regardless of how many observations a channel has - three queries over
+    the chain's ids, plus one per hop to find the chain, none of them per row (CLAUDE.md, no
+    hidden I/O in per-row loops).
     """
     from .database import (ChannelEvent, ChannelTest, Recording,
                            CHANNEL_FAILOVER_HEALTH_OBSERVATION,
@@ -185,13 +213,17 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
                            CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION)
     from .tz_utils import format_local
 
-    excluded = excluded_keys(channel_id)
+    chain = _chain(channel_id, through_links)
+    ids = [channel_id] + [c[0] for c in chain]
+    cutoffs = {c[0]: c[1] for c in chain}
+    names = {c[0]: c[2] for c in chain}
+    excluded = excluded_keys(channel_id, chain)
     obs: List[Observation] = []
 
     # A test that was never blended (CANCELLED, or still running) carries no quality_score,
     # which is exactly the "this one never counted" marker - see score_test_quality.
     tests = (ChannelTest.query
-             .filter(ChannelTest.channel_id == channel_id,
+             .filter(ChannelTest.channel_id.in_(ids),
                      ChannelTest.quality_score.isnot(None))
              .all())
     for t in tests:
@@ -199,13 +231,13 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
         weight = _stored_weight(breakdown, observation_weight(t.duration_seconds, cfg))
         obs.append(Observation(
             SOURCE_TEST, t.id, t.test_started_at, t.quality_score, weight,
-            _test_label(t), (SOURCE_TEST, t.id) in excluded))
+            _test_label(t), (SOURCE_TEST, t.id) in excluded, t.channel_id))
 
     # Either column alone is enough: the correction can exist on a row whose primary
     # observation was never written (its channel had already been re-observed by the time
     # postprocessing finished), and the primary exists long before the correction does.
     recordings = (Recording.query
-                  .filter(Recording.channel_id == channel_id)
+                  .filter(Recording.channel_id.in_(ids))
                   .filter(or_(Recording.health_quality_score.isnot(None),
                               Recording.capture_quality_breakdown.isnot(None)))
                   .all())
@@ -226,7 +258,7 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
                 SOURCE_RECORDING, r.id, observed_at, r.health_quality_score, weight,
                 f'Recording "{r.name}" on {format_local(observed_at)} '
                 f'(scored {r.health_quality_score}/100)',
-                (SOURCE_RECORDING, r.id) in excluded))
+                (SOURCE_RECORDING, r.id) in excluded, r.channel_id))
         correction = _loads(r.capture_quality_breakdown)
         if correction.get('final') is not None:
             # The correction stores no blend_breakdown; its weight is in its own breakdown, or
@@ -242,7 +274,7 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
                 _stored_weight(correction, float(rs_cfg.get('capture_quality_source_weight', 1.0))),
                 f'Post-process check of recording "{r.name}" on {format_local(correction_at)} '
                 f'(scored {correction["final"]}/100)',
-                (SOURCE_CAPTURE_CORRECTION, r.id) in excluded))
+                (SOURCE_CAPTURE_CORRECTION, r.id) in excluded, r.channel_id))
 
     event_kinds = {
         CHANNEL_FAILOVER_HEALTH_OBSERVATION: (SOURCE_FAILOVER, 'Failed over away from this channel'),
@@ -254,7 +286,7 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
                                                    'Delivered faster than real time'),
     }
     events = (ChannelEvent.query
-              .filter(ChannelEvent.channel_id == channel_id,
+              .filter(ChannelEvent.channel_id.in_(ids),
                       ChannelEvent.event_type.in_(list(event_kinds)))
               .all())
     for e in events:
@@ -268,11 +300,18 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
         obs.append(Observation(
             kind, e.id, e.timestamp, quality, weight,
             f'{prose} on {format_local(e.timestamp)} (scored {quality}/100)',
-            (kind, e.id) in excluded))
+            (kind, e.id) in excluded, e.channel_id))
 
     # A NULL timestamp cannot be ordered against a real one and would crash the sort; such a
     # row also cannot be placed in the replay, so it is dropped rather than guessed at.
     obs = [o for o in obs if o.observed_at is not None]
+    # An old channel's observations count up to the accept and no further: a recording that
+    # was already running when it was replaced finishes onto the old channel's own score.
+    obs = [o for o in obs
+           if o.channel_id not in cutoffs or o.observed_at <= cutoffs[o.channel_id]]
+    for o in obs:
+        if o.channel_id in names:
+            o.label = f'{o.label} - on "{names[o.channel_id]}", which this channel replaced'
     obs.sort(key=lambda o: (o.observed_at, _KIND_RANK.get(o.kind, 0), o.kind, o.source_id))
     return obs
 
@@ -310,15 +349,21 @@ def recompute_failure_streak(channel_id, excluded=None):
     CANCELLED tests neither extend nor break a streak, so they are skipped entirely.
     """
     from .database import ChannelTest, TEST_STATUS_CANCELLED, TEST_STATUS_FAILED
+    # Over the same replacement chain and cutoffs as the score, since it is replayed beside it
+    # (dev/docs/DESIGN-channel-successors.md section 6).
+    chain = _chain(channel_id, True)
+    cutoffs = {c[0]: c[1] for c in chain}
     if excluded is None:
-        excluded = excluded_keys(channel_id)
+        excluded = excluded_keys(channel_id, chain)
     tests = (ChannelTest.query
-             .filter(ChannelTest.channel_id == channel_id,
+             .filter(ChannelTest.channel_id.in_([channel_id] + list(cutoffs)),
                      ChannelTest.quality_score.isnot(None))
              .order_by(ChannelTest.test_started_at.desc(), ChannelTest.id.desc())
              .all())
     streak = 0
     for t in tests:
+        if t.channel_id in cutoffs and t.test_started_at > cutoffs[t.channel_id]:
+            continue
         if t.status == TEST_STATUS_CANCELLED:
             continue
         if (SOURCE_TEST, t.id) in excluded:

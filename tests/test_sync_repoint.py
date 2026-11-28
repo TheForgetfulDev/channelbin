@@ -9,10 +9,10 @@ to the survivor. The missing channel row itself is always kept (soft state).
 Covers:
   - RepointCandidateDetectionTests: _repoint_candidates_for_channels() - the batched
     survivor-lookup helper (prefilter, missing-vs-missing exclusion, oldest-first pick).
-  - RepointTransferTests: transfer_channel_state() - the actual transfer, one behavior at
-    a time. Shared with "Remove Duplicate Channels" removal-with-transfer - see
-    tests/test_channel_tests.py, tests/test_channel_groups.py, tests/test_guide.py for
-    that caller's own coverage.
+  - RepointTransferTests: channel_successors.replace() with the pieces the Remove Duplicate
+    Channels paths carry - the actual move, one behavior at a time (it replaced
+    transfer_channel_state(), dev/changelog/1794). See tests/test_channel_successors.py for
+    the replacement's own coverage.
   - RepointRouteTests: the POST /channels/<id>/repoint route - server-side validation and
     the end-to-end happy path via the Flask test client.
 
@@ -32,7 +32,7 @@ from app.database import (  # noqa: E402
     Channel, ChannelGroupMember, ChannelEvent, RecordingEvent, RECORDING_REPOINTED,
     CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE,
 )
-from app.accounts import transfer_channel_state  # noqa: E402
+from app import channel_successors as successors  # noqa: E402
 from app.routes.channels import (  # noqa: E402
     _repoint_candidates_for_channels, _lifecycle_states_for_channels,
 )
@@ -130,8 +130,14 @@ class RepointCandidateDetectionTests(unittest.TestCase):
         self.assertEqual(candidates, {})
 
 
+def transfer(missing, survivor, cfg):
+    """What the three Remove Duplicate Channels paths run."""
+    return successors.replace(missing, survivor, successors.DEDUP_PIECES,
+                              successors.SURFACE_DEDUP, cfg=cfg)
+
+
 class RepointTransferTests(unittest.TestCase):
-    """transfer_channel_state() - the actual mutation, one behavior at a time."""
+    """channel_successors.replace() - the actual mutation, one behavior at a time."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -154,7 +160,7 @@ class RepointTransferTests(unittest.TestCase):
         missing, survivor = self._pair(
             missing_kw={'in_guide': True, 'guide_sort_order': 42},
             survivor_kw={'in_guide': False})
-        transfer_channel_state(missing, survivor, self.cfg)
+        transfer(missing, survivor, self.cfg)
         db.session.commit()
 
         self.assertFalse(missing.in_guide)
@@ -169,7 +175,7 @@ class RepointTransferTests(unittest.TestCase):
         missing, survivor = self._pair(
             missing_kw={'in_guide': False},
             survivor_kw={'in_guide': False, 'guide_sort_order': 7})
-        transfer_channel_state(missing, survivor, self.cfg)
+        transfer(missing, survivor, self.cfg)
         db.session.commit()
 
         self.assertFalse(survivor.in_guide)
@@ -179,7 +185,7 @@ class RepointTransferTests(unittest.TestCase):
         missing, survivor = self._pair(
             missing_kw={'in_guide': True, 'guide_sort_order': 42},
             survivor_kw={'in_guide': True, 'guide_sort_order': 99})
-        transfer_channel_state(missing, survivor, self.cfg)
+        transfer(missing, survivor, self.cfg)
         db.session.commit()
 
         self.assertFalse(missing.in_guide)
@@ -191,7 +197,7 @@ class RepointTransferTests(unittest.TestCase):
         group = seed.make_group(name='Failover Group', members=[missing])
         db.session.commit()
 
-        transfer_channel_state(missing, survivor, self.cfg)
+        transfer(missing, survivor, self.cfg)
         db.session.commit()
 
         self.assertEqual(ChannelGroupMember.query.filter_by(channel_id=missing.id).count(), 0)
@@ -205,13 +211,14 @@ class RepointTransferTests(unittest.TestCase):
         group = seed.make_group(name='Shared Group', members=[missing, survivor])
         db.session.commit()
 
-        message = transfer_channel_state(missing, survivor, self.cfg)
+        result = transfer(missing, survivor, self.cfg)
         db.session.commit()
 
         self.assertEqual(ChannelGroupMember.query.filter_by(channel_id=missing.id).count(), 0)
         self.assertEqual(
             ChannelGroupMember.query.filter_by(group_id=group.id, channel_id=survivor.id).count(), 1)
-        self.assertIn('Shared Group', message)
+        self.assertIn('Shared Group', successors.summary(result))
+        self.assertEqual(result['groups'][0]['merged'], True)
 
     def test_membership_transfers_across_every_group_a_channel_belongs_to(self):
         """M:N since Groups unification - a channel can be in a recording-source failover
@@ -221,7 +228,7 @@ class RepointTransferTests(unittest.TestCase):
         cg = seed.make_group(name='Monitor Bag', members=[missing], recording=False, in_guide=False)
         db.session.commit()
 
-        transfer_channel_state(missing, survivor, self.cfg)
+        transfer(missing, survivor, self.cfg)
         db.session.commit()
 
         self.assertTrue(ChannelGroupMember.query.filter_by(group_id=fg.id, channel_id=survivor.id).first())
@@ -233,7 +240,7 @@ class RepointTransferTests(unittest.TestCase):
                                   url='http://olduser:oldpass@example.test/live/1')
         db.session.commit()
 
-        transfer_channel_state(missing, survivor, self.cfg)
+        transfer(missing, survivor, self.cfg)
         db.session.commit()
 
         db.session.refresh(rec)
@@ -249,7 +256,7 @@ class RepointTransferTests(unittest.TestCase):
         completed = seed.make_recording(status='COMPLETED', channel_id=missing.id)
         db.session.commit()
 
-        transfer_channel_state(missing, survivor, self.cfg)
+        transfer(missing, survivor, self.cfg)
         db.session.commit()
 
         db.session.refresh(in_progress)
@@ -257,15 +264,32 @@ class RepointTransferTests(unittest.TestCase):
         self.assertEqual(in_progress.channel_id, missing.id)
         self.assertEqual(completed.channel_id, missing.id)
 
-    def test_group_backed_scheduled_recording_never_touched(self):
-        """A group-backed recording's channel_id is owned by the group's own member-
-        selection/failover logic (app/recorder.py) - this helper must not fight it."""
+    def test_group_backed_scheduled_recording_follows_its_moved_member(self):
+        """A group recording stamped to the old member is restamped onto the new one when
+        the membership moved, so the old row holds up no later delete
+        (DESIGN-channel-successors.md section 8.2). Record start re-chooses a member anyway."""
         missing, survivor = self._pair()
         group = seed.make_group(name='G', members=[missing])
         rec = seed.make_recording(status='SCHEDULED', channel_id=missing.id, group_id=group.id)
         db.session.commit()
 
-        transfer_channel_state(missing, survivor, self.cfg)
+        transfer(missing, survivor, self.cfg)
+        db.session.commit()
+
+        db.session.refresh(rec)
+        self.assertEqual(rec.channel_id, survivor.id)
+        self.assertEqual(RecordingEvent.query.filter_by(
+            recording_id=rec.id, event_type=RECORDING_REPOINTED).count(), 1)
+
+    def test_group_recording_in_a_group_that_did_not_move_is_never_touched(self):
+        """A group recording on a group the old channel is no longer a member of belongs to
+        that group's own member selection."""
+        missing, survivor = self._pair()
+        group = seed.make_group(name='G', members=[survivor])
+        rec = seed.make_recording(status='SCHEDULED', channel_id=missing.id, group_id=group.id)
+        db.session.commit()
+
+        transfer(missing, survivor, self.cfg)
         db.session.commit()
 
         db.session.refresh(rec)
@@ -275,21 +299,21 @@ class RepointTransferTests(unittest.TestCase):
     def test_test_enabled_transfers_when_missing_enabled_and_survivor_not(self):
         missing, survivor = self._pair(
             missing_kw={'test_enabled': True}, survivor_kw={'test_enabled': False})
-        transfer_channel_state(missing, survivor, self.cfg)
+        transfer(missing, survivor, self.cfg)
         db.session.commit()
         self.assertTrue(survivor.test_enabled)
 
     def test_test_enabled_not_claimed_as_moved_when_already_true(self):
         missing, survivor = self._pair(
             missing_kw={'test_enabled': True}, survivor_kw={'test_enabled': True})
-        message = transfer_channel_state(missing, survivor, self.cfg)
+        result = transfer(missing, survivor, self.cfg)
         db.session.commit()
         self.assertTrue(survivor.test_enabled)
-        self.assertNotIn('channel-test enrollment', message)
+        self.assertNotIn(successors.CARRY_TEST_SWITCH, result['carried'])
 
     def test_missing_channel_row_is_kept(self):
         missing, survivor = self._pair(missing_kw={'in_guide': True})
-        transfer_channel_state(missing, survivor, self.cfg)
+        transfer(missing, survivor, self.cfg)
         db.session.commit()
         self.assertIsNotNone(db.session.get(Channel, missing.id))
 

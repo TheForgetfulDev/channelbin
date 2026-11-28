@@ -1079,6 +1079,10 @@ def _delete_account_and_jobs(account_id):
         # never re-issued, so every `account:<id>:` source is this account's (dev/changelog/1732).
         mark_cleared(Alert.query.filter(Alert.source.like(f'account:{account_id}:%'),
                                         Alert.dismissed_at.is_(None)).all())
+        # A replacement link naming one of these channels re-homes the history it counted
+        # before the cascade takes it (dev/docs/DESIGN-channel-successors.md section 7).
+        from ..channel_successors import before_channel_delete
+        before_channel_delete(channel_ids, cfg)
         # A group pinned to one of these channels goes back to automatic, and says why.
         clear_guide_listings_pins_on(channel_ids)
         # Not cascaded either, and channel ids are re-issued (DESIGN-sports-data.md 9): a
@@ -1120,7 +1124,13 @@ def _delete_account_and_jobs(account_id):
         delete_cached_logos(cached_paths)
     if name is not None and screenshot_paths:
         from ..recorder import delete_files
-        delete_files(screenshot_paths)
+        # A test whose channel replaced one of these moved onto that channel with its file
+        # (channel_successors.before_channel_delete); its path is still in use.
+        kept = set()
+        for chunk in chunked(screenshot_paths, _DELETE_CHUNK_SIZE):
+            kept.update(p for (p,) in db.session.query(ChannelTest.screenshot_path)
+                        .filter(ChannelTest.screenshot_path.in_(chunk)).all())
+        delete_files([p for p in screenshot_paths if p not in kept])
     report_orphaned_guide_groups(
         touched_group_ids,
         cause=f'The channels it could record from belonged to the deleted account "{name}".'
